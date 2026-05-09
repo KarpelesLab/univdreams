@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = []
+
+# Member crates will be added in Phase 0/1 as they are implemented:
+#   crates/ud-core
+#   crates/ud-format
+#   crates/ud-arch
+#   crates/ud-arch-x86
+#   crates/ud-ir
+#   crates/ud-analysis
+#   crates/ud-debug
+#   crates/ud-signatures
+#   crates/ud-decompile
+#   crates/ud-compile
+#   crates/ud-cli
+#
+# See docs/architecture.md for the role of each crate and docs/roadmap.md for
+# the order they come online.
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "TBD"
+repository = "https://github.com/.../univdreams"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+all = { level = "warn", priority = -1 }
