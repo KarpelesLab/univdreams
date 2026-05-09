@@ -13,6 +13,8 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod lexer;
+mod lower;
 mod parser;
 
+pub use lower::{lower_function_bytes, lower_functions, LowerError, LoweredFunction};
 pub use parser::{parse, ParseError};

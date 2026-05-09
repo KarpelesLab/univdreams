@@ -122,7 +122,12 @@ fn asm_count_matches_lifted_instruction_count() {
         .iter()
         .filter_map(|i| {
             if let Item::Function(f) = i {
-                Some(f.body.iter().filter(|s| matches!(s, Stmt::Asm(_))).count())
+                Some(
+                    f.body
+                        .iter()
+                        .filter(|s| matches!(s, Stmt::Asm { .. }))
+                        .count(),
+                )
             } else {
                 None
             }

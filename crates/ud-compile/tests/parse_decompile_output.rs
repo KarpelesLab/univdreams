@@ -86,7 +86,7 @@ fn parser_accepts_every_decompile_output() {
                         let has_content = f
                             .body
                             .iter()
-                            .any(|s| matches!(s, Stmt::Asm(_) | Stmt::Comment(_)));
+                            .any(|s| matches!(s, Stmt::Asm { .. } | Stmt::Comment(_)));
                         assert!(
                             has_content,
                             "function `{}` parsed with an empty body",

@@ -171,6 +171,38 @@ impl Parser {
         Ok(out)
     }
 
+    /// Parse `[byte, byte, …]` where each byte is an integer in 0..=255.
+    /// Used by `@asm("text", [bytes])` and (future) `@raw([bytes])`.
+    fn parse_byte_list(&mut self) -> Result<Vec<u8>, ParseError> {
+        let bracket = self.peek().clone();
+        self.expect(&TokenKind::LBracket, "`[` to open byte list")?;
+        let mut out = Vec::new();
+        if self.peek().kind != TokenKind::RBracket {
+            loop {
+                let tok = self.peek().clone();
+                let n = self.expect_int("byte value (0..=255)")?;
+                if n > 0xff {
+                    return Err(ParseError::Expected {
+                        expected: "byte value (0..=255)".into(),
+                        got: format!("integer 0x{n:x}"),
+                        line: tok.line,
+                        col: tok.col,
+                    });
+                }
+                out.push(n as u8);
+                if !self.eat_kind(&TokenKind::Comma) {
+                    break;
+                }
+                if self.peek().kind == TokenKind::RBracket {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RBracket, "`]` to close byte list")?;
+        let _ = bracket; // kept for potential future use in error messages
+        Ok(out)
+    }
+
     fn parse_value(&mut self) -> Result<Value, ParseError> {
         let tok = self.peek().clone();
         match &tok.kind {
@@ -289,8 +321,13 @@ impl Parser {
                         "asm" => {
                             self.expect(&TokenKind::LParen, "`(` after `@asm`")?;
                             let text = self.expect_string("asm string")?;
+                            let bytes = if self.eat_kind(&TokenKind::Comma) {
+                                self.parse_byte_list()?
+                            } else {
+                                Vec::new()
+                            };
                             self.expect(&TokenKind::RParen, "`)` to close `@asm`")?;
-                            body.push(Stmt::Asm(text));
+                            body.push(Stmt::Asm { text, bytes });
                         }
                         other => {
                             return Err(ParseError::UnknownDirective {
@@ -402,7 +439,7 @@ fn _start() {
         assert_eq!(fn_.addr, Some(0x1080));
         assert_eq!(fn_.name, "_start");
         assert_eq!(fn_.body.len(), 2);
-        assert_eq!(fn_.body[0], Stmt::Asm("endbr64".into()));
+        assert_eq!(fn_.body[0], Stmt::asm_text("endbr64"));
     }
 
     #[test]
@@ -428,6 +465,42 @@ fn f() {
         };
         assert_eq!(fn_.body.len(), 3);
         assert_eq!(fn_.body[1], Stmt::Comment("block: 0x100".into()));
+    }
+
+    #[test]
+    fn asm_with_pinned_bytes() {
+        let src = r#"@module {}
+
+fn f() {
+    @asm("endbr64", [0xf3, 0x0f, 0x1e, 0xfa])
+    @asm("ret", [0xc3])
+}
+"#;
+        let f = parse(src).unwrap();
+        let Item::Function(fn_) = &f.items[0] else {
+            panic!()
+        };
+        assert_eq!(
+            fn_.body[0],
+            Stmt::asm("endbr64", vec![0xf3, 0x0f, 0x1e, 0xfa])
+        );
+        assert_eq!(fn_.body[1], Stmt::asm("ret", vec![0xc3]));
+    }
+
+    #[test]
+    fn asm_byte_outside_range_is_rejected() {
+        let src = r#"@module {}
+
+fn f() {
+    @asm("?", [0x100])
+}
+"#;
+        let err = parse(src).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("byte value"),
+            "expected byte-range error, got: {msg}"
+        );
     }
 
     #[test]

@@ -67,10 +67,43 @@ pub struct FnDecl {
 /// A statement inside a function body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
-    /// `@asm("…")` — an instruction in textual assembly form.
-    Asm(String),
+    /// `@asm("text")` or `@asm("text", [bytes])` — an instruction.
+    ///
+    /// `text` is the human-readable assembly. `bytes` pins the exact
+    /// encoded bytes; when non-empty, it's the ground truth for
+    /// recompilation and the assembler's job is to verify that
+    /// assembling `text` produces matching bytes (with directive-pinned
+    /// encoding choices, when those land).
+    ///
+    /// `bytes` may be empty: a future assembler will then derive them
+    /// from the text alone. v0 always populates `bytes` because we
+    /// don't yet ship a text assembler that produces byte-identical
+    /// output for non-canonical encodings.
+    Asm { text: String, bytes: Vec<u8> },
+
     /// `// …` line. Used by the decompiler to surface block boundaries
     /// and direct-branch targets without committing to a structural
     /// syntax for them yet.
     Comment(String),
+}
+
+impl Stmt {
+    /// Construct an [`Stmt::Asm`] with both text and pinned bytes.
+    #[must_use]
+    pub fn asm(text: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self::Asm {
+            text: text.into(),
+            bytes,
+        }
+    }
+
+    /// Construct an [`Stmt::Asm`] with text only (no bytes pinned).
+    /// Useful in tests; not used by the v0 decompiler.
+    #[must_use]
+    pub fn asm_text(text: impl Into<String>) -> Self {
+        Self::Asm {
+            text: text.into(),
+            bytes: Vec::new(),
+        }
+    }
 }

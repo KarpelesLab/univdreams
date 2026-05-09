@@ -45,16 +45,16 @@ fn sample_ast() -> UdFile {
                 addr: Some(0x1080),
                 name: "_start".into(),
                 body: vec![
-                    Stmt::Asm("endbr64".into()),
+                    Stmt::asm("endbr64", vec![0xf3, 0x0f, 0x1e, 0xfa]),
                     Stmt::Comment("block: 0x1084".into()),
-                    Stmt::Asm("xor rax, rax".into()),
-                    Stmt::Asm("ret".into()),
+                    Stmt::asm("xor rax, rax", vec![0x48, 0x31, 0xc0]),
+                    Stmt::asm("ret", vec![0xc3]),
                 ],
             }),
             Item::Function(FnDecl {
                 addr: Some(0x1100),
                 name: "main".into(),
-                body: vec![Stmt::Asm("ret".into())],
+                body: vec![Stmt::asm("ret", vec![0xc3])],
             }),
         ],
     }

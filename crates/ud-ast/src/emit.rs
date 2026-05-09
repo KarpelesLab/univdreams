@@ -48,8 +48,18 @@ fn emit_fn(out: &mut String, f: &FnDecl) {
     writeln!(out, "fn {}() {{", f.name).unwrap();
     for stmt in &f.body {
         match stmt {
-            Stmt::Asm(text) => {
+            Stmt::Asm { text, bytes } if bytes.is_empty() => {
                 writeln!(out, "    @asm({})", quote_string(text)).unwrap();
+            }
+            Stmt::Asm { text, bytes } => {
+                write!(out, "    @asm({}, [", quote_string(text)).unwrap();
+                for (i, b) in bytes.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write!(out, "0x{b:02x}").unwrap();
+                }
+                writeln!(out, "])").unwrap();
             }
             Stmt::Comment(text) => {
                 writeln!(out, "    // {text}").unwrap();
@@ -189,16 +199,16 @@ mod tests {
     }
 
     #[test]
-    fn function_with_asm_lines() {
+    fn function_with_asm_lines_text_only() {
         let f = UdFile {
             module: empty_module(),
             items: vec![Item::Function(FnDecl {
                 addr: Some(0x1080),
                 name: "_start".into(),
                 body: vec![
-                    Stmt::Asm("endbr64".into()),
+                    Stmt::asm_text("endbr64"),
                     Stmt::Comment("block: 0x1084".into()),
-                    Stmt::Asm("ret".into()),
+                    Stmt::asm_text("ret"),
                 ],
             })],
         };
@@ -207,6 +217,24 @@ mod tests {
         assert!(out.contains("    @asm(\"endbr64\")\n"));
         assert!(out.contains("    // block: 0x1084\n"));
         assert!(out.contains("    @asm(\"ret\")\n"));
+    }
+
+    #[test]
+    fn function_with_asm_lines_and_pinned_bytes() {
+        let f = UdFile {
+            module: empty_module(),
+            items: vec![Item::Function(FnDecl {
+                addr: Some(0x1080),
+                name: "f".into(),
+                body: vec![
+                    Stmt::asm("endbr64", vec![0xf3, 0x0f, 0x1e, 0xfa]),
+                    Stmt::asm("ret", vec![0xc3]),
+                ],
+            })],
+        };
+        let out = emit(&f);
+        assert!(out.contains("    @asm(\"endbr64\", [0xf3, 0x0f, 0x1e, 0xfa])\n"));
+        assert!(out.contains("    @asm(\"ret\", [0xc3])\n"));
     }
 
     #[test]

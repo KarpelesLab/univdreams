@@ -19,7 +19,10 @@ pub fn build_function(f: &Function<DecodedInsn>) -> FnDecl {
             body.push(Stmt::Comment(format!("block: 0x{:x}", block.addr.0)));
         }
         for insn in &block.insns {
-            body.push(Stmt::Asm(format_intel(&insn.iced)));
+            body.push(Stmt::asm(
+                format_intel(&insn.iced),
+                insn.original_bytes.clone(),
+            ));
         }
         match &block.terminator {
             Terminator::ConditionalBranch { taken, fallthrough } => {
