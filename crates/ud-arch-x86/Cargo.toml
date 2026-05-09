@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 thiserror = "2"
+ud-core = { path = "../ud-core" }
+ud-ir = { path = "../ud-ir" }
 iced-x86 = { version = "1", default-features = false, features = [
     "decoder",
     "encoder",
@@ -23,3 +25,4 @@ iced-x86 = { version = "1", default-features = false, features = [
 
 [dev-dependencies]
 ud-format-elf = { path = "../ud-format-elf" }
+ud-analysis = { path = "../ud-analysis" }

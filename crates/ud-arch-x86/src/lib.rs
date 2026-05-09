@@ -22,6 +22,11 @@
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock,
 };
+use ud_core::VAddr;
+use ud_ir::ArchInsn;
+
+mod lift;
+pub use lift::{lift_function, LiftError};
 
 /// Errors produced by decode / encode / round-trip helpers.
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +80,16 @@ impl Bitness {
 pub struct DecodedInsn {
     pub iced: Instruction,
     pub original_bytes: Vec<u8>,
+}
+
+impl ArchInsn for DecodedInsn {
+    fn addr(&self) -> VAddr {
+        VAddr(self.iced.ip())
+    }
+
+    fn original_bytes(&self) -> &[u8] {
+        &self.original_bytes
+    }
 }
 
 /// Decode `bytes` as a contiguous x86 instruction stream starting at

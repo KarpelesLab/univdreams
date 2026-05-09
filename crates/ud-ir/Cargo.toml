@@ -1,0 +1,15 @@
+[package]
+name = "ud-ir"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared IR types: functions, basic blocks, control-flow terminators."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ud-core = { path = "../ud-core" }
