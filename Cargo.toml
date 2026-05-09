@@ -4,6 +4,7 @@ members = [
     "crates/ud-core",
     "crates/ud-format-elf",
     "crates/ud-arch-x86",
+    "crates/ud-analysis",
     "crates/ud-cli",
 ]
 

@@ -32,6 +32,16 @@ const ELFDATA2LSB: u8 = 1;
 /// `sh_type` indicating the section occupies no file space (e.g. `.bss`).
 const SHT_NOBITS: u32 = 8;
 
+/// `sh_type` for a fully-linked symbol table.
+pub const SHT_SYMTAB: u32 = 2;
+
+/// `sh_type` for a string table.
+pub const SHT_STRTAB: u32 = 3;
+
+/// `sh_type` for the dynamic-linking symbol table (always present in dynamic
+/// executables and shared objects).
+pub const SHT_DYNSYM: u32 = 11;
+
 /// `sh_flags` bit indicating the section contains executable instructions.
 pub const SHF_EXECINSTR: u64 = 0x4;
 

@@ -1,0 +1,17 @@
+[package]
+name = "ud-analysis"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Analysis passes over loaded binaries: function discovery, type recovery, and signature matching."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ud-core = { path = "../ud-core" }
+ud-format-elf = { path = "../ud-format-elf" }
+thiserror = "2"
