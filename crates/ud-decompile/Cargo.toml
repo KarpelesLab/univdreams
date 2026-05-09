@@ -1,29 +1,20 @@
 [package]
-name = "ud-arch-x86"
+name = "ud-decompile"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "x86 (16/32/64-bit) decode + encode backend with byte-identical round-trip."
+description = "Emit a .ud source file from an analyzed binary."
 publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-thiserror = "2"
 ud-core = { path = "../ud-core" }
 ud-ir = { path = "../ud-ir" }
-iced-x86 = { version = "1", default-features = false, features = [
-    "decoder",
-    "encoder",
-    "block_encoder",
-    "instr_info",
-    "intel",
-    "std",
-] }
-
-[dev-dependencies]
 ud-format-elf = { path = "../ud-format-elf" }
+ud-arch-x86 = { path = "../ud-arch-x86" }
 ud-analysis = { path = "../ud-analysis" }
+thiserror = "2"

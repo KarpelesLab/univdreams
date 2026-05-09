@@ -20,13 +20,29 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock,
+    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Formatter, Instruction,
+    InstructionBlock, IntelFormatter,
 };
 use ud_core::VAddr;
 use ud_ir::ArchInsn;
 
 mod lift;
 pub use lift::{lift_function, LiftError};
+
+/// Format `insn` as Intel-syntax assembly text, suitable for embedding
+/// inside an `@asm("...")` directive in a `.ud` file.
+///
+/// Goes through iced's [`IntelFormatter`] with default options so the
+/// output matches the ubiquitous Intel-syntax convention (`mov rax,
+/// rbx`, source on the right). Fresh formatter per call: deterministic,
+/// no shared mutable state.
+#[must_use]
+pub fn format_intel(insn: &Instruction) -> String {
+    let mut formatter = IntelFormatter::new();
+    let mut out = String::new();
+    formatter.format(insn, &mut out);
+    out
+}
 
 /// Errors produced by decode / encode / round-trip helpers.
 #[derive(Debug, thiserror::Error)]
