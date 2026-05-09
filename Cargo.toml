@@ -3,10 +3,12 @@ resolver = "2"
 members = [
     "crates/ud-core",
     "crates/ud-ir",
+    "crates/ud-ast",
     "crates/ud-format-elf",
     "crates/ud-arch-x86",
     "crates/ud-analysis",
     "crates/ud-decompile",
+    "crates/ud-compile",
     "crates/ud-cli",
 ]
 

@@ -1,0 +1,20 @@
+[package]
+name = "ud-compile"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parser for the .ud source language: text → AST."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ud-ast = { path = "../ud-ast" }
+thiserror = "2"
+
+[dev-dependencies]
+ud-decompile = { path = "../ud-decompile" }
+ud-format-elf = { path = "../ud-format-elf" }
