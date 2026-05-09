@@ -99,4 +99,4 @@ If you want the full design, read in order:
 
 ## License
 
-TBD.
+MIT. Copyright (c) 2026 Karpeles Lab Inc. See [LICENSE](LICENSE).
