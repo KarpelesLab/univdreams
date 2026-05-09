@@ -1,19 +1,20 @@
 [workspace]
 resolver = "2"
-members = []
+members = [
+    "crates/ud-core",
+    "crates/ud-cli",
+]
 
-# Member crates will be added in Phase 0/1 as they are implemented:
-#   crates/ud-core
-#   crates/ud-format
-#   crates/ud-arch
-#   crates/ud-arch-x86
-#   crates/ud-ir
-#   crates/ud-analysis
-#   crates/ud-debug
-#   crates/ud-signatures
-#   crates/ud-decompile
-#   crates/ud-compile
-#   crates/ud-cli
+# Additional member crates land in later phases:
+#   crates/ud-format       (Phase 1: ELF reader/writer)
+#   crates/ud-arch         (Phase 1: arch trait)
+#   crates/ud-arch-x86     (Phase 1: x86 backend)
+#   crates/ud-ir           (Phase 2: IR types)
+#   crates/ud-analysis     (Phase 2: function discovery, type recovery, sig matching)
+#   crates/ud-debug        (Phase 5: DWARF/PDB)
+#   crates/ud-signatures   (Phase 5: stdlib signature DB)
+#   crates/ud-decompile    (Phase 3: IR → AST → .ud)
+#   crates/ud-compile      (Phase 3: .ud → AST → IR → bytes)
 #
 # See docs/architecture.md for the role of each crate and docs/roadmap.md for
 # the order they come online.
@@ -31,3 +32,7 @@ missing_debug_implementations = "warn"
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 all = { level = "warn", priority = -1 }
+# Documentation lints are revisited once the public surface stabilises.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
