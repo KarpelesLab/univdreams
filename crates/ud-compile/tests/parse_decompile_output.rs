@@ -60,7 +60,7 @@ fn parser_accepts_every_decompile_output() {
             continue;
         }
 
-        let source = match ud_decompile::decompile(&elf) {
+        let source = match ud_decompile::decompile_to_text(&elf) {
             Ok(s) => s,
             Err(e) => {
                 failures.push(format!("{} decompile: {e}", fixture.display()));

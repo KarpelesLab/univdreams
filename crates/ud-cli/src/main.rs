@@ -80,7 +80,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
             let elf = ud_format_elf::Elf64File::parse(&bytes)
                 .with_context(|| format!("parse {} as ELF64-LE", input.display()))?;
-            let source = ud_decompile::decompile(&elf)
+            let source = ud_decompile::decompile_to_text(&elf)
                 .with_context(|| format!("decompile {}", input.display()))?;
             if let Some(path) = out {
                 std::fs::write(&path, source)

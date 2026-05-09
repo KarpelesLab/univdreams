@@ -1,38 +1,34 @@
-//! Emit a `.ud` source file from an analyzed binary.
+//! Decompile a parsed ELF into a `.ud` AST.
 //!
-//! v0 scope: produce a parseable-shaped `.ud` file with
+//! The output of [`decompile`] is a [`ud_ast::UdFile`] in canonical
+//! shape: a `@module { … }` header pinned from the ELF header, plus
+//! one [`ud_ast::Item::Function`] per discovered function (or a
+//! [`ud_ast::Item::Comment`] note for ones whose bytes can't be
+//! located).
 //!
-//! * a `@module { ... }` header pinned from the ELF header
-//! * one `fn <name>() { ... }` per discovered function
-//! * one `@asm("...")` line per instruction (the universal escape
-//!   hatch — every later phase replaces these with structured
-//!   expressions where it can lift them)
+//! Function bodies are sequences of [`ud_ast::Stmt::Asm`]
+//! (one per decoded instruction, formatted in Intel syntax) plus
+//! [`ud_ast::Stmt::Comment`] markers surfacing block boundaries and
+//! direct-branch targets.
 //!
-//! The output is not yet fully recompilable: padding between functions
-//! and non-text sections aren't represented. That's the next layer of
-//! work. What we *do* defend, even at v0:
-//!
-//! * Determinism. Same input bytes always produce identical output
-//!   text.
-//! * Function-byte-identity. The bytes covered by the emitted `fn`
-//!   blocks reconstitute exactly what was in the binary's executable
-//!   sections at those addresses.
+//! The accompanying [`decompile_to_text`] helper is just
+//! `ud_ast::emit(&decompile(elf)?)`; it's the function the CLI uses.
+//! Going through the AST means the canonical text form lives in one
+//! place ([`ud_ast::emit`]) and `parse(decompile_to_text(elf))` is
+//! structurally identical to `decompile(elf)` — defended by the test
+//! suite.
 
 #![allow(clippy::cast_possible_truncation)]
 
-use std::fmt::Write as _;
-
-mod emitter;
-mod module_header;
-
-pub use emitter::emit_function;
-pub use module_header::emit_module_header;
+mod build_function;
+mod build_module;
 
 use ud_analysis::discover_functions;
 use ud_arch_x86::{decode, lift_function, Bitness};
+use ud_ast::{Item, UdFile};
 use ud_format_elf::{Elf64File, EM_X86_64};
 
-/// Errors surfaced by the top-level decompile entry point.
+/// Errors surfaced by the top-level entry point.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("only ELF64-LE x86_64 inputs are supported; got e_machine = {0}")]
@@ -50,54 +46,46 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Top-level entry point: turn a parsed ELF into a `.ud` source string.
-///
-/// Discovers functions, lifts each one to IR, and writes the canonical
-/// `.ud` text. Functions whose bytes can't be located (no recorded
-/// size after merging every discovery source, not in any executable
-/// section) are emitted as a stub with a `// note:` comment so the
-/// reader knows about them.
-pub fn decompile(elf: &Elf64File) -> Result<String> {
+/// Build the AST for `elf`. The structural form is the primary output
+/// of decompilation; [`decompile_to_text`] is a thin convenience.
+pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
     if elf.ehdr.e_machine != EM_X86_64 {
         return Err(Error::UnsupportedMachine(elf.ehdr.e_machine));
     }
 
-    let mut out = String::new();
-    out.push_str(&emit_module_header(elf));
-    out.push('\n');
+    let module = build_module::build_module(elf);
+    let mut items = Vec::new();
 
     let map = discover_functions(elf)?;
     for f in map.iter() {
         if f.size == 0 {
-            writeln!(
-                out,
-                "// note: `{}` at 0x{:x} has no known size; not emitted\n",
+            items.push(Item::Comment(format!(
+                "note: `{}` at 0x{:x} has no known size; not emitted",
                 f.name, f.addr.0
-            )
-            .unwrap();
+            )));
             continue;
         }
         let Some(slice) = slice_function_bytes(elf, f.addr.0, f.size) else {
-            writeln!(
-                out,
-                "// note: `{}` at 0x{:x} not found in any executable section; not emitted\n",
+            items.push(Item::Comment(format!(
+                "note: `{}` at 0x{:x} not found in any executable section; not emitted",
                 f.name, f.addr.0
-            )
-            .unwrap();
+            )));
             continue;
         };
         let insns = decode(Bitness::Bits64, slice, f.addr.0)?;
         let lifted = lift_function(f.name.clone(), &insns)?;
-        out.push_str(&emit_function(&lifted));
-        out.push('\n');
+        items.push(Item::Function(build_function::build_function(&lifted)));
     }
 
-    Ok(out)
+    Ok(UdFile { module, items })
 }
 
-/// Locate the slice of on-disk bytes covering the address range
-/// `[addr, addr + size)`. Returns `None` if no single section contains
-/// the range.
+/// Convenience: build the AST and pretty-print it to canonical text.
+pub fn decompile_to_text(elf: &Elf64File) -> Result<String> {
+    let ast = decompile(elf)?;
+    Ok(ud_ast::emit(&ast))
+}
+
 fn slice_function_bytes(elf: &Elf64File, addr: u64, size: u64) -> Option<&[u8]> {
     if size == 0 {
         return None;

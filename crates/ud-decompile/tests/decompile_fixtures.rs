@@ -1,11 +1,13 @@
-//! Decompile each x86_64 ELF fixture to `.ud` and check the output's
-//! shape against expected facts (function names present, deterministic
-//! across runs, asm-line count matches the lifted instruction count).
+//! Decompile each x86_64 ELF fixture to a `.ud` AST and check shape
+//! against expected facts. Tests assert on the structured AST when
+//! possible (more robust than substring matches on text), and on the
+//! emitted text when the test is specifically about formatting.
 
 #![allow(clippy::cast_possible_truncation)]
 
 use std::path::{Path, PathBuf};
 
+use ud_ast::{Item, Stmt, UdFile, Value};
 use ud_format_elf::{is_elf64_le, Elf64File, EM_X86_64};
 
 fn workspace_root() -> PathBuf {
@@ -17,7 +19,7 @@ fn workspace_root() -> PathBuf {
         .unwrap_or(manifest_dir)
 }
 
-fn decompile_fixture(path: &Path) -> Option<String> {
+fn ast_for(path: &Path) -> Option<UdFile> {
     let bytes = std::fs::read(path).ok()?;
     if !is_elf64_le(&bytes) {
         return None;
@@ -29,68 +31,107 @@ fn decompile_fixture(path: &Path) -> Option<String> {
     Some(ud_decompile::decompile(&elf).expect("decompile"))
 }
 
+fn function_names(ast: &UdFile) -> Vec<&str> {
+    ast.items
+        .iter()
+        .filter_map(|i| {
+            if let Item::Function(f) = i {
+                Some(f.name.as_str())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[test]
-fn hello_fixture_decompiles_with_known_functions() {
+fn hello_fixture_module_header_is_canonical() {
     let path = workspace_root().join("testdata/hello-gcc13-O0");
-    let Some(out) = decompile_fixture(&path) else {
+    let Some(ast) = ast_for(&path) else {
         eprintln!("note: {} unavailable; skipping", path.display());
         return;
     };
 
-    assert!(out.starts_with("@module {"), "missing module header");
-    assert!(out.contains("arch:    \"x86_64\""), "missing arch line");
-    assert!(out.contains("\nfn main() {"), "main not emitted");
-    assert!(out.contains("\nfn _start() {"), "_start not emitted");
-    assert!(
-        out.contains("// note: `_init`"),
-        "expected an explanatory note for _init (no recorded size)"
+    // Field names appear in canonical order; values are well-typed.
+    let names: Vec<&str> = ast.module.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["arch", "abi", "format", "bits", "endian", "type", "entry", "build"]
     );
+
+    // arch/abi/format/endian are strings; bits/type/entry are ints; build is a block.
+    assert_eq!(ast.module.fields[0].value, Value::String("x86_64".into()));
+    assert_eq!(ast.module.fields[1].value, Value::String("sysv".into()));
+    assert_eq!(ast.module.fields[3].value, Value::Int(64));
+    assert!(matches!(ast.module.fields[7].value, Value::Block(_)));
 }
 
 #[test]
-fn output_is_deterministic() {
-    let path = workspace_root().join("testdata/sqrt-gcc13-O0");
-    let Some(a) = decompile_fixture(&path) else {
+fn hello_fixture_includes_main_and_start() {
+    let path = workspace_root().join("testdata/hello-gcc13-O0");
+    let Some(ast) = ast_for(&path) else {
         return;
     };
-    let b = decompile_fixture(&path).unwrap();
-    assert_eq!(a, b, "decompile is non-deterministic");
+    let names = function_names(&ast);
+    for required in &["_start", "main"] {
+        assert!(
+            names.contains(required),
+            "expected `{required}` in {names:?}"
+        );
+    }
+    // _init has no recorded size in our fixtures — surfaces as a Comment item.
+    assert!(
+        ast.items
+            .iter()
+            .any(|i| matches!(i, Item::Comment(c) if c.contains("_init"))),
+        "expected an explanatory note for _init"
+    );
 }
 
 #[test]
 fn sqrt_fixture_emits_user_functions() {
     let path = workspace_root().join("testdata/sqrt-gcc13-O0");
-    let Some(out) = decompile_fixture(&path) else {
-        eprintln!("note: {} unavailable; skipping", path.display());
+    let Some(ast) = ast_for(&path) else {
         return;
     };
-    for required in &["fn main() {", "fn do_fac() {", "fn test_sqrt() {"] {
-        assert!(
-            out.contains(required),
-            "missing `{required}` in decompile output"
-        );
+    let names = function_names(&ast);
+    for required in &["main", "do_fac", "test_sqrt"] {
+        assert!(names.contains(required), "missing `{required}`");
     }
 }
 
-/// The number of `@asm(` lines must equal the total instruction count
-/// the lifter saw, across all emitted functions. This catches silent
-/// drops if the emitter ever forgets a block or instruction.
+/// Determinism: the AST is the same across two runs for the same input.
 #[test]
-fn asm_line_count_matches_lifted_instruction_count() {
+fn output_is_deterministic() {
+    let path = workspace_root().join("testdata/sqrt-gcc13-O0");
+    let Some(a) = ast_for(&path) else { return };
+    let b = ast_for(&path).unwrap();
+    assert_eq!(a, b, "decompile is non-deterministic");
+}
+
+/// The asm-statement count across all functions equals the lifted
+/// instruction count from the same fixtures. Catches silent drops in
+/// either direction.
+#[test]
+fn asm_count_matches_lifted_instruction_count() {
     let path = workspace_root().join("testdata/hello-gcc13-O0");
-    let Some(bytes) = std::fs::read(&path).ok() else {
-        return;
-    };
+    let Some(ast) = ast_for(&path) else { return };
+
+    let asm_count: usize = ast
+        .items
+        .iter()
+        .filter_map(|i| {
+            if let Item::Function(f) = i {
+                Some(f.body.iter().filter(|s| matches!(s, Stmt::Asm(_))).count())
+            } else {
+                None
+            }
+        })
+        .sum();
+
+    // Re-lift via discovery + decode and total the instruction count.
+    let bytes = std::fs::read(&path).expect("read");
     let elf = Elf64File::parse(&bytes).expect("parse");
-    let out = ud_decompile::decompile(&elf).expect("decompile");
-
-    let asm_lines = out
-        .lines()
-        .filter(|l| l.trim_start().starts_with("@asm("))
-        .count();
-
-    // Re-lift via the analysis + arch-x86 path and total the
-    // instruction count. The decompile output must match.
     let map = ud_analysis::discover_functions(&elf).expect("discover");
     let mut expected = 0usize;
     for f in map.iter() {
@@ -106,8 +147,24 @@ fn asm_line_count_matches_lifted_instruction_count() {
     }
 
     assert_eq!(
-        asm_lines, expected,
-        "@asm line count {asm_lines} differs from lifted instruction total {expected}"
+        asm_count, expected,
+        "Stmt::Asm count {asm_count} differs from lifted total {expected}"
+    );
+}
+
+/// Source-level round-trip: take the canonical text the decompiler
+/// emits, parse it back, and verify the resulting AST is structurally
+/// equal to the AST we started from. This is the strongest property
+/// the .ud language layer can defend right now.
+#[test]
+fn parse_of_decompile_to_text_equals_decompile() {
+    let path = workspace_root().join("testdata/sqrt-gcc13-O0");
+    let Some(ast) = ast_for(&path) else { return };
+    let text = ud_ast::emit(&ast);
+    let reparsed = ud_compile::parse(&text).expect("parse decompile output");
+    assert_eq!(
+        reparsed, ast,
+        "parse(decompile_to_text(elf)) != decompile(elf)"
     );
 }
 
