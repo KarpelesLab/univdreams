@@ -442,6 +442,48 @@ impl Elf64File {
         self.section_data.get(idx).map(Vec::as_slice)
     }
 
+    /// Construct an [`Elf64File`] from already-parsed parts.
+    ///
+    /// Used by reconstructive code paths (such as `ud-compile`'s lower
+    /// path) that build the file's structure from a `.ud` AST rather
+    /// than from on-disk bytes. The caller is responsible for keeping
+    /// the parts consistent: `section_data` must be parallel to
+    /// `shdrs`, `padding` must cover every gap between structured
+    /// regions, and `file_size` must equal the total covered.
+    /// [`write_to_vec`](Self::write_to_vec) does no validation; it
+    /// assumes consistency.
+    #[must_use]
+    pub fn from_parts(
+        ehdr: Ehdr64,
+        phdrs: Vec<Phdr64>,
+        shdrs: Vec<Shdr64>,
+        section_data: Vec<Vec<u8>>,
+        padding: Vec<(u64, Vec<u8>)>,
+        file_size: u64,
+    ) -> Self {
+        Self {
+            ehdr,
+            phdrs,
+            shdrs,
+            section_data,
+            padding,
+            file_size,
+        }
+    }
+
+    /// Total size of the underlying file in bytes.
+    #[must_use]
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// All padding regions captured between structured regions.
+    /// Returns `(file_offset, bytes)` pairs in offset order.
+    #[must_use]
+    pub fn padding(&self) -> &[(u64, Vec<u8>)] {
+        &self.padding
+    }
+
     /// Iterator over `(index, &Shdr64, &[u8])` for every section.
     pub fn sections(&self) -> impl Iterator<Item = (usize, &Shdr64, &[u8])> {
         self.shdrs

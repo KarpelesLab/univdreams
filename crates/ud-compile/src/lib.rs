@@ -14,10 +14,12 @@
 
 mod lexer;
 mod lower;
+mod lower_elf;
 mod parser;
 
 pub use lower::{
     lower_function_bytes, lower_functions, lower_section_bytes, lower_sections, LowerError,
     LoweredFunction, LoweredSection,
 };
+pub use lower_elf::{build_elf64, lower_to_elf, ElfLowerError};
 pub use parser::{parse, ParseError};

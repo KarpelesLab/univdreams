@@ -45,9 +45,9 @@ fn collect_fixtures(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn slice_section_bytes(elf: &Elf64File, addr: u64) -> Option<&[u8]> {
-    for (_, sh, data) in elf.sections() {
-        if sh.sh_addr == addr {
+fn slice_section_bytes_by_name<'a>(elf: &'a Elf64File, name: &str) -> Option<&'a [u8]> {
+    for (idx, _, data) in elf.sections() {
+        if elf.section_name(idx) == Some(name) {
             return Some(data);
         }
     }
@@ -103,7 +103,7 @@ fn source_round_trip_byte_identity_per_section() {
         };
 
         for sec in &lowered {
-            let Some(original) = slice_section_bytes(&elf, sec.addr) else {
+            let Some(original) = slice_section_bytes_by_name(&elf, &sec.name) else {
                 failures.push(format!(
                     "{}: section `{}` at 0x{:x} not found in original ELF",
                     fixture.display(),

@@ -107,12 +107,14 @@ pub fn decompile_to_text(elf: &Elf64File) -> Result<String> {
 }
 
 /// Whether a section will be emitted as `@section`. Skips sections
-/// without on-disk content (NULL, NOBITS, zero-size) and sections
-/// without a runtime virtual address (debug info, `.comment`, etc.).
+/// without on-disk content (NULL, NOBITS, zero-size). Sections with
+/// `sh_addr == 0` (debug info, `.comment`, `.symtab`, …) ARE emitted —
+/// their items are addressed in [0, sh_size) since virtual addresses
+/// don't apply, and the lower path matches them to shdrs by name.
 fn section_is_emittable(sh: &Shdr64) -> bool {
     const SHT_NULL: u32 = 0;
     const SHT_NOBITS: u32 = 8;
-    sh.sh_type != SHT_NULL && sh.sh_type != SHT_NOBITS && sh.sh_size > 0 && sh.sh_addr > 0
+    sh.sh_type != SHT_NULL && sh.sh_type != SHT_NOBITS && sh.sh_size > 0
 }
 
 fn function_lives_in_a_section(elf: &Elf64File, addr: u64, size: u64) -> bool {
