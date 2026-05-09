@@ -451,6 +451,39 @@ impl Elf64File {
             .map(|(i, (sh, data))| (i, sh, data.as_slice()))
     }
 
+    /// Resolve the section's name through the section-header string
+    /// table (`.shstrtab`, indexed by `e_shstrndx`).
+    ///
+    /// Returns `None` if the section index is out of range, the
+    /// `e_shstrndx` points outside the section table, the name offset
+    /// is past the end of `.shstrtab`, or the bytes aren't valid UTF-8
+    /// (which would indicate a malformed or non-standard ELF; real
+    /// toolchains write ASCII section names).
+    #[must_use]
+    pub fn section_name(&self, idx: usize) -> Option<&str> {
+        let shstrtab = self.section_data(self.ehdr.e_shstrndx as usize)?;
+        let sh = self.shdrs.get(idx)?;
+        let start = sh.sh_name as usize;
+        let tail = shstrtab.get(start..)?;
+        let nul = tail.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(&tail[..nul]).ok()
+    }
+
+    /// Find the first section with the given name.
+    ///
+    /// Iterates section headers in order, so for ELFs with multiple
+    /// sections sharing a name (rare but legal) the lowest-indexed one
+    /// wins.
+    #[must_use]
+    pub fn section_by_name(&self, name: &str) -> Option<(usize, &Shdr64, &[u8])> {
+        for (i, sh, data) in self.sections() {
+            if self.section_name(i) == Some(name) {
+                return Some((i, sh, data));
+            }
+        }
+        None
+    }
+
     /// Serialize the parsed file back to bytes. For any input parsed from
     /// real bytes, the output is byte-identical to the input.
     #[must_use]

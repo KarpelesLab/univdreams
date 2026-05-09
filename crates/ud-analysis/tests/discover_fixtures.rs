@@ -1,15 +1,15 @@
-//! Run function discovery on the workspace's binary fixtures and assert
-//! that known names show up at expected addresses.
+//! Run function discovery on the workspace's binary fixtures and
+//! assert that:
 //!
-//! The fixtures are not stripped, so the symbol-table source alone
-//! should give us complete coverage. When `.eh_frame` and prologue
-//! signals come online, the merged map should still contain at least
-//! these names — additional sources may *add* coverage but should not
-//! lose it.
+//! * Known names from the symbol table show up at expected addresses.
+//! * Imports (`U printf`, etc.) do not leak through.
+//! * `.eh_frame` fills in sizes that the symbol table left at zero
+//!   (typically `_init` / `_fini`).
+//! * Functions covered by both sources record both in their provenance.
 
 use std::path::{Path, PathBuf};
 
-use ud_analysis::{discover_from_symbol_tables, FunctionMap};
+use ud_analysis::{discover_functions, FunctionMap, FunctionSource};
 use ud_format_elf::{is_elf64_le, Elf64File, EM_X86_64};
 
 fn workspace_root() -> PathBuf {
@@ -30,12 +30,7 @@ fn discover_fixture(path: &Path) -> Option<FunctionMap> {
     if elf.ehdr.e_machine != EM_X86_64 {
         return None;
     }
-    let funcs = discover_from_symbol_tables(&elf).expect("symbol-table parse");
-    let mut map = FunctionMap::new();
-    for f in funcs {
-        map.insert(f);
-    }
-    Some(map)
+    Some(discover_functions(&elf).expect("discover"))
 }
 
 fn names(map: &FunctionMap) -> Vec<&str> {
@@ -58,7 +53,6 @@ fn hello_fixture_has_main_and_start() {
         );
     }
 
-    // main should have a non-zero size and an address in the .text range.
     let main = map.iter().find(|f| f.name == "main").unwrap();
     assert!(main.size > 0, "main should have a recorded size");
     assert!(
@@ -87,10 +81,6 @@ fn sqrt_fixture_has_user_functions() {
 
 #[test]
 fn imports_are_filtered_out() {
-    // Functions like `printf` and `puts` are dynamic imports — they appear
-    // in `.dynsym` but with `st_shndx = SHN_UNDEF` and `st_value = 0`.
-    // Our discovery filter must reject them; including them would invent
-    // function bodies for code that lives in libc, not in this binary.
     let path = workspace_root().join("testdata/sqrt-gcc13-O0");
     let Some(map) = discover_fixture(&path) else {
         eprintln!("note: {} unavailable; skipping", path.display());
@@ -103,4 +93,61 @@ fn imports_are_filtered_out() {
             f.name
         );
     }
+}
+
+/// `.eh_frame` should add coverage that the symbol table doesn't
+/// provide. Concretely on these fixtures: PLT trampolines have FDEs
+/// (so stack unwinding can step through them) but no symbol-table
+/// entry, so they only enter the map via the `.eh_frame` source.
+///
+/// gcc 13 at `-O0` does *not* emit FDEs for `_init` / `_fini`; those
+/// are hand-written CRT assembly with no exception-handling needs. We
+/// don't assert anything about them — covering them needs a future
+/// prologue-pattern source.
+#[test]
+fn eh_frame_adds_coverage_beyond_symbol_table() {
+    let path = workspace_root().join("testdata/hello-gcc13-O0");
+    let Some(map) = discover_fixture(&path) else {
+        eprintln!("note: {} unavailable; skipping", path.display());
+        return;
+    };
+
+    let only_eh_frame: Vec<&str> = map
+        .iter()
+        .filter(|f| f.sources == [FunctionSource::EhFrame])
+        .map(|f| f.name.as_str())
+        .collect();
+
+    assert!(
+        !only_eh_frame.is_empty(),
+        "expected at least one function discovered exclusively from .eh_frame; got none"
+    );
+
+    // Every PLT trampoline lives below 0x1100 in our PIE fixtures and
+    // is named `sub_<addr>` because .eh_frame doesn't carry names. They
+    // should all be eh_frame-only.
+    for name in &only_eh_frame {
+        assert!(
+            name.starts_with("sub_"),
+            "expected eh-frame-only function to use the default sub_<addr> naming, got `{name}`"
+        );
+    }
+}
+
+/// Functions covered by both .eh_frame and the symbol table should
+/// record both sources, with the symbol-table name winning.
+#[test]
+fn merged_functions_record_both_sources() {
+    let path = workspace_root().join("testdata/sqrt-gcc13-O0");
+    let Some(map) = discover_fixture(&path) else {
+        eprintln!("note: {} unavailable; skipping", path.display());
+        return;
+    };
+    let main = map.iter().find(|f| f.name == "main").unwrap();
+    assert!(
+        main.sources.contains(&FunctionSource::SymTab)
+            && main.sources.contains(&FunctionSource::EhFrame),
+        "expected `main` to record both SymTab and EhFrame, got {:?}",
+        main.sources
+    );
 }

@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ud_analysis::{discover_from_symbol_tables, Function as DiscoveredFunction, FunctionMap};
+use ud_analysis::{discover_functions, Function as DiscoveredFunction};
 use ud_arch_x86::{decode, lift_function, Bitness};
 use ud_format_elf::{is_elf64_le, Elf64File, Shdr64, EM_X86_64};
 
@@ -100,11 +100,7 @@ fn lift_every_x86_64_fixture_function() {
             continue;
         }
 
-        let funcs = discover_from_symbol_tables(&elf).expect("discover");
-        let mut map = FunctionMap::new();
-        for f in funcs {
-            map.insert(f);
-        }
+        let map = discover_functions(&elf).expect("discover");
 
         for f in map.iter() {
             let result = lift_one(&elf, f);
