@@ -37,6 +37,30 @@ pub enum LowerError {
         stmt_index: usize,
         text: String,
     },
+
+    #[error(
+        "section `{section}` has a gap: item at 0x{item_addr:x} but cursor was at 0x{cursor:x}"
+    )]
+    SectionGap {
+        section: String,
+        cursor: u64,
+        item_addr: u64,
+    },
+
+    #[error(
+        "section `{section}` has overlapping items: cursor at 0x{cursor:x}, next item at 0x{item_addr:x}"
+    )]
+    SectionOverlap {
+        section: String,
+        cursor: u64,
+        item_addr: u64,
+    },
+
+    #[error("section `{section}` contains a nested section, which is not supported")]
+    NestedSection { section: String },
+
+    #[error("function `{fn_name}` has no @addr; cannot place it inside a section")]
+    FunctionWithoutAddr { fn_name: String },
 }
 
 /// Lower one [`FnDecl`] to its byte sequence.
@@ -62,17 +86,105 @@ pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
 
 /// Lower every function in the file to bytes.
 ///
-/// Returns one [`LoweredFunction`] per [`Item::Function`] in
-/// declaration order. Non-function items ([`Item::Comment`]) are
-/// skipped silently.
+/// Walks both top-level items and items nested inside `@section`
+/// blocks. Returns one [`LoweredFunction`] per [`Item::Function`] in
+/// source order. Non-function items are skipped silently.
 pub fn lower_functions(file: &UdFile) -> Result<Vec<LoweredFunction>, LowerError> {
     let mut out = Vec::new();
+    walk_functions(&file.items, &mut out)?;
+    Ok(out)
+}
+
+fn walk_functions(items: &[Item], out: &mut Vec<LoweredFunction>) -> Result<(), LowerError> {
+    for item in items {
+        match item {
+            Item::Function(f) => {
+                out.push(LoweredFunction {
+                    name: f.name.clone(),
+                    addr: f.addr,
+                    bytes: lower_function_bytes(f)?,
+                });
+            }
+            Item::Section { items: nested, .. } => walk_functions(nested, out)?,
+            Item::Comment(_) | Item::Raw { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// One section lowered to its on-disk bytes.
+#[derive(Debug, Clone)]
+pub struct LoweredSection {
+    pub name: String,
+    pub addr: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// Lower the contents of an `@section` to its byte sequence.
+///
+/// Walks the section's items in source order, requiring contiguity:
+/// the first item starts at `section.addr`, and each subsequent item
+/// starts exactly where the previous one ended. Gaps and overlaps are
+/// hard errors.
+///
+/// Nested sections are rejected — the decompiler doesn't produce them
+/// and the runtime semantics aren't yet defined.
+pub fn lower_section_bytes(
+    name: &str,
+    section_addr: u64,
+    items: &[Item],
+) -> Result<Vec<u8>, LowerError> {
+    let mut out = Vec::new();
+    let mut cursor = section_addr;
+
+    for item in items {
+        let (item_addr, item_bytes) = match item {
+            Item::Comment(_) => continue,
+            Item::Raw { addr, bytes } => (*addr, bytes.clone()),
+            Item::Function(f) => {
+                let addr = f.addr.ok_or_else(|| LowerError::FunctionWithoutAddr {
+                    fn_name: f.name.clone(),
+                })?;
+                (addr, lower_function_bytes(f)?)
+            }
+            Item::Section { name: nested, .. } => {
+                return Err(LowerError::NestedSection {
+                    section: nested.clone(),
+                });
+            }
+        };
+
+        if item_addr < cursor {
+            return Err(LowerError::SectionOverlap {
+                section: name.to_string(),
+                cursor,
+                item_addr,
+            });
+        }
+        if item_addr > cursor {
+            return Err(LowerError::SectionGap {
+                section: name.to_string(),
+                cursor,
+                item_addr,
+            });
+        }
+        out.extend_from_slice(&item_bytes);
+        cursor = cursor.saturating_add(item_bytes.len() as u64);
+    }
+
+    Ok(out)
+}
+
+/// Lower every `@section` block in `file` to its bytes. Returns one
+/// [`LoweredSection`] per top-level section, in source order.
+pub fn lower_sections(file: &UdFile) -> Result<Vec<LoweredSection>, LowerError> {
+    let mut out = Vec::new();
     for item in &file.items {
-        if let Item::Function(f) = item {
-            let bytes = lower_function_bytes(f)?;
-            out.push(LoweredFunction {
-                name: f.name.clone(),
-                addr: f.addr,
+        if let Item::Section { name, addr, items } = item {
+            let bytes = lower_section_bytes(name, *addr, items)?;
+            out.push(LoweredSection {
+                name: name.clone(),
+                addr: *addr,
                 bytes,
             });
         }
@@ -124,17 +236,80 @@ mod tests {
             body: vec![Stmt::asm_text("ret")],
         };
         let err = lower_function_bytes(&f).unwrap_err();
-        match err {
-            LowerError::MissingBytes {
-                fn_name,
-                stmt_index,
-                text,
-            } => {
-                assert_eq!(fn_name, "f");
-                assert_eq!(stmt_index, 0);
-                assert_eq!(text, "ret");
-            }
-        }
+        let LowerError::MissingBytes {
+            fn_name,
+            stmt_index,
+            text,
+        } = err
+        else {
+            panic!("expected MissingBytes")
+        };
+        assert_eq!(fn_name, "f");
+        assert_eq!(stmt_index, 0);
+        assert_eq!(text, "ret");
+    }
+
+    #[test]
+    fn lower_section_concatenates_contiguous_items() {
+        let items = vec![
+            Item::Function(FnDecl {
+                addr: Some(0x1000),
+                name: "f".into(),
+                body: vec![Stmt::asm("ret", vec![0xc3])],
+            }),
+            Item::Raw {
+                addr: 0x1001,
+                bytes: vec![0x90, 0x90],
+            },
+        ];
+        let bytes = lower_section_bytes(".text", 0x1000, &items).unwrap();
+        assert_eq!(bytes, vec![0xc3, 0x90, 0x90]);
+    }
+
+    #[test]
+    fn lower_section_detects_gap() {
+        let items = vec![
+            Item::Function(FnDecl {
+                addr: Some(0x1000),
+                name: "f".into(),
+                body: vec![Stmt::asm("ret", vec![0xc3])],
+            }),
+            Item::Raw {
+                addr: 0x1010, // gap from 0x1001 to 0x1010
+                bytes: vec![0x90],
+            },
+        ];
+        let err = lower_section_bytes(".text", 0x1000, &items).unwrap_err();
+        assert!(matches!(err, LowerError::SectionGap { .. }));
+    }
+
+    #[test]
+    fn lower_section_detects_overlap() {
+        let items = vec![
+            Item::Raw {
+                addr: 0x1000,
+                bytes: vec![0xaa, 0xbb, 0xcc],
+            },
+            Item::Raw {
+                addr: 0x1001, // overlaps with previous (which ended at 0x1003)
+                bytes: vec![0xdd],
+            },
+        ];
+        let err = lower_section_bytes(".text", 0x1000, &items).unwrap_err();
+        assert!(matches!(err, LowerError::SectionOverlap { .. }));
+    }
+
+    #[test]
+    fn lower_section_skips_nested_comments() {
+        let items = vec![
+            Item::Comment("preamble".into()),
+            Item::Raw {
+                addr: 0x1000,
+                bytes: vec![0xaa],
+            },
+        ];
+        let bytes = lower_section_bytes(".x", 0x1000, &items).unwrap();
+        assert_eq!(bytes, vec![0xaa]);
     }
 
     #[test]

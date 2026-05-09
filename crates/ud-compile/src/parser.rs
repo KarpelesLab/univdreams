@@ -252,10 +252,11 @@ impl Parser {
                 self.bump();
                 Ok(Item::Comment(text))
             }
-            TokenKind::At => self.parse_directive_then_fn(),
+            TokenKind::At => self.parse_at_directive(),
             TokenKind::Ident(ref name) if name == "fn" => self.parse_fn(None),
             other => Err(ParseError::Expected {
-                expected: "a top-level item (`@addr`, `fn`, or `// comment`)".into(),
+                expected: "a top-level item (`@addr`, `@raw`, `@section`, `fn`, or `// comment`)"
+                    .into(),
                 got: describe(&other),
                 line: self.peek().line,
                 col: self.peek().col,
@@ -263,9 +264,7 @@ impl Parser {
         }
     }
 
-    fn parse_directive_then_fn(&mut self) -> Result<Item, ParseError> {
-        // Currently the only top-level directive that precedes `fn` is
-        // `@addr(0x…)`. Future expansions land here.
+    fn parse_at_directive(&mut self) -> Result<Item, ParseError> {
         self.expect(&TokenKind::At, "`@`")?;
         let dir_tok = self.peek().clone();
         let name = self.expect_ident("directive name")?;
@@ -275,6 +274,32 @@ impl Parser {
                 let addr = self.expect_int("an integer address")?;
                 self.expect(&TokenKind::RParen, "`)` to close `@addr`")?;
                 self.parse_fn(Some(addr))
+            }
+            "raw" => {
+                self.expect(&TokenKind::LParen, "`(` after `@raw`")?;
+                let addr = self.expect_int("an integer address")?;
+                self.expect(&TokenKind::Comma, "`,` after `@raw` address")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@raw`")?;
+                Ok(Item::Raw { addr, bytes })
+            }
+            "section" => {
+                self.expect(&TokenKind::LParen, "`(` after `@section`")?;
+                let section_name = self.expect_string("section name")?;
+                self.expect(&TokenKind::Comma, "`,` after section name")?;
+                let addr = self.expect_int("section start address")?;
+                self.expect(&TokenKind::RParen, "`)` to close `@section`")?;
+                self.expect(&TokenKind::LBrace, "`{` to open section body")?;
+                let mut items = Vec::new();
+                while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+                    items.push(self.parse_item()?);
+                }
+                self.expect(&TokenKind::RBrace, "`}` to close section body")?;
+                Ok(Item::Section {
+                    name: section_name,
+                    addr,
+                    items,
+                })
             }
             other => Err(ParseError::UnknownDirective {
                 name: other.to_string(),
@@ -501,6 +526,43 @@ fn f() {
             msg.contains("byte value"),
             "expected byte-range error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn raw_item_at_top_level() {
+        let src = "@module {}\n\n@raw(0x10c0, [0xcc, 0xcc, 0xcc])\n";
+        let f = parse(src).unwrap();
+        assert_eq!(
+            f.items[0],
+            Item::Raw {
+                addr: 0x10c0,
+                bytes: vec![0xcc, 0xcc, 0xcc],
+            }
+        );
+    }
+
+    #[test]
+    fn section_with_nested_items() {
+        let src = r#"@module {}
+
+@section(".text", 0x1000) {
+    @addr(0x1000)
+    fn f() {
+        @asm("ret", [0xc3])
+    }
+
+    @raw(0x1001, [0x90])
+}
+"#;
+        let f = parse(src).unwrap();
+        let Item::Section { name, addr, items } = &f.items[0] else {
+            panic!("expected Section");
+        };
+        assert_eq!(name, ".text");
+        assert_eq!(*addr, 0x1000);
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], Item::Function(_)));
+        assert!(matches!(items[1], Item::Raw { .. }));
     }
 
     #[test]

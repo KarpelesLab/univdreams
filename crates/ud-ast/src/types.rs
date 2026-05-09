@@ -38,14 +38,32 @@ pub enum Value {
     Block(Vec<Field>),
 }
 
-/// A top-level item between the module header and end of file.
+/// An item in the file: at the top level, or nested inside an
+/// [`Item::Section`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     /// Free-floating `// …` line. Preserved on emit so structural
-    /// notes the decompiler emitted survive parse → re-emit.
+    /// notes survive parse → re-emit.
     Comment(String),
+
     /// A function declaration.
     Function(FnDecl),
+
+    /// `@raw(0x…, [bytes])` — pin a slice of bytes at a virtual address.
+    /// Used by the decompiler to fill the gaps between functions
+    /// (alignment padding) and to capture the content of non-executable
+    /// sections (`.rodata`, `.data`, etc.).
+    Raw { addr: u64, bytes: Vec<u8> },
+
+    /// `@section("name", 0x…) { items… }` — group items under an ELF
+    /// section. The section's start address must equal the first
+    /// nested item's address; items are required to cover the section
+    /// contiguously (no gaps) for [`lower`](crate) to succeed.
+    Section {
+        name: String,
+        addr: u64,
+        items: Vec<Item>,
+    },
 }
 
 /// A function declaration.

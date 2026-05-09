@@ -32,16 +32,19 @@ fn ast_for(path: &Path) -> Option<UdFile> {
 }
 
 fn function_names(ast: &UdFile) -> Vec<&str> {
-    ast.items
-        .iter()
-        .filter_map(|i| {
-            if let Item::Function(f) = i {
-                Some(f.name.as_str())
-            } else {
-                None
-            }
-        })
-        .collect()
+    let mut out = Vec::new();
+    walk_functions(&ast.items, &mut out);
+    out
+}
+
+fn walk_functions<'a>(items: &'a [Item], out: &mut Vec<&'a str>) {
+    for item in items {
+        match item {
+            Item::Function(f) => out.push(f.name.as_str()),
+            Item::Section { items, .. } => walk_functions(items, out),
+            _ => {}
+        }
+    }
 }
 
 #[test]
@@ -117,22 +120,7 @@ fn asm_count_matches_lifted_instruction_count() {
     let path = workspace_root().join("testdata/hello-gcc13-O0");
     let Some(ast) = ast_for(&path) else { return };
 
-    let asm_count: usize = ast
-        .items
-        .iter()
-        .filter_map(|i| {
-            if let Item::Function(f) = i {
-                Some(
-                    f.body
-                        .iter()
-                        .filter(|s| matches!(s, Stmt::Asm { .. }))
-                        .count(),
-                )
-            } else {
-                None
-            }
-        })
-        .sum();
+    let asm_count = count_asm_stmts(&ast.items);
 
     // Re-lift via discovery + decode and total the instruction count.
     let bytes = std::fs::read(&path).expect("read");
@@ -171,6 +159,24 @@ fn parse_of_decompile_to_text_equals_decompile() {
         reparsed, ast,
         "parse(decompile_to_text(elf)) != decompile(elf)"
     );
+}
+
+fn count_asm_stmts(items: &[Item]) -> usize {
+    let mut n = 0;
+    for item in items {
+        match item {
+            Item::Function(f) => {
+                n += f
+                    .body
+                    .iter()
+                    .filter(|s| matches!(s, Stmt::Asm { .. }))
+                    .count();
+            }
+            Item::Section { items, .. } => n += count_asm_stmts(items),
+            _ => {}
+        }
+    }
+    n
 }
 
 fn slice_function_bytes(elf: &Elf64File, addr: u64, size: u64) -> Option<&[u8]> {

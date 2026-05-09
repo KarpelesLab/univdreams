@@ -16,5 +16,8 @@ mod lexer;
 mod lower;
 mod parser;
 
-pub use lower::{lower_function_bytes, lower_functions, LowerError, LoweredFunction};
+pub use lower::{
+    lower_function_bytes, lower_functions, lower_section_bytes, lower_sections, LowerError,
+    LoweredFunction, LoweredSection,
+};
 pub use parser::{parse, ParseError};

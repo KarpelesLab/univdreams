@@ -35,24 +35,62 @@ fn emit_module(out: &mut String, module: &Module) {
 }
 
 fn emit_item(out: &mut String, item: &Item) {
+    emit_item_indented(out, item, 0);
+}
+
+fn emit_item_indented(out: &mut String, item: &Item, depth: usize) {
+    let indent = " ".repeat(depth * 4);
     match item {
-        Item::Comment(text) => writeln!(out, "// {text}").unwrap(),
-        Item::Function(f) => emit_fn(out, f),
+        Item::Comment(text) => writeln!(out, "{indent}// {text}").unwrap(),
+        Item::Function(f) => emit_fn_indented(out, f, depth),
+        Item::Raw { addr, bytes } => emit_raw(out, *addr, bytes, depth),
+        Item::Section { name, addr, items } => emit_section(out, name, *addr, items, depth),
     }
 }
 
-fn emit_fn(out: &mut String, f: &FnDecl) {
-    if let Some(addr) = f.addr {
-        writeln!(out, "@addr(0x{addr:x})").unwrap();
+fn emit_raw(out: &mut String, addr: u64, bytes: &[u8], depth: usize) {
+    let indent = " ".repeat(depth * 4);
+    write!(out, "{indent}@raw(0x{addr:x}, [").unwrap();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write!(out, "0x{b:02x}").unwrap();
     }
-    writeln!(out, "fn {}() {{", f.name).unwrap();
+    writeln!(out, "])").unwrap();
+}
+
+fn emit_section(out: &mut String, name: &str, addr: u64, items: &[Item], depth: usize) {
+    let indent = " ".repeat(depth * 4);
+    writeln!(
+        out,
+        "{indent}@section({}, 0x{addr:x}) {{",
+        quote_string(name)
+    )
+    .unwrap();
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        emit_item_indented(out, item, depth + 1);
+    }
+    writeln!(out, "{indent}}}").unwrap();
+}
+
+fn emit_fn_indented(out: &mut String, f: &FnDecl, depth: usize) {
+    let indent = " ".repeat(depth * 4);
+    let body_indent = " ".repeat((depth + 1) * 4);
+    if let Some(addr) = f.addr {
+        writeln!(out, "{indent}@addr(0x{addr:x})").unwrap();
+    }
+    writeln!(out, "{indent}fn {}() {{", f.name).unwrap();
     for stmt in &f.body {
         match stmt {
             Stmt::Asm { text, bytes } if bytes.is_empty() => {
-                writeln!(out, "    @asm({})", quote_string(text)).unwrap();
+                writeln!(out, "{body_indent}@asm({})", quote_string(text)).unwrap();
             }
             Stmt::Asm { text, bytes } => {
-                write!(out, "    @asm({}, [", quote_string(text)).unwrap();
+                write!(out, "{body_indent}@asm({}, [", quote_string(text)).unwrap();
                 for (i, b) in bytes.iter().enumerate() {
                     if i > 0 {
                         out.push_str(", ");
@@ -62,11 +100,11 @@ fn emit_fn(out: &mut String, f: &FnDecl) {
                 writeln!(out, "])").unwrap();
             }
             Stmt::Comment(text) => {
-                writeln!(out, "    // {text}").unwrap();
+                writeln!(out, "{body_indent}// {text}").unwrap();
             }
         }
     }
-    writeln!(out, "}}").unwrap();
+    writeln!(out, "{indent}}}").unwrap();
 }
 
 fn emit_field(out: &mut String, f: &Field, depth: usize) {
@@ -235,6 +273,47 @@ mod tests {
         let out = emit(&f);
         assert!(out.contains("    @asm(\"endbr64\", [0xf3, 0x0f, 0x1e, 0xfa])\n"));
         assert!(out.contains("    @asm(\"ret\", [0xc3])\n"));
+    }
+
+    #[test]
+    fn raw_item_emits_addr_and_byte_list() {
+        let f = UdFile {
+            module: empty_module(),
+            items: vec![Item::Raw {
+                addr: 0x10c0,
+                bytes: vec![0xcc, 0xcc, 0xcc],
+            }],
+        };
+        let out = emit(&f);
+        assert!(out.contains("@raw(0x10c0, [0xcc, 0xcc, 0xcc])\n"));
+    }
+
+    #[test]
+    fn section_wraps_nested_items_with_indentation() {
+        let f = UdFile {
+            module: empty_module(),
+            items: vec![Item::Section {
+                name: ".text".into(),
+                addr: 0x1000,
+                items: vec![
+                    Item::Function(FnDecl {
+                        addr: Some(0x1000),
+                        name: "f".into(),
+                        body: vec![Stmt::asm("ret", vec![0xc3])],
+                    }),
+                    Item::Raw {
+                        addr: 0x1001,
+                        bytes: vec![0x90, 0x90],
+                    },
+                ],
+            }],
+        };
+        let out = emit(&f);
+        assert!(out.contains("@section(\".text\", 0x1000) {\n"));
+        assert!(out.contains("    @addr(0x1000)\n"));
+        assert!(out.contains("    fn f() {\n"));
+        assert!(out.contains("        @asm(\"ret\", [0xc3])\n"));
+        assert!(out.contains("    @raw(0x1001, [0x90, 0x90])\n"));
     }
 
     #[test]
