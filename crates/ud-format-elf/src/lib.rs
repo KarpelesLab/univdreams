@@ -32,6 +32,15 @@ const ELFDATA2LSB: u8 = 1;
 /// `sh_type` indicating the section occupies no file space (e.g. `.bss`).
 const SHT_NOBITS: u32 = 8;
 
+/// `sh_flags` bit indicating the section contains executable instructions.
+pub const SHF_EXECINSTR: u64 = 0x4;
+
+/// `e_machine` value for x86-64.
+pub const EM_X86_64: u16 = 62;
+
+/// `e_machine` value for `AArch64`.
+pub const EM_AARCH64: u16 = 183;
+
 /// On-disk size of an ELF64 ELF header.
 const EHDR64_SIZE: u16 = 64;
 
@@ -413,6 +422,23 @@ impl Elf64File {
             shdrs.push(sh);
         }
         Ok((shdrs, section_data))
+    }
+
+    /// Raw on-disk bytes of the section at index `idx`, parallel to
+    /// [`Self::shdrs`]. Returns an empty slice for NOBITS or zero-size
+    /// sections. Returns `None` only for an out-of-range index.
+    #[must_use]
+    pub fn section_data(&self, idx: usize) -> Option<&[u8]> {
+        self.section_data.get(idx).map(Vec::as_slice)
+    }
+
+    /// Iterator over `(index, &Shdr64, &[u8])` for every section.
+    pub fn sections(&self) -> impl Iterator<Item = (usize, &Shdr64, &[u8])> {
+        self.shdrs
+            .iter()
+            .zip(&self.section_data)
+            .enumerate()
+            .map(|(i, (sh, data))| (i, sh, data.as_slice()))
     }
 
     /// Serialize the parsed file back to bytes. For any input parsed from

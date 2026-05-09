@@ -1,0 +1,25 @@
+[package]
+name = "ud-arch-x86"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "x86 (16/32/64-bit) decode + encode backend with byte-identical round-trip."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"
+iced-x86 = { version = "1", default-features = false, features = [
+    "decoder",
+    "encoder",
+    "block_encoder",
+    "instr_info",
+    "std",
+] }
+
+[dev-dependencies]
+ud-format-elf = { path = "../ud-format-elf" }
