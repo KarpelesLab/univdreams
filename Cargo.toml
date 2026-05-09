@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "crates/ud-core",
+    "crates/ud-format-elf",
     "crates/ud-cli",
 ]
 
 # Additional member crates land in later phases:
-#   crates/ud-format       (Phase 1: ELF reader/writer)
 #   crates/ud-arch         (Phase 1: arch trait)
 #   crates/ud-arch-x86     (Phase 1: x86 backend)
 #   crates/ud-ir           (Phase 2: IR types)
@@ -36,3 +36,7 @@ all = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+# Binary-format spec field names are deliberately similar (e_phoff/e_phnum,
+# sh_offset/sh_size, etc.). Renaming them to please clippy makes the code
+# diverge from the spec.
+similar_names = "allow"
