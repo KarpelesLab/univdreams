@@ -1,115 +1,111 @@
 # Roadmap
 
-Phases are ordered by dependency, not calendar. Each phase has a definition of done that gates the next.
+Phases are ordered by dependency, not calendar. Each phase has a definition of done; the suite of tests defending the contract is the gate.
 
-## Phase 0 — Foundations (current)
-
-**Goal:** A buildable workspace, agreed-upon design, and the round-trip test harness.
+## Phase 0 — Foundations ✅
 
 - [x] Project plan, README, design docs.
-- [ ] Cargo workspace skeleton (`ud-core`, `ud-cli` only — no logic).
-- [ ] CI: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`.
-- [ ] Round-trip test harness skeleton (compile a tiny C program with gcc/clang at multiple optimization levels, store as fixture, run a placeholder round-trip that initially just `cmp`s the file with itself).
-- [ ] License decision.
+- [x] Cargo workspace skeleton.
+- [x] CI: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`.
+- [x] Round-trip test harness running on real fixtures.
+- [x] License (MIT, 2026 Karpeles Lab Inc).
 
-**Done when:** `cargo build --workspace` succeeds, CI is green, harness runs end-to-end on at least one fixture (with the placeholder round-trip).
+## Phase 1 — ELF + x86-64 instruction-level round-trip ✅
 
-## Phase 1 — ELF + x86-64 instruction-level round-trip
+- [x] `ud-format-elf`: hand-rolled ELF64-LE reader + writer, byte-identical.
+- [x] `ud-arch-x86`: iced-x86 integration; decode + dual-path emit (preserved bytes for round-trip; `BlockEncoder` for analysis-then-edit).
+- [x] CLI: `ud roundtrip <bin>` runs the loop and reports diffs.
 
-**Goal:** Read an ELF file, disassemble every instruction in `.text`, re-encode each one, write back an ELF, and produce a byte-identical output.
+The phase exposed iced's canonicalization of redundant prefixes (e.g. drops the `66` data16 on alignment NOPs). The fix shaped the design: structured form ≠ encoder source; original bytes preserve fidelity.
 
-This phase intentionally does **not** introduce IR or structured source. The "source" form is a flat sequence of `@asm(...)` and `@raw(...)` directives. The point is to prove the encode/decode round-trip and the format reader/writer.
+## Phase 2 — Function discovery + IR lifting ✅
 
-- [ ] `ud-format-elf`: minimal ELF64 reader covering the sections the test corpus uses.
-- [ ] `ud-format-elf`: ELF64 writer that reconstructs the input byte-for-byte from a structured representation.
-- [ ] `ud-arch-x86`: integration with `iced-x86` for decode/encode. Capture all encoding metadata (prefixes, displacement size, REX/VEX bits).
-- [ ] CLI: `ud roundtrip <bin>` runs the loop and reports diffs.
+- [x] `.symtab` / `.dynsym` consumer (`ud-analysis::discover_from_symbol_tables`).
+- [x] `.eh_frame` parser (`ud-analysis::discover_from_eh_frame`).
+- [x] Function-boundary fusion via `FunctionMap` merge logic.
+- [x] `ud-ir`: generic `Function<I>` / `BasicBlock<I>` / `Terminator` over an `ArchInsn` trait.
+- [x] x86 → IR lifter with CFG construction (leaders / blocks / terminators) using iced flow-control.
+- [x] Default `sub_<hex_addr>` naming with `@addr` ordering preserved.
 
-**Done when:** the round-trip test corpus from Phase 0 passes byte-identical, where the corpus is small statically-linked C programs at `-O0` and `-O2`. No structuring yet.
+## Phase 3 — Source language v0 ✅
 
-## Phase 2 — Function discovery + IR lifting
+- [x] `ud-ast`: AST types + canonical pretty-printer.
+- [x] `ud-compile`: hand-rolled lexer + recursive-descent parser; ParseError with line/col diagnostics.
+- [x] Round-trip property tests on parser/emitter (synthetic + against real decompile output).
+- [x] Directives wired up: `@module`, `@section`, `@addr`, `@asm` (with optional pinned bytes), `@raw`, top-level and section-level comments.
+- [x] AST extended with typed function signatures (`Type`, `Param`, `Signature`).
 
-**Goal:** Recognize functions, lift their instructions to IR, and emit one `fn` per discovered function in the source — still with bodies that are mostly raw `@asm(...)` lines, but now wrapped in functions with proper headers.
+## Phase 4 — Whole-binary source round-trip ✅
 
-- [ ] Symbol table consumer.
-- [ ] `.eh_frame` parser (function-boundary signal).
-- [ ] Prologue-pattern matcher (gcc/clang sysv-x64 patterns).
-- [ ] Function-boundary fusion (combine signals, report conflicts).
-- [ ] `ud-ir`: IR types for x86-64.
-- [ ] x86 → IR lifter, with full encoding metadata preserved.
-- [ ] IR → x86 lowerer.
-- [ ] Default `sub_<addr>` naming with `@addr` ordering preserved.
+- [x] AST / parser / emitter handle complete ELF metadata in `@module.build`: ehdr fields, phdrs, shdrs (with resolved names), padding regions.
+- [x] `ud-format-elf::Elf64File::from_parts` exposed for reconstructive callers.
+- [x] `ud-compile::lower_to_elf` reads the AST and produces a byte-identical ELF.
+- [x] Whole-binary round-trip property defended on every push: `lower_to_elf(parse(decompile_to_text(elf)))` byte-equals the input. Verified across both x86_64 fixtures (33,680 bytes).
 
-**Done when:** Phase 1's corpus round-trips, and the source now has a `fn sub_<addr>(…) { @asm … }` per function instead of one flat blob. The bytes still match.
+This phase wasn't in the original numbering — the original Phase 3 was "structured control flow." Whole-binary round-trip turned out to be the right next step because it's the precondition for everything that follows: edits, signature recovery, type recovery, etc.
 
-## Phase 3 — Source language v0
+## Phase 5 — Type recovery and stdlib signatures (in progress)
 
-**Goal:** A real lexer/parser for `.ud`, the directive vocabulary defined in [source-language.md](source-language.md), and end-to-end use as the canonical source format.
+What's done:
 
-- [ ] Grammar specified.
-- [ ] Parser + AST.
-- [ ] Pretty-printer (deterministic).
-- [ ] Round-trip property test on parser/emitter.
-- [ ] All Phase 2 directives recognized: `@arch`, `@abi`, `@addr`, `@section`, `@reg`, `@align`, `@pad`, `@encoding`, `@asm`, `@raw`.
+- [x] `ud-signatures` crate with byte-pattern matcher (exact + wildcard) and DB for x86-64 CRT helpers (`deregister_tm_clones`, `register_tm_clones`, `__do_global_dtors_aux`, `frame_dummy`).
+- [x] Size-filling pass for size-less discovery sources (signatures, symtab entries with `st_size = 0`).
+- [x] `ud-debug` crate with DWARF reader. `DW_TAG_subprogram` walks yield typed function signatures: parameter and return types via `DW_TAG_base_type` (size+encoding) and `DW_TAG_pointer_type` (recursive).
+- [x] Decompile attaches DWARF signatures to `FnDecl` AST nodes.
 
-**Done when:** the same corpus round-trips, edited by hand-rewriting one function from `@asm(...)` lines to a typed expression, with the encoder respecting the directives so the bytes still match.
+Still ahead:
 
-## Phase 4 — Structured control flow
+- [ ] Conservative confidence scoring for signature matches (currently always-trusts-the-DB).
+- [ ] Static-link fixture corpus + libc primitive signatures (`memcpy`, `memmove`, `memset`, `strlen`, `strcpy`, `strcmp`, `strncmp`, `malloc`, `free`, `printf`-family) for glibc/musl.
+- [ ] Type recovery from access patterns when DWARF is absent.
+- [ ] Composite types (structs, unions, arrays) in the AST type vocabulary.
 
-**Goal:** Recover loops, if/else, and switches from the CFG. Emit them as structured constructs with directives that pin lowering choices.
+## Phase 6 — `-O2 scalar` correctness (not started)
 
-- [ ] CFG construction.
-- [ ] Loop nesting forest.
-- [ ] Reducible CFG → structured AST (Sharir, Cifuentes-style).
-- [ ] Irreducible CFG fallback: `@cfg { … goto … }` blocks.
-- [ ] Switch-table recognition (jump tables in `.rodata`).
-- [ ] Short-circuit boolean rebuild for `&&` / `||`.
-- [ ] Directives: `@loop(kind=…, encoding=…)`, `@switch(table=…)`, `@branch(encoding=…)`.
-
-**Done when:** human-readable loops appear in the decompiled source for at least the corpus's hot paths, while the byte-identity test still passes.
-
-## Phase 5 — Type recovery and stdlib signatures
-
-**Goal:** Names and types in the output that are useful to a human reader.
-
-- [ ] Type-recovery pass: integer widths, pointer-vs-integer, struct field inference from access patterns.
-- [ ] DWARF reader (gimli) and overlay onto recovered types.
-- [ ] FLIRT-style signature DB with the most common libc primitives (memcpy/memmove/memset/strlen/strcpy/strcmp/strncmp/malloc/free/printf-family) for glibc/musl.
-- [ ] Conservative match policy with confidence scores.
-- [ ] Source uses recognized names (`strlen`, `memcpy`, …) instead of `sub_<addr>`.
-
-**Done when:** decompiling a stripped statically-linked busybox-like binary produces source with libc primitives correctly named, and the round-trip still byte-matches.
-
-## Phase 6 — `-O2 scalar` correctness
-
-**Goal:** Cleanly handle the optimizations that scalar `-O2` performs: register allocation, instruction reordering, tail calls, dead-store elimination effects, common subexpression elimination, peephole choices.
-
-This is mostly about *preserving* what the compiler did, not redoing it. The decompiler captures choices; the recompiler honors them.
+Goal: cleanly handle the optimizations scalar `-O2` performs — register allocation, instruction reordering, tail calls, dead-store elimination effects, common subexpression elimination, peephole choices. Mostly about *preserving* what the compiler did, not redoing it.
 
 - [ ] Reordering directives (`@no_reorder`, ordering hints).
-- [ ] Register-allocation pinning (`@reg`, `@spill_at`).
-- [ ] Tail-call recognition with `@tail`.
+- [ ] Register-allocation pinning (`@reg(rN)`).
+- [ ] Tail-call recognition (`@tail`).
 - [ ] Calling-convention inference covering common variations.
 - [ ] Sufficient corpus diversity to catch regressions.
 
-**Done when:** the corpus expands to mid-size programs (≥10k LOC each) compiled at `-O2`, and round-trips remain byte-identical.
+## Phase 7 — Structured statement lifting (not started)
 
-## Phase 7 — Second arch and second format
+Function bodies today are sequences of `@asm("text", [bytes])` lines. This phase replaces some of those with typed expressions where the lifter can recover them safely:
 
-**Goal:** Validate modularity. Pick one of {ARM64 ELF, x86-64 PE, x86-64 Mach-O}.
+- [ ] `let x: T = expr;`
+- [ ] `return expr;`
+- [ ] Simple arithmetic via DWARF + iced semantics.
+- [ ] If / while / for from CFG structuring (Sharir, Cifuentes-style).
+- [ ] Switch-table recognition (jump tables in `.rodata`).
+- [ ] Short-circuit boolean rebuild for `&&` / `||`.
 
-- [ ] Implement the format reader/writer.
-- [ ] Implement the arch backend (or wire up the appropriate format if same arch).
-- [ ] Toolchain-specific runtime/CRT signatures.
+The escape hatch (`@asm` with bytes) remains available at every level of incomplete recovery. Round-trip is preserved by construction — the bytes are still pinned.
 
-**Done when:** an analogous corpus on the new target round-trips byte-identically.
+## Phase 8 — Edit-aware lower (not started)
+
+Editing semantics are not yet defined. Concretely:
+
+- [ ] Warn (but don't fail) when an `@asm` line's text and pinned bytes disagree.
+- [ ] When a function's lowered length changes due to an edit, surface the change so the user can decide whether to repack.
+- [ ] Provide a "drop bytes, re-encode from text" mode behind a flag for users who want canonical encodings (paying the cost of losing redundant-prefix preservation).
+
+## Phase 9 — Second arch and second format (not started)
+
+- [ ] PE/COFF reader/writer or Mach-O reader/writer.
+- [ ] arm64 backend (or x86 32-bit on the existing format).
+- [ ] Toolchain-specific runtime/CRT signatures for the new target.
+
+The arch-trait abstraction (`ArchInsn`) is in place; adding a backend is mostly a question of writing the decoder/encoder/lifter for the new arch and shipping signatures.
 
 ## Beyond v1
 
-In open consideration once v1 stabilizes:
-- SIMD/vectorized code lifting and pinning.
+In open consideration once Phases 5–9 stabilize:
+
+- SIMD/vectorized code lifting.
 - Cross-arch porting via shared semantic IR (deliberate lossy step).
 - LTO/PGO output.
 - Packed/obfuscated binaries.
-- Full GUI / IDE integration.
+- GUI / IDE integration.
 - Decompiling non-CPU bytecode (Java, Wasm, Python `.pyc`, JVM, MSIL) — same architecture, new backends.

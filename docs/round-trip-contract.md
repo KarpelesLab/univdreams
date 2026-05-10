@@ -1,6 +1,6 @@
 # The round-trip contract
 
-This document defines what univdreams promises to preserve, what it does not, and the escape hatches that let it preserve everything anyway.
+This document defines what univdreams preserves, at which layer of the pipeline each property is tested, and what's still in scope for future iterations.
 
 ## The contract, stated precisely
 
@@ -10,84 +10,127 @@ For any binary `B` that the system claims to support:
 compile(decompile(B)) == B            (byte-equal)
 ```
 
-with the qualification that **the user has not edited the intermediate `.ud` source**. If the user edits the source, the recompile reflects the edit, and byte-equality holds only over the parts the user did not change.
+with the qualification that **the user has not edited the intermediate `.ud` source**. Editing semantics are not yet defined; see the bottom of this document.
 
-"Supports" means: the binary's format is implemented, all its arches/sections/relocations are within the implemented set, and no required information has been irrecoverably lost (e.g., by stripping in a way the system cannot reconstruct).
+"Supports" today means: ELF64-LE x86-64 produced by GCC with debug info. Other formats and architectures fall through to the byte-copy path in `ud roundtrip` (which is also byte-identical, just trivially).
 
-## What is preserved
+## Layered round-trip properties
+
+Each layer of the pipeline has its own round-trip property, and each is tested by CI on every push.
+
+### Layer 1: ELF format
+
+> `Elf64File::write_to_vec(Elf64File::parse(bytes)?)`  ==  `bytes`
+
+The hand-rolled ELF64-LE reader/writer captures every byte: header fields, program-header table, section-header table, every section's content, every interstitial padding gap. Anything we don't interpret is preserved as opaque bytes and re-emitted verbatim.
+
+Tested in `crates/ud-format-elf/tests/fixtures.rs` against every ELF64-LE fixture in `testdata/`.
+
+### Layer 2: x86 instruction stream
+
+> Decoding bytes to a `Vec<DecodedInsn>` and concatenating each instruction's `original_bytes`  ==  the input bytes.
+
+We deliberately do *not* round-trip via iced's `BlockEncoder` — it canonicalizes redundant prefixes (e.g. drops the `66` data16 override on alignment NOPs), and our test corpus exposed this immediately. Instead, decode captures each instruction's exact bytes; emit re-uses them. iced's structured `Instruction` lives alongside as the analysis form.
+
+Tested in `crates/ud-arch-x86/tests/text_roundtrip.rs` across every x86_64 executable section (12 sections, 259 instructions in the current corpus).
+
+### Layer 3: IR Function
+
+> `Function::emit_bytes(lift_function(insns))` == concatenation of `insns` `original_bytes`.
+
+The IR is a *view* over the byte stream, not a transformation. CFG construction (leaders / blocks / terminators) doesn't change the bytes; emission concatenates each instruction's preserved bytes in address order.
+
+Tested in `crates/ud-arch-x86/tests/lift_fixtures.rs`: every function discovered in every fixture is lifted, then `emit_bytes` is compared against its original slice.
+
+### Layer 4: AST round-trip (synthetic)
+
+> `parse(emit(ast))` is structurally equal to `ast`.
+> `emit(parse(canonical_text))` is byte-equal to `canonical_text`.
+
+The pretty-printer is deterministic; the parser is whitespace-tolerant but normalizes to the canonical form on re-emit.
+
+Tested in `crates/ud-compile/tests/round_trip.rs` against synthetic ASTs.
+
+### Layer 5: Source-level round-trip via decompile
+
+> `parse(decompile_to_text(elf))`  ==  `decompile(elf)`
+
+The AST that comes out of `decompile`, pretty-printed, then parsed back, is structurally identical to the AST we started with. This is what defends the parser against drift in the decompiler's text output and vice versa.
+
+Tested in `crates/ud-decompile/tests/decompile_fixtures.rs`.
+
+### Layer 6: Per-function source round-trip
+
+> `lower_functions(parse(decompile_to_text(elf)))` produces, for each function, the same bytes as in the input ELF.
+
+12 functions, 562 bytes verified across the corpus.
+
+Tested in `crates/ud-compile/tests/source_round_trip.rs`.
+
+### Layer 7: Per-section source round-trip
+
+> `lower_sections(parse(decompile_to_text(elf)))` produces, for each `@section`, the same bytes as in the input ELF section.
+
+68 sections, 9,093 bytes verified across the corpus — including `.text`, `.rodata`, `.dynamic`, `.data`, `.symtab`, `.strtab`, `.shstrtab`, debug sections.
+
+Tested in `crates/ud-compile/tests/section_round_trip.rs`.
+
+### Layer 8: Whole-binary round-trip via source
+
+> `lower_to_elf(parse(decompile_to_text(elf)))`  ==  `elf-bytes`
+
+Every byte of the input ELF — header, program-header table, section-header table, every section's content, every interstitial padding gap — survives a round trip through the `.ud` source language byte-identically.
+
+**33,680 bytes across two real-world fixtures** (`hello-gcc13-O0`, `sqrt-gcc13-O0`) verified byte-identical.
+
+Tested in `crates/ud-compile/tests/whole_binary_round_trip.rs`.
+
+## What's preserved
 
 ### Byte-level layout
 - Section order, sizes, alignment, and padding fill bytes.
-- Header fields, including non-deterministic ones (build IDs, timestamps, `e_flags` quirks). These are captured into the `@module.build` block on decompile and written back unchanged on compile.
-- Symbol table (or its absence). A stripped binary on input means a stripped binary on output.
-- Relocations (static and dynamic), preserved structurally and re-emitted at the same offsets with the same kinds.
+- Header fields, including non-deterministic ones (build IDs, timestamps, `e_flags` quirks). These are captured into `@module.build` on decompile and written back unchanged on compile.
+- Program-header table, section-header table, every entry's every field.
+- Every interstitial gap between structured regions, captured as `@module.build.padding` and re-spliced on lower.
 
 ### Instruction-level layout
-- Function order in `.text` (default `sub_<addr>` naming makes this automatic).
-- Per-instruction encoding choices: prefix bytes, REX/VEX/EVEX bits, displacement size, immediate size, segment overrides.
-- Branch encoding size: short vs near vs far.
-- Specific zeroing/move idioms (`xor reg,reg` vs `mov reg,0`, etc.).
-- Padding inside functions (alignment after a `ret`, `int3` filler) preserved as `@pad` directives or as `@raw` blocks for non-instruction filler.
+- Function order in `.text` (emitted in section-layout order; `@addr` pins addresses).
+- Per-instruction encoding choices: every byte preserved in `@asm`'s pinned-bytes field. Includes redundant prefixes like the `66` data16 on alignment NOPs.
+- Branch encoding size: short vs near vs far — captured in the bytes directly.
+- Padding inside functions (alignment after a `ret`, NOP filler) preserved verbatim either inside the function's `@asm` stream or as `@raw` blocks between functions.
 
 ### Function-level layout
-- Prologue/epilogue shape, even when nonstandard, via `@prologue("custom")` followed by an inline-asm body.
-- Stack-frame size and slot assignments, via `@stack` and `@spill`.
-- Register-allocation choices that affect bytes (i.e., where a different choice of register would change the encoded instruction), pinned via `@reg(...)`.
-- Tail-call lowering (jmp vs call), pinned via `@tail`.
+- Function names: real names from `.symtab` / `.dynsym` when present; pattern-matched names (CRT helpers) when signatures recognise them; otherwise `sub_<hex_addr>` which encodes the address.
+- Function sizes: from `.eh_frame` / `.symtab` when supplied; otherwise filled in from neighbouring functions (distance to next discovered start in the same executable section).
+- Typed signatures: parameter and return types from DWARF when present.
 
 ### Data-section content
-- Read-only data, including string literals, jump tables, and switch dispatch tables, preserved with their addresses and contents.
-- Initialized writable data preserved verbatim.
-- BSS sized correctly.
+- Read-only data, jump tables, switch dispatch tables, dynamic linker structures (`.dynamic`, `.got`, `.plt`-related sections), debug info — all preserved verbatim as `@raw` inside their respective `@section` blocks.
 
-## What is **not** preserved
+## What is **not** preserved (yet)
 
-These categories are explicitly out of scope. If they matter for a given binary, the system reports a hard failure rather than silently producing different bytes.
-
-- **Compiler-injected non-determinism not captured in headers.** Some compilers inject randomness into otherwise-stable structures (e.g., hashed-symbol-table seed). When detected, these are captured into `@module.build` and round-tripped. When undetected, the round-trip fails the byte-equality test and the user sees a diff.
-- **Self-modifying code at runtime.** The on-disk bytes round-trip; what the program does at runtime is the program's business.
-- **Output of compilers / passes we have not modeled.** Optimizations beyond v1's scope (auto-vectorization, LTO across the link, PGO-driven layout) frequently produce shapes the lifter cannot recognize. Affected functions degrade to `@asm` blocks; round-trip is preserved, but the source is unstructured for those functions.
-- **Behavior of `_RANDOM` build flags.** If the build was non-reproducible upstream (e.g., `-frandom-seed` left unset), the same source compiles to different bytes; we round-trip the *observed* binary, not the abstract program.
-
-## Escape hatches and the degradation chain
-
-When the lifter cannot produce structured source, it degrades along a chain. At every level, byte-identity is preserved.
-
-```
-typed expression  →  inline asm  →  raw bytes
-```
-
-1. **Typed expression**: the normal output. `let x: u32 = a + b;`
-2. **Inline asm**: when the instruction is implemented on this arch but the IR lifter can't produce a typed expression for it (e.g., uncommon instruction, intrinsic-like behavior). Emitted as `@asm("rdtsc")`. The compiler's assembler handles encoding; encoding metadata is preserved by per-asm-line `@encoding(...)` annotations when relevant.
-3. **Raw bytes**: when the disassembler refuses or the bytes are data-in-code. Emitted as `@raw(at=0x..., bytes=[...])`. The compiler emits these bytes verbatim at the pinned address.
-
-These are not failure modes. They are part of the language. A `.ud` file that is 100% `@raw` blocks is a perfectly valid round-tripping representation — it just won't help a human read the program.
+- **PE/COFF, Mach-O, 32-bit ELF, ARM** — these fall through to `ud roundtrip`'s byte-copy path. The byte-copy is byte-identical (trivially), but the source-language layer doesn't apply.
+- **Edits to `.ud` that change function size** — if you edit an `@asm` line's text such that re-encoding would change the function's byte length, the bytes pinned in the `.ud` still get emitted as-is, producing a binary whose text disagrees with its bytes. A warning for this case is the next CLI work item.
 
 ## Verification methodology
 
-The round-trip property is checked by an automated suite. The suite is the system's primary regression detector and ships as part of the repo.
+Every property above is checked by an automated test in CI on every push. Property failures are hard CI failures; merging is gated on green.
 
-For each fixture:
-1. The fixture binary is committed to the repo (or generated reproducibly from committed source).
-2. `ud roundtrip <fixture>` runs the full decompile → recompile pipeline.
-3. The output bytes are compared against the fixture using `cmp`.
-4. Any difference is a hard failure; the diff (offset + bytes) is reported.
+The fixture corpus is two ELF64 binaries totalling 33,680 bytes:
 
-Fixtures are chosen to cover, in increasing order:
-1. Each documented encoding choice (one fixture per).
-2. Each ABI permutation (parameter overflow to stack, struct returns, varargs).
-3. Each control-flow construct (loops, switches with various table layouts, irreducible CFGs).
-4. Each section/relocation kind we claim to handle.
-5. Real small open-source programs at multiple `-O` levels and toolchains.
+| Fixture | Toolchain | Notes |
+|---------|-----------|-------|
+| `testdata/hello-gcc13-O0` | gcc 13.3.1, `-O0 -ggdb -fcf-protection` | minimal hello-world |
+| `testdata/sqrt-gcc13-O0` | gcc 13.3.1, `-O0 -ggdb -fcf-protection` | dynamic-link to libm; recursion in `do_fac` |
 
-A failure at any tier blocks merging changes that affect that area.
+Plus three byte-copy-only fixtures (`sqrt-gcc13-O0-m32` 32-bit ELF, `sqrt-mingw15-O0.exe` PE32, `sqrt-gcc14-O0-aarch64` aarch64 ELF) that exercise the byte-copy fallback.
 
 ## Hard-failure policy
 
-When the system cannot satisfy the contract — even with all escape hatches engaged — it must fail loudly, not produce different bytes. Concretely:
+When the system can't satisfy a layer's contract, it must fail loudly, not produce different bytes. Concretely:
 
-- The decompiler refuses to emit if it cannot account for every input byte (covered by either a directive or an `@raw` block).
-- The compiler refuses to emit if it cannot honor every directive in the source.
-- The CLI's `roundtrip` command exits non-zero on any byte difference and prints a diff.
+- The decompiler refuses to emit if it can't account for every input byte (covered by either an `@section`/function/`@raw`).
+- The lower path refuses to emit if any required section is missing, if `@section` lengths don't match `shdrs[].sh_size`, or if an `@asm` is missing pinned bytes.
+- The CLI's `roundtrip` exits non-zero on any byte difference.
 
-There is no "best effort" fallback. Best-effort decompilers exist; this isn't one. The whole project is the bet that the byte-identity property is achievable and worth the engineering cost — and that means we don't quietly drop it when it gets hard.
+There is no "best-effort" fallback that produces different bytes. The whole project is the bet that the byte-identity property is achievable and worth the engineering cost — and that means we don't quietly drop it when it gets hard.

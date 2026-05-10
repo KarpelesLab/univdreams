@@ -1,16 +1,16 @@
 # Architecture
 
-This document describes the overall structure of univdreams — the pipelines, the IR, and how the system preserves enough information to round-trip a binary through source and back.
+This document describes the structure of univdreams as it exists today — the pipelines, the IR, the crate boundaries, and how the system preserves enough information to round-trip a binary through source and back.
 
 ## The single load-bearing idea
 
 Most decompilers are lossy because the source languages they emit (C, pseudocode) cannot express the choices a compiler made. There is no syntax for "the compiler used `rbx` for this loop counter," or "this branch was encoded as a short jump even though near would also work," or "the linker padded the function tail with `nop` `nop` `int3`." So the information is dropped, and recompiling produces a *different* binary.
 
-univdreams's source language (`.ud`) has first-class directives for every non-semantic choice. The decompiler writes those directives. The compiler reads them and pins itself to the same choice. Result: the source is a complete, executable specification of the binary.
+univdreams's source language (`.ud`) makes those choices first-class. Today's primary mechanism is **pinning the bytes** alongside each instruction (`@asm("text", [bytes])`) and capturing every other byte (headers, padding, data sections) as either structured `@module.build` metadata or `@raw` blocks. The result: a `.ud` file is a complete, executable specification of its binary. The lower path reconstructs the binary byte-for-byte.
 
-When the system encounters something it cannot lift to structured source, it falls back through a chain of escape hatches — typed expression → inline assembly → raw bytes — none of which break round-trip. The roof never collapses; it just degrades clarity.
+When the system encounters something it cannot lift to structured source, it falls back through a chain of escape hatches — typed function signature → `@asm` with bytes → `@raw` bytes — none of which break round-trip. The roof never collapses; it just degrades clarity.
 
-See [round-trip-contract.md](round-trip-contract.md) for the precise definition of what "identical" means and which information categories are preserved.
+See [round-trip-contract.md](round-trip-contract.md) for the precise definition of what's preserved and at which layer.
 
 ## Pipelines
 
@@ -20,176 +20,141 @@ See [round-trip-contract.md](round-trip-contract.md) for the precise definition 
 binary file
    │
    ▼
-loader              detect format (ELF/PE/Mach-O), parse headers, sections,
-                    symbols, relocations, debug info into a memory model
-   │
+ud-format-elf::Elf64File::parse
+   │  parses ehdr / phdrs / shdrs, captures every section's bytes,
+   │  and every interstitial padding gap.
    ▼
-section catalog     enumerate executable ranges and their attributes
-   │
+ud-analysis::discover_functions
+   │  layered sources merged into a FunctionMap:
+   │    .symtab → names + sizes (when not stripped)
+   │    .dynsym → names + sizes for dynamic exports
+   │    .eh_frame → sizes via FDE walk; placeholder names
+   │    ud-signatures DB → CRT helpers by byte pattern
+   │    fill-in pass → size = distance to next neighbour
    ▼
-disassembler        per-arch: bytes → instruction stream with full encoding
-                    detail (prefixes, displacement size, REX bits, …)
-   │
+ud-debug::read_debug_info
+   │  parses .debug_info via gimli, returns DebugFunction
+   │  records (addr → typed signature) for AST attachment.
    ▼
-function discovery  combine: symbol table, exception/unwind tables (.eh_frame,
-                    .pdata), prologue patterns, call-target sweep, control-
-                    flow recovery from entry points
-   │
+ud-arch-x86::decode + ud-arch-x86::lift_function
+   │  per function: bytes → DecodedInsn[] → Function<DecodedInsn>
+   │  with CFG (basic blocks + Terminators) recovered from iced
+   │  flow-control classification.
    ▼
-CFG reconstruction  per function: basic blocks, edges, loop nests
-   │
+ud-decompile::build_module + build_function
+   │  Build the .ud AST: @module with full ELF metadata,
+   │  @section for each ELF section with on-disk content,
+   │  Item::Function for each lifted function (with DWARF-
+   │  attached signature when available), Item::Raw for the
+   │  inter-function gaps and non-text sections.
    ▼
-IR lifter           per-arch: instructions → arch-tagged IR ops. Lifting is
-                    deliberately mechanical — no semantics-changing rewrites.
-                    Every encoding choice is captured as IR-op metadata.
-   │
+ud-ast::emit
+   │  canonical pretty-printer.
    ▼
-analysis passes     type recovery, calling-convention inference, signature
-                    matching against a libc/runtime DB, naming, debug-info
-                    overlay
-   │
-   ▼
-structuring         IR → AST: re-discover loops (while/for/do), if/else,
-                    switch tables, short-circuit boolean operators. Anything
-                    irreducible falls through as @cfg{ goto } blocks.
-   │
-   ▼
-emitter             AST → .ud source text with directives sufficient to pin
-                    every captured choice
+.ud source text
 ```
 
 ### Compile pipeline
 
 ```
-.ud source
+.ud source text
    │
    ▼
-lexer + parser      produce AST. Directives are validated against the
-                    target arch and ABI at parse time.
-   │
+ud-compile::parse
+   │  hand-rolled lexer + recursive-descent parser; produces
+   │  a ud_ast::UdFile.
    ▼
-AST → IR            structured constructs lower to IR; directives attach
-                    as constraints on IR ops and on layout.
-   │
+ud-compile::lower_to_elf
+   │  Read @module.build to reconstruct Ehdr64 / Vec<Phdr64> /
+   │  Vec<Shdr64> / padding. Lower every @section to bytes;
+   │  match section names to shdr entries (via the resolved
+   │  `name` field carried on each shdr); verify each section's
+   │  lowered length equals its sh_size. Build an Elf64File
+   │  via from_parts, call write_to_vec.
    ▼
-instruction sel.    per-arch: IR → arch instructions. Where directives pin
-                    a choice (register, encoding, ordering) the selector
-                    obeys; otherwise it picks deterministically.
-   │
-   ▼
-encoder             per-arch: instructions → bytes. Encoding directives
-                    (e.g. force-near jump, REX.W=0) are honored.
-   │
-   ▼
-section assembler   build .text and other sections, applying alignment and
-                    padding as directed.
-   │
-   ▼
-relocations         resolve cross-references; emit dynamic relocations
-                    according to the format's expectations.
-   │
-   ▼
-format writer       emit ELF/PE/Mach-O with the original layout, headers,
-                    and metadata pinned by the directives at the top of
-                    the source.
+binary file
 ```
 
-The two pipelines are inverses. The IR is the pivot. The directives are the residuum that makes the inversion exact.
+The two pipelines are inverses. The AST is the pivot. Pinned bytes in `@asm` and `@raw`, plus the metadata in `@module.build`, are the residuum that makes the inversion exact.
 
 ## IR design
 
-The IR is **arch-tagged**, not generic. There is no aspiration to a single SSA form that works for every architecture. Each arch has its own IR vocabulary that maps closely to its instruction semantics, augmented with shared concepts (basic blocks, function boundaries, types, memory references).
+The IR is **arch-tagged**, not generic. There is no aspiration to a single SSA form that works for every architecture.
 
-Why not a generic IR like LLVM:
-- LLVM IR is *lossy* by design. It throws away precisely the information we need (encoding choices, register hints, instruction order across non-aliasing memory).
-- A generic IR would force us to invent a way to round-trip arch-specific quirks anyway, and that invented mechanism is what we call the IR. Better to start there.
+`ud-ir` provides shared concepts (`Function`, `BasicBlock`, `Terminator`) generic over an arch instruction type via the [`ArchInsn`] trait. Per-arch crates implement `ArchInsn` for their decoded type and provide the arch-specific lifter:
 
-Why not shared by all arches:
-- Shared semantics shouldn't outweigh the modeling cost of pretending that x86 segment overrides and ARM predication and MIPS branch delay slots are all the same thing. They aren't.
-- Cross-arch porting (out of scope for v1) can use a *separate* lowering between two arch IRs when needed. We don't pay for that complexity until we want it.
+```rust
+pub trait ArchInsn {
+    fn addr(&self) -> VAddr;
+    fn original_bytes(&self) -> &[u8];
+}
+```
 
-What every arch IR has in common:
-- Function (entry block, exit blocks, parameters/returns described by ABI tags)
-- Basic block (sequence of ops, terminator)
-- Op (an arch-specific instruction-class, with operands and *encoding metadata*)
-- Operand (register, immediate, memory ref, label)
-- Type (integer width, float kind, pointer-to, array-of, struct-of — recovered, often partially)
+The byte-identity contract for the IR layer:
 
-Encoding metadata on each op records every reversible-choice bit the assembler can flip: prefix bytes, displacement size, REX/VEX/EVEX choices, segment override, address-size override. The encoder reads the metadata; if absent, it picks the canonical shortest form deterministically.
+> For any `Function` built from real bytes by an arch's lifter,
+> `Function::emit_bytes` returns exactly the input bytes.
 
-## Module breakdown
+This is true by construction — `emit_bytes` concatenates each instruction's preserved `original_bytes` in address order. The CFG is a *view* over the byte stream, not a transformation of it.
+
+`ud-arch-x86::DecodedInsn` carries the iced `Instruction` for analysis plus the original byte slice. iced's `BlockEncoder` is available via `reencode_via_iced` for analysis-then-edit workflows where canonical encoding is acceptable; the round-trip path goes through `emit_preserved` which never re-encodes.
+
+[`ArchInsn`]: ../crates/ud-ir/src/lib.rs
+
+## Crate breakdown
 
 | Crate | Purpose |
 |-------|---------|
-| `ud-core` | Common types: `Address`, `Range`, `ByteSlice`, error chain. |
-| `ud-format` | Format dispatch + per-format readers/writers (ELF first). |
-| `ud-arch` | The arch trait. Each arch is a sub-crate behind features. |
-| `ud-arch-x86` | x86-16/32/64 backend. Decode, encode, lift, lower. Uses `iced-x86`. |
-| `ud-arch-arm` | arm32/arm64 backend. Stub initially. |
-| `ud-ir` | IR types, traversal helpers, validation. |
-| `ud-analysis` | Function discovery, prologue detection, CFG, type recovery, calling-convention inference, naming. |
-| `ud-debug` | DWARF (gimli), PDB, stabs, Mach-O `.dSYM` readers. |
-| `ud-signatures` | FLIRT-style signature DB and matcher for libc/runtime functions. |
-| `ud-decompile` | IR → AST structuring + `.ud` emitter. |
-| `ud-compile` | `.ud` parser + AST → IR + driver of the per-arch lowering. |
-| `ud-cli` | The `ud` binary: `decompile`, `compile`, `roundtrip`, `inspect`. |
+| `ud-core` | Shared types: `VAddr`, `Result`, `Error`, `assert_bytes_equal`. |
+| `ud-format-elf` | ELF64-LE reader + writer with byte-identical round-trip. Public `Elf64File::from_parts` for reconstructive callers. |
+| `ud-arch-x86` | x86 backend: decode (iced), Intel formatter, lift to IR with CFG, `DecodedInsn` implementing `ArchInsn`. |
+| `ud-ir` | `Function<I>`, `BasicBlock<I>`, `Terminator`, `ArchInsn` trait. Generic over the per-arch instruction type. |
+| `ud-analysis` | Function discovery: layered sources (symtab / dynsym / eh_frame / signatures), merge logic in `FunctionMap`, size-filling pass. |
+| `ud-signatures` | Byte-pattern matcher with wildcards. v0 DB: x86-64 CRT helpers. |
+| `ud-debug` | DWARF reader (gimli). Returns `DebugFunction { addr, name, return_type, params }` for typed signature attachment. PDB / stabs / Mach-O dSYM are future modules. |
+| `ud-ast` | `UdFile`, `Module`, `Item`, `FnDecl`, `Stmt`, `Type`, `Param`, `Signature`. Canonical pretty-printer (`emit`). Source of truth for what `.ud` looks like. |
+| `ud-compile` | `.ud` parser (text → AST). `lower_function_bytes`, `lower_section_bytes`, `lower_to_elf`. |
+| `ud-decompile` | Decompile orchestration: ELF → discover → lift → build AST. `decompile()` returns a `UdFile`; `decompile_to_text` is `emit(decompile(elf)?)`. |
+| `ud-cli` | The `ud` binary. Subcommands today: `roundtrip`, `decompile`. |
 
 ## Function-discovery strategy
 
-Function-boundary detection is the single most error-prone step. The system layers signals from highest to lowest confidence and merges them:
+`ud-analysis::discover_functions` runs every available source in increasing-confidence order so the merge in `FunctionMap` resolves name conflicts in favour of the higher-confidence source:
 
-1. **Symbol table** (if present and not stripped). Authoritative for what it covers.
-2. **Exception/unwind tables.** `.eh_frame` (ELF), `.pdata`/`.xdata` (PE x64), `LC_FUNCTION_STARTS` (Mach-O). These are emitted by every modern compiler and survive stripping.
-3. **Compiler prologue patterns.** Per-arch, per-toolchain library of byte/instruction patterns that signal "function starts here." Configurable; users can add patterns.
-4. **Reachability sweep from known entries.** Recursive disassembly from `_start`, exported symbols, signature-matched stdlib, and from any address mentioned as a call target.
-5. **User overrides** in a sidecar config: `--function 0x401050 my_decoder`.
+1. **Prologue patterns** (Phase 0; not yet wired but the slot exists in `FunctionSource`).
+2. **`.eh_frame`** — FDE walks via gimli. Yields accurate sizes; placeholder `sub_<addr>` names. Survives stripping.
+3. **`ud-signatures`** — byte-pattern DB. Yields meaningful names (`deregister_tm_clones`, etc.) for functions that no other source covers. Sizes start at zero; filled in by the post-pass.
+4. **`.dynsym`** — names for exported / imported symbols.
+5. **`.symtab`** — full symbol table (when not stripped). Authoritative names + sizes.
+6. **User overrides** (sidecar config; future).
 
-Conflicts (e.g., a prologue match in the middle of another function) are reported but not silently resolved.
+After all sources merge, `fill_in_sizes_from_neighbors` closes any size-zero entry by setting its size to the distance to the next discovered function in the same executable section. This catches functions for which no source recorded a size — `_init`, `_fini`, signature-matched CRT helpers without an `.eh_frame` entry, etc.
 
-## Standard-function recognition
+## Naming conventions
 
-A signature DB for common runtime functions (libc primitives, C++ runtime, common compiler builtins) ships with the project. Matching is conservative — false positives are worse than false negatives, since a misidentified `strlen` would silently change behavior on round-trip if a user edits the file. Default policy: identify only on a high-quality match; otherwise leave the function as `sub_<address>`.
-
-The signature format is FLIRT-influenced but extended with multi-encoding, since the same source `strlen` can compile to wildly different bytes depending on the toolchain and flags. We store per-toolchain variants.
-
-## Source-level naming
-
-Default function name: `sub_<hex_address>` (e.g., `sub_401050`). The numeric address in the name is parsed by the compiler and used as the link-order key, so by default the binary's `.text` section comes back in the same order without anyone having to think about it.
-
-A function may opt out by giving an explicit name and an `@addr(...)` directive:
-
-```
-@addr(0x401050)
-fn parse_header(buf: ptr, len: usize) -> i32 { … }
-```
-
-The `@addr` is honored on recompile; the link-order key falls back to it.
-
-When debug info is present, the recovered name is used directly (still with `@addr` to preserve order) and types from DWARF/PDB are folded into the source.
-
-## Calling-convention handling
-
-ABIs are first-class. A function header carries `@abi(...)` (e.g., `@abi("sysv")`, `@abi("ms64")`, `@abi("aapcs")`, `@abi("custom")`). For SysV/MS64/AAPCS, parameter and return-value placement is implicit; the compiler emits the standard register/stack mapping. For `custom`, every parameter gets an explicit `@reg(...)` or `@stack(offset=...)` annotation.
-
-A correctly inferred ABI on decompile means a clean source. An incorrectly inferred ABI is recoverable: the user can override the `@abi(...)` directive and recompile.
+- Real names from symtab / DWARF are used as-is.
+- Recognized stdlib / CRT helpers get their canonical name from the signature DB.
+- Everything else falls back to `sub_<hex_addr>`. The numeric address in the name is parsed by the lower path and used as the layout key, so by default the binary's `.text` section comes back in the same order.
 
 ## Failure modes and escape hatches
 
-- **An instruction we can't lift to typed IR**: emit `@asm("...")` with the textual disassembly. The compiler's assembler handles it.
-- **Bytes we can't disassemble at all** (data-in-code, jump tables embedded in `.text`, padding): emit `@raw(at=0x..., bytes=[...])`. Identity-preserving; opaque to analysis.
-- **A compiler quirk we don't model yet**: emit `@encoding(opaque="...")` with the exact bytes for the op. Lints flag this so we know to grow the model.
+The structural escape-hatch chain, from richest to most opaque:
 
-These are not bugs; they are pressure valves. Round-trip is preserved at every level of degradation.
+1. **Typed function signature**: `fn name(args: T, …) -> R { @asm … }`. Used when DWARF or other source supplies types.
+2. **Untyped function**: `fn name() { @asm … }`. Used when no signature is available.
+3. **`@raw(addr, [bytes])`**: a slice of bytes inside a section that the analyser couldn't lift to a function. Used for alignment padding inside `.text` and for the entire content of non-loadable sections (`.dynamic`, `.symtab`, debug info).
+4. **`@module.build.padding`**: bytes that fall outside any structured region, captured at the file level.
+
+These aren't bugs; they're how round-trip stays intact at every level of structural recovery. A `.ud` file that's 100% `@raw` is a perfectly valid round-tripping representation — it just won't help a human read the program.
 
 ## Testing strategy
 
-The single most important test is the **round-trip suite**: a corpus of small programs, each compiled with multiple toolchains and flags, decompiled, recompiled, and byte-compared. Any byte difference is a hard failure.
+Every layer of the pipeline has a round-trip property defended by CI. See [round-trip-contract.md](round-trip-contract.md) for the full list. The fixture corpus is two ELF64 binaries totalling 33,680 bytes (whole-binary byte-identity) plus byte-copy-only coverage for 32-bit ELF, PE32, and aarch64 ELF.
 
-Tiers of the suite:
-1. Hand-crafted fixtures targeting specific instructions/encodings.
-2. A growing set of small open-source programs (busybox applets, coreutils-likes, single-file C programs).
-3. (Later) larger programs and full distros.
+The CI pipeline:
 
-Property-based tests on the parser and emitter ensure `parse(emit(ast)) == ast`.
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
 
-Per-arch backends have unit tests for every encoding choice they claim to support, asserting `decode(encode(op)) == op` and `encode(decode(bytes)) == bytes`.
+All three jobs run in parallel on every push. 104 tests across 11 crates as of this writing.
