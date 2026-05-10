@@ -369,6 +369,18 @@ fn emit_block_stmts(
             });
             continue;
         }
+        // Lift `add/sub dword ptr [rbp+disp], IMM` into
+        // `@local_arith`. Catches loop-counter increments/decrements
+        // and accumulator updates.
+        if let Some((slot, op, value)) = ud_arch_x86::match_local_arith_immediate(&insn.iced) {
+            out.push(Stmt::LocalArith {
+                slot,
+                op: op.to_string(),
+                value,
+                bytes: insn.original_bytes.clone(),
+            });
+            continue;
+        }
         out.push(Stmt::asm(
             format_intel(&insn.iced),
             insn.original_bytes.clone(),

@@ -233,6 +233,18 @@ pub enum Stmt {
         bytes: Vec<u8>,
     },
 
+    /// `@local_arith(slot, op, value, [bytes])` — a recognised
+    /// `add/sub dword/qword ptr [rbp+disp], IMM` pattern. Lifts
+    /// the loop-counter / accumulator-update idiom.
+    /// `op` is the arithmetic operation (`"+="` or `"-="`); `value`
+    /// is the immediate, signed.
+    LocalArith {
+        slot: i64,
+        op: String,
+        value: i64,
+        bytes: Vec<u8>,
+    },
+
     /// A structured loop with the test at the bottom. Canonical
     /// gcc -O0 shape:
     ///

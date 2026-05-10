@@ -105,6 +105,7 @@ fn emit_stmts(out: &mut String, stmts: &[Stmt], indent: &str) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
     match stmt {
         Stmt::Asm { text, bytes } if bytes.is_empty() => {
@@ -199,6 +200,20 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             write!(out, "{indent}@local_set(").unwrap();
             emit_signed_hex(out, *slot);
             out.push_str(", ");
+            emit_signed_hex(out, *value);
+            out.push_str(", [");
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
+        Stmt::LocalArith {
+            slot,
+            op,
+            value,
+            bytes,
+        } => {
+            write!(out, "{indent}@local_arith(").unwrap();
+            emit_signed_hex(out, *slot);
+            write!(out, ", {}, ", quote_string(op)).unwrap();
             emit_signed_hex(out, *value);
             out.push_str(", [");
             emit_byte_list(out, bytes);

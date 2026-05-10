@@ -557,6 +557,25 @@ impl Parser {
                 self.expect(&TokenKind::RParen, "`)` to close `@local_set`")?;
                 Ok(Stmt::LocalSet { slot, value, bytes })
             }
+            "local_arith" => {
+                self.expect(&TokenKind::LParen, "`(` after `@local_arith`")?;
+                #[allow(clippy::cast_possible_wrap)]
+                let slot = self.expect_int("local-arith slot displacement")? as i64;
+                self.expect(&TokenKind::Comma, "`,` after `@local_arith` slot")?;
+                let op = self.expect_string("local-arith op string (e.g. \"+=\")")?;
+                self.expect(&TokenKind::Comma, "`,` after `@local_arith` op")?;
+                #[allow(clippy::cast_possible_wrap)]
+                let value = self.expect_int("local-arith immediate value")? as i64;
+                self.expect(&TokenKind::Comma, "`,` after `@local_arith` value")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@local_arith`")?;
+                Ok(Stmt::LocalArith {
+                    slot,
+                    op,
+                    value,
+                    bytes,
+                })
+            }
             other => Err(ParseError::UnknownDirective {
                 name: other.to_string(),
                 line: dir_tok.line,
