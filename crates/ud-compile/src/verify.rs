@@ -141,7 +141,8 @@ fn verify_stmts(
             | Stmt::Call { bytes, .. }
             | Stmt::LocalSet { bytes, .. }
             | Stmt::LocalArith { bytes, .. }
-            | Stmt::LocalCompound { bytes, .. } => {
+            | Stmt::LocalCompound { bytes, .. }
+            | Stmt::Move { bytes, .. } => {
                 *cursor = cursor.saturating_add(bytes.len() as u64);
             }
             Stmt::IfBranch {

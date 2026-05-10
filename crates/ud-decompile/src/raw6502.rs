@@ -257,6 +257,14 @@ fn build_stmt_slice(
             i += 1;
             continue;
         }
+        // 5. LDA src; STA dst (and LDX/LDY variants) → @move.
+        //    Chains a trailing run of same-register stores into a
+        //    multi-destination assignment text.
+        if let Some((move_stmt, consumed)) = try_lift_move(local, i, resolver) {
+            out.push(move_stmt);
+            i += consumed;
+            continue;
+        }
         // 5. Plain @asm.
         let ins = local[i];
         if let Some(lbl) = labels.get(&ins.addr.0) {
@@ -290,6 +298,71 @@ fn try_lift_imm_call(local: &[&DecodedInsn], i: usize, entries: &HashSet<u64>) -
         args: vec![format!("A=#${:02X}", lda.operand)],
         bytes,
     })
+}
+
+/// If `local[i..]` starts with a register load (`LDA`/`LDX`/`LDY`)
+/// followed by one or more stores of that same register, return
+/// `(Stmt::Move, consumed)` where `consumed` is the number of
+/// instructions folded in.
+///
+/// The `dst` field of `Move` becomes either the single destination
+/// operand or `"dst1 = dst2 = …"` when multiple stores fan out the
+/// same value (catches the canonical `LDA #x; STA a; STA b` setup
+/// in WozMon's reset).
+fn try_lift_move(
+    local: &[&DecodedInsn],
+    i: usize,
+    resolver: SymbolResolver,
+) -> Option<(Stmt, usize)> {
+    let load = local.get(i)?;
+    let store_mn = match load.mnemonic {
+        Mnemonic::LDA => Mnemonic::STA,
+        Mnemonic::LDX => Mnemonic::STX,
+        Mnemonic::LDY => Mnemonic::STY,
+        _ => return None,
+    };
+    let mut bytes = load.original_bytes.clone();
+    let mut dsts: Vec<String> = Vec::new();
+    let mut j = i + 1;
+    while let Some(store) = local.get(j) {
+        if store.mnemonic != store_mn {
+            break;
+        }
+        if matches!(
+            store.mode,
+            AddressingMode::Implied | AddressingMode::Accumulator | AddressingMode::IllegalOperand
+        ) {
+            break;
+        }
+        let dst = format_operand(store, resolver);
+        // Avoid a degenerate self-move (LDA $24; STA $24) — but only
+        // for the very first store; later stores in a fanout are
+        // fine to repeat.
+        if j == i + 1 {
+            let src = format_operand(load, resolver);
+            if src == dst {
+                return None;
+            }
+        }
+        bytes.extend_from_slice(&store.original_bytes);
+        dsts.push(dst);
+        j += 1;
+    }
+    if dsts.is_empty() {
+        return None;
+    }
+    let src = format_operand(load, resolver);
+    let dst = dsts.join(" = ");
+    Some((Stmt::Move { dst, src, bytes }, j - i))
+}
+
+/// Render only the operand part of an instruction (everything that
+/// `format_insn_with` produces after the mnemonic). Used to build
+/// the source / destination text in `@move`.
+fn format_operand(ins: &DecodedInsn, resolver: SymbolResolver) -> String {
+    let full = format_insn_with(ins, resolver);
+    full.split_once(' ')
+        .map_or(full.clone(), |(_, rest)| rest.to_string())
 }
 
 /// If `local[i]` is a plain `JSR target` where `target` is a

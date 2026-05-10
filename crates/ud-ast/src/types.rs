@@ -262,6 +262,20 @@ pub enum Stmt {
         bytes: Vec<u8>,
     },
 
+    /// `@move("dst", "src", [bytes])` — an arch-agnostic
+    /// "dst := src" data move whose lowering is pinned by `bytes`.
+    /// The 6502 decompiler emits this for `LDA src; STA dst` pairs;
+    /// the `dst` and `src` strings are operand text from the
+    /// instruction stream (e.g. `"IN,Y"` and `"KBD"`).
+    ///
+    /// Round-trip: the source-language text is purely informational,
+    /// `bytes` is what the lower path emits.
+    Move {
+        dst: String,
+        src: String,
+        bytes: Vec<u8>,
+    },
+
     /// A structured loop with the test at the bottom. Canonical
     /// gcc -O0 shape:
     ///

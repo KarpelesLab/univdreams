@@ -260,7 +260,8 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
             }
             Stmt::LocalSet { bytes, .. }
             | Stmt::LocalArith { bytes, .. }
-            | Stmt::LocalCompound { bytes, .. } => {
+            | Stmt::LocalCompound { bytes, .. }
+            | Stmt::Move { bytes, .. } => {
                 let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, bytes, 0)
                     .expect("decode local-op bytes");
                 n += insns.len();

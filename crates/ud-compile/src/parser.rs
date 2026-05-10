@@ -595,6 +595,16 @@ impl Parser {
                     bytes,
                 })
             }
+            "move" => {
+                self.expect(&TokenKind::LParen, "`(` after `@move`")?;
+                let dst = self.expect_string("move dst operand string")?;
+                self.expect(&TokenKind::Comma, "`,` after `@move` dst")?;
+                let src = self.expect_string("move src operand string")?;
+                self.expect(&TokenKind::Comma, "`,` after `@move` src")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@move`")?;
+                Ok(Stmt::Move { dst, src, bytes })
+            }
             other => Err(ParseError::UnknownDirective {
                 name: other.to_string(),
                 line: dir_tok.line,
