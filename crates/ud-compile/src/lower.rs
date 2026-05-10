@@ -105,7 +105,9 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
             } => {
                 out.extend_from_slice(cond_bytes);
                 lower_stmts_into(fn_name, then_body, out)?;
-                lower_stmts_into(fn_name, else_body, out)?;
+                if let Some(else_body) = else_body {
+                    lower_stmts_into(fn_name, else_body, out)?;
+                }
             }
             Stmt::Comment(_) => {}
         }
@@ -255,12 +257,30 @@ mod tests {
                 cond_text: "cmp eax,0; je".into(),
                 cond_bytes: vec![0x83, 0xf8, 0x00, 0x74, 0x01],
                 then_body: vec![Stmt::asm("ret", vec![0xc3])],
-                else_body: vec![Stmt::asm("nop", vec![0x90])],
+                else_body: Some(vec![Stmt::asm("nop", vec![0x90])]),
             }],
         };
         let bytes = lower_function_bytes(&f).unwrap();
         // cond_bytes + then bytes + else bytes
         assert_eq!(bytes, vec![0x83, 0xf8, 0x00, 0x74, 0x01, 0xc3, 0x90]);
+    }
+
+    #[test]
+    fn lower_if_branch_without_else_omits_else_bytes() {
+        let f = FnDecl {
+            addr: Some(0x1000),
+            name: "f".into(),
+            signature: None,
+            body: vec![Stmt::IfBranch {
+                cond_text: "test rax,rax; je".into(),
+                cond_bytes: vec![0x48, 0x85, 0xc0, 0x74, 0x02],
+                then_body: vec![Stmt::asm("call rax", vec![0xff, 0xd0])],
+                else_body: None,
+            }],
+        };
+        let bytes = lower_function_bytes(&f).unwrap();
+        // Only cond_bytes + then bytes; no else bytes.
+        assert_eq!(bytes, vec![0x48, 0x85, 0xc0, 0x74, 0x02, 0xff, 0xd0]);
     }
 
     #[test]

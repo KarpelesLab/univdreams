@@ -237,7 +237,9 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
                     .expect("decode if-branch cond bytes");
                 n += insns.len();
                 n += count_stmts(then_body);
-                n += count_stmts(else_body);
+                if let Some(else_body) = else_body {
+                    n += count_stmts(else_body);
+                }
             }
             Stmt::Comment(_) => {}
         }

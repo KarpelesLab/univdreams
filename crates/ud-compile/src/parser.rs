@@ -530,10 +530,10 @@ impl Parser {
         }
     }
 
-    /// Parse `@if_branch("cond", [bytes]) { @then { … } @else { … } }`
+    /// Parse `@if_branch("cond", [bytes]) { @then { … } [@else { … }] }`
     /// after the `@if_branch` directive name has already been consumed.
-    /// Both `@then` and `@else` arms are required and may appear in
-    /// either order.
+    /// `@then` is required; `@else` is optional. The arms may appear
+    /// in either order.
     fn parse_if_branch_directive(&mut self, dir_tok: &Token) -> Result<Stmt, ParseError> {
         self.expect(&TokenKind::LParen, "`(` after `@if_branch`")?;
         let cond_text = self.expect_string("if-branch cond text")?;
@@ -610,13 +610,7 @@ impl Parser {
 
         let then_body = then_body.ok_or_else(|| ParseError::Expected {
             expected: "`@then` arm inside `@if_branch`".into(),
-            got: "neither `@then` nor `@else` provided".into(),
-            line: dir_tok.line,
-            col: dir_tok.col,
-        })?;
-        let else_body = else_body.ok_or_else(|| ParseError::Expected {
-            expected: "`@else` arm inside `@if_branch`".into(),
-            got: "missing `@else` arm".into(),
+            got: "missing `@then` arm".into(),
             line: dir_tok.line,
             col: dir_tok.col,
         })?;
@@ -850,6 +844,27 @@ fn f() {
     }
 
     #[test]
+    fn if_branch_else_body_round_trips_via_some() {
+        let src = r#"@module {}
+
+fn f() {
+    @if_branch("c", [0x90]) {
+        @then { @asm("ret", [0xc3]) }
+        @else { @asm("nop", [0x90]) }
+    }
+}
+"#;
+        let f = parse(src).unwrap();
+        let Item::Function(fn_) = &f.items[0] else {
+            panic!()
+        };
+        let Stmt::IfBranch { else_body, .. } = &fn_.body[0] else {
+            panic!()
+        };
+        assert!(else_body.is_some());
+    }
+
+    #[test]
     fn if_branch_with_then_and_else_arms() {
         let src = r#"@module {}
 
@@ -881,6 +896,7 @@ fn f() {
         assert_eq!(cond_text, "cmp [rbp-4],1; jne");
         assert_eq!(cond_bytes, &vec![0x83, 0x7d, 0xfc, 0x01, 0x75, 0x07]);
         assert_eq!(then_body.len(), 1);
+        let else_body = else_body.as_ref().expect("else arm");
         assert_eq!(else_body.len(), 1);
         assert_eq!(then_body[0], Stmt::asm("ret", vec![0xc3]));
         assert_eq!(else_body[0], Stmt::asm("nop", vec![0x90]));
@@ -910,24 +926,51 @@ fn f() {
             panic!()
         };
         assert_eq!(then_body[0], Stmt::asm("ret", vec![0xc3]));
+        let else_body = else_body.as_ref().expect("else arm");
         assert_eq!(else_body[0], Stmt::asm("nop", vec![0x90]));
     }
 
     #[test]
-    fn if_branch_missing_else_arm_errors() {
+    fn if_branch_without_else_arm_is_accepted() {
+        let src = r#"@module {}
+
+fn f() {
+    @if_branch("test rax,rax; je short 0x1016", [0x48, 0x85, 0xc0, 0x74, 0x02]) {
+        @then { @asm("call rax", [0xff, 0xd0]) }
+    }
+}
+"#;
+        let f = parse(src).unwrap();
+        let Item::Function(fn_) = &f.items[0] else {
+            panic!()
+        };
+        let Stmt::IfBranch {
+            then_body,
+            else_body,
+            ..
+        } = &fn_.body[0]
+        else {
+            panic!("expected IfBranch")
+        };
+        assert_eq!(then_body[0], Stmt::asm("call rax", vec![0xff, 0xd0]));
+        assert!(else_body.is_none());
+    }
+
+    #[test]
+    fn if_branch_missing_then_arm_errors() {
         let src = r#"@module {}
 
 fn f() {
     @if_branch("c", [0x90]) {
-        @then { @asm("ret", [0xc3]) }
+        @else { @asm("nop", [0x90]) }
     }
 }
 "#;
         let err = parse(src).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("@else"),
-            "expected `@else` mention in error, got: {msg}"
+            msg.contains("@then"),
+            "expected `@then` mention in error, got: {msg}"
         );
     }
 

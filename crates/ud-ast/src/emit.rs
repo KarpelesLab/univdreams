@@ -157,9 +157,11 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             writeln!(out, "{arm_indent}@then {{").unwrap();
             emit_stmts(out, then_body, &arm_body_indent);
             writeln!(out, "{arm_indent}}}").unwrap();
-            writeln!(out, "{arm_indent}@else {{").unwrap();
-            emit_stmts(out, else_body, &arm_body_indent);
-            writeln!(out, "{arm_indent}}}").unwrap();
+            if let Some(else_body) = else_body {
+                writeln!(out, "{arm_indent}@else {{").unwrap();
+                emit_stmts(out, else_body, &arm_body_indent);
+                writeln!(out, "{arm_indent}}}").unwrap();
+            }
             writeln!(out, "{indent}}}").unwrap();
         }
     }
@@ -436,7 +438,7 @@ mod tests {
                     cond_text: "cmp [rbp-4],1; jne".into(),
                     cond_bytes: vec![0x83, 0x7d, 0xfc, 0x01, 0x75, 0x07],
                     then_body: vec![Stmt::asm("ret", vec![0xc3])],
-                    else_body: vec![Stmt::asm("nop", vec![0x90])],
+                    else_body: Some(vec![Stmt::asm("nop", vec![0x90])]),
                 }],
             })],
         };
@@ -451,6 +453,27 @@ mod tests {
         assert!(out.contains("            @asm(\"ret\", [0xc3])\n"));
         assert!(out.contains("        @else {\n"));
         assert!(out.contains("            @asm(\"nop\", [0x90])\n"));
+    }
+
+    #[test]
+    fn if_branch_without_else_omits_else_block() {
+        let f = UdFile {
+            module: empty_module(),
+            items: vec![Item::Function(FnDecl {
+                addr: Some(0x1000),
+                name: "f".into(),
+                signature: None,
+                body: vec![Stmt::IfBranch {
+                    cond_text: "test rax,rax; je".into(),
+                    cond_bytes: vec![0x48, 0x85, 0xc0, 0x74, 0x02],
+                    then_body: vec![Stmt::asm("call rax", vec![0xff, 0xd0])],
+                    else_body: None,
+                }],
+            })],
+        };
+        let out = emit(&f);
+        assert!(out.contains("        @then {\n"));
+        assert!(!out.contains("@else"), "should not emit @else: {out}");
     }
 
     #[test]

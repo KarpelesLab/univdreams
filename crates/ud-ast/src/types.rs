@@ -184,26 +184,27 @@ pub enum Stmt {
     /// doesn't appear in the directive shape.
     ArgSpill { arg_index: u32, bytes: Vec<u8> },
 
-    /// A structured `cmp/test + jcc` head plus its two branches:
+    /// A structured `cmp/test + jcc` head plus its branches:
     ///
     /// ```text
     /// @if_branch("cond text", [cond bytes]) {
     ///     @then { …fallthrough body… }
-    ///     @else { …taken body… }
+    ///     @else { …taken body… }   // optional
     /// }
     /// ```
     ///
-    /// Lifted from a CFG triple where one block ends with
-    /// `cmp/test + jcc`, the next block in memory is the fallthrough
-    /// (`@then`), and the block at the jcc's target address is the
-    /// taken branch (`@else`). Bytes layout, exactly preserved on
-    /// lower: `cond_bytes` then bytes of `then_body` then bytes of
-    /// `else_body`.
+    /// `else_body == None` means the source-language `if` has no
+    /// `else` clause — the jcc-taken side jumps directly to whatever
+    /// code follows the `@if_branch` in source order. With `Some`,
+    /// both arms are real branches that converge somewhere later.
+    ///
+    /// Bytes layout, exactly preserved on lower: `cond_bytes` then
+    /// bytes of `then_body`, then bytes of `else_body` if present.
     IfBranch {
         cond_text: String,
         cond_bytes: Vec<u8>,
         then_body: Vec<Stmt>,
-        else_body: Vec<Stmt>,
+        else_body: Option<Vec<Stmt>>,
     },
 }
 

@@ -45,8 +45,10 @@ pub fn build_function(
     let mut i = 0;
     while i < f.blocks.len() {
         if let Some(group) = groups[i].as_ref() {
-            // Conditional block A is at i, fallthrough B at i+1, taken C at i+2.
-            // The cmp+jcc pair is consumed by the IfBranch head.
+            // Conditional block A is at i; fallthrough B is at i+1.
+            // For an if-with-else group C is at i+2 and the lift owns
+            // three blocks; for an if-only group C is the post-if join
+            // block, owned by the outer iteration.
             emit_block_stmts(
                 &mut body,
                 &f.blocks[i],
@@ -74,19 +76,24 @@ pub fn build_function(
                 &ctx,
             );
 
-            let mut else_body = Vec::new();
-            emit_block_stmts(
-                &mut else_body,
-                &f.blocks[i + 2],
-                BlockEmitConfig {
-                    is_first: false,
-                    emit_block_comment: false,
-                    truncate_trailing: 0,
-                    emit_terminator_comment: false,
-                },
-                lifts[i + 2].as_ref(),
-                &ctx,
-            );
+            let (else_body, advance) = if group.has_else {
+                let mut else_body = Vec::new();
+                emit_block_stmts(
+                    &mut else_body,
+                    &f.blocks[i + 2],
+                    BlockEmitConfig {
+                        is_first: false,
+                        emit_block_comment: false,
+                        truncate_trailing: 0,
+                        emit_terminator_comment: false,
+                    },
+                    lifts[i + 2].as_ref(),
+                    &ctx,
+                );
+                (Some(else_body), 3)
+            } else {
+                (None, 2)
+            };
 
             body.push(Stmt::IfBranch {
                 cond_text: group.cond_text.clone(),
@@ -94,7 +101,7 @@ pub fn build_function(
                 then_body,
                 else_body,
             });
-            i += 3;
+            i += advance;
         } else {
             emit_block_stmts(
                 &mut body,
@@ -374,14 +381,20 @@ fn compute_block_tail_lifts(
     out
 }
 
-/// One detected `cmp/test + jcc + then-block + else-block` group whose
-/// conditional block sits at a particular index in `f.blocks`.
+/// One detected `cmp/test + jcc + then-block [+ else-block]` group
+/// whose conditional block sits at a particular index in `f.blocks`.
 struct IfElseGroup {
     /// Number of trailing instructions in the conditional block that
     /// the IfBranch head consumes (always 2 for v0).
     head_consumed: usize,
     cond_text: String,
     cond_bytes: Vec<u8>,
+    /// True when the fallthrough block "exits" (returns or jumps past
+    /// the taken block) — the taken block is then a real `else` arm.
+    /// False when the fallthrough block falls through into the taken
+    /// block — the taken block is the post-if join code, and the
+    /// `if` has no `else` clause.
+    has_else: bool,
 }
 
 /// Per-block: is this block the head of a recognised if/else group?
@@ -394,14 +407,21 @@ struct IfElseGroup {
 ///   direct `jcc`).
 /// * The next block in memory is at the conditional branch's
 ///   fallthrough address (the "then" arm).
-/// * The block after that is at the jcc's taken target (the "else"
-///   arm).
+/// * The block after that is at the jcc's taken target.
+///
+/// `has_else` then distinguishes the two flavours:
+///
+/// * **if-with-else** — the fallthrough block "exits past" the
+///   taken block (returns, or unconditionally jumps to a later
+///   address). The taken block is a real `else` arm; the lift owns
+///   blocks `i, i+1, i+2`.
+/// * **if-only** — the fallthrough block falls through directly into
+///   the taken block. The taken block is the post-`if` join code;
+///   the lift owns only `i, i+1` and `else_body` is `None`.
 ///
 /// More general CFG patterns (multi-block branches, nested ifs in
 /// either arm, fallthrough into a join block at non-adjacent index)
-/// don't fire yet — they need data-flow / dominator analysis. The
-/// rule here covers the simple-conditional shape gcc emits at -O0,
-/// which is what our fixtures exercise today.
+/// don't fire yet — they need data-flow / dominator analysis.
 fn identify_if_else_groups(f: &Function<DecodedInsn>) -> Vec<Option<IfElseGroup>> {
     let mut groups: Vec<Option<IfElseGroup>> = (0..f.blocks.len()).map(|_| None).collect();
     if f.blocks.len() < 3 {
@@ -424,10 +444,23 @@ fn identify_if_else_groups(f: &Function<DecodedInsn>) -> Vec<Option<IfElseGroup>
         if f.blocks[i + 1].addr != fallthrough || f.blocks[i + 2].addr != taken {
             continue;
         }
+        let b = &f.blocks[i + 1];
+        let c_addr = f.blocks[i + 2].addr.0;
+        // `has_else` iff the fallthrough block exits past the taken
+        // block — i.e. it doesn't simply fall through into C, and
+        // doesn't unconditionally jump straight to C either.
+        let has_else = match b.terminator {
+            Terminator::Return | Terminator::IndirectBranch | Terminator::InvalidOrUnreachable => {
+                true
+            }
+            Terminator::UnconditionalBranch { target } => target.0 != c_addr,
+            Terminator::ConditionalBranch { .. } | Terminator::Fallthrough => false,
+        };
         groups[i] = Some(IfElseGroup {
             head_consumed: head.insns_consumed,
             cond_text: head.cond_text,
             cond_bytes: head.cond_bytes,
+            has_else,
         });
     }
     groups

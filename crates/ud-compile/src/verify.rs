@@ -148,7 +148,9 @@ fn verify_stmts(
             } => {
                 *cursor = cursor.saturating_add(cond_bytes.len() as u64);
                 verify_stmts(f, section, then_body, cursor, out);
-                verify_stmts(f, section, else_body, cursor, out);
+                if let Some(else_body) = else_body {
+                    verify_stmts(f, section, else_body, cursor, out);
+                }
             }
             Stmt::Comment(_) => {}
         }
