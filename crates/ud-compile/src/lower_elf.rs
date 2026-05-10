@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use ud_ast::{Item, Module, UdFile, Value};
-use ud_format_elf::{Ehdr64, Elf64File, Phdr64, Shdr64};
+use ud_format_elf::{Ehdr64, Elf64File, ElfClass, Phdr64, Shdr64};
 
 use crate::lower::{lower_section_bytes, LowerError};
 
@@ -70,6 +70,7 @@ pub fn lower_to_elf(file: &UdFile) -> Result<Vec<u8>, ElfLowerError> {
 pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
     let build = build_block(&file.module)?;
 
+    let class = read_elf_class(&file.module)?;
     let ehdr = read_ehdr(&file.module, build)?;
     let phdrs = read_phdrs(build)?;
     let shdrs = read_shdrs(build)?;
@@ -118,6 +119,7 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
     }
 
     Ok(Elf64File::from_parts(
+        class,
         ehdr,
         phdrs,
         shdrs,
@@ -125,6 +127,33 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
         padding,
         file_size,
     ))
+}
+
+/// Map the `bits` field of `@module` (32 or 64) to the corresponding
+/// [`ElfClass`].
+fn read_elf_class(module: &Module) -> Result<ElfClass, ElfLowerError> {
+    for f in &module.fields {
+        if f.name == "bits" {
+            if let Value::Int(n) = &f.value {
+                return match *n {
+                    32 => Ok(ElfClass::Elf32),
+                    64 => Ok(ElfClass::Elf64),
+                    other => Err(ElfLowerError::ValueOutOfRange {
+                        field: "bits".into(),
+                        value: other,
+                        target: "ElfClass (only 32 or 64 are valid)",
+                    }),
+                };
+            }
+            return Err(ElfLowerError::WrongShape {
+                field: "bits".into(),
+                expected: "integer".into(),
+            });
+        }
+    }
+    Err(ElfLowerError::MissingField {
+        field: "bits".into(),
+    })
 }
 
 fn shdr_occupies_file(sh: &Shdr64) -> bool {

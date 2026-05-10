@@ -68,12 +68,17 @@ pub fn build_module(elf: &Elf64File) -> Module {
         ),
     ]);
 
+    let bits = match elf.class {
+        ud_format_elf::ElfClass::Elf32 => 32,
+        ud_format_elf::ElfClass::Elf64 => 64,
+    };
+
     Module {
         fields: vec![
             field("arch", Value::String(arch.into())),
             field("abi", Value::String(abi.into())),
             field("format", Value::String("elf".into())),
-            field("bits", Value::Int(64)),
+            field("bits", Value::Int(bits)),
             field("endian", Value::String("little".into())),
             field("type", Value::Int(u64::from(elf.ehdr.e_type))),
             field("entry", Value::Int(elf.ehdr.e_entry)),
