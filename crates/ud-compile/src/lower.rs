@@ -112,8 +112,14 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
                 }
             }
             Stmt::Loop {
-                tail_bytes, body, ..
+                entry_jmp_bytes,
+                tail_bytes,
+                body,
+                ..
             } => {
+                if let Some(jmp_bytes) = entry_jmp_bytes {
+                    out.extend_from_slice(jmp_bytes);
+                }
                 lower_stmts_into(fn_name, body, out)?;
                 out.extend_from_slice(tail_bytes);
             }

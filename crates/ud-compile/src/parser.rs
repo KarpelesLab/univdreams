@@ -565,9 +565,20 @@ impl Parser {
         }
     }
 
-    /// Parse `@loop("cond", [tail bytes]) { …body stmts… }`.
+    /// Parse `@loop([entry_jmp=[bytes],] "cond", [tail bytes]) { …body… }`.
     fn parse_loop_directive(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&TokenKind::LParen, "`(` after `@loop`")?;
+        // Optional `entry_jmp=[bytes],` prefix.
+        let entry_jmp_bytes = if matches!(&self.peek().kind, TokenKind::Ident(name) if name == "entry_jmp")
+        {
+            self.bump();
+            self.expect(&TokenKind::Eq, "`=` after `entry_jmp`")?;
+            let bytes = self.parse_byte_list()?;
+            self.expect(&TokenKind::Comma, "`,` after `entry_jmp` bytes")?;
+            Some(bytes)
+        } else {
+            None
+        };
         let cond_text = self.expect_string("loop cond text")?;
         self.expect(&TokenKind::Comma, "`,` after loop cond text")?;
         let tail_bytes = self.parse_byte_list()?;
@@ -577,6 +588,7 @@ impl Parser {
         self.expect(&TokenKind::RBrace, "`}` to close `@loop` body")?;
         Ok(Stmt::Loop {
             cond_text,
+            entry_jmp_bytes,
             tail_bytes,
             body,
         })
@@ -690,6 +702,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Arrow => "`->`".into(),
         TokenKind::Lt => "`<`".into(),
         TokenKind::Gt => "`>`".into(),
+        TokenKind::Eq => "`=`".into(),
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::String(_) => "a string literal".into(),
         TokenKind::Int(n) => format!("integer 0x{n:x}"),

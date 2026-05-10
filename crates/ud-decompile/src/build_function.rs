@@ -23,6 +23,7 @@ use crate::data_lookup::DataLookup;
 /// blocks are folded into a single [`Stmt::IfBranch`] with the
 /// branches embedded as nested statements.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_function(
     f: &Function<DecodedInsn>,
     debug: Option<&DebugFunction>,
@@ -47,6 +48,16 @@ pub fn build_function(
         signature: signature.as_ref(),
         data,
     };
+
+    // Loops can fold the unconditional `jmp` from the block right
+    // before the body into their `entry_jmp_bytes`. Track which
+    // blocks need a trailing instruction truncated for that.
+    let mut pre_jmp_truncate: HashMap<usize, usize> = HashMap::new();
+    for lg in loops.iter().flatten() {
+        if let Some(idx) = lg.pre_jmp_block_idx {
+            pre_jmp_truncate.insert(idx, 1);
+        }
+    }
 
     let mut i = 0;
     while i < f.blocks.len() {
@@ -73,8 +84,15 @@ pub fn build_function(
                 .iter()
                 .flat_map(|insn| insn.original_bytes.iter().copied())
                 .collect();
+            let entry_jmp_bytes = lg.pre_jmp_block_idx.and_then(|pre_idx| {
+                f.blocks[pre_idx]
+                    .insns
+                    .last()
+                    .map(|insn| insn.original_bytes.clone())
+            });
             body.push(Stmt::Loop {
                 cond_text: lg.cond_text.clone(),
+                entry_jmp_bytes,
                 tail_bytes,
                 body: body_stmts,
             });
@@ -113,14 +131,19 @@ pub fn build_function(
             });
             i += advance;
         } else {
+            let truncate_trailing = pre_jmp_truncate.get(&i).copied().unwrap_or(0);
+            // Suppress the "// -> 0xN" terminator comment when the
+            // trailing jmp it would describe has been folded into a
+            // loop directive that follows.
+            let emit_term = truncate_trailing == 0;
             emit_block_stmts(
                 &mut body,
                 &f.blocks[i],
                 BlockEmitConfig {
                     is_first: i == 0,
                     emit_block_comment: i > 0,
-                    truncate_trailing: 0,
-                    emit_terminator_comment: true,
+                    truncate_trailing,
+                    emit_terminator_comment: emit_term,
                 },
                 lifts[i].as_ref(),
                 &ctx,
@@ -529,6 +552,13 @@ struct LoopGroup {
     /// Block index of the tail — `body_idx + 1` in v0.
     tail_idx: usize,
     cond_text: String,
+    /// When the block immediately preceding the body ends with an
+    /// unconditional `jmp` to the tail's address (the gcc -O0
+    /// "skip body on first iteration" idiom), that block's index is
+    /// recorded here. The pre-block's emission then truncates one
+    /// trailing instruction; those bytes go into the `@loop`'s
+    /// `entry_jmp_bytes`.
+    pre_jmp_block_idx: Option<usize>,
 }
 
 /// Per-block: is this the body block of a recognised loop?
@@ -569,9 +599,32 @@ fn identify_loop_groups(f: &Function<DecodedInsn>) -> Vec<Option<LoopGroup>> {
         let Some(head) = try_lift_if_branch_head(&tail.insns) else {
             continue;
         };
+        // Pre-jmp folding: the block immediately before the body
+        // ends with `jmp tail.addr`. The pre-block must end with
+        // an unconditional branch to the tail's address (gcc puts
+        // the test at the bottom and jumps in from above).
+        let pre_jmp_block_idx = if i > 0 {
+            let pre = &f.blocks[i - 1];
+            match pre.terminator {
+                Terminator::UnconditionalBranch { target } if target == tail.addr => {
+                    // Confirm the last insn is the actual jmp (not
+                    // some other unconditional flow). Direct
+                    // unconditional branches return Some here.
+                    pre.insns
+                        .last()
+                        .and_then(|insn| direct_unconditional_branch_target(&insn.iced))
+                        .filter(|&target| target == tail.addr.0)
+                        .map(|_| i - 1)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         out[i] = Some(LoopGroup {
             tail_idx,
             cond_text: head.cond_text,
+            pre_jmp_block_idx,
         });
     }
     out

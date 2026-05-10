@@ -243,8 +243,16 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
                 }
             }
             Stmt::Loop {
-                tail_bytes, body, ..
+                entry_jmp_bytes,
+                tail_bytes,
+                body,
+                ..
             } => {
+                if let Some(jmp) = entry_jmp_bytes {
+                    let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, jmp, 0)
+                        .expect("decode loop entry jmp");
+                    n += insns.len();
+                }
                 let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, tail_bytes, 0)
                     .expect("decode loop tail bytes");
                 n += insns.len();

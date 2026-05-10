@@ -178,10 +178,17 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
         }
         Stmt::Loop {
             cond_text,
+            entry_jmp_bytes,
             tail_bytes,
             body,
         } => {
-            write!(out, "{indent}@loop({}, [", quote_string(cond_text)).unwrap();
+            write!(out, "{indent}@loop(").unwrap();
+            if let Some(jmp_bytes) = entry_jmp_bytes {
+                out.push_str("entry_jmp=[");
+                emit_byte_list(out, jmp_bytes);
+                out.push_str("], ");
+            }
+            write!(out, "{}, [", quote_string(cond_text)).unwrap();
             emit_byte_list(out, tail_bytes);
             writeln!(out, "]) {{").unwrap();
             let body_indent = format!("{indent}    ");

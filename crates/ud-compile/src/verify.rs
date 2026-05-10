@@ -155,8 +155,14 @@ fn verify_stmts(
                 }
             }
             Stmt::Loop {
-                tail_bytes, body, ..
+                entry_jmp_bytes,
+                tail_bytes,
+                body,
+                ..
             } => {
+                if let Some(jmp) = entry_jmp_bytes {
+                    *cursor = cursor.saturating_add(jmp.len() as u64);
+                }
                 verify_stmts(f, section, body, cursor, out);
                 *cursor = cursor.saturating_add(tail_bytes.len() as u64);
             }

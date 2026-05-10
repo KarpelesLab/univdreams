@@ -237,7 +237,7 @@ pub enum Stmt {
     /// gcc -O0 shape:
     ///
     /// ```text
-    /// @loop("cond text", [tail bytes]) {
+    /// @loop(entry_jmp=[bytes], "cond text", [tail bytes]) {
     ///     …body stmts…
     /// }
     /// ```
@@ -248,14 +248,18 @@ pub enum Stmt {
     /// * the tail block ends with a conditional branch whose
     ///   `taken` target is the body block (i.e. a back-edge),
     ///
-    /// The pre-header jump (the unconditional `jmp` from the
-    /// caller's block that enters the loop at the tail) is left
-    /// outside the directive — it gets emitted as `@asm` in the
-    /// preceding flow. Lower-path byte order: `body` bytes
-    /// then `tail_bytes`, so concatenation reproduces the on-disk
-    /// layout of (body, then test).
+    /// `entry_jmp_bytes` is the pre-header `jmp` that enters the
+    /// loop at the tail (gcc's "skip body on first iteration" idiom).
+    /// When detected, those bytes are folded into the directive so
+    /// no `@asm` line is left behind for them.
+    ///
+    /// Lower-path byte order: `entry_jmp_bytes` (if any) → `body`
+    /// bytes → `tail_bytes`. The `@loop` itself contributes nothing
+    /// before `entry_jmp_bytes` — its placement in the function body
+    /// determines where the bytes land.
     Loop {
         cond_text: String,
+        entry_jmp_bytes: Option<Vec<u8>>,
         tail_bytes: Vec<u8>,
         body: Vec<Stmt>,
     },
