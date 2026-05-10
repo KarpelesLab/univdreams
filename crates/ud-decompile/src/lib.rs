@@ -33,9 +33,11 @@ mod build_function;
 mod build_module;
 mod data_lookup;
 pub mod pe;
+pub mod raw6502;
 
 pub use data_lookup::DataLookup;
 pub use pe::{decompile_pe, decompile_pe_to_text};
+pub use raw6502::{decompile_raw_6502, decompile_raw_6502_to_text};
 
 use std::collections::HashMap;
 

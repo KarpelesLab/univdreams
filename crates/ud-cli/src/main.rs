@@ -163,9 +163,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let pe = ud_format_pe::PeFile::parse(&bytes)
                     .with_context(|| format!("parse {} as PE", input.display()))?;
                 ud_decompile::decompile_pe_to_text(&pe)
+            } else if let Some(load_addr) = ud_cli::raw_6502_load_addr(&bytes) {
+                let image = ud_format_raw::RawImage::new(bytes, load_addr);
+                ud_decompile::decompile_raw_6502_to_text(&image)
+                    .with_context(|| format!("decompile {} as 6502 raw", input.display()))?
             } else {
                 anyhow::bail!(
-                    "unrecognised binary format: {} (expected ELF or PE)",
+                    "unrecognised binary format: {} (expected ELF, PE, or 6502 raw image)",
                     input.display()
                 );
             };

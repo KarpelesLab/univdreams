@@ -1,0 +1,16 @@
+[package]
+name = "ud-format-raw"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Raw flat-binary container format for univdreams (load-at-fixed-address ROMs)."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ud-core = { path = "../ud-core" }
+thiserror = "2"

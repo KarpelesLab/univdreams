@@ -105,6 +105,8 @@ pub enum SourceRoundTripError {
     #[error(transparent)]
     Decompile(#[from] ud_decompile::Error),
     #[error(transparent)]
+    Decompile6502(#[from] ud_decompile::raw6502::Error),
+    #[error(transparent)]
     ElfFormat(#[from] ud_format_elf::Error),
     #[error(transparent)]
     PeFormat(#[from] ud_format_pe::Error),
@@ -114,6 +116,8 @@ pub enum SourceRoundTripError {
     ElfLower(#[from] ud_compile::ElfLowerError),
     #[error(transparent)]
     PeLower(#[from] ud_compile::PeLowerError),
+    #[error(transparent)]
+    RawLower(#[from] ud_compile::RawLowerError),
 }
 
 /// Run `input` through the full source pipeline:
@@ -147,6 +151,15 @@ pub fn roundtrip_through_source(
         let warnings = ud_compile::verify_asm(&parsed);
         let rebuilt = ud_compile::lower_to_pe(&parsed)?;
         (text, warnings, rebuilt)
+    } else if let Some(load_addr) = raw_6502_load_addr(&input_bytes) {
+        let image = ud_format_raw::RawImage::new(input_bytes.clone(), load_addr);
+        let ast = ud_decompile::decompile_raw_6502(&image)?;
+        let text = ud_ast::emit(&ast);
+        let parsed =
+            ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_compile::verify_asm(&parsed);
+        let rebuilt = ud_compile::lower_to_raw(&parsed)?;
+        (text, warnings, rebuilt)
     } else {
         return Err(SourceRoundTripError::UnknownFormat);
     };
@@ -174,6 +187,39 @@ fn make_diff_context(off: usize, input: &[u8], output: &[u8]) -> DiffContext {
         window_start,
         input_window: input[window_start..window_end_in].to_vec(),
         output_window: output[window_start..window_end_out].to_vec(),
+    }
+}
+
+/// Detect "this is a 6502 raw ROM image" inputs. The convention is
+/// that 6502 binaries place vectors (NMI/RESET/IRQ) at the top of
+/// the 16-bit address space, $FFFA-$FFFF. For an image of length L,
+/// the natural load address is `0x10000 - L` so the image extends
+/// exactly to $FFFF.
+///
+/// v0 heuristic: accept files in `[6, 65536]` bytes whose reset
+/// vector at $FFFC under that load address points back into the
+/// image. WozMon (256 bytes, load $FF00, reset $FF00) matches.
+#[must_use]
+pub fn raw_6502_load_addr(bytes: &[u8]) -> Option<u64> {
+    let len = bytes.len();
+    if !(6..=0x10000).contains(&len) {
+        return None;
+    }
+    let load_addr = 0x10000u64 - len as u64;
+    let end = 0x10000u64;
+    let reset_lo_off = usize::try_from(0xFFFCu64 - load_addr).ok()?;
+    let reset_hi_off = reset_lo_off + 1;
+    if reset_hi_off >= len {
+        return None;
+    }
+    let reset = u64::from(u16::from_le_bytes([
+        bytes[reset_lo_off],
+        bytes[reset_hi_off],
+    ]));
+    if reset >= load_addr && reset < end {
+        Some(load_addr)
+    } else {
+        None
     }
 }
 

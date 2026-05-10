@@ -17,8 +17,10 @@ ud-ir = { path = "../ud-ir" }
 ud-ast = { path = "../ud-ast" }
 ud-format-elf = { path = "../ud-format-elf" }
 ud-format-pe = { path = "../ud-format-pe" }
+ud-format-raw = { path = "../ud-format-raw" }
 ud-arch-x86 = { path = "../ud-arch-x86" }
 ud-arch-aarch64 = { path = "../ud-arch-aarch64" }
+ud-arch-6502 = { path = "../ud-arch-6502" }
 ud-analysis = { path = "../ud-analysis" }
 ud-debug = { path = "../ud-debug" }
 thiserror = "2"
