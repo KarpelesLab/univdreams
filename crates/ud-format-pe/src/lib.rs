@@ -53,6 +53,18 @@ const COFF_HEADER_SIZE: usize = 20;
 /// On-disk size of an `IMAGE_SECTION_HEADER` entry.
 pub const SECTION_HEADER_SIZE: usize = 40;
 
+/// On-disk size of one COFF symbol-table entry (main or aux).
+pub const COFF_SYMBOL_SIZE: usize = 18;
+
+/// `Type` field high nibble: function (`IMAGE_SYM_DTYPE_FUNCTION`).
+pub const COFF_DTYPE_FUNCTION: u16 = 0x20;
+
+/// `StorageClass`: external (`IMAGE_SYM_CLASS_EXTERNAL`).
+pub const COFF_SYM_CLASS_EXTERNAL: u8 = 2;
+
+/// `StorageClass`: static (`IMAGE_SYM_CLASS_STATIC`).
+pub const COFF_SYM_CLASS_STATIC: u8 = 3;
+
 /// `Magic` value at the start of `IMAGE_OPTIONAL_HEADER` for PE32
 /// (32-bit images).
 pub const OPTIONAL_HEADER_MAGIC_PE32: u16 = 0x010b;
@@ -108,6 +120,40 @@ pub struct CoffHeader {
     pub number_of_symbols: u32,
     pub size_of_optional_header: u16,
     pub characteristics: u16,
+}
+
+/// One main COFF symbol-table entry, with its name resolved through
+/// the string table when needed. Aux records are skipped on iteration
+/// (their `aux_count` field on the preceding main symbol governs
+/// how many to skip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoffSymbol {
+    /// The symbol's name. For "long" names (those whose first 4
+    /// bytes are zero), the trailing 4 bytes index into the COFF
+    /// string table; we resolve the indirection here. Empty when
+    /// the indirection points outside the string table.
+    pub name: String,
+    /// Value associated with the symbol. For function symbols
+    /// defined in a section, this is the offset within the section.
+    pub value: u32,
+    /// 1-indexed section number; 0 for undefined, -1 for
+    /// `IMAGE_SYM_ABSOLUTE`, -2 for `IMAGE_SYM_DEBUG`.
+    pub section_number: i16,
+    /// Combined low-byte (base type) + high-byte (derived type).
+    /// Functions have the [`COFF_DTYPE_FUNCTION`] high nibble.
+    pub type_: u16,
+    /// `IMAGE_SYM_CLASS_*` value.
+    pub storage_class: u8,
+    /// Number of trailing aux records belonging to this symbol.
+    pub aux_count: u8,
+}
+
+impl CoffSymbol {
+    /// True when this symbol's `Type` field marks it a function.
+    #[must_use]
+    pub fn is_function(&self) -> bool {
+        (self.type_ & 0xf0) == COFF_DTYPE_FUNCTION
+    }
 }
 
 /// Parsed `IMAGE_SECTION_HEADER`.
@@ -277,6 +323,59 @@ impl PeFile {
             .map(str::to_string)
     }
 
+    /// Iterate the COFF symbol table, skipping aux records.
+    ///
+    /// Returns an empty iterator when the file declares no symbol
+    /// table (`pointer_to_symbol_table == 0` or
+    /// `number_of_symbols == 0`) or when the table runs past the
+    /// end of the file.
+    #[must_use]
+    pub fn coff_symbols(&self) -> Vec<CoffSymbol> {
+        let sym_off = self.coff.pointer_to_symbol_table as usize;
+        let count = self.coff.number_of_symbols as usize;
+        if sym_off == 0 || count == 0 {
+            return Vec::new();
+        }
+        let table_size = count * COFF_SYMBOL_SIZE;
+        let Some(table_end) = sym_off.checked_add(table_size) else {
+            return Vec::new();
+        };
+        if table_end > self.raw.len() {
+            return Vec::new();
+        }
+        let table = &self.raw[sym_off..table_end];
+
+        // String table: contiguous block right after the symbol
+        // table. First u32 is its total size (including the field
+        // itself); names are NUL-terminated past offset 4.
+        let str_off = table_end;
+        let strtab = self.raw.get(str_off..).unwrap_or(&[]);
+
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < count {
+            let off = i * COFF_SYMBOL_SIZE;
+            let chunk = &table[off..off + COFF_SYMBOL_SIZE];
+            let aux_count = chunk[17] as usize;
+            let name = decode_coff_symbol_name(&chunk[0..8], strtab);
+            let value = read_u32(chunk, 8);
+            #[allow(clippy::cast_possible_wrap)]
+            let section_number = read_u16(chunk, 12) as i16;
+            let type_ = read_u16(chunk, 14);
+            let storage_class = chunk[16];
+            out.push(CoffSymbol {
+                name,
+                value,
+                section_number,
+                type_,
+                storage_class,
+                aux_count: chunk[17],
+            });
+            i = i.saturating_add(1).saturating_add(aux_count);
+        }
+        out
+    }
+
     /// Serialize back to bytes. Always byte-identical to the input
     /// in v0 — the parsed file stores the original buffer and we
     /// simply hand it back.
@@ -348,6 +447,38 @@ fn read_u16(bytes: &[u8], off: usize) -> u16 {
 
 fn read_u32(bytes: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
+}
+
+/// Decode the 8-byte name field of a COFF symbol entry.
+///
+/// Two encodings:
+///
+/// * Short name (≤ 8 bytes): the bytes are the name, possibly NUL-
+///   padded if shorter than 8. We trim to first NUL.
+/// * Long name (> 8 bytes): the first 4 bytes are zero; the next 4
+///   bytes are a u32 offset into the string table. We follow the
+///   indirection and read up to the next NUL.
+///
+/// Returns an empty string if the bytes aren't valid UTF-8 or the
+/// long-name offset overflows the string table.
+fn decode_coff_symbol_name(name: &[u8], strtab: &[u8]) -> String {
+    debug_assert!(name.len() == 8);
+    if name[0..4] == [0u8; 4] {
+        let off = u32::from_le_bytes(name[4..8].try_into().unwrap()) as usize;
+        let Some(tail) = strtab.get(off..) else {
+            return String::new();
+        };
+        let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        return std::str::from_utf8(&tail[..nul])
+            .ok()
+            .map(str::to_string)
+            .unwrap_or_default();
+    }
+    let nul = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    std::str::from_utf8(&name[..nul])
+        .ok()
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

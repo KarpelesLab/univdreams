@@ -18,7 +18,10 @@
 //! [`ud_compile::lower_to_pe`]: ../../ud-compile/index.html
 
 use ud_ast::{Field, Item, Module, UdFile, Value};
-use ud_format_pe::{PeFile, PeKind, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386};
+use ud_format_pe::{
+    CoffSymbol, PeFile, PeKind, COFF_SYM_CLASS_EXTERNAL, COFF_SYM_CLASS_STATIC,
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386,
+};
 
 /// Build the AST for `pe`. Always succeeds — every byte of the input
 /// is captured either via `@module` structured fields or via
@@ -116,11 +119,14 @@ fn build_pe_module(pe: &PeFile) -> Module {
             .collect(),
     );
 
+    let functions_value = Value::List(build_function_blocks(pe));
+
     let build = Value::Block(vec![
         field("e_lfanew", Value::Int(u64::from(pe.e_lfanew))),
         field("file_size", Value::Int(pe.file_size())),
         field("coff", coff_block),
         field("sections", sections_value),
+        field("functions", functions_value),
     ]);
 
     Module {
@@ -198,4 +204,64 @@ fn field(name: &str, value: Value) -> Field {
 
 fn byte_list(bs: &[u8]) -> Value {
     Value::List(bs.iter().map(|b| Value::Int(u64::from(*b))).collect())
+}
+
+fn build_function_blocks(pe: &PeFile) -> Vec<Value> {
+    pe.coff_symbols()
+        .iter()
+        .filter(|s| is_code_function(pe, s))
+        .map(|s| {
+            // section_number is 1-indexed and >0 here (filter rejects
+            // ABS/DEBUG/UNDEF), so the i16 → usize cast is non-lossy.
+            #[allow(clippy::cast_sign_loss)]
+            let section_idx = (s.section_number - 1) as usize;
+            let section_va = pe
+                .sections
+                .get(section_idx)
+                .map_or(0u32, |sh| sh.virtual_address);
+            let rva = section_va.wrapping_add(s.value);
+            // Likewise the section_number fits in u16 once positive.
+            #[allow(clippy::cast_sign_loss)]
+            let section = s.section_number as u16;
+            Value::Block(vec![
+                field("name", Value::String(s.name.clone())),
+                field("rva", Value::Int(u64::from(rva))),
+                field("section", Value::Int(u64::from(section))),
+                field("section_offset", Value::Int(u64::from(s.value))),
+                field("storage_class", Value::Int(u64::from(s.storage_class))),
+            ])
+        })
+        .collect()
+}
+
+/// True for COFF symbols that look like functions in code sections —
+/// the candidates for later body lifting. Filters out absolute (`-1`),
+/// debug (`-2`), and undefined (`0`) section numbers.
+fn is_code_function(pe: &PeFile, sym: &CoffSymbol) -> bool {
+    if sym.section_number <= 0 {
+        return false;
+    }
+    // section_number > 0 here, so subtracting 1 stays non-negative
+    // and the cast to usize is non-lossy.
+    #[allow(clippy::cast_sign_loss)]
+    let section_idx = (sym.section_number - 1) as usize;
+    let Some(sh) = pe.sections.get(section_idx) else {
+        return false;
+    };
+    // IMAGE_SCN_MEM_EXECUTE
+    let is_executable = sh.characteristics & 0x2000_0000 != 0;
+    if !is_executable {
+        return false;
+    }
+    // Either the symbol's Type field marks it a function (DT_FCN
+    // high nibble), or its storage class is EXTERNAL/STATIC and it
+    // sits in a code section. mingw frequently leaves Type = 0 even
+    // for entries it generated, so we accept both forms.
+    if sym.is_function() {
+        return true;
+    }
+    matches!(
+        sym.storage_class,
+        COFF_SYM_CLASS_EXTERNAL | COFF_SYM_CLASS_STATIC
+    )
 }
