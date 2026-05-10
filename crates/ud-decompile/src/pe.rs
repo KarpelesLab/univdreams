@@ -17,11 +17,16 @@
 //! [`PeFile`]: ud_format_pe::PeFile
 //! [`ud_compile::lower_to_pe`]: ../../ud-compile/index.html
 
+use std::collections::HashMap;
+
+use ud_arch_x86::{decode, lift_function, Bitness};
 use ud_ast::{Field, Item, Module, UdFile, Value};
 use ud_format_pe::{
     CoffSymbol, PeFile, PeKind, COFF_SYM_CLASS_EXTERNAL, COFF_SYM_CLASS_STATIC,
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386,
 };
+
+use crate::build_function;
 
 /// Build the AST for `pe`. Always succeeds — every byte of the input
 /// is captured either via `@module` structured fields or via
@@ -83,7 +88,7 @@ fn build_pe_module(pe: &PeFile) -> Module {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let name = pe.section_name(i).unwrap_or_default();
+                let name = pe.section_name(i).unwrap_or_default().to_string();
                 Value::Block(vec![
                     field("name", Value::String(name)),
                     field("name_raw", byte_list(&s.name)),
@@ -280,6 +285,12 @@ fn emit_section_with_function_split(
         });
     }
 
+    let bitness = match pe.coff.machine {
+        IMAGE_FILE_MACHINE_I386 => Some(Bitness::Bits32),
+        IMAGE_FILE_MACHINE_AMD64 => Some(Bitness::Bits64),
+        _ => None,
+    };
+    let name_at = pe_name_at(pe);
     for (i, f) in funcs.iter().enumerate() {
         let off = f.section_offset.min(section_size);
         let next_off = funcs
@@ -290,6 +301,21 @@ fn emit_section_with_function_split(
         }
         let lo = start + off as usize;
         let hi = start + next_off as usize;
+        let func_bytes = &bytes[lo..hi];
+
+        // Try to lift the function body. Falls back to a per-
+        // function `@raw` block on any failure (decoder rejection,
+        // unsupported machine type, etc.) so the round-trip
+        // property holds even when we can't yet structure the
+        // function.
+        if let Some(bn) = bitness {
+            if let Some(item) =
+                lift_pe_function(pe, &f.name, lo as u64, f.rva, bn, func_bytes, &name_at)
+            {
+                items.push(item);
+                continue;
+            }
+        }
         let section_name = pe.section_name(sec_idx).unwrap_or_default();
         items.push(Item::Comment(format!(
             "fn {} at {section_name}+0x{off:x} (rva 0x{:x}, {} bytes)",
@@ -299,7 +325,7 @@ fn emit_section_with_function_split(
         )));
         items.push(Item::Raw {
             addr: lo as u64,
-            bytes: bytes[lo..hi].to_vec(),
+            bytes: func_bytes.to_vec(),
         });
     }
 
@@ -332,6 +358,67 @@ fn byte_list(bs: &[u8]) -> Value {
     Value::List(bs.iter().map(|b| Value::Int(u64::from(*b))).collect())
 }
 
+/// Build the `name_at: addr -> name` map that arch-x86's call-site
+/// analyzer uses to render call targets. For PE we key by RVA: jcc
+/// and call instruction operands carry RVAs after iced sets the IP
+/// to the function's RVA.
+fn pe_name_at(pe: &PeFile) -> HashMap<u64, String> {
+    let mut out = HashMap::new();
+    for sym in pe.coff_symbols() {
+        if !is_code_function(pe, &sym) {
+            continue;
+        }
+        // is_code_function rejects section_number <= 0
+        #[allow(clippy::cast_sign_loss)]
+        let idx = (sym.section_number - 1) as usize;
+        let Some(sh) = pe.sections.get(idx) else {
+            continue;
+        };
+        let rva = u64::from(sh.virtual_address.wrapping_add(sym.value));
+        out.insert(rva, sym.name);
+    }
+    out
+}
+
+/// Decode + lift + build one PE function's body as a structured
+/// `FnDecl`. Returns `None` on any decoder rejection so the caller
+/// can fall back to a per-function `@raw` block.
+fn lift_pe_function(
+    pe: &PeFile,
+    name: &str,
+    file_offset: u64,
+    rva: u32,
+    bitness: Bitness,
+    func_bytes: &[u8],
+    name_at: &HashMap<u64, String>,
+) -> Option<Item> {
+    let insns = decode(bitness, func_bytes, u64::from(rva)).ok()?;
+    let lifted = lift_function(name.to_string(), &insns).ok()?;
+    let fn_decl = build_function::build_function(&lifted, None, name_at, pe);
+    Some(Item::Function(ud_ast::FnDecl {
+        addr: Some(file_offset),
+        name: name.to_string(),
+        signature: fn_decl.signature,
+        body: fn_decl.body,
+    }))
+}
+
+/// `.ud` identifiers must start with an alpha character or `_` and
+/// can contain `.` after that; COFF section-marker symbols (`.text`,
+/// `.data`, etc.) start with `.` and would not parse back as
+/// identifiers if we surfaced them as `fn` blocks. Filter them out
+/// here before they reach the decompile output.
+fn is_emittable_function_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c == '_' || c == '.' || c.is_ascii_alphanumeric())
+}
+
 fn build_function_blocks(pe: &PeFile) -> Vec<Value> {
     pe.coff_symbols()
         .iter()
@@ -362,9 +449,14 @@ fn build_function_blocks(pe: &PeFile) -> Vec<Value> {
 
 /// True for COFF symbols that look like functions in code sections —
 /// the candidates for later body lifting. Filters out absolute (`-1`),
-/// debug (`-2`), and undefined (`0`) section numbers.
+/// debug (`-2`), and undefined (`0`) section numbers, plus
+/// section-marker symbols whose name doesn't make a valid `.ud`
+/// identifier (`.text`, `.data`, etc.).
 fn is_code_function(pe: &PeFile, sym: &CoffSymbol) -> bool {
     if sym.section_number <= 0 {
+        return false;
+    }
+    if !is_emittable_function_name(&sym.name) {
         return false;
     }
     // section_number > 0 here, so subtracting 1 stays non-negative

@@ -11,8 +11,9 @@ use ud_arch_x86::{
 };
 use ud_ast::{FnDecl, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
-use ud_format_elf::Elf64File;
 use ud_ir::{BasicBlock, Function, Terminator};
+
+use crate::data_lookup::DataLookup;
 
 /// Convert a lifted [`Function`] into the AST's [`FnDecl`].
 ///
@@ -26,7 +27,7 @@ pub fn build_function(
     f: &Function<DecodedInsn>,
     debug: Option<&DebugFunction>,
     name_at: &HashMap<u64, String>,
-    elf: &Elf64File,
+    data: &dyn DataLookup,
 ) -> FnDecl {
     let signature = debug.map(|d| Signature {
         params: d.params.clone(),
@@ -43,7 +44,7 @@ pub fn build_function(
         fn_addr_end: func_end,
         name_at,
         signature: signature.as_ref(),
-        elf,
+        data,
     };
 
     let mut i = 0;
@@ -162,7 +163,7 @@ struct EmitCtx<'a> {
     fn_addr_end: u64,
     name_at: &'a HashMap<u64, String>,
     signature: Option<&'a Signature>,
-    elf: &'a Elf64File,
+    data: &'a dyn DataLookup,
 }
 
 /// Emit one block's worth of statements into `out`.
@@ -312,7 +313,7 @@ fn emit_block_stmts(
         {
             out.push(Stmt::Comment(annotation));
         }
-        if let Some(annotation) = lea_target_annotation(insn, ctx.elf, ctx.name_at) {
+        if let Some(annotation) = lea_target_annotation(insn, ctx.data, ctx.name_at) {
             out.push(Stmt::Comment(annotation));
         }
     }
@@ -754,13 +755,15 @@ fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
             if let Some(name) = ctx.name_at.get(addr) {
                 return format!("&{name}");
             }
-            if let Some((section_name, data, off)) = find_section_at(ctx.elf, *addr) {
+            if let Some((section_name, data, off)) = ctx.data.section_at(*addr) {
                 if is_string_data_section(section_name) {
                     if let Some(s) = read_cstring_at(data, off) {
                         return format!("{:?}", shorten_for_display(s));
                     }
                 }
-                return format!("{section_name} @ 0x{addr:x}");
+                if !section_name.is_empty() {
+                    return format!("{section_name} @ 0x{addr:x}");
+                }
             }
             format!("&0x{addr:x}")
         }
@@ -768,8 +771,10 @@ fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
             if let Some(name) = ctx.name_at.get(addr) {
                 return format!("*{name}");
             }
-            if let Some((section_name, _, _)) = find_section_at(ctx.elf, *addr) {
-                return format!("*{section_name} @ 0x{addr:x}");
+            if let Some((section_name, _, _)) = ctx.data.section_at(*addr) {
+                if !section_name.is_empty() {
+                    return format!("*{section_name} @ 0x{addr:x}");
+                }
             }
             format!("*0x{addr:x}")
         }
@@ -806,40 +811,26 @@ fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
 ///   can't surface with a single string.
 fn lea_target_annotation(
     insn: &DecodedInsn,
-    elf: &Elf64File,
+    data: &dyn DataLookup,
     name_at: &HashMap<u64, String>,
 ) -> Option<String> {
     let addr = direct_lea_rip_target(&insn.iced)?;
     if let Some(name) = name_at.get(&addr) {
         return Some(format!("= &{name}"));
     }
-    let (section_name, data, sec_offset) = find_section_at(elf, addr)?;
+    let (section_name, section_data, sec_offset) = data.section_at(addr)?;
     if is_string_data_section(section_name) {
-        if let Some(text) = read_cstring_at(data, sec_offset) {
+        if let Some(text) = read_cstring_at(section_data, sec_offset) {
             return Some(format!(
                 "= {section_name} @ 0x{addr:x} ({:?})",
                 shorten_for_display(text)
             ));
         }
     }
-    Some(format!("= {section_name} @ 0x{addr:x}"))
-}
-
-/// Find the section containing `vaddr`. Returns the section name,
-/// its raw data, and the byte offset of `vaddr` within that data.
-fn find_section_at(elf: &Elf64File, vaddr: u64) -> Option<(&str, &[u8], usize)> {
-    for (idx, sh, data) in elf.sections() {
-        if sh.sh_size == 0 {
-            continue;
-        }
-        let end = sh.sh_addr.checked_add(sh.sh_size)?;
-        if vaddr >= sh.sh_addr && vaddr < end {
-            let offset = (vaddr - sh.sh_addr) as usize;
-            let name = elf.section_name(idx)?;
-            return Some((name, data, offset));
-        }
+    if section_name.is_empty() {
+        return Some(format!("= 0x{addr:x}"));
     }
-    None
+    Some(format!("= {section_name} @ 0x{addr:x}"))
 }
 
 fn is_string_data_section(name: &str) -> bool {

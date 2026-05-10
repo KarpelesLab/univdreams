@@ -30,8 +30,10 @@
 
 mod build_function;
 mod build_module;
+mod data_lookup;
 pub mod pe;
 
+pub use data_lookup::DataLookup;
 pub use pe::{decompile_pe, decompile_pe_to_text};
 
 use std::collections::HashMap;

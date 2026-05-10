@@ -311,16 +311,14 @@ impl PeFile {
     /// `'/'` followed by a decimal offset) are returned verbatim;
     /// the COFF string table that resolves them isn't yet parsed.
     #[must_use]
-    pub fn section_name(&self, idx: usize) -> Option<String> {
+    pub fn section_name(&self, idx: usize) -> Option<&str> {
         let sh = self.sections.get(idx)?;
         let nul = sh
             .name
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(sh.name.len());
-        std::str::from_utf8(&sh.name[..nul])
-            .ok()
-            .map(str::to_string)
+        std::str::from_utf8(&sh.name[..nul]).ok()
     }
 
     /// Iterate the COFF symbol table, skipping aux records.

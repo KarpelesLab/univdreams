@@ -20,6 +20,8 @@
 
 use ud_ast::{Field, Item, Module, UdFile, Value};
 
+use crate::lower::lower_function_bytes;
+
 /// Errors specific to the PE lower path.
 #[derive(Debug, thiserror::Error)]
 pub enum PeLowerError {
@@ -66,6 +68,12 @@ pub enum PeLowerError {
 
     #[error("`@module.format` field is missing — can't tell which lower path to use")]
     UnknownFormat,
+
+    #[error("function `{name}` has no `@addr` — required for PE placement")]
+    FunctionWithoutAddr { name: String },
+
+    #[error(transparent)]
+    InnerLower(#[from] crate::lower::LowerError),
 }
 
 /// Lower a `.ud` file describing a PE image to its bytes.
@@ -80,16 +88,28 @@ pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
 
     let mut out = vec![0u8; file_size as usize];
 
-    // Collect all `@raw` items in file-offset order. Strict: every
-    // byte in [0, file_size) must be covered by exactly one @raw.
-    let mut raws: Vec<(u64, &[u8])> = file
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Raw { addr, bytes } => Some((*addr, bytes.as_slice())),
-            _ => None,
-        })
-        .collect();
+    // Collect all byte-bearing items in file-offset order. Both
+    // `@raw` and `fn name() {…}` contribute bytes; for `fn` blocks
+    // we lower the body to its bytes via `lower_function_bytes`.
+    // Strict: every byte in [0, file_size) must be covered by
+    // exactly one such item.
+    let mut owned_function_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut raws: Vec<(u64, Vec<u8>)> = Vec::new();
+    for item in &file.items {
+        match item {
+            Item::Raw { addr, bytes } => raws.push((*addr, bytes.clone())),
+            Item::Function(f) => {
+                let addr = f.addr.ok_or_else(|| PeLowerError::FunctionWithoutAddr {
+                    name: f.name.clone(),
+                })?;
+                let bytes = lower_function_bytes(f)?;
+                owned_function_bytes.push(bytes);
+                let last = owned_function_bytes.last().unwrap();
+                raws.push((addr, last.clone()));
+            }
+            Item::Comment(_) | Item::Section { .. } => {}
+        }
+    }
     raws.sort_by_key(|(addr, _)| *addr);
 
     let mut cursor: u64 = 0;
@@ -124,6 +144,7 @@ pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
         out[off..off + bytes.len()].copy_from_slice(bytes);
         cursor = end;
     }
+    let _ = owned_function_bytes; // borrow target lifetime
 
     if cursor != file_size {
         return Err(PeLowerError::CoverageSizeMismatch {
