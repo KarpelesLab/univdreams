@@ -23,7 +23,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use ud_arch_6502::{
-    classify, decode_range, format_insn_with, AddressingMode, DecodedInsn, InsnKind,
+    classify, decode_range, format_insn_with, AddressingMode, DecodedInsn, InsnKind, Mnemonic,
 };
 use ud_ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
 use ud_format_raw::RawImage;
@@ -167,9 +167,15 @@ fn build_body_range(
     build_stmt_slice(&local, &entry_set, labels)
 }
 
-/// Recursive body builder: detect tight do-while loops (back-branch
-/// to an earlier address in the slice) and recurse into their body
-/// so nested loops are also lifted.
+/// Recursive body builder. In priority order:
+///
+/// 1. Tight do-while loop — Bcc back-branch to an earlier insn in
+///    the slice.
+/// 2. Forward conditional `@if_branch` — Bcc whose taken target is
+///    a later insn in the slice. The skipped instructions become
+///    `then_body`.
+/// 3. `LDA #imm; JSR known` — lift to a single `@call`.
+/// 4. Fall back to a label comment + `@asm` line.
 fn build_stmt_slice(
     local: &[&DecodedInsn],
     entries: &HashSet<u64>,
@@ -178,6 +184,7 @@ fn build_stmt_slice(
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < local.len() {
+        // 1. Back-branch do-while.
         if let Some((j, tail)) = find_back_branch_target(local, i) {
             let body = build_stmt_slice(&local[i..j], entries, labels);
             let tail_bytes = tail.original_bytes.clone();
@@ -191,6 +198,26 @@ fn build_stmt_slice(
             i = j + 1;
             continue;
         }
+        // 2. Forward conditional branch.
+        if let Some((target_idx, branch)) = find_forward_branch_target(local, i) {
+            let then_body = build_stmt_slice(&local[i + 1..target_idx], entries, labels);
+            let cond_text = format_branch_cond(branch, entries, labels);
+            out.push(Stmt::IfBranch {
+                cond_text,
+                cond_bytes: branch.original_bytes.clone(),
+                then_body,
+                else_body: None,
+            });
+            i = target_idx;
+            continue;
+        }
+        // 3. LDA #imm; JSR known_target → @call with A=#$imm.
+        if let Some(call_stmt) = try_lift_imm_call(local, i, entries) {
+            out.push(call_stmt);
+            i += 2;
+            continue;
+        }
+        // 4. Plain @asm.
         let ins = local[i];
         if let Some(lbl) = labels.get(&ins.addr.0) {
             out.push(Stmt::Comment(format!("{lbl}:")));
@@ -199,6 +226,67 @@ fn build_stmt_slice(
         i += 1;
     }
     out
+}
+
+/// If `local[i]` is `LDA #imm` and `local[i+1]` is a `JSR target`
+/// where `target` is a function entry, return a `Stmt::Call` for the
+/// combined two-instruction sequence.
+fn try_lift_imm_call(local: &[&DecodedInsn], i: usize, entries: &HashSet<u64>) -> Option<Stmt> {
+    let lda = local.get(i)?;
+    if lda.mnemonic != Mnemonic::LDA || lda.mode != AddressingMode::Immediate {
+        return None;
+    }
+    let jsr = local.get(i + 1)?;
+    let InsnKind::Call { target, .. } = classify(jsr) else {
+        return None;
+    };
+    if !entries.contains(&target) {
+        return None;
+    }
+    let mut bytes = lda.original_bytes.clone();
+    bytes.extend_from_slice(&jsr.original_bytes);
+    Some(Stmt::Call {
+        name: function_name(target, u64::MAX),
+        args: vec![format!("A=#${:02X}", lda.operand)],
+        bytes,
+    })
+}
+
+/// If `local[start_idx]` is a forward conditional branch whose
+/// taken target lands on a later instruction inside this same
+/// slice, return `(target_idx, branch_insn)`. The branch must use
+/// the relative addressing mode (so `JMP $nnnn` doesn't match).
+fn find_forward_branch_target<'a>(
+    local: &[&'a DecodedInsn],
+    start_idx: usize,
+) -> Option<(usize, &'a DecodedInsn)> {
+    let branch = local[start_idx];
+    if branch.mode != AddressingMode::Relative {
+        return None;
+    }
+    let InsnKind::Branch { taken, .. } = classify(branch) else {
+        return None;
+    };
+    let next_addr = branch
+        .addr
+        .0
+        .wrapping_add(branch.original_bytes.len() as u64);
+    if taken <= next_addr {
+        return None;
+    }
+    let target_idx = local
+        .iter()
+        .enumerate()
+        .skip(start_idx + 1)
+        .find(|(_, ins)| ins.addr.0 == taken)
+        .map(|(j, _)| j)?;
+    // Must skip at least one instruction. A zero-skip Bcc with
+    // target == next-insn is degenerate (Bcc would never be useful);
+    // require body to be non-empty.
+    if target_idx <= start_idx + 1 {
+        return None;
+    }
+    Some((target_idx, branch))
 }
 
 /// If a back-branch loop opens at `local[start_idx]`, return
