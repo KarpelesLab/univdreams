@@ -163,6 +163,9 @@ impl<'a> Lexer<'a> {
                 self.read_line_comment()
             }
             '"' => self.read_string(line, col)?,
+            '-' if self.peek_char().is_some_and(|c| c.is_ascii_digit()) => {
+                self.read_number(start, line, col)?
+            }
             c if c.is_ascii_digit() => self.read_number(start, line, col)?,
             c if is_ident_start(c) => self.read_ident(start),
             other => {
@@ -224,11 +227,28 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_number(&mut self, start: usize, line: u32, col: u32) -> Result<TokenKind, LexError> {
-        // We've already consumed the first digit at `start`. Continue
-        // collecting digits, and detect 0x/0X for hex.
+        // We've already consumed the first character at `start`,
+        // which is either an ASCII digit or a `-` followed by a
+        // digit. Read the rest of the number in either case.
         let first = self.src.as_bytes()[start] as char;
+        let negative = first == '-';
         let mut end = start + first.len_utf8();
-        let radix = if first == '0' && matches!(self.peek_char(), Some('x' | 'X')) {
+        // Skip past the leading `-` so radix detection sees the
+        // first digit.
+        let radix_start = if negative {
+            // The `-` was consumed before calling read_number; now
+            // the first actual digit is the next char waiting.
+            end
+        } else {
+            start
+        };
+        let radix_first = self.src.as_bytes()[radix_start] as char;
+        if negative {
+            // Consume the digit at `radix_start` (we know it's a digit).
+            self.bump();
+            end += radix_first.len_utf8();
+        }
+        let radix = if radix_first == '0' && matches!(self.peek_char(), Some('x' | 'X')) {
             self.bump(); // consume the 'x'
             end += 1;
             16
@@ -245,9 +265,31 @@ impl<'a> Lexer<'a> {
         }
         let text = &self.src[start..end];
         let trimmed = text.replace('_', "");
-        let body = if radix == 16 { &trimmed[2..] } else { &trimmed };
-        match u64::from_str_radix(body, radix) {
-            Ok(n) => Ok(TokenKind::Int(n)),
+        // Strip the leading `-` and the optional `0x` prefix.
+        let body = if negative {
+            if radix == 16 {
+                &trimmed[3..] // skip "-0x"
+            } else {
+                &trimmed[1..] // skip "-"
+            }
+        } else if radix == 16 {
+            &trimmed[2..]
+        } else {
+            &trimmed
+        };
+        let parsed = u64::from_str_radix(body, radix);
+        match parsed {
+            Ok(n) => {
+                let value = if negative {
+                    // Two's-complement negation; the parser stores
+                    // the bit pattern, callers that want signed
+                    // semantics cast back to i64.
+                    n.wrapping_neg()
+                } else {
+                    n
+                };
+                Ok(TokenKind::Int(value))
+            }
             Err(e) => Err(LexError::InvalidNumber {
                 text: text.to_string(),
                 line,

@@ -221,6 +221,18 @@ pub enum Stmt {
         else_body: Option<Vec<Stmt>>,
     },
 
+    /// `@local_set(slot, value, [bytes])` — a recognised
+    /// `mov dword/qword ptr [rbp+disp], IMM` (or analogous on i386
+    /// `[ebp+disp]`) where the destination is a stack-frame local.
+    /// Lifts the common "initialise a local with a literal" pattern.
+    /// `slot` is the signed displacement from the frame pointer
+    /// (e.g. `-8` for `[rbp-8]`); `value` is the immediate, signed.
+    LocalSet {
+        slot: i64,
+        value: i64,
+        bytes: Vec<u8>,
+    },
+
     /// A structured loop with the test at the bottom. Canonical
     /// gcc -O0 shape:
     ///

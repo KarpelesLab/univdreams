@@ -188,6 +188,23 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_stmts(out, body, &body_indent);
             writeln!(out, "{indent}}}").unwrap();
         }
+        Stmt::LocalSet { slot, value, bytes } => {
+            write!(out, "{indent}@local_set(").unwrap();
+            emit_signed_hex(out, *slot);
+            out.push_str(", ");
+            emit_signed_hex(out, *value);
+            out.push_str(", [");
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
+    }
+}
+
+fn emit_signed_hex(out: &mut String, n: i64) {
+    if n < 0 {
+        write!(out, "-0x{:x}", n.unsigned_abs()).unwrap();
+    } else {
+        write!(out, "0x{n:x}").unwrap();
     }
 }
 

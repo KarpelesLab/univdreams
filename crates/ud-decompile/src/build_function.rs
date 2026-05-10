@@ -336,6 +336,16 @@ fn emit_block_stmts(
             });
             continue;
         }
+        // Lift `mov [rbp+disp], IMM` (local being initialised or
+        // assigned a literal) into a structured `@local_set`.
+        if let Some((slot, value)) = ud_arch_x86::match_local_set_immediate(&insn.iced) {
+            out.push(Stmt::LocalSet {
+                slot,
+                value,
+                bytes: insn.original_bytes.clone(),
+            });
+            continue;
+        }
         out.push(Stmt::asm(
             format_intel(&insn.iced),
             insn.original_bytes.clone(),

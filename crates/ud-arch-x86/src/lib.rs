@@ -450,6 +450,43 @@ pub fn signed_memory_displacement(insn: &Instruction) -> i64 {
     }
 }
 
+/// If `insn` is a `mov [rbp/ebp+disp], IMM` — a stack-frame local
+/// being initialised or assigned a literal — return the signed
+/// displacement and the immediate value. The displacement honours
+/// 32-bit addressing mode (so `[ebp-0x8]` round-trips as `-8`,
+/// not `0xffff_fff8`).
+#[must_use]
+pub fn match_local_set_immediate(insn: &Instruction) -> Option<(i64, i64)> {
+    if insn.mnemonic() != Mnemonic::Mov {
+        return None;
+    }
+    if insn.op_count() != 2 {
+        return None;
+    }
+    if insn.op0_kind() != OpKind::Memory {
+        return None;
+    }
+    if !matches!(insn.memory_base(), Register::RBP | Register::EBP) {
+        return None;
+    }
+    if insn.memory_index() != Register::None {
+        return None;
+    }
+    #[allow(clippy::cast_possible_wrap)]
+    let value = match insn.op1_kind() {
+        OpKind::Immediate8 => i64::from(insn.immediate8() as i8),
+        OpKind::Immediate16 => i64::from(insn.immediate16() as i16),
+        OpKind::Immediate32 => i64::from(insn.immediate32() as i32),
+        OpKind::Immediate64 => insn.immediate64() as i64,
+        OpKind::Immediate8to16 => i64::from(insn.immediate8to16()),
+        OpKind::Immediate8to32 => i64::from(insn.immediate8to32()),
+        OpKind::Immediate8to64 => insn.immediate8to64(),
+        OpKind::Immediate32to64 => insn.immediate32to64(),
+        _ => return None,
+    };
+    Some((signed_memory_displacement(insn), value))
+}
+
 /// If `insn` is a `lea reg, [rip+disp]` (compiler-typical
 /// "load address of a global / string-constant"), return the absolute
 /// virtual address of the target. Returns `None` for non-`lea`s, or

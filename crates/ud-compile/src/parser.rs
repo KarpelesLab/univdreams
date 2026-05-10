@@ -454,6 +454,7 @@ impl Parser {
 
     /// Dispatch on the directive name after a leading `@` inside a
     /// statement context (function body or if-branch arm).
+    #[allow(clippy::too_many_lines)]
     fn parse_stmt_at_directive(
         &mut self,
         dir_name: &str,
@@ -544,6 +545,18 @@ impl Parser {
             }
             "if_branch" => self.parse_if_branch_directive(dir_tok),
             "loop" => self.parse_loop_directive(),
+            "local_set" => {
+                self.expect(&TokenKind::LParen, "`(` after `@local_set`")?;
+                #[allow(clippy::cast_possible_wrap)]
+                let slot = self.expect_int("local-set slot displacement")? as i64;
+                self.expect(&TokenKind::Comma, "`,` after `@local_set` slot")?;
+                #[allow(clippy::cast_possible_wrap)]
+                let value = self.expect_int("local-set immediate value")? as i64;
+                self.expect(&TokenKind::Comma, "`,` after `@local_set` value")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@local_set`")?;
+                Ok(Stmt::LocalSet { slot, value, bytes })
+            }
             other => Err(ParseError::UnknownDirective {
                 name: other.to_string(),
                 line: dir_tok.line,
