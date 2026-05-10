@@ -45,10 +45,9 @@ pub fn build_function(
     let mut i = 0;
     while i < f.blocks.len() {
         if let Some(group) = groups[i].as_ref() {
-            // Conditional block A is at i; fallthrough B is at i+1.
-            // For an if-with-else group C is at i+2 and the lift owns
-            // three blocks; for an if-only group C is the post-if join
-            // block, owned by the outer iteration.
+            // Conditional block A at i; arms span the index ranges
+            // recorded on the group. The cmp+jcc head is consumed by
+            // the IfBranch (truncate_trailing).
             emit_block_stmts(
                 &mut body,
                 &f.blocks[i],
@@ -62,39 +61,13 @@ pub fn build_function(
                 &ctx,
             );
 
-            let mut then_body = Vec::new();
-            emit_block_stmts(
-                &mut then_body,
-                &f.blocks[i + 1],
-                BlockEmitConfig {
-                    is_first: false,
-                    emit_block_comment: false,
-                    truncate_trailing: 0,
-                    emit_terminator_comment: false,
-                },
-                lifts[i + 1].as_ref(),
-                &ctx,
-            );
+            let then_body = emit_arm_blocks(f, group.then_range.clone(), lifts.as_slice(), &ctx);
+            let else_body = group
+                .else_range
+                .clone()
+                .map(|er| emit_arm_blocks(f, er, lifts.as_slice(), &ctx));
 
-            let (else_body, advance) = if group.has_else {
-                let mut else_body = Vec::new();
-                emit_block_stmts(
-                    &mut else_body,
-                    &f.blocks[i + 2],
-                    BlockEmitConfig {
-                        is_first: false,
-                        emit_block_comment: false,
-                        truncate_trailing: 0,
-                        emit_terminator_comment: false,
-                    },
-                    lifts[i + 2].as_ref(),
-                    &ctx,
-                );
-                (Some(else_body), 3)
-            } else {
-                (None, 2)
-            };
-
+            let advance = group.end_idx() - i;
             body.push(Stmt::IfBranch {
                 cond_text: group.cond_text.clone(),
                 cond_bytes: group.cond_bytes.clone(),
@@ -125,6 +98,41 @@ pub fn build_function(
         signature,
         body,
     }
+}
+
+/// Emit every block in `range` as the body of an `@if_branch` arm.
+///
+/// Each block is emitted with `is_first=false` (no prologue lifting
+/// inside an arm), `emit_block_comment=false` for the first block of
+/// the arm (the structural directive already conveys "this is where
+/// the arm starts"), and `emit_block_comment=true` between blocks
+/// so multi-block arms stay navigable. Terminator comments are
+/// suppressed on the arm's last block — its exit target is the join
+/// point implied by the `@if_branch`.
+fn emit_arm_blocks(
+    f: &Function<DecodedInsn>,
+    range: std::ops::Range<usize>,
+    lifts: &[Option<BlockTailLift>],
+    ctx: &EmitCtx<'_>,
+) -> Vec<Stmt> {
+    let mut out = Vec::new();
+    let arm_start = range.start;
+    let arm_last = range.end.saturating_sub(1);
+    for j in range {
+        emit_block_stmts(
+            &mut out,
+            &f.blocks[j],
+            BlockEmitConfig {
+                is_first: false,
+                emit_block_comment: j != arm_start,
+                truncate_trailing: 0,
+                emit_terminator_comment: j != arm_last,
+            },
+            lifts[j].as_ref(),
+            ctx,
+        );
+    }
+    out
 }
 
 /// Per-block emission knobs.
@@ -381,89 +389,183 @@ fn compute_block_tail_lifts(
     out
 }
 
-/// One detected `cmp/test + jcc + then-block [+ else-block]` group
-/// whose conditional block sits at a particular index in `f.blocks`.
+/// One detected `cmp/test + jcc + then-arm [+ else-arm]` group whose
+/// conditional block sits at a particular index in `f.blocks`.
+///
+/// Both arms can span multiple basic blocks. The arm ranges are
+/// half-open block-index intervals.
 struct IfElseGroup {
     /// Number of trailing instructions in the conditional block that
     /// the IfBranch head consumes (always 2 for v0).
     head_consumed: usize,
     cond_text: String,
     cond_bytes: Vec<u8>,
-    /// True when the fallthrough block "exits" (returns or jumps past
-    /// the taken block) — the taken block is then a real `else` arm.
-    /// False when the fallthrough block falls through into the taken
-    /// block — the taken block is the post-if join code, and the
-    /// `if` has no `else` clause.
-    has_else: bool,
+    /// Block-index range of the fallthrough (`@then`) arm. Always
+    /// non-empty; starts at `a_idx + 1`.
+    then_range: std::ops::Range<usize>,
+    /// Block-index range of the taken (`@else`) arm. `None` for
+    /// if-only patterns where the fallthrough arm falls through into
+    /// the would-be-else block (which is then the post-if join, owned
+    /// by the outer iteration).
+    else_range: Option<std::ops::Range<usize>>,
+}
+
+impl IfElseGroup {
+    /// One past the last block index this group owns.
+    fn end_idx(&self) -> usize {
+        match &self.else_range {
+            Some(r) => r.end,
+            None => self.then_range.end,
+        }
+    }
 }
 
 /// Per-block: is this block the head of a recognised if/else group?
 ///
-/// v0 detection rules (tight):
+/// v0 detection rules:
 ///
 /// * The block ends with [`Terminator::ConditionalBranch`].
-/// * The trailing two instructions match
-///   [`try_lift_if_branch_head`] (i.e. a `cmp/test` followed by a
-///   direct `jcc`).
-/// * The next block in memory is at the conditional branch's
-///   fallthrough address (the "then" arm).
-/// * The block after that is at the jcc's taken target.
+/// * The trailing two instructions match [`try_lift_if_branch_head`]
+///   — a `cmp/test` followed by a direct `jcc`.
+/// * The block immediately after in memory is at the conditional
+///   branch's fallthrough address — start of the `@then` arm.
+/// * The "then" arm is a maximal contiguous run of fall-through
+///   blocks ending just before the jcc's taken-target block, OR
+///   ending in a single non-fallthrough exit (`jmp join_addr` /
+///   `Return` / `IndirectBranch` / `InvalidOrUnreachable`).
+/// * For if-with-else: the `@else` arm starts at the jcc's
+///   taken-target block and runs as a similar contiguous run ending
+///   at the join.
+/// * For if-only: the "then" arm falls through into the jcc target —
+///   that target is then the post-if join, not a separate `else` arm.
 ///
-/// `has_else` then distinguishes the two flavours:
-///
-/// * **if-with-else** — the fallthrough block "exits past" the
-///   taken block (returns, or unconditionally jumps to a later
-///   address). The taken block is a real `else` arm; the lift owns
-///   blocks `i, i+1, i+2`.
-/// * **if-only** — the fallthrough block falls through directly into
-///   the taken block. The taken block is the post-`if` join code;
-///   the lift owns only `i, i+1` and `else_body` is `None`.
-///
-/// More general CFG patterns (multi-block branches, nested ifs in
-/// either arm, fallthrough into a join block at non-adjacent index)
-/// don't fire yet — they need data-flow / dominator analysis.
+/// Nested if-else inside an arm isn't detected structurally yet —
+/// the inner conditional stays as `@asm` until a later iteration
+/// adds recursive detection.
 fn identify_if_else_groups(f: &Function<DecodedInsn>) -> Vec<Option<IfElseGroup>> {
     let mut groups: Vec<Option<IfElseGroup>> = (0..f.blocks.len()).map(|_| None).collect();
-    if f.blocks.len() < 3 {
+    if f.blocks.len() < 2 {
         return groups;
     }
 
-    let limit = f.blocks.len() - 2;
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..limit {
-        let a = &f.blocks[i];
-        let Terminator::ConditionalBranch { taken, fallthrough } = a.terminator else {
+    // addr → block-index map for jumping to jcc / join targets.
+    let addr_to_idx: HashMap<u64, usize> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.addr.0, i))
+        .collect();
+
+    let mut next_a = 0usize;
+    while next_a < f.blocks.len() {
+        let a_idx = next_a;
+        next_a += 1;
+        let Some(group) = try_detect_if_else_at(f, a_idx, &addr_to_idx) else {
             continue;
         };
-        let Some(head) = try_lift_if_branch_head(&a.insns) else {
-            continue;
-        };
-        if head.jcc_target != taken.0 {
-            continue;
-        }
-        if f.blocks[i + 1].addr != fallthrough || f.blocks[i + 2].addr != taken {
-            continue;
-        }
-        let b = &f.blocks[i + 1];
-        let c_addr = f.blocks[i + 2].addr.0;
-        // `has_else` iff the fallthrough block exits past the taken
-        // block — i.e. it doesn't simply fall through into C, and
-        // doesn't unconditionally jump straight to C either.
-        let has_else = match b.terminator {
-            Terminator::Return | Terminator::IndirectBranch | Terminator::InvalidOrUnreachable => {
-                true
-            }
-            Terminator::UnconditionalBranch { target } => target.0 != c_addr,
-            Terminator::ConditionalBranch { .. } | Terminator::Fallthrough => false,
-        };
-        groups[i] = Some(IfElseGroup {
-            head_consumed: head.insns_consumed,
-            cond_text: head.cond_text,
-            cond_bytes: head.cond_bytes,
-            has_else,
-        });
+        let end = group.end_idx();
+        groups[a_idx] = Some(group);
+        next_a = end; // skip blocks the group owns; nested detection is future work
     }
+
     groups
+}
+
+/// Try to recognise an if/else group whose conditional block is at
+/// `a_idx`. Returns `None` when the shape doesn't fit one of the
+/// supported patterns described on [`identify_if_else_groups`].
+fn try_detect_if_else_at(
+    f: &Function<DecodedInsn>,
+    a_idx: usize,
+    addr_to_idx: &HashMap<u64, usize>,
+) -> Option<IfElseGroup> {
+    let a = &f.blocks[a_idx];
+    let Terminator::ConditionalBranch { taken, fallthrough } = a.terminator else {
+        return None;
+    };
+    let head = try_lift_if_branch_head(&a.insns)?;
+    if head.jcc_target != taken.0 {
+        return None;
+    }
+
+    let f_idx = a_idx + 1;
+    if f.blocks.get(f_idx).map(|b| b.addr.0) != Some(fallthrough.0) {
+        return None;
+    }
+    let &t_idx = addr_to_idx.get(&taken.0)?;
+    if t_idx <= f_idx {
+        return None;
+    }
+
+    // Walk the "then" arm: blocks `f_idx..t_idx`. Every block except
+    // the last must fall through; the last either falls through (=
+    // if-only) or has a clean exit (= if-with-else).
+    if !is_clean_fallthrough_run(f, f_idx..t_idx - 1) {
+        return None;
+    }
+    let then_last = &f.blocks[t_idx - 1];
+
+    let then_exit_join = match then_last.terminator {
+        Terminator::Fallthrough => {
+            // Falls into f.blocks[t_idx] → if-only pattern.
+            return Some(IfElseGroup {
+                head_consumed: head.insns_consumed,
+                cond_text: head.cond_text,
+                cond_bytes: head.cond_bytes,
+                then_range: f_idx..t_idx,
+                else_range: None,
+            });
+        }
+        Terminator::UnconditionalBranch { target } => Some(target.0),
+        Terminator::Return | Terminator::IndirectBranch | Terminator::InvalidOrUnreachable => None,
+        Terminator::ConditionalBranch { .. } => return None,
+    };
+
+    // Walk the "else" arm: blocks `t_idx..join_idx`. Same rule:
+    // non-last blocks fall through; the last either falls through
+    // to the join address or jumps directly to it.
+    let join_idx = match then_exit_join {
+        Some(j) => *addr_to_idx.get(&j)?,
+        None => f.blocks.len(),
+    };
+    if join_idx <= t_idx {
+        return None;
+    }
+    if !is_clean_fallthrough_run(f, t_idx..join_idx - 1) {
+        return None;
+    }
+    let else_last = &f.blocks[join_idx - 1];
+    let else_meets_join = match (then_exit_join, &else_last.terminator) {
+        // Then-arm exits the function and the else-arm runs to the
+        // function's tail. Accept any tail terminator.
+        (None, _) if join_idx == f.blocks.len() => true,
+        (Some(j), Terminator::Fallthrough) => f.blocks.get(join_idx).is_some_and(|b| b.addr.0 == j),
+        (Some(j), Terminator::UnconditionalBranch { target }) => target.0 == j,
+        (
+            Some(_),
+            Terminator::Return | Terminator::IndirectBranch | Terminator::InvalidOrUnreachable,
+        ) => true,
+        _ => false,
+    };
+    if !else_meets_join {
+        return None;
+    }
+
+    Some(IfElseGroup {
+        head_consumed: head.insns_consumed,
+        cond_text: head.cond_text,
+        cond_bytes: head.cond_bytes,
+        then_range: f_idx..t_idx,
+        else_range: Some(t_idx..join_idx),
+    })
+}
+
+/// Every block index in `range` must have `Terminator::Fallthrough`.
+/// An empty range trivially satisfies this.
+fn is_clean_fallthrough_run(f: &Function<DecodedInsn>, range: std::ops::Range<usize>) -> bool {
+    range
+        .into_iter()
+        .all(|i| matches!(f.blocks[i].terminator, Terminator::Fallthrough))
 }
 
 /// Walk the entry block looking for arg-spill instructions
