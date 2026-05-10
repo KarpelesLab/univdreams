@@ -497,6 +497,31 @@ fn compute_block_tail_lifts(
                     continue;
                 }
             }
+            // Try lifting the tail block as "value computation +
+            // epilogue" → @return_expr. The leading insns
+            // (everything before leave/pop+ret) must model into an
+            // EAX-bearing expression; the trailing 2 must be a
+            // recognised epilogue. Folds patterns like
+            // `mov eax, [rbp-8]; leave; ret` into one directive.
+            if return_lift_allowed {
+                if let Some(epi) = try_lift_epilogue_pattern(&block.insns) {
+                    let split = block.insns.len() - epi.insns_consumed;
+                    if split > 0 {
+                        let leading = &block.insns[..split];
+                        if let Some(value) = try_lift_value_block(leading, name_at) {
+                            let render_ctx = ExprRenderCtx {
+                                slot_to_name,
+                                name_at,
+                            };
+                            out[i] = Some(BlockTailLift::ReturnExpr {
+                                insns_consumed: block.insns.len(),
+                                text: value.expr.render(&render_ctx),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
             if let Some(lifted) = try_lift_epilogue_pattern(&block.insns) {
                 out[i] = Some(BlockTailLift::Epilogue {
                     insns_consumed: lifted.insns_consumed,
