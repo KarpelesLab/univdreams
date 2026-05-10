@@ -153,6 +153,12 @@ fn verify_stmts(
                     verify_stmts(f, section, else_body, cursor, out);
                 }
             }
+            Stmt::Loop {
+                tail_bytes, body, ..
+            } => {
+                verify_stmts(f, section, body, cursor, out);
+                *cursor = cursor.saturating_add(tail_bytes.len() as u64);
+            }
             Stmt::Comment(_) => {}
         }
     }

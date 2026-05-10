@@ -220,6 +220,33 @@ pub enum Stmt {
         then_body: Vec<Stmt>,
         else_body: Option<Vec<Stmt>>,
     },
+
+    /// A structured loop with the test at the bottom. Canonical
+    /// gcc -O0 shape:
+    ///
+    /// ```text
+    /// @loop("cond text", [tail bytes]) {
+    ///     …body stmts…
+    /// }
+    /// ```
+    ///
+    /// Lifted from a CFG triple where:
+    ///
+    /// * a body block falls through to a tail block,
+    /// * the tail block ends with a conditional branch whose
+    ///   `taken` target is the body block (i.e. a back-edge),
+    ///
+    /// The pre-header jump (the unconditional `jmp` from the
+    /// caller's block that enters the loop at the tail) is left
+    /// outside the directive — it gets emitted as `@asm` in the
+    /// preceding flow. Lower-path byte order: `body` bytes
+    /// then `tail_bytes`, so concatenation reproduces the on-disk
+    /// layout of (body, then test).
+    Loop {
+        cond_text: String,
+        tail_bytes: Vec<u8>,
+        body: Vec<Stmt>,
+    },
 }
 
 impl Stmt {

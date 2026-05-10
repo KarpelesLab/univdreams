@@ -242,6 +242,14 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
                     n += count_stmts(else_body);
                 }
             }
+            Stmt::Loop {
+                tail_bytes, body, ..
+            } => {
+                let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, tail_bytes, 0)
+                    .expect("decode loop tail bytes");
+                n += insns.len();
+                n += count_stmts(body);
+            }
             Stmt::Comment(_) => {}
         }
     }

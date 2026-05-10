@@ -176,6 +176,18 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             }
             writeln!(out, "{indent}}}").unwrap();
         }
+        Stmt::Loop {
+            cond_text,
+            tail_bytes,
+            body,
+        } => {
+            write!(out, "{indent}@loop({}, [", quote_string(cond_text)).unwrap();
+            emit_byte_list(out, tail_bytes);
+            writeln!(out, "]) {{").unwrap();
+            let body_indent = format!("{indent}    ");
+            emit_stmts(out, body, &body_indent);
+            writeln!(out, "{indent}}}").unwrap();
+        }
     }
 }
 

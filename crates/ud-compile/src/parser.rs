@@ -543,12 +543,30 @@ impl Parser {
                 Ok(Stmt::ArgSpill { arg_index, bytes })
             }
             "if_branch" => self.parse_if_branch_directive(dir_tok),
+            "loop" => self.parse_loop_directive(),
             other => Err(ParseError::UnknownDirective {
                 name: other.to_string(),
                 line: dir_tok.line,
                 col: dir_tok.col,
             }),
         }
+    }
+
+    /// Parse `@loop("cond", [tail bytes]) { …body stmts… }`.
+    fn parse_loop_directive(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::LParen, "`(` after `@loop`")?;
+        let cond_text = self.expect_string("loop cond text")?;
+        self.expect(&TokenKind::Comma, "`,` after loop cond text")?;
+        let tail_bytes = self.parse_byte_list()?;
+        self.expect(&TokenKind::RParen, "`)` to close `@loop` head")?;
+        self.expect(&TokenKind::LBrace, "`{` to open `@loop` body")?;
+        let body = self.parse_stmt_list_until_rbrace()?;
+        self.expect(&TokenKind::RBrace, "`}` to close `@loop` body")?;
+        Ok(Stmt::Loop {
+            cond_text,
+            tail_bytes,
+            body,
+        })
     }
 
     /// Parse `@if_branch("cond", [bytes]) { @then { … } [@else { … }] }`

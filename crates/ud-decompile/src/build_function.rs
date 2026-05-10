@@ -36,6 +36,7 @@ pub fn build_function(
     let slot_to_name = collect_slot_to_name(f, signature.as_ref());
     let lifts = compute_block_tail_lifts(f, signature.as_ref(), &slot_to_name, name_at);
     let groups = identify_if_else_groups(f);
+    let loops = identify_loop_groups(f);
 
     let mut body = Vec::new();
     let func_end = f.addr.0.saturating_add(f.size() as u64);
@@ -49,6 +50,37 @@ pub fn build_function(
 
     let mut i = 0;
     while i < f.blocks.len() {
+        if let Some(lg) = loops[i].as_ref() {
+            // Body block at i; tail block at i+1. Emit the body
+            // block's stmts as the loop body (no terminator comment
+            // because the structural directive carries the flow);
+            // wrap them with the tail block's full bytes.
+            let mut body_stmts = Vec::new();
+            emit_block_stmts(
+                &mut body_stmts,
+                &f.blocks[i],
+                BlockEmitConfig {
+                    is_first: false,
+                    emit_block_comment: false,
+                    truncate_trailing: 0,
+                    emit_terminator_comment: false,
+                },
+                lifts[i].as_ref(),
+                &ctx,
+            );
+            let tail_bytes: Vec<u8> = f.blocks[lg.tail_idx]
+                .insns
+                .iter()
+                .flat_map(|insn| insn.original_bytes.iter().copied())
+                .collect();
+            body.push(Stmt::Loop {
+                cond_text: lg.cond_text.clone(),
+                tail_bytes,
+                body: body_stmts,
+            });
+            i = lg.tail_idx + 1;
+            continue;
+        }
         if let Some(group) = groups[i].as_ref() {
             // Conditional block A at i; arms span the index ranges
             // recorded on the group. The cmp+jcc head is consumed by
@@ -480,6 +512,61 @@ fn compute_block_tail_lifts(
 ///
 /// Both arms can span multiple basic blocks. The arm ranges are
 /// half-open block-index intervals.
+/// One detected back-edge loop. The body block's stmts go inside the
+/// `@loop` directive; the tail block's full bytes become
+/// `tail_bytes`.
+struct LoopGroup {
+    /// Block index of the tail — `body_idx + 1` in v0.
+    tail_idx: usize,
+    cond_text: String,
+}
+
+/// Per-block: is this the body block of a recognised loop?
+///
+/// v0 detects only the canonical gcc -O0 / clang -O0 shape with the
+/// test at the bottom:
+///
+/// * Body block (B) terminates with `Fallthrough` to the tail block
+///   (immediately following in `f.blocks`).
+/// * Tail block (C) terminates with
+///   `ConditionalBranch { taken == B.addr, .. }` (the back-edge).
+/// * Tail block's last two instructions are a `cmp/test + jcc` pair,
+///   so [`try_lift_if_branch_head`] gives us a cond text.
+///
+/// Multi-block loop bodies (with inner if-else, nested loops, etc.)
+/// don't fire yet — the body must be a single Fallthrough-terminated
+/// block.
+fn identify_loop_groups(f: &Function<DecodedInsn>) -> Vec<Option<LoopGroup>> {
+    let mut out: Vec<Option<LoopGroup>> = (0..f.blocks.len()).map(|_| None).collect();
+    if f.blocks.len() < 2 {
+        return out;
+    }
+    let limit = f.blocks.len() - 1;
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..limit {
+        let body = &f.blocks[i];
+        if !matches!(body.terminator, Terminator::Fallthrough) {
+            continue;
+        }
+        let tail_idx = i + 1;
+        let tail = &f.blocks[tail_idx];
+        let Terminator::ConditionalBranch { taken, .. } = tail.terminator else {
+            continue;
+        };
+        if taken != body.addr {
+            continue;
+        }
+        let Some(head) = try_lift_if_branch_head(&tail.insns) else {
+            continue;
+        };
+        out[i] = Some(LoopGroup {
+            tail_idx,
+            cond_text: head.cond_text,
+        });
+    }
+    out
+}
+
 struct IfElseGroup {
     /// Number of trailing instructions in the conditional block that
     /// the IfBranch head consumes (always 2 for v0).

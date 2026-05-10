@@ -110,6 +110,12 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
                     lower_stmts_into(fn_name, else_body, out)?;
                 }
             }
+            Stmt::Loop {
+                tail_bytes, body, ..
+            } => {
+                lower_stmts_into(fn_name, body, out)?;
+                out.extend_from_slice(tail_bytes);
+            }
             Stmt::Comment(_) => {}
         }
     }
