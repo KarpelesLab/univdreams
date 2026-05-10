@@ -196,16 +196,26 @@ fn parse_of_decompile_to_text_equals_decompile() {
     );
 }
 
+/// Total number of instructions represented in the AST. Counts each
+/// `Stmt::Asm` as one instruction; for each `Stmt::Return`, decodes
+/// the pinned bytes to count how many instructions it stands in for
+/// (typically 2-3: the value-setter, optional epilogue, and `ret`).
 fn count_asm_stmts(items: &[Item]) -> usize {
     let mut n = 0;
     for item in items {
         match item {
             Item::Function(f) => {
-                n += f
-                    .body
-                    .iter()
-                    .filter(|s| matches!(s, Stmt::Asm { .. }))
-                    .count();
+                for stmt in &f.body {
+                    match stmt {
+                        Stmt::Asm { .. } => n += 1,
+                        Stmt::Return { bytes, .. } => {
+                            let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, bytes, 0)
+                                .expect("decode @return bytes");
+                            n += insns.len();
+                        }
+                        Stmt::Comment(_) => {}
+                    }
+                }
             }
             Item::Section { items, .. } => n += count_asm_stmts(items),
             _ => {}
