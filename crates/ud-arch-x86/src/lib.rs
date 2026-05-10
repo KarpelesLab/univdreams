@@ -44,6 +44,74 @@ pub fn direct_call_target(insn: &Instruction) -> Option<u64> {
     }
 }
 
+/// One recognised return-with-literal pattern at the tail of a
+/// function: how many trailing instructions matched, and the literal
+/// integer value the function returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiftedReturn {
+    pub insns_consumed: usize,
+    pub value: u64,
+}
+
+/// Try to recognize the trailing instructions of `insns` as a return
+/// with a known integer literal: the canonical SysV-x64 epilogue
+/// patterns gcc emits at `-O0`.
+///
+/// Recognised forms (working backwards from `ret`):
+///
+/// * `mov eax, IMM32; [pop rbp | leave;] ret`
+/// * `xor eax, eax;   [pop rbp | leave;] ret`
+/// * `mov eax, IMM32; ret`
+/// * `xor eax, eax;   ret`
+///
+/// Only matches when the trailing instruction is a `ret` (`0xc3`); the
+/// caller is expected to invoke this only on a function's last block.
+/// Returns `None` when no pattern fits.
+#[must_use]
+pub fn try_lift_return_pattern(insns: &[DecodedInsn]) -> Option<LiftedReturn> {
+    if insns.is_empty() {
+        return None;
+    }
+
+    let mut i = insns.len();
+
+    // Last instruction must be `ret` (0xc3). Iret / retf etc. are
+    // beyond v0 scope.
+    let ret = insns.get(i - 1)?;
+    if ret.original_bytes.as_slice() != [0xc3] {
+        return None;
+    }
+    i -= 1;
+
+    // Optional epilogue: pop rbp (0x5d) or leave (0xc9).
+    if i > 0 {
+        let prev = &insns[i - 1].original_bytes;
+        if prev.as_slice() == [0x5d] || prev.as_slice() == [0xc9] {
+            i -= 1;
+        }
+    }
+
+    if i == 0 {
+        return None;
+    }
+
+    // The instruction setting the return value.
+    let setter = &insns[i - 1].original_bytes;
+    let value = match setter.as_slice() {
+        // mov eax, imm32 — opcode 0xB8, 4 little-endian bytes follow.
+        [0xb8, b0, b1, b2, b3] => u64::from(u32::from_le_bytes([*b0, *b1, *b2, *b3])),
+        // xor eax, eax — clears eax to zero.
+        [0x31, 0xc0] => 0,
+        _ => return None,
+    };
+    i -= 1;
+
+    Some(LiftedReturn {
+        insns_consumed: insns.len() - i,
+        value,
+    })
+}
+
 /// Like [`direct_call_target`], but for unconditional direct branches
 /// (`jmp rel32` / `jmp short rel8`). Useful for spotting tail calls
 /// when the target lives in another discovered function.
@@ -410,6 +478,71 @@ mod tests {
         let bytes = [0x06]; // invalid in 64-bit mode
         let result = verify_intel_text(Bitness::Bits64, "ret", &bytes, 0x1000);
         assert!(matches!(result, VerifyAsm::Undecodable));
+    }
+
+    #[test]
+    fn lift_return_recognizes_mov_eax_pop_rbp_ret() {
+        // mov eax, 0; pop rbp; ret
+        let bytes = [0xb8, 0x00, 0x00, 0x00, 0x00, 0x5d, 0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_return_pattern(&insns).unwrap();
+        assert_eq!(lifted.value, 0);
+        assert_eq!(lifted.insns_consumed, 3);
+    }
+
+    #[test]
+    fn lift_return_recognizes_xor_zero_pop_rbp_ret() {
+        // xor eax, eax; pop rbp; ret
+        let bytes = [0x31, 0xc0, 0x5d, 0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_return_pattern(&insns).unwrap();
+        assert_eq!(lifted.value, 0);
+        assert_eq!(lifted.insns_consumed, 3);
+    }
+
+    #[test]
+    fn lift_return_recognizes_mov_eax_leave_ret() {
+        // mov eax, 1; leave; ret
+        let bytes = [0xb8, 0x01, 0x00, 0x00, 0x00, 0xc9, 0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_return_pattern(&insns).unwrap();
+        assert_eq!(lifted.value, 1);
+        assert_eq!(lifted.insns_consumed, 3);
+    }
+
+    #[test]
+    fn lift_return_recognizes_mov_ret_without_epilogue() {
+        // mov eax, 42; ret
+        let bytes = [0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_return_pattern(&insns).unwrap();
+        assert_eq!(lifted.value, 0x2a);
+        assert_eq!(lifted.insns_consumed, 2);
+    }
+
+    #[test]
+    fn lift_return_rejects_bare_ret() {
+        // ret only — no value-setter, no pattern
+        let bytes = [0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert!(try_lift_return_pattern(&insns).is_none());
+    }
+
+    #[test]
+    fn lift_return_rejects_unrecognized_setter() {
+        // mov rax, rbx; ret — not a literal value
+        let bytes = [0x48, 0x89, 0xd8, 0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert!(try_lift_return_pattern(&insns).is_none());
+    }
+
+    #[test]
+    fn lift_return_only_consumes_tail() {
+        // some_other_insn; mov eax, 0; ret
+        let bytes = [0x90, 0xb8, 0x00, 0x00, 0x00, 0x00, 0xc3]; // nop, mov, ret
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_return_pattern(&insns).unwrap();
+        assert_eq!(lifted.insns_consumed, 2);
     }
 
     #[test]

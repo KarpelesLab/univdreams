@@ -438,6 +438,14 @@ impl Parser {
                             self.expect(&TokenKind::RParen, "`)` to close `@asm`")?;
                             body.push(Stmt::Asm { text, bytes });
                         }
+                        "return" => {
+                            self.expect(&TokenKind::LParen, "`(` after `@return`")?;
+                            let value = self.expect_int("return value (integer literal)")?;
+                            self.expect(&TokenKind::Comma, "`,` after return value")?;
+                            let bytes = self.parse_byte_list()?;
+                            self.expect(&TokenKind::RParen, "`)` to close `@return`")?;
+                            body.push(Stmt::Return { value, bytes });
+                        }
                         other => {
                             return Err(ParseError::UnknownDirective {
                                 name: other.to_string(),

@@ -113,6 +113,16 @@ fn emit_fn_indented(out: &mut String, f: &FnDecl, depth: usize) {
             Stmt::Comment(text) => {
                 writeln!(out, "{body_indent}// {text}").unwrap();
             }
+            Stmt::Return { value, bytes } => {
+                write!(out, "{body_indent}@return(0x{value:x}, [").unwrap();
+                for (i, b) in bytes.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write!(out, "0x{b:02x}").unwrap();
+                }
+                writeln!(out, "])").unwrap();
+            }
         }
     }
     writeln!(out, "{indent}}}").unwrap();

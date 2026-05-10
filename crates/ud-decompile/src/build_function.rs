@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 
 use ud_arch_x86::{
-    direct_call_target, direct_unconditional_branch_target, format_intel, DecodedInsn,
+    direct_call_target, direct_unconditional_branch_target, format_intel, try_lift_return_pattern,
+    DecodedInsn,
 };
-use ud_ast::{FnDecl, Signature, Stmt};
+use ud_ast::{FnDecl, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
 use ud_ir::{Function, Terminator};
 
@@ -57,12 +58,72 @@ pub fn build_function(
         params: d.params.clone(),
         return_type: d.return_type.clone(),
     });
+
+    // Phase 7: lift the trailing instructions of the last block to a
+    // structured `Stmt::Return` when they match a recognised pattern
+    // and the function returns an integer-like type. Bytes are pinned,
+    // so round-trip is unaffected.
+    if let Some(sig) = &signature {
+        if return_type_is_integer_like(&sig.return_type) {
+            if let Some(last_block) = f.blocks.last() {
+                if let Some(lifted) = try_lift_return_pattern(&last_block.insns) {
+                    let total = last_block.insns.len();
+                    let return_bytes: Vec<u8> = last_block.insns[total - lifted.insns_consumed..]
+                        .iter()
+                        .flat_map(|i| i.original_bytes.iter().copied())
+                        .collect();
+                    drop_trailing_for_return(&mut body, lifted.insns_consumed);
+                    body.push(Stmt::Return {
+                        value: lifted.value,
+                        bytes: return_bytes,
+                    });
+                }
+            }
+        }
+    }
+
     FnDecl {
         addr: Some(f.addr.0),
         name: f.name.clone(),
         signature,
         body,
     }
+}
+
+/// Pop the last `n_asm` `Stmt::Asm` entries from `body`, along with any
+/// trailing comments that sit between them (e.g. `// -> name` annotations
+/// the call-target pass might have added). Used to make room for a
+/// lifted `Stmt::Return`.
+fn drop_trailing_for_return(body: &mut Vec<Stmt>, n_asm: usize) {
+    let mut popped = 0usize;
+    while popped < n_asm {
+        match body.last() {
+            Some(Stmt::Asm { .. }) => {
+                body.pop();
+                popped += 1;
+            }
+            Some(Stmt::Comment(_)) => {
+                body.pop();
+            }
+            _ => break,
+        }
+    }
+}
+
+fn return_type_is_integer_like(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Bool
+            | Type::Char
+    )
 }
 
 /// Decide what (if anything) to comment after an instruction based on

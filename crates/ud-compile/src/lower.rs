@@ -78,6 +78,9 @@ pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
                 }
                 out.extend_from_slice(bytes);
             }
+            Stmt::Return { bytes, .. } => {
+                out.extend_from_slice(bytes);
+            }
             Stmt::Comment(_) => {}
         }
     }

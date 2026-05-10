@@ -147,6 +147,13 @@ pub enum Stmt {
     /// and direct-branch targets without committing to a structural
     /// syntax for them yet.
     Comment(String),
+
+    /// `@return(value, [bytes])` — a recognised return-with-literal
+    /// pattern at the tail of a function. Lifted from sequences like
+    /// `mov eax, N; [pop rbp;] ret` or `xor eax, eax; [pop rbp;] ret`.
+    /// `bytes` carries every encoded byte of those instructions
+    /// concatenated, so the lower path just emits the bytes.
+    Return { value: u64, bytes: Vec<u8> },
 }
 
 impl Stmt {
