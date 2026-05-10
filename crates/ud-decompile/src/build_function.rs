@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 
 use ud_arch_x86::{
-    arg_spill_index, direct_call_target, direct_unconditional_branch_target, format_intel,
-    try_lift_epilogue_pattern, try_lift_if_branch_head, try_lift_prologue_pattern,
+    arg_spill_index, direct_call_target, direct_lea_rip_target, direct_unconditional_branch_target,
+    format_intel, try_lift_epilogue_pattern, try_lift_if_branch_head, try_lift_prologue_pattern,
     try_lift_return_pattern, try_lift_return_via_jmp, try_lift_value_block, DecodedInsn,
     ExprRenderCtx,
 };
 use ud_ast::{FnDecl, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
+use ud_format_elf::Elf64File;
 use ud_ir::{BasicBlock, Function, Terminator};
 
 /// Convert a lifted [`Function`] into the AST's [`FnDecl`].
@@ -24,6 +25,7 @@ pub fn build_function(
     f: &Function<DecodedInsn>,
     debug: Option<&DebugFunction>,
     name_at: &HashMap<u64, String>,
+    elf: &Elf64File,
 ) -> FnDecl {
     let signature = debug.map(|d| Signature {
         params: d.params.clone(),
@@ -40,6 +42,7 @@ pub fn build_function(
         fn_addr_end: func_end,
         name_at,
         signature: signature.as_ref(),
+        elf,
     };
 
     let mut i = 0;
@@ -158,6 +161,7 @@ struct EmitCtx<'a> {
     fn_addr_end: u64,
     name_at: &'a HashMap<u64, String>,
     signature: Option<&'a Signature>,
+    elf: &'a Elf64File,
 }
 
 /// Emit one block's worth of statements into `out`.
@@ -228,6 +232,9 @@ fn emit_block_stmts(
         if let Some(annotation) =
             call_annotation(insn, ctx.fn_addr_start, ctx.fn_addr_end, ctx.name_at)
         {
+            out.push(Stmt::Comment(annotation));
+        }
+        if let Some(annotation) = lea_target_annotation(insn, ctx.elf, ctx.name_at) {
             out.push(Stmt::Comment(annotation));
         }
     }
@@ -651,6 +658,95 @@ fn call_annotation(
         }
     }
     None
+}
+
+/// If `insn` is a `lea reg, [rip+disp]` whose target lives in a
+/// recognisable data section, return a comment string surfacing
+/// what's at that address. Goal: turn the cryptic
+/// `lea rax, [2015h]` into a navigable hint like
+/// `// = .rodata @ 0x2015 ("Hello from test2.c!")`.
+///
+/// Resolution rules:
+///
+/// * If the target address belongs to a known function (in `name_at`),
+///   render as `// = &<function_name>` — typical for "load the
+///   address of a function and indirect-call it" idioms.
+/// * Else if the target falls inside a section whose name we
+///   recognise as read-only data (`.rodata`, `.data.rel.ro`,
+///   `.eh_frame`, `.eh_frame_hdr`), and the bytes there are a valid
+///   NUL-terminated UTF-8 C-string of length ≥ 1, render as
+///   `// = .rodata @ 0xADDR ("string")`.
+/// * Else if the target is just inside *some* section, render as
+///   `// = .secname @ 0xADDR`.
+/// * Otherwise return None — the lea probably loads computed state we
+///   can't surface with a single string.
+fn lea_target_annotation(
+    insn: &DecodedInsn,
+    elf: &Elf64File,
+    name_at: &HashMap<u64, String>,
+) -> Option<String> {
+    let addr = direct_lea_rip_target(&insn.iced)?;
+    if let Some(name) = name_at.get(&addr) {
+        return Some(format!("= &{name}"));
+    }
+    let (section_name, data, sec_offset) = find_section_at(elf, addr)?;
+    if is_string_data_section(section_name) {
+        if let Some(text) = read_cstring_at(data, sec_offset) {
+            return Some(format!(
+                "= {section_name} @ 0x{addr:x} ({:?})",
+                shorten_for_display(text)
+            ));
+        }
+    }
+    Some(format!("= {section_name} @ 0x{addr:x}"))
+}
+
+/// Find the section containing `vaddr`. Returns the section name,
+/// its raw data, and the byte offset of `vaddr` within that data.
+fn find_section_at(elf: &Elf64File, vaddr: u64) -> Option<(&str, &[u8], usize)> {
+    for (idx, sh, data) in elf.sections() {
+        if sh.sh_size == 0 {
+            continue;
+        }
+        let end = sh.sh_addr.checked_add(sh.sh_size)?;
+        if vaddr >= sh.sh_addr && vaddr < end {
+            let offset = (vaddr - sh.sh_addr) as usize;
+            let name = elf.section_name(idx)?;
+            return Some((name, data, offset));
+        }
+    }
+    None
+}
+
+fn is_string_data_section(name: &str) -> bool {
+    matches!(
+        name,
+        ".rodata" | ".rodata.str1.1" | ".rodata.str1.8" | ".data.rel.ro" | ".data.rel.ro.local"
+    )
+}
+
+/// Read a NUL-terminated UTF-8 string at `offset` in `data`. Returns
+/// `None` for empty strings, missing NUL terminators, or non-UTF-8
+/// content (typical of pointer/relocation tables that happen to live
+/// in `.data.rel.ro`).
+fn read_cstring_at(data: &[u8], offset: usize) -> Option<&str> {
+    let tail = data.get(offset..)?;
+    let nul = tail.iter().position(|&b| b == 0)?;
+    if nul == 0 {
+        return None;
+    }
+    std::str::from_utf8(&tail[..nul]).ok()
+}
+
+/// Truncate strings longer than 60 chars in the lea-annotation
+/// comment. Long strings get a trailing `…`.
+fn shorten_for_display(s: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    if s.chars().count() <= MAX_CHARS {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(MAX_CHARS).collect();
+    format!("{truncated}…")
 }
 
 /// If `insn` is a mov of a SysV-x64 argument register to a stack slot

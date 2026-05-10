@@ -146,7 +146,7 @@ fn function_lives_in_a_section(elf: &Elf64File, addr: u64, size: u64) -> bool {
 /// address range falls inside the section, plus `@raw` blocks for
 /// every byte not covered by a function.
 fn build_section_items(
-    _elf: &Elf64File,
+    elf: &Elf64File,
     sh: &Shdr64,
     data: &[u8],
     map: &FunctionMap,
@@ -188,7 +188,7 @@ fn build_section_items(
         let lifted = lift_function(f.name.clone(), &insns)?;
         let debug = debug_by_addr.get(&f.addr.0);
         out.push(Item::Function(build_function::build_function(
-            &lifted, debug, name_at,
+            &lifted, debug, name_at, elf,
         )));
         cursor = f.addr.0.saturating_add(f.size);
     }

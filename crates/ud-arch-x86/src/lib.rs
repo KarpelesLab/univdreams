@@ -405,6 +405,36 @@ pub fn direct_unconditional_branch_target(insn: &Instruction) -> Option<u64> {
     }
 }
 
+/// If `insn` is a `lea reg, [rip+disp]` (compiler-typical
+/// "load address of a global / string-constant"), return the absolute
+/// virtual address of the target. Returns `None` for non-`lea`s, or
+/// for `lea`s with a non-RIP base or a non-trivial index.
+///
+/// Iced computes the rip-relative target for us in
+/// `memory_displacement64()` when the operand's base is `RIP`.
+#[must_use]
+pub fn direct_lea_rip_target(insn: &Instruction) -> Option<u64> {
+    if insn.mnemonic() != Mnemonic::Lea {
+        return None;
+    }
+    if insn.op_count() != 2 {
+        return None;
+    }
+    if insn.op0_kind() != OpKind::Register {
+        return None;
+    }
+    if insn.op1_kind() != OpKind::Memory {
+        return None;
+    }
+    if insn.memory_base() != Register::RIP {
+        return None;
+    }
+    if insn.memory_index() != Register::None {
+        return None;
+    }
+    Some(insn.memory_displacement64())
+}
+
 /// Format `insn` as Intel-syntax assembly text, suitable for embedding
 /// inside an `@asm("...")` directive in a `.ud` file.
 ///
@@ -1012,6 +1042,31 @@ mod tests {
         let bytes = [0x83, 0xf8, 0x00, 0xeb, 0x05];
         let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
         assert!(try_lift_if_branch_head(&insns).is_none());
+    }
+
+    #[test]
+    fn direct_lea_rip_target_resolves_rip_relative_load() {
+        // lea rax, [rip+0x10]  encoded as 48 8d 05 10 00 00 00 (7 bytes).
+        // Block at 0x1000; rip-after-this-insn = 0x1007; target = 0x1017.
+        let bytes = [0x48, 0x8d, 0x05, 0x10, 0x00, 0x00, 0x00];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert_eq!(direct_lea_rip_target(&insns[0].iced), Some(0x1017));
+    }
+
+    #[test]
+    fn direct_lea_rip_target_rejects_non_lea() {
+        // mov rax, [rip+0x10]  (also rip-relative but not lea)
+        let bytes = [0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert_eq!(direct_lea_rip_target(&insns[0].iced), None);
+    }
+
+    #[test]
+    fn direct_lea_rip_target_rejects_non_rip_base() {
+        // lea rax, [rbx+0x10] — base is rbx, not rip.
+        let bytes = [0x48, 0x8d, 0x43, 0x10];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert_eq!(direct_lea_rip_target(&insns[0].iced), None);
     }
 
     #[test]
