@@ -217,6 +217,12 @@ fn build_stmt_slice(
             i += 2;
             continue;
         }
+        // 4. Bare JSR known_target → @call with no args.
+        if let Some(call_stmt) = try_lift_bare_call(local, i, entries) {
+            out.push(call_stmt);
+            i += 1;
+            continue;
+        }
         // 4. Plain @asm.
         let ins = local[i];
         if let Some(lbl) = labels.get(&ins.addr.0) {
@@ -249,6 +255,23 @@ fn try_lift_imm_call(local: &[&DecodedInsn], i: usize, entries: &HashSet<u64>) -
         name: function_name(target, u64::MAX),
         args: vec![format!("A=#${:02X}", lda.operand)],
         bytes,
+    })
+}
+
+/// If `local[i]` is a plain `JSR target` where `target` is a
+/// known function entry, return a `Stmt::Call` with no args.
+fn try_lift_bare_call(local: &[&DecodedInsn], i: usize, entries: &HashSet<u64>) -> Option<Stmt> {
+    let jsr = local.get(i)?;
+    let InsnKind::Call { target, .. } = classify(jsr) else {
+        return None;
+    };
+    if !entries.contains(&target) {
+        return None;
+    }
+    Some(Stmt::Call {
+        name: function_name(target, u64::MAX),
+        args: Vec::new(),
+        bytes: jsr.original_bytes.clone(),
     })
 }
 
