@@ -220,7 +220,9 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
             Stmt::Asm { .. } => n += 1,
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
-            | Stmt::Epilogue { bytes, .. } => {
+            | Stmt::Epilogue { bytes, .. }
+            | Stmt::ReturnExpr { bytes, .. }
+            | Stmt::ArgSpill { bytes, .. } => {
                 let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, bytes, 0)
                     .expect("decode lifted-block bytes");
                 n += insns.len();

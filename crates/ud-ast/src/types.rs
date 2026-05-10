@@ -168,6 +168,22 @@ pub enum Stmt {
     /// (e.g. the return value was computed in an earlier block).
     Epilogue { kind: String, bytes: Vec<u8> },
 
+    /// `@return_expr("text", [bytes])` — a recognised
+    /// "compute-a-value-and-fall-through-to-the-epilogue" block whose
+    /// contents have been lifted into a single human-readable
+    /// expression. The expression text is informational; the pinned
+    /// bytes are the lower path's source of truth, so the original
+    /// instruction stream re-emits exactly even if the expression is
+    /// edited.
+    ReturnExpr { text: String, bytes: Vec<u8> },
+
+    /// `@arg_spill(N, [bytes])` — a recognised SysV-x64 argument
+    /// spill: `mov [rbp+disp], REG_N` where `REG_N` is the integer or
+    /// XMM register holding argument `N` at function entry. The slot
+    /// displacement is recoverable from the pinned bytes, so it
+    /// doesn't appear in the directive shape.
+    ArgSpill { arg_index: u32, bytes: Vec<u8> },
+
     /// A structured `cmp/test + jcc` head plus its two branches:
     ///
     /// ```text

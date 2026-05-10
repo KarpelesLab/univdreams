@@ -26,7 +26,9 @@ use iced_x86::{
 use ud_core::VAddr;
 use ud_ir::ArchInsn;
 
+mod expr;
 mod lift;
+pub use expr::{try_lift_value_block, ExprRenderCtx, LiftedValueBlock, ValueExpr};
 pub use lift::{lift_function, LiftError};
 
 /// If `insn` is a direct (relative) `call` whose target is statically

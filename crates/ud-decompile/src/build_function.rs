@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use ud_arch_x86::{
     arg_spill_index, direct_call_target, direct_unconditional_branch_target, format_intel,
     try_lift_epilogue_pattern, try_lift_if_branch_head, try_lift_prologue_pattern,
-    try_lift_return_pattern, try_lift_return_via_jmp, DecodedInsn,
+    try_lift_return_pattern, try_lift_return_via_jmp, try_lift_value_block, DecodedInsn,
+    ExprRenderCtx,
 };
-use ud_ast::{FnDecl, Param, Signature, Stmt, Type};
+use ud_ast::{FnDecl, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
 use ud_ir::{BasicBlock, Function, Terminator};
 
@@ -28,7 +29,8 @@ pub fn build_function(
         params: d.params.clone(),
         return_type: d.return_type.clone(),
     });
-    let lifts = compute_block_tail_lifts(f, signature.as_ref());
+    let slot_to_name = collect_slot_to_name(f, signature.as_ref());
+    let lifts = compute_block_tail_lifts(f, signature.as_ref(), &slot_to_name, name_at);
     let groups = identify_if_else_groups(f);
 
     let mut body = Vec::new();
@@ -181,7 +183,8 @@ fn emit_block_stmts(
     let tail_consumed = match lift {
         Some(
             BlockTailLift::Return { insns_consumed, .. }
-            | BlockTailLift::Epilogue { insns_consumed, .. },
+            | BlockTailLift::Epilogue { insns_consumed, .. }
+            | BlockTailLift::ReturnExpr { insns_consumed, .. },
         ) => *insns_consumed,
         None => 0,
     };
@@ -191,6 +194,18 @@ fn emit_block_stmts(
         .saturating_sub(tail_consumed + cfg.truncate_trailing);
 
     for insn in &block.insns[prologue_consumed..asm_count] {
+        // Lift `mov [rbp+disp], REG_arg` into `@arg_spill(N, [bytes])`
+        // when the function has a parameter at that arg index. The
+        // directive subsumes both the `@asm` and the
+        // `// arg N: name (type)` comment that the v0 decompiler used
+        // to emit as separate statements.
+        if let Some(arg_index) = arg_spill_lift_index(insn, ctx.signature) {
+            out.push(Stmt::ArgSpill {
+                arg_index,
+                bytes: insn.original_bytes.clone(),
+            });
+            continue;
+        }
         out.push(Stmt::asm(
             format_intel(&insn.iced),
             insn.original_bytes.clone(),
@@ -198,9 +213,6 @@ fn emit_block_stmts(
         if let Some(annotation) =
             call_annotation(insn, ctx.fn_addr_start, ctx.fn_addr_end, ctx.name_at)
         {
-            out.push(Stmt::Comment(annotation));
-        }
-        if let Some(annotation) = arg_spill_annotation(insn, ctx.signature) {
             out.push(Stmt::Comment(annotation));
         }
     }
@@ -226,6 +238,12 @@ fn emit_block_stmts(
             BlockTailLift::Epilogue { kind, .. } => {
                 out.push(Stmt::Epilogue {
                     kind: (*kind).to_string(),
+                    bytes: lifted_bytes,
+                });
+            }
+            BlockTailLift::ReturnExpr { text, .. } => {
+                out.push(Stmt::ReturnExpr {
+                    text: text.clone(),
                     bytes: lifted_bytes,
                 });
             }
@@ -265,13 +283,31 @@ enum BlockTailLift {
         insns_consumed: usize,
         kind: &'static str,
     },
+    /// The whole block models into a value-producing expression that
+    /// lands in EAX/RAX, and the block falls through to a recognised
+    /// epilogue. The lift consumes every instruction in the block;
+    /// `Stmt::ReturnExpr` carries the rendered text.
+    ReturnExpr { insns_consumed: usize, text: String },
 }
 
-/// Per-block: which trailing instructions become a `Stmt::Return` or
-/// `Stmt::Epilogue`?
+/// Per-block: which trailing instructions become a `Stmt::Return`,
+/// `Stmt::Epilogue`, or `Stmt::ReturnExpr`?
+///
+/// Order of preference for non-tail blocks:
+///
+/// 1. `try_lift_return_via_jmp` — recognised `mov eax, IMM; jmp epilogue`
+///    pattern. Folds into `Stmt::Return` with a literal value.
+/// 2. `try_lift_value_block` — entire block models cleanly into a
+///    value expression AND falls through directly to a recognised
+///    epilogue tail. Folds the whole block into `Stmt::ReturnExpr`.
+///
+/// The tail block is unchanged — it tries `try_lift_return_pattern`
+/// then `try_lift_epilogue_pattern`.
 fn compute_block_tail_lifts(
     f: &Function<DecodedInsn>,
     signature: Option<&Signature>,
+    slot_to_name: &HashMap<i64, String>,
+    name_at: &HashMap<u64, String>,
 ) -> Vec<Option<BlockTailLift>> {
     let mut out: Vec<Option<BlockTailLift>> = (0..f.blocks.len()).map(|_| None).collect();
     let Some(last_idx) = f.blocks.len().checked_sub(1) else {
@@ -281,6 +317,8 @@ fn compute_block_tail_lifts(
 
     let return_lift_allowed =
         signature.is_some_and(|s| return_type_is_integer_like(&s.return_type));
+
+    let tail_is_epilogue = try_lift_epilogue_pattern(&f.blocks[last_idx].insns).is_some();
 
     for (i, block) in f.blocks.iter().enumerate() {
         if i == last_idx {
@@ -299,12 +337,37 @@ fn compute_block_tail_lifts(
                     kind: lifted.kind,
                 });
             }
-        } else if return_lift_allowed {
+            continue;
+        }
+
+        if return_lift_allowed {
             if let Some(lifted) = try_lift_return_via_jmp(&block.insns, epilogue_addr) {
                 out[i] = Some(BlockTailLift::Return {
                     insns_consumed: lifted.insns_consumed,
                     value: lifted.value,
                 });
+                continue;
+            }
+        }
+
+        // ReturnExpr: this block falls through directly to the
+        // function's tail block, which itself is a recognised
+        // epilogue. The block's instructions all model into an
+        // expression that lives in EAX at fall-through.
+        if return_lift_allowed && tail_is_epilogue {
+            if let Terminator::Fallthrough = block.terminator {
+                if i + 1 == last_idx {
+                    if let Some(lifted) = try_lift_value_block(&block.insns, name_at) {
+                        let render_ctx = ExprRenderCtx {
+                            slot_to_name,
+                            name_at,
+                        };
+                        out[i] = Some(BlockTailLift::ReturnExpr {
+                            insns_consumed: lifted.insns_consumed,
+                            text: lifted.expr.render(&render_ctx),
+                        });
+                    }
+                }
             }
         }
     }
@@ -370,6 +433,44 @@ fn identify_if_else_groups(f: &Function<DecodedInsn>) -> Vec<Option<IfElseGroup>
     groups
 }
 
+/// Walk the entry block looking for arg-spill instructions
+/// (`mov [rbp+disp], REG_arg`); record `disp -> param_name` for every
+/// match where the function has a named parameter at that arg index.
+///
+/// The map is consumed by [`try_lift_value_block`] via [`ExprRenderCtx`]
+/// so that loads from `[rbp-4]` render as the parameter name (e.g.
+/// `v`) instead of the raw memory operand.
+fn collect_slot_to_name(
+    f: &Function<DecodedInsn>,
+    signature: Option<&Signature>,
+) -> HashMap<i64, String> {
+    let mut out = HashMap::new();
+    let Some(sig) = signature else {
+        return out;
+    };
+    let Some(entry) = f.blocks.first() else {
+        return out;
+    };
+    for insn in &entry.insns {
+        let Some(idx) = arg_spill_index(&insn.iced) else {
+            continue;
+        };
+        let Some(param) = sig.params.get(idx as usize) else {
+            continue;
+        };
+        if param.name.is_empty() {
+            continue;
+        }
+        // The arg-spill helper validates the destination is `[rbp+disp]`,
+        // so memory_displacement64() is meaningful here. Cast u64 -> i64
+        // round-trips two's-complement signed displacements.
+        #[allow(clippy::cast_possible_wrap)]
+        let disp = insn.iced.memory_displacement64() as i64;
+        out.insert(disp, param.name.clone());
+    }
+    out
+}
+
 fn return_type_is_integer_like(t: &Type) -> bool {
     matches!(
         t,
@@ -418,41 +519,18 @@ fn call_annotation(
 }
 
 /// If `insn` is a mov of a SysV-x64 argument register to a stack slot
-/// AND the function has a parameter at that argument's index, return
-/// a comment string naming the parameter. The decompiler appends the
-/// returned string as a `Stmt::Comment` after the insn's `@asm` line.
-fn arg_spill_annotation(insn: &DecodedInsn, signature: Option<&Signature>) -> Option<String> {
+/// AND the function has a (named) parameter at that argument's index,
+/// return the index — the caller emits a `Stmt::ArgSpill`.
+///
+/// The unnamed-parameter case still falls through to `@asm`, since
+/// without a name the spill carries no extra semantic information
+/// over the raw instruction.
+fn arg_spill_lift_index(insn: &DecodedInsn, signature: Option<&Signature>) -> Option<u32> {
     let idx = arg_spill_index(&insn.iced)?;
     let sig = signature?;
     let param = sig.params.get(idx as usize)?;
-    Some(format_param_annotation(idx, param))
-}
-
-fn format_param_annotation(idx: u32, param: &Param) -> String {
-    let ty = format_type(&param.ty);
     if param.name.is_empty() {
-        format!("arg {idx}: {ty}")
-    } else {
-        format!("arg {idx}: {} ({ty})", param.name)
+        return None;
     }
-}
-
-fn format_type(t: &Type) -> String {
-    match t {
-        Type::Void => "void".into(),
-        Type::I8 => "i8".into(),
-        Type::I16 => "i16".into(),
-        Type::I32 => "i32".into(),
-        Type::I64 => "i64".into(),
-        Type::U8 => "u8".into(),
-        Type::U16 => "u16".into(),
-        Type::U32 => "u32".into(),
-        Type::U64 => "u64".into(),
-        Type::F32 => "f32".into(),
-        Type::F64 => "f64".into(),
-        Type::Bool => "bool".into(),
-        Type::Char => "char".into(),
-        Type::Pointer(inner) => format!("ptr<{}>", format_type(inner)),
-        Type::Unknown => "unknown".into(),
-    }
+    Some(idx)
 }

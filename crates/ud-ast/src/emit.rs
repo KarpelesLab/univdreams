@@ -133,6 +133,16 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
         }
+        Stmt::ReturnExpr { text, bytes } => {
+            write!(out, "{indent}@return_expr({}, [", quote_string(text)).unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
+        Stmt::ArgSpill { arg_index, bytes } => {
+            write!(out, "{indent}@arg_spill({arg_index}, [").unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
         Stmt::IfBranch {
             cond_text,
             cond_bytes,

@@ -495,6 +495,32 @@ impl Parser {
                 self.expect(&TokenKind::RParen, "`)` to close `@epilogue`")?;
                 Ok(Stmt::Epilogue { kind, bytes })
             }
+            "return_expr" => {
+                self.expect(&TokenKind::LParen, "`(` after `@return_expr`")?;
+                let text = self.expect_string("return-expr text")?;
+                self.expect(&TokenKind::Comma, "`,` after return-expr text")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@return_expr`")?;
+                Ok(Stmt::ReturnExpr { text, bytes })
+            }
+            "arg_spill" => {
+                self.expect(&TokenKind::LParen, "`(` after `@arg_spill`")?;
+                let idx = self.expect_int("argument index")?;
+                if idx > u64::from(u32::MAX) {
+                    return Err(ParseError::Expected {
+                        expected: "argument index in 0..=u32::MAX".into(),
+                        got: format!("integer 0x{idx:x}"),
+                        line: dir_tok.line,
+                        col: dir_tok.col,
+                    });
+                }
+                self.expect(&TokenKind::Comma, "`,` after argument index")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@arg_spill`")?;
+                #[allow(clippy::cast_possible_truncation)]
+                let arg_index = idx as u32;
+                Ok(Stmt::ArgSpill { arg_index, bytes })
+            }
             "if_branch" => self.parse_if_branch_directive(dir_tok),
             other => Err(ParseError::UnknownDirective {
                 name: other.to_string(),

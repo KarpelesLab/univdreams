@@ -135,7 +135,9 @@ fn verify_stmts(
             // stay correct.
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
-            | Stmt::Epilogue { bytes, .. } => {
+            | Stmt::Epilogue { bytes, .. }
+            | Stmt::ReturnExpr { bytes, .. }
+            | Stmt::ArgSpill { bytes, .. } => {
                 *cursor = cursor.saturating_add(bytes.len() as u64);
             }
             Stmt::IfBranch {
