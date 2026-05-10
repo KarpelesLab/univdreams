@@ -71,11 +71,23 @@ pub struct SourceRoundTripReport {
     /// Offset of the first byte that differs, when the round-trip
     /// failed; `None` when the result is byte-identical.
     pub first_diff_offset: Option<usize>,
+    /// 16-byte excerpts of input and output bytes around the first
+    /// divergence. Populated only on mismatch.
+    pub diff_context: Option<DiffContext>,
     /// `verify_asm` findings produced during the round-trip. Empty
     /// for a clean decompile output; populated when the `.ud`
     /// in-flight had `@asm` lines whose text disagreed with their
     /// pinned bytes.
     pub warnings: Vec<AsmWarning>,
+}
+
+/// 16-byte windows of input vs rebuilt bytes around the first
+/// divergence, with the divergence offset highlighted.
+#[derive(Debug, Clone)]
+pub struct DiffContext {
+    pub window_start: usize,
+    pub input_window: Vec<u8>,
+    pub output_window: Vec<u8>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -121,13 +133,26 @@ pub fn roundtrip_through_source(
     std::fs::write(output, &rebuilt).map_err(SourceRoundTripError::Io)?;
 
     let first_diff_offset = first_byte_diff(&input_bytes, &rebuilt);
+    let diff_context = first_diff_offset.map(|off| make_diff_context(off, &input_bytes, &rebuilt));
     Ok(SourceRoundTripReport {
         byte_identical: first_diff_offset.is_none() && input_bytes.len() == rebuilt.len(),
         input_len: input_bytes.len(),
         output_len: rebuilt.len(),
         first_diff_offset,
+        diff_context,
         warnings,
     })
+}
+
+fn make_diff_context(off: usize, input: &[u8], output: &[u8]) -> DiffContext {
+    let window_start = off.saturating_sub(8);
+    let window_end_in = (off + 8).min(input.len());
+    let window_end_out = (off + 8).min(output.len());
+    DiffContext {
+        window_start,
+        input_window: input[window_start..window_end_in].to_vec(),
+        output_window: output[window_start..window_end_out].to_vec(),
+    }
 }
 
 fn first_byte_diff(a: &[u8], b: &[u8]) -> Option<usize> {

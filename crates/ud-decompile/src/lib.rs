@@ -71,6 +71,10 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
     let map = discover_functions(elf)?;
     let debug_by_addr: HashMap<u64, DebugFunction> = ud_debug::read_debug_info(elf)?;
 
+    // Build an address → name map once; passed to every build_function so
+    // call sites can be annotated with target names.
+    let name_at: HashMap<u64, String> = map.iter().map(|f| (f.addr.0, f.name.clone())).collect();
+
     let mut items = Vec::new();
 
     // Top-level notes for functions we know about but can't body.
@@ -96,7 +100,7 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
         let name = elf
             .section_name(idx)
             .map_or_else(|| format!("section{idx}"), str::to_string);
-        let section_items = build_section_items(elf, sh, data, &map, &debug_by_addr)?;
+        let section_items = build_section_items(elf, sh, data, &map, &debug_by_addr, &name_at)?;
         items.push(Item::Section {
             name,
             addr: sh.sh_addr,
@@ -147,6 +151,7 @@ fn build_section_items(
     data: &[u8],
     map: &FunctionMap,
     debug_by_addr: &HashMap<u64, DebugFunction>,
+    name_at: &HashMap<u64, String>,
 ) -> Result<Vec<Item>> {
     let section_start = sh.sh_addr;
     let section_end = sh.sh_addr.saturating_add(sh.sh_size);
@@ -183,7 +188,7 @@ fn build_section_items(
         let lifted = lift_function(f.name.clone(), &insns)?;
         let debug = debug_by_addr.get(&f.addr.0);
         out.push(Item::Function(build_function::build_function(
-            &lifted, debug,
+            &lifted, debug, name_at,
         )));
         cursor = f.addr.0.saturating_add(f.size);
     }

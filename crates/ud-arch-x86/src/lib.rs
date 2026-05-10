@@ -20,14 +20,40 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Formatter, Instruction,
-    InstructionBlock, IntelFormatter,
+    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, FlowControl, Formatter,
+    Instruction, InstructionBlock, IntelFormatter,
 };
 use ud_core::VAddr;
 use ud_ir::ArchInsn;
 
 mod lift;
 pub use lift::{lift_function, LiftError};
+
+/// If `insn` is a direct (relative) `call` whose target is statically
+/// known, return that target's virtual address. Indirect calls
+/// (`call rax`, `call [rip+…]`) and non-call instructions return
+/// `None`.
+///
+/// Lets downstream code annotate call sites with the destination
+/// function's name without depending on iced directly.
+#[must_use]
+pub fn direct_call_target(insn: &Instruction) -> Option<u64> {
+    match insn.flow_control() {
+        FlowControl::Call => Some(insn.near_branch_target()),
+        _ => None,
+    }
+}
+
+/// Like [`direct_call_target`], but for unconditional direct branches
+/// (`jmp rel32` / `jmp short rel8`). Useful for spotting tail calls
+/// when the target lives in another discovered function.
+#[must_use]
+pub fn direct_unconditional_branch_target(insn: &Instruction) -> Option<u64> {
+    match insn.flow_control() {
+        FlowControl::UnconditionalBranch => Some(insn.near_branch_target()),
+        _ => None,
+    }
+}
 
 /// Format `insn` as Intel-syntax assembly text, suitable for embedding
 /// inside an `@asm("...")` directive in a `.ud` file.

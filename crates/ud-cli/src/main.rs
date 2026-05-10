@@ -78,6 +78,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Roundtrip {
@@ -124,6 +125,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         report.output_len,
                         offset,
                     );
+                    if let Some(ctx) = &report.diff_context {
+                        eprintln!(
+                            "input  @ 0x{:x}: {}",
+                            ctx.window_start,
+                            hex_window(&ctx.input_window)
+                        );
+                        eprintln!(
+                            "output @ 0x{:x}: {}",
+                            ctx.window_start,
+                            hex_window(&ctx.output_window)
+                        );
+                    }
                 }
                 Ok(())
             } else {
@@ -212,4 +225,12 @@ fn format_location(l: &ud_compile::AsmLocation) -> String {
     let section = l.section.as_deref().unwrap_or("<top-level>");
     let function = l.function.as_deref().unwrap_or("<no fn>");
     format!("{section}::{function}#{}", l.stmt_index)
+}
+
+fn hex_window(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
