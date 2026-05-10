@@ -37,12 +37,12 @@ use ud_analysis::{discover_functions, FunctionMap};
 use ud_arch_x86::{decode, lift_function, Bitness};
 use ud_ast::{Item, UdFile};
 use ud_debug::DebugFunction;
-use ud_format_elf::{Elf64File, Shdr64, EM_X86_64};
+use ud_format_elf::{Elf64File, ElfClass, Shdr64, EM_386, EM_X86_64};
 
 /// Errors surfaced by the top-level entry point.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("only ELF64-LE x86_64 inputs are supported; got e_machine = {0}")]
+    #[error("only x86 ELF inputs are supported; got e_machine = {0}")]
     UnsupportedMachine(u16),
 
     #[error(transparent)]
@@ -63,9 +63,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Build the AST for `elf`. The structural form is the primary output
 /// of decompilation; [`decompile_to_text`] is a thin convenience.
 pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
-    if elf.ehdr.e_machine != EM_X86_64 {
-        return Err(Error::UnsupportedMachine(elf.ehdr.e_machine));
-    }
+    let bitness = match (elf.class, elf.ehdr.e_machine) {
+        (ElfClass::Elf64, EM_X86_64) => Bitness::Bits64,
+        (ElfClass::Elf32, EM_386) => Bitness::Bits32,
+        _ => return Err(Error::UnsupportedMachine(elf.ehdr.e_machine)),
+    };
 
     let module = build_module::build_module(elf);
     let map = discover_functions(elf)?;
@@ -100,7 +102,8 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
         let name = elf
             .section_name(idx)
             .map_or_else(|| format!("section{idx}"), str::to_string);
-        let section_items = build_section_items(elf, sh, data, &map, &debug_by_addr, &name_at)?;
+        let section_items =
+            build_section_items(elf, sh, data, &map, &debug_by_addr, &name_at, bitness)?;
         items.push(Item::Section {
             name,
             addr: sh.sh_addr,
@@ -152,6 +155,7 @@ fn build_section_items(
     map: &FunctionMap,
     debug_by_addr: &HashMap<u64, DebugFunction>,
     name_at: &HashMap<u64, String>,
+    bitness: Bitness,
 ) -> Result<Vec<Item>> {
     let section_start = sh.sh_addr;
     let section_end = sh.sh_addr.saturating_add(sh.sh_size);
@@ -184,7 +188,7 @@ fn build_section_items(
         let lo = (f.addr.0 - section_start) as usize;
         let hi = lo + f.size as usize;
         let slice = &data[lo..hi];
-        let insns = decode(Bitness::Bits64, slice, f.addr.0)?;
+        let insns = decode(bitness, slice, f.addr.0)?;
         let lifted = lift_function(f.name.clone(), &insns)?;
         let debug = debug_by_addr.get(&f.addr.0);
         out.push(Item::Function(build_function::build_function(

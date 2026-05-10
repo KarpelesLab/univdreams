@@ -275,8 +275,13 @@ fn is_ident_start(c: char) -> bool {
     c == '_' || c.is_ascii_alphabetic()
 }
 
+/// Identifier continuation chars. `.` is permitted because gcc's
+/// i386 PC-thunk helpers have names like `__x86.get_pc_thunk.bx`,
+/// and our function-name field stores them verbatim. The leading
+/// character is still restricted (no identifier starts with `.`),
+/// which keeps `// foo.bar` from being lexed as an ident.
 fn is_ident_continue(c: char) -> bool {
-    c == '_' || c.is_ascii_alphanumeric()
+    c == '_' || c == '.' || c.is_ascii_alphanumeric()
 }
 
 #[cfg(test)]

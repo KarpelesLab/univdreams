@@ -62,6 +62,9 @@ pub const SHT_RELA: u32 = 4;
 /// `sh_flags` bit indicating the section contains executable instructions.
 pub const SHF_EXECINSTR: u64 = 0x4;
 
+/// `e_machine` value for i386 (32-bit x86).
+pub const EM_386: u16 = 3;
+
 /// `e_machine` value for x86-64.
 pub const EM_X86_64: u16 = 62;
 

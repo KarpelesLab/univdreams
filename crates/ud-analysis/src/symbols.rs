@@ -7,12 +7,14 @@
 //! get filtered out.
 
 use ud_core::VAddr;
-use ud_format_elf::{Elf64File, SHT_DYNSYM, SHT_SYMTAB};
+use ud_format_elf::{Elf64File, ElfClass, SHT_DYNSYM, SHT_SYMTAB};
 
 use crate::function_map::{Function, FunctionSource};
 
 /// On-disk size of an `Elf64_Sym` entry.
 const SYM64_SIZE: usize = 24;
+/// On-disk size of an `Elf32_Sym` entry.
+const SYM32_SIZE: usize = 16;
 
 /// `st_shndx` value indicating an undefined symbol — for instance a
 /// dynamic import that the loader resolves at runtime. We skip these.
@@ -80,20 +82,24 @@ fn collect_one_table(
     out: &mut Vec<Function>,
 ) -> Result<(), SymbolError> {
     let shdr = &elf.shdrs[idx];
+    let entry_size = match elf.class {
+        ElfClass::Elf32 => SYM32_SIZE,
+        ElfClass::Elf64 => SYM64_SIZE,
+    };
 
-    if shdr.sh_entsize != SYM64_SIZE as u64 {
+    if shdr.sh_entsize != entry_size as u64 {
         return Err(SymbolError::BadEntsize {
             idx,
             got: shdr.sh_entsize,
-            expected: SYM64_SIZE as u64,
+            expected: entry_size as u64,
         });
     }
     let table = elf.section_data(idx).unwrap_or(&[]);
-    if table.len() % SYM64_SIZE != 0 {
+    if table.len() % entry_size != 0 {
         return Err(SymbolError::BadTableSize {
             idx,
             size: table.len() as u64,
-            entry: SYM64_SIZE as u64,
+            entry: entry_size as u64,
         });
     }
 
@@ -102,14 +108,11 @@ fn collect_one_table(
         .section_data(strtab_idx)
         .ok_or(SymbolError::BadStrtabIndex { idx, strtab_idx })?;
 
-    for (sym_idx, chunk) in table.chunks_exact(SYM64_SIZE).enumerate() {
-        let st_name = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-        let st_info = chunk[4];
-        // chunk[5] is st_other (visibility) — preserved by the ELF
-        // round-trip but irrelevant to function discovery.
-        let st_shndx = u16::from_le_bytes(chunk[6..8].try_into().unwrap());
-        let st_value = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
-        let st_size = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+    for (sym_idx, chunk) in table.chunks_exact(entry_size).enumerate() {
+        let (st_name, st_info, st_shndx, st_value, st_size) = match elf.class {
+            ElfClass::Elf64 => parse_sym64(chunk),
+            ElfClass::Elf32 => parse_sym32(chunk),
+        };
 
         let st_type = st_info & 0xf;
         if st_type != STT_FUNC && st_type != STT_GNU_IFUNC {
@@ -143,6 +146,37 @@ fn collect_one_table(
         });
     }
     Ok(())
+}
+
+/// Decode an `Elf64_Sym` entry. Field order:
+/// `st_name(4) st_info(1) st_other(1) st_shndx(2) st_value(8) st_size(8)`.
+fn parse_sym64(chunk: &[u8]) -> (u32, u8, u16, u64, u64) {
+    let st_name = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+    let st_info = chunk[4];
+    // chunk[5] is st_other (visibility); preserved on round-trip
+    // but irrelevant to function discovery.
+    let st_shndx = u16::from_le_bytes(chunk[6..8].try_into().unwrap());
+    let st_value = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+    let st_size = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+    (st_name, st_info, st_shndx, st_value, st_size)
+}
+
+/// Decode an `Elf32_Sym` entry. Field order differs from `Elf64_Sym`:
+/// `st_name(4) st_value(4) st_size(4) st_info(1) st_other(1) st_shndx(2)`.
+fn parse_sym32(chunk: &[u8]) -> (u32, u8, u16, u64, u64) {
+    let st_name = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+    let st_value = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+    let st_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+    let st_info = chunk[12];
+    // chunk[13] is st_other.
+    let st_shndx = u16::from_le_bytes(chunk[14..16].try_into().unwrap());
+    (
+        st_name,
+        st_info,
+        st_shndx,
+        u64::from(st_value),
+        u64::from(st_size),
+    )
 }
 
 /// Read a NUL-terminated byte slice starting at `offset` in `strtab`.
