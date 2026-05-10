@@ -206,6 +206,7 @@ mod tests {
         let f = FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
+            signature: None,
             body: vec![
                 Stmt::asm("endbr64", vec![0xf3, 0x0f, 0x1e, 0xfa]),
                 Stmt::asm("ret", vec![0xc3]),
@@ -220,6 +221,7 @@ mod tests {
         let f = FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
+            signature: None,
             body: vec![
                 Stmt::asm("ret", vec![0xc3]),
                 Stmt::Comment("block: 0x1001".into()),
@@ -233,6 +235,7 @@ mod tests {
         let f = FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
+            signature: None,
             body: vec![Stmt::asm_text("ret")],
         };
         let err = lower_function_bytes(&f).unwrap_err();
@@ -255,6 +258,7 @@ mod tests {
             Item::Function(FnDecl {
                 addr: Some(0x1000),
                 name: "f".into(),
+                signature: None,
                 body: vec![Stmt::asm("ret", vec![0xc3])],
             }),
             Item::Raw {
@@ -272,6 +276,7 @@ mod tests {
             Item::Function(FnDecl {
                 addr: Some(0x1000),
                 name: "f".into(),
+                signature: None,
                 body: vec![Stmt::asm("ret", vec![0xc3])],
             }),
             Item::Raw {
@@ -320,12 +325,14 @@ mod tests {
                 Item::Function(FnDecl {
                     addr: Some(0x1000),
                     name: "a".into(),
+                    signature: None,
                     body: vec![Stmt::asm("ret", vec![0xc3])],
                 }),
                 Item::Comment("note: skip me".into()),
                 Item::Function(FnDecl {
                     addr: Some(0x2000),
                     name: "b".into(),
+                    signature: None,
                     body: vec![Stmt::asm("ret", vec![0xc3])],
                 }),
             ],

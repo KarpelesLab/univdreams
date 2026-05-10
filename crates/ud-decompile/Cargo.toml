@@ -18,6 +18,7 @@ ud-ast = { path = "../ud-ast" }
 ud-format-elf = { path = "../ud-format-elf" }
 ud-arch-x86 = { path = "../ud-arch-x86" }
 ud-analysis = { path = "../ud-analysis" }
+ud-debug = { path = "../ud-debug" }
 thiserror = "2"
 
 [dev-dependencies]

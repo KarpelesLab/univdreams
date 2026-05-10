@@ -3,7 +3,7 @@
 //! Expects the canonical-form output of [`ud_ast::emit`] plus minor
 //! whitespace variations. Errors carry a 1-indexed line/column.
 
-use ud_ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
+use ud_ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
 
 use crate::lexer::{tokenize, LexError, Token, TokenKind};
 
@@ -171,6 +171,59 @@ impl Parser {
         Ok(out)
     }
 
+    /// Parse `name: type, name: type, …` (no parentheses; consumes
+    /// up to but not including the closing `)`).
+    fn parse_param_list(&mut self) -> Result<Vec<Param>, ParseError> {
+        let mut out = Vec::new();
+        loop {
+            let name = self.expect_ident("parameter name")?;
+            self.expect(&TokenKind::Colon, "`:` after parameter name")?;
+            let ty = self.parse_type()?;
+            out.push(Param { name, ty });
+            if !self.eat_kind(&TokenKind::Comma) {
+                break;
+            }
+            if self.peek().kind == TokenKind::RParen {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Parse a type token-sequence: a primitive name or `ptr<T>`.
+    fn parse_type(&mut self) -> Result<Type, ParseError> {
+        let tok = self.peek().clone();
+        let name = self.expect_ident("type name")?;
+        match name.as_str() {
+            "void" => Ok(Type::Void),
+            "i8" => Ok(Type::I8),
+            "i16" => Ok(Type::I16),
+            "i32" => Ok(Type::I32),
+            "i64" => Ok(Type::I64),
+            "u8" => Ok(Type::U8),
+            "u16" => Ok(Type::U16),
+            "u32" => Ok(Type::U32),
+            "u64" => Ok(Type::U64),
+            "f32" => Ok(Type::F32),
+            "f64" => Ok(Type::F64),
+            "bool" => Ok(Type::Bool),
+            "char" => Ok(Type::Char),
+            "unknown" => Ok(Type::Unknown),
+            "ptr" => {
+                self.expect(&TokenKind::Lt, "`<` after `ptr`")?;
+                let inner = self.parse_type()?;
+                self.expect(&TokenKind::Gt, "`>` to close `ptr<…>`")?;
+                Ok(Type::Pointer(Box::new(inner)))
+            }
+            other => Err(ParseError::Expected {
+                expected: "a type (void, iN, uN, fN, bool, char, ptr<…>, unknown)".into(),
+                got: format!("identifier `{other}`"),
+                line: tok.line,
+                col: tok.col,
+            }),
+        }
+    }
+
     /// Parse `[byte, byte, …]` where each byte is an integer in 0..=255.
     /// Used by `@asm("text", [bytes])` and (future) `@raw([bytes])`.
     fn parse_byte_list(&mut self) -> Result<Vec<u8>, ParseError> {
@@ -322,8 +375,39 @@ impl Parser {
         }
         let name = self.expect_ident("function name")?;
         self.expect(&TokenKind::LParen, "`(` after function name")?;
-        // v0: no parameters.
+
+        // Parameter list: empty `(...)` means no signature; non-empty
+        // means typed.
+        let params = if self.peek().kind == TokenKind::RParen {
+            None
+        } else {
+            Some(self.parse_param_list()?)
+        };
         self.expect(&TokenKind::RParen, "`)` after parameter list")?;
+
+        // Optional `-> type` for the return type.
+        let return_type = if self.eat_kind(&TokenKind::Arrow) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        let signature = match (params, return_type) {
+            (None, None) => None,
+            (Some(p), Some(r)) => Some(Signature {
+                params: p,
+                return_type: r,
+            }),
+            (Some(p), None) => Some(Signature {
+                params: p,
+                return_type: Type::Void,
+            }),
+            (None, Some(r)) => Some(Signature {
+                params: Vec::new(),
+                return_type: r,
+            }),
+        };
+
         self.expect(&TokenKind::LBrace, "`{` to open function body")?;
 
         let mut body = Vec::new();
@@ -374,7 +458,12 @@ impl Parser {
             }
         }
 
-        Ok(Item::Function(FnDecl { addr, name, body }))
+        Ok(Item::Function(FnDecl {
+            addr,
+            name,
+            signature,
+            body,
+        }))
     }
 }
 
@@ -389,6 +478,9 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Comma => "`,`".into(),
         TokenKind::Colon => "`:`".into(),
         TokenKind::At => "`@`".into(),
+        TokenKind::Arrow => "`->`".into(),
+        TokenKind::Lt => "`<`".into(),
+        TokenKind::Gt => "`>`".into(),
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::String(_) => "a string literal".into(),
         TokenKind::Int(n) => format!("integer 0x{n:x}"),
@@ -526,6 +618,35 @@ fn f() {
             msg.contains("byte value"),
             "expected byte-range error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn function_with_typed_signature() {
+        let src = "@module {}\n\nfn main(argc: i32, argv: ptr<ptr<u8>>) -> i32 {\n}\n";
+        let f = parse(src).unwrap();
+        let Item::Function(fn_) = &f.items[0] else {
+            panic!()
+        };
+        let sig = fn_.signature.as_ref().unwrap();
+        assert_eq!(sig.params.len(), 2);
+        assert_eq!(sig.params[0].name, "argc");
+        assert_eq!(sig.params[0].ty, Type::I32);
+        assert_eq!(sig.params[1].name, "argv");
+        assert_eq!(
+            sig.params[1].ty,
+            Type::Pointer(Box::new(Type::Pointer(Box::new(Type::U8))))
+        );
+        assert_eq!(sig.return_type, Type::I32);
+    }
+
+    #[test]
+    fn function_without_signature() {
+        let src = "@module {}\n\nfn _init() {\n}\n";
+        let f = parse(src).unwrap();
+        let Item::Function(fn_) = &f.items[0] else {
+            panic!()
+        };
+        assert!(fn_.signature.is_none());
     }
 
     #[test]

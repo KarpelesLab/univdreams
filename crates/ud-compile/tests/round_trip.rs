@@ -44,6 +44,7 @@ fn sample_ast() -> UdFile {
             Item::Function(FnDecl {
                 addr: Some(0x1080),
                 name: "_start".into(),
+                signature: None,
                 body: vec![
                     Stmt::asm("endbr64", vec![0xf3, 0x0f, 0x1e, 0xfa]),
                     Stmt::Comment("block: 0x1084".into()),
@@ -54,6 +55,7 @@ fn sample_ast() -> UdFile {
             Item::Function(FnDecl {
                 addr: Some(0x1100),
                 name: "main".into(),
+                signature: None,
                 body: vec![Stmt::asm("ret", vec![0xc3])],
             }),
         ],

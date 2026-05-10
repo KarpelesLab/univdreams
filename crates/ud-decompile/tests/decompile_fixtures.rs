@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ud_ast::{Item, Stmt, UdFile, Value};
+use ud_ast::{Item, Stmt, Type, UdFile, Value};
 use ud_format_elf::{is_elf64_le, Elf64File, EM_X86_64};
 
 fn workspace_root() -> PathBuf {
@@ -145,6 +145,39 @@ fn asm_count_matches_lifted_instruction_count() {
         asm_count, expected,
         "Stmt::Asm count {asm_count} differs from lifted total {expected}"
     );
+}
+
+/// DWARF integration: functions whose source signature lives in
+/// `.debug_info` get typed parameters and a typed return on the
+/// emitted `fn` line. Confirmed against the `do_fac(int) -> int`
+/// signature in sqrt.c.
+#[test]
+fn dwarf_supplies_function_signatures() {
+    let path = workspace_root().join("testdata/sqrt-gcc13-O0");
+    let Some(ast) = ast_for(&path) else { return };
+    let do_fac = find_function(&ast, "do_fac").expect("do_fac present");
+    let sig = do_fac.signature.as_ref().expect("do_fac has a signature");
+    assert_eq!(sig.return_type, Type::I32);
+    assert_eq!(sig.params.len(), 1);
+    assert_eq!(sig.params[0].ty, Type::I32);
+}
+
+fn find_function<'a>(ast: &'a UdFile, name: &str) -> Option<&'a ud_ast::FnDecl> {
+    fn search<'a>(items: &'a [Item], name: &str) -> Option<&'a ud_ast::FnDecl> {
+        for item in items {
+            match item {
+                Item::Function(f) if f.name == name => return Some(f),
+                Item::Section { items, .. } => {
+                    if let Some(f) = search(items, name) {
+                        return Some(f);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    search(&ast.items, name)
 }
 
 /// Source-level round-trip: take the canonical text the decompiler

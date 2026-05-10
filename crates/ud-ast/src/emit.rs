@@ -11,7 +11,7 @@
 
 use std::fmt::Write as _;
 
-use crate::types::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
+use crate::types::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
 
 /// Format an entire AST as canonical `.ud` text. Trailing newline is
 /// included; the file always ends in `\n`.
@@ -83,7 +83,18 @@ fn emit_fn_indented(out: &mut String, f: &FnDecl, depth: usize) {
     if let Some(addr) = f.addr {
         writeln!(out, "{indent}@addr(0x{addr:x})").unwrap();
     }
-    writeln!(out, "{indent}fn {}() {{", f.name).unwrap();
+    write!(out, "{indent}fn {}(", f.name).unwrap();
+    if let Some(sig) = &f.signature {
+        emit_params(out, &sig.params);
+    }
+    write!(out, ")").unwrap();
+    if let Some(sig) = &f.signature {
+        if !matches!(sig.return_type, Type::Void) {
+            write!(out, " -> ").unwrap();
+            emit_type(out, &sig.return_type);
+        }
+    }
+    writeln!(out, " {{").unwrap();
     for stmt in &f.body {
         match stmt {
             Stmt::Asm { text, bytes } if bytes.is_empty() => {
@@ -144,6 +155,44 @@ fn emit_block(out: &mut String, fields: &[Field], depth: usize) {
     out.push_str(&close_indent);
     out.push('}');
 }
+
+fn emit_params(out: &mut String, params: &[Param]) {
+    for (i, p) in params.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write!(out, "{}: ", p.name).unwrap();
+        emit_type(out, &p.ty);
+    }
+}
+
+fn emit_type(out: &mut String, t: &Type) {
+    match t {
+        Type::Void => out.push_str("void"),
+        Type::I8 => out.push_str("i8"),
+        Type::I16 => out.push_str("i16"),
+        Type::I32 => out.push_str("i32"),
+        Type::I64 => out.push_str("i64"),
+        Type::U8 => out.push_str("u8"),
+        Type::U16 => out.push_str("u16"),
+        Type::U32 => out.push_str("u32"),
+        Type::U64 => out.push_str("u64"),
+        Type::F32 => out.push_str("f32"),
+        Type::F64 => out.push_str("f64"),
+        Type::Bool => out.push_str("bool"),
+        Type::Char => out.push_str("char"),
+        Type::Pointer(inner) => {
+            out.push_str("ptr<");
+            emit_type(out, inner);
+            out.push('>');
+        }
+        Type::Unknown => out.push_str("unknown"),
+    }
+}
+
+// Suppress unused-when-no-signature warning by referencing in tests below.
+#[allow(dead_code)]
+fn _signature_used(_: &Signature) {}
 
 /// Quote a string for `.ud` output: surround in `"…"`, escape backslash
 /// and double-quote.
@@ -243,6 +292,7 @@ mod tests {
             items: vec![Item::Function(FnDecl {
                 addr: Some(0x1080),
                 name: "_start".into(),
+                signature: None,
                 body: vec![
                     Stmt::asm_text("endbr64"),
                     Stmt::Comment("block: 0x1084".into()),
@@ -264,6 +314,7 @@ mod tests {
             items: vec![Item::Function(FnDecl {
                 addr: Some(0x1080),
                 name: "f".into(),
+                signature: None,
                 body: vec![
                     Stmt::asm("endbr64", vec![0xf3, 0x0f, 0x1e, 0xfa]),
                     Stmt::asm("ret", vec![0xc3]),
@@ -299,6 +350,7 @@ mod tests {
                     Item::Function(FnDecl {
                         addr: Some(0x1000),
                         name: "f".into(),
+                        signature: None,
                         body: vec![Stmt::asm("ret", vec![0xc3])],
                     }),
                     Item::Raw {

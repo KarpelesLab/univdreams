@@ -1,7 +1,8 @@
 //! Build the `FnDecl` AST node for a lifted function.
 
 use ud_arch_x86::{format_intel, DecodedInsn};
-use ud_ast::{FnDecl, Stmt};
+use ud_ast::{FnDecl, Signature, Stmt};
+use ud_debug::DebugFunction;
 use ud_ir::{Function, Terminator};
 
 /// Convert a lifted [`Function`] into the AST's [`FnDecl`].
@@ -12,7 +13,7 @@ use ud_ir::{Function, Terminator};
 /// surfacing the targets. Indirect / return / unreachable blocks need
 /// no annotation since the asm text already says so.
 #[must_use]
-pub fn build_function(f: &Function<DecodedInsn>) -> FnDecl {
+pub fn build_function(f: &Function<DecodedInsn>, debug: Option<&DebugFunction>) -> FnDecl {
     let mut body = Vec::new();
     for (i, block) in f.blocks.iter().enumerate() {
         if i > 0 {
@@ -40,9 +41,14 @@ pub fn build_function(f: &Function<DecodedInsn>) -> FnDecl {
             | Terminator::Fallthrough => {}
         }
     }
+    let signature = debug.map(|d| Signature {
+        params: d.params.clone(),
+        return_type: d.return_type.clone(),
+    });
     FnDecl {
         addr: Some(f.addr.0),
         name: f.name.clone(),
+        signature,
         body,
     }
 }

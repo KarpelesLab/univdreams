@@ -29,6 +29,12 @@ pub enum TokenKind {
     Colon,
     /// `@`
     At,
+    /// `->` (return-type arrow)
+    Arrow,
+    /// `<` (type-parameter open)
+    Lt,
+    /// `>` (type-parameter close)
+    Gt,
     /// An identifier or keyword.
     Ident(String),
     /// A double-quoted string literal (already unescaped).
@@ -146,6 +152,12 @@ impl<'a> Lexer<'a> {
             ',' => TokenKind::Comma,
             ':' => TokenKind::Colon,
             '@' => TokenKind::At,
+            '-' if self.peek_char() == Some('>') => {
+                self.bump(); // consume '>'
+                TokenKind::Arrow
+            }
+            '<' => TokenKind::Lt,
+            '>' => TokenKind::Gt,
             '/' if self.peek_char() == Some('/') => {
                 self.bump(); // consume the second '/'
                 self.read_line_comment()

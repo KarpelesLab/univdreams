@@ -31,9 +31,12 @@
 mod build_function;
 mod build_module;
 
+use std::collections::HashMap;
+
 use ud_analysis::{discover_functions, FunctionMap};
 use ud_arch_x86::{decode, lift_function, Bitness};
 use ud_ast::{Item, UdFile};
+use ud_debug::DebugFunction;
 use ud_format_elf::{Elf64File, Shdr64, EM_X86_64};
 
 /// Errors surfaced by the top-level entry point.
@@ -50,6 +53,9 @@ pub enum Error {
 
     #[error(transparent)]
     Lift(#[from] ud_arch_x86::LiftError),
+
+    #[error(transparent)]
+    Debug(#[from] ud_debug::DebugError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -63,6 +69,7 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
 
     let module = build_module::build_module(elf);
     let map = discover_functions(elf)?;
+    let debug_by_addr: HashMap<u64, DebugFunction> = ud_debug::read_debug_info(elf)?;
 
     let mut items = Vec::new();
 
@@ -89,7 +96,7 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
         let name = elf
             .section_name(idx)
             .map_or_else(|| format!("section{idx}"), str::to_string);
-        let section_items = build_section_items(elf, sh, data, &map)?;
+        let section_items = build_section_items(elf, sh, data, &map, &debug_by_addr)?;
         items.push(Item::Section {
             name,
             addr: sh.sh_addr,
@@ -139,6 +146,7 @@ fn build_section_items(
     sh: &Shdr64,
     data: &[u8],
     map: &FunctionMap,
+    debug_by_addr: &HashMap<u64, DebugFunction>,
 ) -> Result<Vec<Item>> {
     let section_start = sh.sh_addr;
     let section_end = sh.sh_addr.saturating_add(sh.sh_size);
@@ -173,7 +181,10 @@ fn build_section_items(
         let slice = &data[lo..hi];
         let insns = decode(Bitness::Bits64, slice, f.addr.0)?;
         let lifted = lift_function(f.name.clone(), &insns)?;
-        out.push(Item::Function(build_function::build_function(&lifted)));
+        let debug = debug_by_addr.get(&f.addr.0);
+        out.push(Item::Function(build_function::build_function(
+            &lifted, debug,
+        )));
         cursor = f.addr.0.saturating_add(f.size);
     }
 

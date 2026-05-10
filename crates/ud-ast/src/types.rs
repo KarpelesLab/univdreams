@@ -68,9 +68,9 @@ pub enum Item {
 
 /// A function declaration.
 ///
-/// v0 has no parameters or return type yet — the body is a sequence of
-/// `@asm("…")` directives and comments. Future iterations expand the
-/// surface to typed parameters, return types, and structured statements.
+/// `signature` carries typed parameters and return type when known
+/// (e.g. recovered from DWARF). When absent, the function emits as
+/// `fn name() { … }` and behaves as untyped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnDecl {
     /// Optional `@addr(0x…)` directive preceding `fn`. Required for
@@ -79,7 +79,51 @@ pub struct FnDecl {
     /// clarity.
     pub addr: Option<u64>,
     pub name: String,
+    /// Typed parameters and return type, when known.
+    pub signature: Option<Signature>,
     pub body: Vec<Stmt>,
+}
+
+/// A function signature: parameter list + return type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    pub params: Vec<Param>,
+    pub return_type: Type,
+}
+
+/// One typed parameter in a function signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    pub name: String,
+    pub ty: Type,
+}
+
+/// A type expressible in `.ud` source.
+///
+/// v0 covers C-like primitives plus single-level pointer wrapping.
+/// Anything we can't recover (composite types, qualifiers, function
+/// pointers) lands as [`Type::Unknown`], which the parser still
+/// accepts so the round-trip closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Type {
+    Void,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
+    Bool,
+    Char,
+    /// `ptr<T>` — pointer to `T`.
+    Pointer(Box<Type>),
+    /// A type the source language can't yet express. Round-trips
+    /// verbatim as the literal token `unknown`.
+    Unknown,
 }
 
 /// A statement inside a function body.
