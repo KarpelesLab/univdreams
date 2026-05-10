@@ -245,8 +245,8 @@ fn build_stmt_slice(
             i = target_idx;
             continue;
         }
-        // 3. LDA #imm; JSR known_target → @call with A=#$imm.
-        if let Some(call_stmt) = try_lift_imm_call(local, i, entries) {
+        // 3. LDA <src>; JSR known_target → @call with A=<src>.
+        if let Some(call_stmt) = try_lift_imm_call(local, i, entries, resolver) {
             out.push(call_stmt);
             i += 2;
             continue;
@@ -292,12 +292,25 @@ fn build_stmt_slice(
     out
 }
 
-/// If `local[i]` is `LDA #imm` and `local[i+1]` is a `JSR target`
-/// where `target` is a function entry, return a `Stmt::Call` for the
-/// combined two-instruction sequence.
-fn try_lift_imm_call(local: &[&DecodedInsn], i: usize, entries: &HashSet<u64>) -> Option<Stmt> {
+/// If `local[i]` is `LDA <anything>` (immediate, zero-page,
+/// absolute, …) and `local[i+1]` is `JSR target` where `target`
+/// is a function entry, return a `Stmt::Call` for the combined
+/// two-instruction sequence. The arg renders as `"A=<src>"` —
+/// `"A=#$0D"` for immediate, `"A=KBD"` / `"A=XAMH"` etc. for memory.
+fn try_lift_imm_call(
+    local: &[&DecodedInsn],
+    i: usize,
+    entries: &HashSet<u64>,
+    resolver: SymbolResolver,
+) -> Option<Stmt> {
     let lda = local.get(i)?;
-    if lda.mnemonic != Mnemonic::LDA || lda.mode != AddressingMode::Immediate {
+    if lda.mnemonic != Mnemonic::LDA {
+        return None;
+    }
+    if matches!(
+        lda.mode,
+        AddressingMode::Implied | AddressingMode::Accumulator | AddressingMode::IllegalOperand
+    ) {
         return None;
     }
     let jsr = local.get(i + 1)?;
@@ -309,9 +322,10 @@ fn try_lift_imm_call(local: &[&DecodedInsn], i: usize, entries: &HashSet<u64>) -
     }
     let mut bytes = lda.original_bytes.clone();
     bytes.extend_from_slice(&jsr.original_bytes);
+    let src_text = format_operand(lda, resolver);
     Some(Stmt::Call {
         name: function_name(target, u64::MAX),
-        args: vec![format!("A=#${:02X}", lda.operand)],
+        args: vec![format!("A={src_text}")],
         bytes,
     })
 }
