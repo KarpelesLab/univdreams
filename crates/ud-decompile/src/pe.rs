@@ -146,14 +146,25 @@ fn build_pe_module(pe: &PeFile) -> Module {
 /// `@section`) — the format lower path identifies them via the
 /// section table in `@module.build.sections` rather than via
 /// structural nesting.
+///
+/// Within a code section, the section's flat `@raw` is split by
+/// COFF function boundaries: each detected function gets its own
+/// `@raw` preceded by a `// fn <name> at 0x<rva>` comment.
+/// Inter-function gaps (alignment, unknown content) get their own
+/// `@raw` blocks. Round-trip is unchanged because the lower path
+/// concatenates `@raw` blocks in offset order.
 fn build_pe_items(pe: &PeFile) -> Vec<Item> {
     let bytes = pe.raw_bytes();
     let mut items: Vec<Item> = Vec::new();
 
+    // Group functions by section index for fast lookup when we
+    // emit each section's bytes.
+    let funcs_by_section = group_functions_by_section(pe);
+
     // Collect structured byte regions in file-offset order. Each
-    // region is `(start, end_exclusive)` — `[start, end)`.
-    let mut regions: Vec<(usize, usize)> = Vec::new();
-    for s in &pe.sections {
+    // region is `(start, end_exclusive, section_idx)`.
+    let mut regions: Vec<(usize, usize, usize)> = Vec::new();
+    for (idx, s) in pe.sections.iter().enumerate() {
         let start = s.pointer_to_raw_data as usize;
         let size = s.size_of_raw_data as usize;
         if size == 0 {
@@ -163,12 +174,12 @@ fn build_pe_items(pe: &PeFile) -> Vec<Item> {
         if end > bytes.len() {
             continue; // skip out-of-range section data
         }
-        regions.push((start, end));
+        regions.push((start, end, idx));
     }
-    regions.sort_unstable();
+    regions.sort_unstable_by_key(|(start, _, _)| *start);
 
     let mut cursor = 0usize;
-    for (start, end) in &regions {
+    for (start, end, sec_idx) in &regions {
         if *start > cursor {
             // Pre-section gap (DOS header, COFF, optional header,
             // section table, alignment). Stored as one big `@raw`.
@@ -177,11 +188,14 @@ fn build_pe_items(pe: &PeFile) -> Vec<Item> {
                 bytes: bytes[cursor..*start].to_vec(),
             });
         }
-        // The section's bytes themselves.
-        items.push(Item::Raw {
-            addr: *start as u64,
-            bytes: bytes[*start..*end].to_vec(),
-        });
+        if let Some(funcs) = funcs_by_section.get(sec_idx) {
+            emit_section_with_function_split(pe, *sec_idx, *start, *end, funcs, bytes, &mut items);
+        } else {
+            items.push(Item::Raw {
+                addr: *start as u64,
+                bytes: bytes[*start..*end].to_vec(),
+            });
+        }
         cursor = *end;
     }
 
@@ -193,6 +207,118 @@ fn build_pe_items(pe: &PeFile) -> Vec<Item> {
     }
 
     items
+}
+
+/// Function record local to this module: the COFF symbol's name plus
+/// the function's offset within its section (the COFF symbol's
+/// `value` field) and the RVA derived from the section's
+/// `virtual_address`. We carry the RVA explicitly so the rendered
+/// comment names the user-visible address rather than the file
+/// offset.
+struct PeFunctionRecord {
+    name: String,
+    section_offset: u32,
+    rva: u32,
+}
+
+fn group_functions_by_section(
+    pe: &PeFile,
+) -> std::collections::HashMap<usize, Vec<PeFunctionRecord>> {
+    let mut out: std::collections::HashMap<usize, Vec<PeFunctionRecord>> =
+        std::collections::HashMap::new();
+    for sym in pe.coff_symbols() {
+        if !is_code_function(pe, &sym) {
+            continue;
+        }
+        // is_code_function rejects section_number <= 0 already.
+        #[allow(clippy::cast_sign_loss)]
+        let idx = (sym.section_number - 1) as usize;
+        let Some(sh) = pe.sections.get(idx) else {
+            continue;
+        };
+        let rva = sh.virtual_address.wrapping_add(sym.value);
+        out.entry(idx).or_default().push(PeFunctionRecord {
+            name: sym.name,
+            section_offset: sym.value,
+            rva,
+        });
+    }
+    for v in out.values_mut() {
+        v.sort_by_key(|f| f.section_offset);
+        v.dedup_by(|a, b| a.section_offset == b.section_offset && a.name == b.name);
+    }
+    out
+}
+
+/// Emit one section whose contents are split by COFF function
+/// boundaries. Each function gets a leading `// fn <name> at <rva>`
+/// comment followed by an `@raw` covering its bytes; pre/inter/post-
+/// function gaps (alignment, unknown content) get their own `@raw`
+/// blocks so the byte coverage stays exhaustive.
+fn emit_section_with_function_split(
+    pe: &PeFile,
+    sec_idx: usize,
+    start: usize,
+    end: usize,
+    funcs: &[PeFunctionRecord],
+    bytes: &[u8],
+    items: &mut Vec<Item>,
+) {
+    let _ = &pe.sections[sec_idx]; // bounds check; structural fields used via section_name below
+    let section_size = (end - start) as u32;
+
+    // Emit leading gap before the first function.
+    let first_off = funcs
+        .first()
+        .map_or(section_size, |f| f.section_offset.min(section_size));
+    if first_off > 0 {
+        let lo = start;
+        let hi = start + first_off as usize;
+        items.push(Item::Raw {
+            addr: lo as u64,
+            bytes: bytes[lo..hi].to_vec(),
+        });
+    }
+
+    for (i, f) in funcs.iter().enumerate() {
+        let off = f.section_offset.min(section_size);
+        let next_off = funcs
+            .get(i + 1)
+            .map_or(section_size, |n| n.section_offset.min(section_size));
+        if next_off <= off {
+            continue; // zero-size or stacked symbols
+        }
+        let lo = start + off as usize;
+        let hi = start + next_off as usize;
+        let section_name = pe.section_name(sec_idx).unwrap_or_default();
+        items.push(Item::Comment(format!(
+            "fn {} at {section_name}+0x{off:x} (rva 0x{:x}, {} bytes)",
+            f.name,
+            f.rva,
+            hi - lo,
+        )));
+        items.push(Item::Raw {
+            addr: lo as u64,
+            bytes: bytes[lo..hi].to_vec(),
+        });
+    }
+
+    // Emit trailing gap after the last function.
+    let last_end = funcs.last().map_or(0u32, |f| {
+        // The last function's end is the next-symbol boundary,
+        // which the loop above used as `section_size`. So the
+        // trailing gap is empty unless the last symbol's offset
+        // was past section_size (defensive).
+        let off = f.section_offset.min(section_size);
+        off.max(section_size)
+    });
+    if (last_end as usize) < (end - start) {
+        let lo = start + last_end as usize;
+        items.push(Item::Raw {
+            addr: lo as u64,
+            bytes: bytes[lo..end].to_vec(),
+        });
+    }
 }
 
 fn field(name: &str, value: Value) -> Field {
