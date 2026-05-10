@@ -362,7 +362,6 @@ impl Parser {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn parse_fn(&mut self, addr: Option<u64>) -> Result<Item, ParseError> {
         let kw_tok = self.peek().clone();
         let kw = self.expect_ident("`fn`")?;
@@ -410,14 +409,24 @@ impl Parser {
         };
 
         self.expect(&TokenKind::LBrace, "`{` to open function body")?;
+        let body = self.parse_stmt_list_until_rbrace()?;
+        self.expect(&TokenKind::RBrace, "`}` to close function body")?;
 
+        Ok(Item::Function(FnDecl {
+            addr,
+            name,
+            signature,
+            body,
+        }))
+    }
+
+    /// Parse a sequence of statements until a `}` is the next token
+    /// (or end of input). Does NOT consume the `}` — caller does.
+    fn parse_stmt_list_until_rbrace(&mut self) -> Result<Vec<Stmt>, ParseError> {
         let mut body = Vec::new();
         loop {
             match self.peek().kind.clone() {
-                TokenKind::RBrace => {
-                    self.bump();
-                    break;
-                }
+                TokenKind::RBrace => break,
                 TokenKind::Eof => return Err(ParseError::UnexpectedEof),
                 TokenKind::Comment(text) => {
                     self.bump();
@@ -427,50 +436,8 @@ impl Parser {
                     self.bump();
                     let dir_tok = self.peek().clone();
                     let dir_name = self.expect_ident("statement directive name")?;
-                    match dir_name.as_str() {
-                        "asm" => {
-                            self.expect(&TokenKind::LParen, "`(` after `@asm`")?;
-                            let text = self.expect_string("asm string")?;
-                            let bytes = if self.eat_kind(&TokenKind::Comma) {
-                                self.parse_byte_list()?
-                            } else {
-                                Vec::new()
-                            };
-                            self.expect(&TokenKind::RParen, "`)` to close `@asm`")?;
-                            body.push(Stmt::Asm { text, bytes });
-                        }
-                        "return" => {
-                            self.expect(&TokenKind::LParen, "`(` after `@return`")?;
-                            let value = self.expect_int("return value (integer literal)")?;
-                            self.expect(&TokenKind::Comma, "`,` after return value")?;
-                            let bytes = self.parse_byte_list()?;
-                            self.expect(&TokenKind::RParen, "`)` to close `@return`")?;
-                            body.push(Stmt::Return { value, bytes });
-                        }
-                        "prologue" => {
-                            self.expect(&TokenKind::LParen, "`(` after `@prologue`")?;
-                            let kind = self.expect_string("prologue kind string")?;
-                            self.expect(&TokenKind::Comma, "`,` after prologue kind")?;
-                            let bytes = self.parse_byte_list()?;
-                            self.expect(&TokenKind::RParen, "`)` to close `@prologue`")?;
-                            body.push(Stmt::Prologue { kind, bytes });
-                        }
-                        "epilogue" => {
-                            self.expect(&TokenKind::LParen, "`(` after `@epilogue`")?;
-                            let kind = self.expect_string("epilogue kind string")?;
-                            self.expect(&TokenKind::Comma, "`,` after epilogue kind")?;
-                            let bytes = self.parse_byte_list()?;
-                            self.expect(&TokenKind::RParen, "`)` to close `@epilogue`")?;
-                            body.push(Stmt::Epilogue { kind, bytes });
-                        }
-                        other => {
-                            return Err(ParseError::UnknownDirective {
-                                name: other.to_string(),
-                                line: dir_tok.line,
-                                col: dir_tok.col,
-                            });
-                        }
-                    }
+                    let stmt = self.parse_stmt_at_directive(&dir_name, &dir_tok)?;
+                    body.push(stmt);
                 }
                 other => {
                     return Err(ParseError::Expected {
@@ -482,13 +449,158 @@ impl Parser {
                 }
             }
         }
+        Ok(body)
+    }
 
-        Ok(Item::Function(FnDecl {
-            addr,
-            name,
-            signature,
-            body,
-        }))
+    /// Dispatch on the directive name after a leading `@` inside a
+    /// statement context (function body or if-branch arm).
+    fn parse_stmt_at_directive(
+        &mut self,
+        dir_name: &str,
+        dir_tok: &Token,
+    ) -> Result<Stmt, ParseError> {
+        match dir_name {
+            "asm" => {
+                self.expect(&TokenKind::LParen, "`(` after `@asm`")?;
+                let text = self.expect_string("asm string")?;
+                let bytes = if self.eat_kind(&TokenKind::Comma) {
+                    self.parse_byte_list()?
+                } else {
+                    Vec::new()
+                };
+                self.expect(&TokenKind::RParen, "`)` to close `@asm`")?;
+                Ok(Stmt::Asm { text, bytes })
+            }
+            "return" => {
+                self.expect(&TokenKind::LParen, "`(` after `@return`")?;
+                let value = self.expect_int("return value (integer literal)")?;
+                self.expect(&TokenKind::Comma, "`,` after return value")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@return`")?;
+                Ok(Stmt::Return { value, bytes })
+            }
+            "prologue" => {
+                self.expect(&TokenKind::LParen, "`(` after `@prologue`")?;
+                let kind = self.expect_string("prologue kind string")?;
+                self.expect(&TokenKind::Comma, "`,` after prologue kind")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@prologue`")?;
+                Ok(Stmt::Prologue { kind, bytes })
+            }
+            "epilogue" => {
+                self.expect(&TokenKind::LParen, "`(` after `@epilogue`")?;
+                let kind = self.expect_string("epilogue kind string")?;
+                self.expect(&TokenKind::Comma, "`,` after epilogue kind")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@epilogue`")?;
+                Ok(Stmt::Epilogue { kind, bytes })
+            }
+            "if_branch" => self.parse_if_branch_directive(dir_tok),
+            other => Err(ParseError::UnknownDirective {
+                name: other.to_string(),
+                line: dir_tok.line,
+                col: dir_tok.col,
+            }),
+        }
+    }
+
+    /// Parse `@if_branch("cond", [bytes]) { @then { … } @else { … } }`
+    /// after the `@if_branch` directive name has already been consumed.
+    /// Both `@then` and `@else` arms are required and may appear in
+    /// either order.
+    fn parse_if_branch_directive(&mut self, dir_tok: &Token) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::LParen, "`(` after `@if_branch`")?;
+        let cond_text = self.expect_string("if-branch cond text")?;
+        self.expect(&TokenKind::Comma, "`,` after if-branch cond text")?;
+        let cond_bytes = self.parse_byte_list()?;
+        self.expect(&TokenKind::RParen, "`)` to close `@if_branch` head")?;
+        self.expect(&TokenKind::LBrace, "`{` to open `@if_branch` body")?;
+
+        let mut then_body: Option<Vec<Stmt>> = None;
+        let mut else_body: Option<Vec<Stmt>> = None;
+
+        loop {
+            match self.peek().kind.clone() {
+                TokenKind::RBrace => {
+                    self.bump();
+                    break;
+                }
+                TokenKind::Eof => return Err(ParseError::UnexpectedEof),
+                TokenKind::Comment(_) => {
+                    self.bump(); // tolerate comments between arms; they're not retained
+                }
+                TokenKind::At => {
+                    self.bump();
+                    let arm_tok = self.peek().clone();
+                    let arm_name = self.expect_ident("`then` or `else` after `@`")?;
+                    match arm_name.as_str() {
+                        "then" => {
+                            if then_body.is_some() {
+                                return Err(ParseError::Expected {
+                                    expected: "exactly one `@then` arm".into(),
+                                    got: "duplicate `@then`".into(),
+                                    line: arm_tok.line,
+                                    col: arm_tok.col,
+                                });
+                            }
+                            self.expect(&TokenKind::LBrace, "`{` to open `@then` arm")?;
+                            let body = self.parse_stmt_list_until_rbrace()?;
+                            self.expect(&TokenKind::RBrace, "`}` to close `@then` arm")?;
+                            then_body = Some(body);
+                        }
+                        "else" => {
+                            if else_body.is_some() {
+                                return Err(ParseError::Expected {
+                                    expected: "exactly one `@else` arm".into(),
+                                    got: "duplicate `@else`".into(),
+                                    line: arm_tok.line,
+                                    col: arm_tok.col,
+                                });
+                            }
+                            self.expect(&TokenKind::LBrace, "`{` to open `@else` arm")?;
+                            let body = self.parse_stmt_list_until_rbrace()?;
+                            self.expect(&TokenKind::RBrace, "`}` to close `@else` arm")?;
+                            else_body = Some(body);
+                        }
+                        other => {
+                            return Err(ParseError::UnknownDirective {
+                                name: other.to_string(),
+                                line: arm_tok.line,
+                                col: arm_tok.col,
+                            });
+                        }
+                    }
+                }
+                other => {
+                    return Err(ParseError::Expected {
+                        expected: "`@then`, `@else`, or `}`".into(),
+                        got: describe(&other),
+                        line: self.peek().line,
+                        col: self.peek().col,
+                    });
+                }
+            }
+        }
+
+        let then_body = then_body.ok_or_else(|| ParseError::Expected {
+            expected: "`@then` arm inside `@if_branch`".into(),
+            got: "neither `@then` nor `@else` provided".into(),
+            line: dir_tok.line,
+            col: dir_tok.col,
+        })?;
+        let else_body = else_body.ok_or_else(|| ParseError::Expected {
+            expected: "`@else` arm inside `@if_branch`".into(),
+            got: "missing `@else` arm".into(),
+            line: dir_tok.line,
+            col: dir_tok.col,
+        })?;
+
+        Ok(Stmt::IfBranch {
+            cond_text,
+            cond_bytes,
+            then_body,
+            else_body,
+        })
     }
 }
 
@@ -709,6 +821,88 @@ fn f() {
         assert_eq!(items.len(), 2);
         assert!(matches!(items[0], Item::Function(_)));
         assert!(matches!(items[1], Item::Raw { .. }));
+    }
+
+    #[test]
+    fn if_branch_with_then_and_else_arms() {
+        let src = r#"@module {}
+
+fn f() {
+    @if_branch("cmp [rbp-4],1; jne", [0x83, 0x7d, 0xfc, 0x01, 0x75, 0x07]) {
+        @then {
+            @asm("ret", [0xc3])
+        }
+        @else {
+            @asm("nop", [0x90])
+        }
+    }
+}
+"#;
+        let f = parse(src).unwrap();
+        let Item::Function(fn_) = &f.items[0] else {
+            panic!()
+        };
+        assert_eq!(fn_.body.len(), 1);
+        let Stmt::IfBranch {
+            cond_text,
+            cond_bytes,
+            then_body,
+            else_body,
+        } = &fn_.body[0]
+        else {
+            panic!("expected IfBranch, got {:?}", fn_.body[0]);
+        };
+        assert_eq!(cond_text, "cmp [rbp-4],1; jne");
+        assert_eq!(cond_bytes, &vec![0x83, 0x7d, 0xfc, 0x01, 0x75, 0x07]);
+        assert_eq!(then_body.len(), 1);
+        assert_eq!(else_body.len(), 1);
+        assert_eq!(then_body[0], Stmt::asm("ret", vec![0xc3]));
+        assert_eq!(else_body[0], Stmt::asm("nop", vec![0x90]));
+    }
+
+    #[test]
+    fn if_branch_arms_can_be_in_either_order() {
+        let src = r#"@module {}
+
+fn f() {
+    @if_branch("test eax,eax; je", [0x85, 0xc0, 0x74, 0x01]) {
+        @else { @asm("nop", [0x90]) }
+        @then { @asm("ret", [0xc3]) }
+    }
+}
+"#;
+        let f = parse(src).unwrap();
+        let Item::Function(fn_) = &f.items[0] else {
+            panic!()
+        };
+        let Stmt::IfBranch {
+            then_body,
+            else_body,
+            ..
+        } = &fn_.body[0]
+        else {
+            panic!()
+        };
+        assert_eq!(then_body[0], Stmt::asm("ret", vec![0xc3]));
+        assert_eq!(else_body[0], Stmt::asm("nop", vec![0x90]));
+    }
+
+    #[test]
+    fn if_branch_missing_else_arm_errors() {
+        let src = r#"@module {}
+
+fn f() {
+    @if_branch("c", [0x90]) {
+        @then { @asm("ret", [0xc3]) }
+    }
+}
+"#;
+        let err = parse(src).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@else"),
+            "expected `@else` mention in error, got: {msg}"
+        );
     }
 
     #[test]

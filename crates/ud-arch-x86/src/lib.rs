@@ -276,6 +276,70 @@ pub fn try_lift_return_via_jmp(insns: &[DecodedInsn], epilogue_addr: u64) -> Opt
     })
 }
 
+/// One recognised `cmp/test + jcc` pair at the tail of a basic block,
+/// suitable for lifting into a structured `if/else` directive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiftedIfBranchHead {
+    /// Number of trailing instructions matched. Always 2 in v0
+    /// (one comparison + one conditional jump).
+    pub insns_consumed: usize,
+    /// Human-readable form of the head, e.g.
+    /// `"cmp dword ptr [rbp-4],1; jne short 11F6h"`.
+    pub cond_text: String,
+    /// Raw encoded bytes of the comparison and conditional jump,
+    /// concatenated. The lower path emits these unchanged.
+    pub cond_bytes: Vec<u8>,
+    /// Absolute virtual address the jcc transfers control to when
+    /// taken. Used to find the "taken" basic block in the CFG.
+    pub jcc_target: u64,
+}
+
+/// Try to recognise the trailing two instructions of `insns` as a
+/// `cmp` (or `test`) followed by a direct conditional jump.
+///
+/// Returns `None` when the pair doesn't fit; in particular the jcc
+/// must be a *direct* conditional branch with a constant near target —
+/// indirect / unsupported jcc forms aren't lifted because we can't
+/// statically point at a "taken" block address.
+///
+/// The function does not look further back than the last two
+/// instructions; chained comparisons or short-circuit boolean rebuilds
+/// are out of scope for v0.
+#[must_use]
+pub fn try_lift_if_branch_head(insns: &[DecodedInsn]) -> Option<LiftedIfBranchHead> {
+    if insns.len() < 2 {
+        return None;
+    }
+    let cmp = &insns[insns.len() - 2];
+    let jcc = &insns[insns.len() - 1];
+
+    if !matches!(cmp.iced.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
+        return None;
+    }
+    if jcc.iced.flow_control() != FlowControl::ConditionalBranch {
+        return None;
+    }
+    // Only direct jcc — `near_branch_target()` is meaningful only for
+    // direct near branches; indirect forms (rare for jcc but possible
+    // in obfuscated code) would return 0 or a stale value.
+    let target = jcc.iced.near_branch_target();
+    if target == 0 {
+        return None;
+    }
+
+    let cond_text = format!("{}; {}", format_intel(&cmp.iced), format_intel(&jcc.iced));
+    let mut cond_bytes = Vec::with_capacity(cmp.original_bytes.len() + jcc.original_bytes.len());
+    cond_bytes.extend_from_slice(&cmp.original_bytes);
+    cond_bytes.extend_from_slice(&jcc.original_bytes);
+
+    Some(LiftedIfBranchHead {
+        insns_consumed: 2,
+        cond_text,
+        cond_bytes,
+        jcc_target: target,
+    })
+}
+
 /// If `insn` is an "argument spill" — `mov [rbp+disp], REG` (or
 /// `movss/movsd [rbp+disp], xmm`) where `REG` is one of the SysV
 /// x86-64 argument-passing registers — return that argument's
@@ -911,5 +975,48 @@ mod tests {
             roundtrip_bytes(Bitness::Bits64, &bytes, 0x1000),
             Err(Error::DecodeFailed { .. })
         ));
+    }
+
+    #[test]
+    fn lift_if_branch_head_recognizes_cmp_jne() {
+        // cmp dword ptr [rbp-4], 1; jne short 0x1007 (rel8 = +1)
+        // Block at 0x1000: cmp is 4 bytes (ends at 0x1004), jne short
+        // is 2 bytes at 0x1004; rel8=1 lands at 0x1004+2+1 = 0x1007.
+        let bytes = [0x83, 0x7d, 0xfc, 0x01, 0x75, 0x01];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_if_branch_head(&insns).expect("should match");
+        assert_eq!(lifted.insns_consumed, 2);
+        assert_eq!(lifted.jcc_target, 0x1007);
+        assert_eq!(lifted.cond_bytes, bytes.to_vec());
+        assert!(lifted.cond_text.contains("cmp"));
+        assert!(lifted.cond_text.contains("jne"));
+    }
+
+    #[test]
+    fn lift_if_branch_head_recognizes_test_je() {
+        // test eax, eax; je short 0x1004 (off=0)
+        let bytes = [0x85, 0xc0, 0x74, 0x00];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_if_branch_head(&insns).expect("should match");
+        assert_eq!(lifted.insns_consumed, 2);
+        assert_eq!(lifted.jcc_target, 0x1004);
+        assert!(lifted.cond_text.contains("test"));
+        assert!(lifted.cond_text.contains("je"));
+    }
+
+    #[test]
+    fn lift_if_branch_head_rejects_unconditional_jmp() {
+        // cmp eax,0; jmp +5 — second insn is not a conditional branch
+        let bytes = [0x83, 0xf8, 0x00, 0xeb, 0x05];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert!(try_lift_if_branch_head(&insns).is_none());
+    }
+
+    #[test]
+    fn lift_if_branch_head_rejects_non_compare_predecessor() {
+        // mov eax, ebx; je short +5 — first insn is not cmp/test
+        let bytes = [0x89, 0xd8, 0x74, 0x05];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert!(try_lift_if_branch_head(&insns).is_none());
     }
 }

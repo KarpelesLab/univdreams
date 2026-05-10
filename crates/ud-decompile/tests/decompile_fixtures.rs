@@ -197,30 +197,47 @@ fn parse_of_decompile_to_text_equals_decompile() {
 }
 
 /// Total number of instructions represented in the AST. Counts each
-/// `Stmt::Asm` as one instruction; for each `Stmt::Return`, decodes
-/// the pinned bytes to count how many instructions it stands in for
-/// (typically 2-3: the value-setter, optional epilogue, and `ret`).
+/// `Stmt::Asm` as one; for any directive that pins multi-instruction
+/// bytes (`Stmt::Return`, `Stmt::Prologue`, `Stmt::Epilogue`,
+/// `Stmt::IfBranch`'s cond head), decodes the bytes to count the real
+/// instruction total. Recurses into IfBranch arms.
 fn count_asm_stmts(items: &[Item]) -> usize {
     let mut n = 0;
     for item in items {
         match item {
-            Item::Function(f) => {
-                for stmt in &f.body {
-                    match stmt {
-                        Stmt::Asm { .. } => n += 1,
-                        Stmt::Return { bytes, .. }
-                        | Stmt::Prologue { bytes, .. }
-                        | Stmt::Epilogue { bytes, .. } => {
-                            let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, bytes, 0)
-                                .expect("decode lifted-block bytes");
-                            n += insns.len();
-                        }
-                        Stmt::Comment(_) => {}
-                    }
-                }
-            }
+            Item::Function(f) => n += count_stmts(&f.body),
             Item::Section { items, .. } => n += count_asm_stmts(items),
             _ => {}
+        }
+    }
+    n
+}
+
+fn count_stmts(stmts: &[Stmt]) -> usize {
+    let mut n = 0;
+    for stmt in stmts {
+        match stmt {
+            Stmt::Asm { .. } => n += 1,
+            Stmt::Return { bytes, .. }
+            | Stmt::Prologue { bytes, .. }
+            | Stmt::Epilogue { bytes, .. } => {
+                let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, bytes, 0)
+                    .expect("decode lifted-block bytes");
+                n += insns.len();
+            }
+            Stmt::IfBranch {
+                cond_bytes,
+                then_body,
+                else_body,
+                ..
+            } => {
+                let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, cond_bytes, 0)
+                    .expect("decode if-branch cond bytes");
+                n += insns.len();
+                n += count_stmts(then_body);
+                n += count_stmts(else_body);
+            }
+            Stmt::Comment(_) => {}
         }
     }
     n

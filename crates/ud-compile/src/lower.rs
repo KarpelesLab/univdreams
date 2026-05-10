@@ -66,12 +66,24 @@ pub enum LowerError {
 /// Lower one [`FnDecl`] to its byte sequence.
 pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
     let mut out = Vec::new();
-    for (i, stmt) in f.body.iter().enumerate() {
+    lower_stmts_into(&f.name, &f.body, &mut out)?;
+    Ok(out)
+}
+
+/// Recursive worker: lower a flat statement list into `out`,
+/// recursing into nested arms (e.g. `Stmt::IfBranch`).
+///
+/// Path-tracking note: errors carry the function name. We intentionally
+/// don't track stmt-index paths through nested arms — the body indices
+/// in errors refer to the outermost iteration order, which is enough
+/// to find the bad statement in practice.
+fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<(), LowerError> {
+    for (i, stmt) in stmts.iter().enumerate() {
         match stmt {
             Stmt::Asm { text, bytes } => {
                 if bytes.is_empty() {
                     return Err(LowerError::MissingBytes {
-                        fn_name: f.name.clone(),
+                        fn_name: fn_name.to_string(),
                         stmt_index: i,
                         text: text.clone(),
                     });
@@ -83,10 +95,20 @@ pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
             | Stmt::Epilogue { bytes, .. } => {
                 out.extend_from_slice(bytes);
             }
+            Stmt::IfBranch {
+                cond_bytes,
+                then_body,
+                else_body,
+                ..
+            } => {
+                out.extend_from_slice(cond_bytes);
+                lower_stmts_into(fn_name, then_body, out)?;
+                lower_stmts_into(fn_name, else_body, out)?;
+            }
             Stmt::Comment(_) => {}
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Lower every function in the file to bytes.
@@ -219,6 +241,24 @@ mod tests {
         };
         let bytes = lower_function_bytes(&f).unwrap();
         assert_eq!(bytes, vec![0xf3, 0x0f, 0x1e, 0xfa, 0xc3]);
+    }
+
+    #[test]
+    fn lower_if_branch_concatenates_cond_then_else() {
+        let f = FnDecl {
+            addr: Some(0x1000),
+            name: "f".into(),
+            signature: None,
+            body: vec![Stmt::IfBranch {
+                cond_text: "cmp eax,0; je".into(),
+                cond_bytes: vec![0x83, 0xf8, 0x00, 0x74, 0x01],
+                then_body: vec![Stmt::asm("ret", vec![0xc3])],
+                else_body: vec![Stmt::asm("nop", vec![0x90])],
+            }],
+        };
+        let bytes = lower_function_bytes(&f).unwrap();
+        // cond_bytes + then bytes + else bytes
+        assert_eq!(bytes, vec![0x83, 0xf8, 0x00, 0x74, 0x01, 0xc3, 0x90]);
     }
 
     #[test]

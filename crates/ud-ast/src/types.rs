@@ -167,6 +167,28 @@ pub enum Stmt {
     /// the last block when no [`Stmt::Return`] consumed those bytes
     /// (e.g. the return value was computed in an earlier block).
     Epilogue { kind: String, bytes: Vec<u8> },
+
+    /// A structured `cmp/test + jcc` head plus its two branches:
+    ///
+    /// ```text
+    /// @if_branch("cond text", [cond bytes]) {
+    ///     @then { …fallthrough body… }
+    ///     @else { …taken body… }
+    /// }
+    /// ```
+    ///
+    /// Lifted from a CFG triple where one block ends with
+    /// `cmp/test + jcc`, the next block in memory is the fallthrough
+    /// (`@then`), and the block at the jcc's target address is the
+    /// taken branch (`@else`). Bytes layout, exactly preserved on
+    /// lower: `cond_bytes` then bytes of `then_body` then bytes of
+    /// `else_body`.
+    IfBranch {
+        cond_text: String,
+        cond_bytes: Vec<u8>,
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
+    },
 }
 
 impl Stmt {

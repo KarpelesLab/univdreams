@@ -83,7 +83,17 @@ fn walk(items: &[Item], section: Option<&str>, out: &mut Vec<AsmWarning>) {
 fn verify_fn_body(f: &ud_ast::FnDecl, section: Option<&str>, out: &mut Vec<AsmWarning>) {
     let base_addr = f.addr.unwrap_or(0);
     let mut cursor = base_addr;
-    for (i, stmt) in f.body.iter().enumerate() {
+    verify_stmts(f, section, &f.body, &mut cursor, out);
+}
+
+fn verify_stmts(
+    f: &ud_ast::FnDecl,
+    section: Option<&str>,
+    stmts: &[Stmt],
+    cursor: &mut u64,
+    out: &mut Vec<AsmWarning>,
+) {
+    for (i, stmt) in stmts.iter().enumerate() {
         match stmt {
             Stmt::Asm { text, bytes } => {
                 if bytes.is_empty() {
@@ -94,7 +104,7 @@ fn verify_fn_body(f: &ud_ast::FnDecl, section: Option<&str>, out: &mut Vec<AsmWa
                     section: section.map(str::to_string),
                     stmt_index: i,
                 };
-                match verify_intel_text(Bitness::Bits64, text, bytes, cursor) {
+                match verify_intel_text(Bitness::Bits64, text, bytes, *cursor) {
                     VerifyAsm::Match => {}
                     VerifyAsm::Diverged { canonical } => {
                         out.push(AsmWarning::Divergence {
@@ -117,7 +127,7 @@ fn verify_fn_body(f: &ud_ast::FnDecl, section: Option<&str>, out: &mut Vec<AsmWa
                         });
                     }
                 }
-                cursor = cursor.saturating_add(bytes.len() as u64);
+                *cursor = cursor.saturating_add(bytes.len() as u64);
             }
             // @return / @prologue / @epilogue are structurally multi-
             // instruction groups with their own pinned bytes; advance
@@ -126,7 +136,17 @@ fn verify_fn_body(f: &ud_ast::FnDecl, section: Option<&str>, out: &mut Vec<AsmWa
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. } => {
-                cursor = cursor.saturating_add(bytes.len() as u64);
+                *cursor = cursor.saturating_add(bytes.len() as u64);
+            }
+            Stmt::IfBranch {
+                cond_bytes,
+                then_body,
+                else_body,
+                ..
+            } => {
+                *cursor = cursor.saturating_add(cond_bytes.len() as u64);
+                verify_stmts(f, section, then_body, cursor, out);
+                verify_stmts(f, section, else_body, cursor, out);
             }
             Stmt::Comment(_) => {}
         }

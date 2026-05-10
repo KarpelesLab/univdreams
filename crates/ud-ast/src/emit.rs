@@ -95,57 +95,73 @@ fn emit_fn_indented(out: &mut String, f: &FnDecl, depth: usize) {
         }
     }
     writeln!(out, " {{").unwrap();
-    for stmt in &f.body {
-        match stmt {
-            Stmt::Asm { text, bytes } if bytes.is_empty() => {
-                writeln!(out, "{body_indent}@asm({})", quote_string(text)).unwrap();
-            }
-            Stmt::Asm { text, bytes } => {
-                write!(out, "{body_indent}@asm({}, [", quote_string(text)).unwrap();
-                for (i, b) in bytes.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    write!(out, "0x{b:02x}").unwrap();
-                }
-                writeln!(out, "])").unwrap();
-            }
-            Stmt::Comment(text) => {
-                writeln!(out, "{body_indent}// {text}").unwrap();
-            }
-            Stmt::Return { value, bytes } => {
-                write!(out, "{body_indent}@return(0x{value:x}, [").unwrap();
-                for (i, b) in bytes.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    write!(out, "0x{b:02x}").unwrap();
-                }
-                writeln!(out, "])").unwrap();
-            }
-            Stmt::Prologue { kind, bytes } => {
-                write!(out, "{body_indent}@prologue({}, [", quote_string(kind)).unwrap();
-                for (i, b) in bytes.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    write!(out, "0x{b:02x}").unwrap();
-                }
-                writeln!(out, "])").unwrap();
-            }
-            Stmt::Epilogue { kind, bytes } => {
-                write!(out, "{body_indent}@epilogue({}, [", quote_string(kind)).unwrap();
-                for (i, b) in bytes.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    write!(out, "0x{b:02x}").unwrap();
-                }
-                writeln!(out, "])").unwrap();
-            }
+    emit_stmts(out, &f.body, &body_indent);
+    writeln!(out, "{indent}}}").unwrap();
+}
+
+fn emit_stmts(out: &mut String, stmts: &[Stmt], indent: &str) {
+    for stmt in stmts {
+        emit_stmt(out, stmt, indent);
+    }
+}
+
+fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
+    match stmt {
+        Stmt::Asm { text, bytes } if bytes.is_empty() => {
+            writeln!(out, "{indent}@asm({})", quote_string(text)).unwrap();
+        }
+        Stmt::Asm { text, bytes } => {
+            write!(out, "{indent}@asm({}, [", quote_string(text)).unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
+        Stmt::Comment(text) => {
+            writeln!(out, "{indent}// {text}").unwrap();
+        }
+        Stmt::Return { value, bytes } => {
+            write!(out, "{indent}@return(0x{value:x}, [").unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
+        Stmt::Prologue { kind, bytes } => {
+            write!(out, "{indent}@prologue({}, [", quote_string(kind)).unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
+        Stmt::Epilogue { kind, bytes } => {
+            write!(out, "{indent}@epilogue({}, [", quote_string(kind)).unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
+        Stmt::IfBranch {
+            cond_text,
+            cond_bytes,
+            then_body,
+            else_body,
+        } => {
+            write!(out, "{indent}@if_branch({}, [", quote_string(cond_text)).unwrap();
+            emit_byte_list(out, cond_bytes);
+            writeln!(out, "]) {{").unwrap();
+            let arm_indent = format!("{indent}    ");
+            let arm_body_indent = format!("{indent}        ");
+            writeln!(out, "{arm_indent}@then {{").unwrap();
+            emit_stmts(out, then_body, &arm_body_indent);
+            writeln!(out, "{arm_indent}}}").unwrap();
+            writeln!(out, "{arm_indent}@else {{").unwrap();
+            emit_stmts(out, else_body, &arm_body_indent);
+            writeln!(out, "{arm_indent}}}").unwrap();
+            writeln!(out, "{indent}}}").unwrap();
         }
     }
-    writeln!(out, "{indent}}}").unwrap();
+}
+
+fn emit_byte_list(out: &mut String, bytes: &[u8]) {
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write!(out, "0x{b:02x}").unwrap();
+    }
 }
 
 fn emit_field(out: &mut String, f: &Field, depth: usize) {
@@ -396,6 +412,35 @@ mod tests {
         assert!(out.contains("    fn f() {\n"));
         assert!(out.contains("        @asm(\"ret\", [0xc3])\n"));
         assert!(out.contains("    @raw(0x1001, [0x90, 0x90])\n"));
+    }
+
+    #[test]
+    fn if_branch_emits_then_and_else_arms() {
+        let f = UdFile {
+            module: empty_module(),
+            items: vec![Item::Function(FnDecl {
+                addr: Some(0x1000),
+                name: "f".into(),
+                signature: None,
+                body: vec![Stmt::IfBranch {
+                    cond_text: "cmp [rbp-4],1; jne".into(),
+                    cond_bytes: vec![0x83, 0x7d, 0xfc, 0x01, 0x75, 0x07],
+                    then_body: vec![Stmt::asm("ret", vec![0xc3])],
+                    else_body: vec![Stmt::asm("nop", vec![0x90])],
+                }],
+            })],
+        };
+        let out = emit(&f);
+        assert!(
+            out.contains(
+                "    @if_branch(\"cmp [rbp-4],1; jne\", [0x83, 0x7d, 0xfc, 0x01, 0x75, 0x07]) {\n"
+            ),
+            "actual: {out}"
+        );
+        assert!(out.contains("        @then {\n"));
+        assert!(out.contains("            @asm(\"ret\", [0xc3])\n"));
+        assert!(out.contains("        @else {\n"));
+        assert!(out.contains("            @asm(\"nop\", [0x90])\n"));
     }
 
     #[test]
