@@ -44,6 +44,15 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+
+    /// Verify a `.ud` source file: parse, then check every `@asm`
+    /// line's text against the canonical form for its pinned bytes.
+    /// Warnings go to stderr; the exit code is non-zero only on
+    /// parse errors, not on warnings.
+    Verify {
+        /// `.ud` source file.
+        input: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -91,5 +100,62 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Verify { input } => {
+            let text = std::fs::read_to_string(&input)
+                .with_context(|| format!("read {}", input.display()))?;
+            let ast =
+                ud_compile::parse(&text).with_context(|| format!("parse {}", input.display()))?;
+            let warnings = ud_compile::verify_asm(&ast);
+            if warnings.is_empty() {
+                println!(
+                    "ok: {} ({} item{})",
+                    input.display(),
+                    ast.items.len(),
+                    if ast.items.len() == 1 { "" } else { "s" }
+                );
+                return Ok(());
+            }
+            for w in &warnings {
+                eprintln!("{}", format_warning(w));
+            }
+            eprintln!("{} warning(s) in {}", warnings.len(), input.display());
+            Ok(())
+        }
     }
+}
+
+fn format_warning(w: &ud_compile::AsmWarning) -> String {
+    match w {
+        ud_compile::AsmWarning::Divergence {
+            location,
+            text,
+            canonical,
+        } => format!(
+            "{}: text {:?} disagrees with canonical form {:?}",
+            format_location(location),
+            text,
+            canonical,
+        ),
+        ud_compile::AsmWarning::Undecodable { location, text } => format!(
+            "{}: pinned bytes don't decode as a valid x86 instruction (text was {:?})",
+            format_location(location),
+            text,
+        ),
+        ud_compile::AsmWarning::MultipleInsns {
+            location,
+            text,
+            count,
+        } => format!(
+            "{}: pinned bytes decode to {} instructions, not 1 (text was {:?})",
+            format_location(location),
+            count,
+            text,
+        ),
+    }
+}
+
+fn format_location(l: &ud_compile::AsmLocation) -> String {
+    let section = l.section.as_deref().unwrap_or("<top-level>");
+    let function = l.function.as_deref().unwrap_or("<no fn>");
+    format!("{section}::{function}#{}", l.stmt_index)
 }

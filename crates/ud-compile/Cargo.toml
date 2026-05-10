@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 ud-ast = { path = "../ud-ast" }
 ud-format-elf = { path = "../ud-format-elf" }
+ud-arch-x86 = { path = "../ud-arch-x86" }
 thiserror = "2"
 
 [dev-dependencies]

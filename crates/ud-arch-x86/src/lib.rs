@@ -44,6 +44,73 @@ pub fn format_intel(insn: &Instruction) -> String {
     out
 }
 
+/// Result of [`verify_intel_text`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyAsm {
+    /// `text` matches the canonical Intel-syntax form for `bytes`.
+    Match,
+    /// `text` and the canonical form diverge; the canonical form is
+    /// what `bytes` actually decode to.
+    Diverged { canonical: String },
+    /// `bytes` couldn't be decoded as a single x86 instruction.
+    Undecodable,
+    /// `bytes` decoded to multiple instructions instead of one.
+    MultipleInsns { count: usize },
+}
+
+/// Decode `bytes` as a single x86 instruction at `rip`, format it via
+/// [`format_intel`], and compare against `text` (after a light
+/// normalization that ignores case and folds whitespace runs).
+///
+/// Returns [`VerifyAsm::Match`] when the user's text agrees with what
+/// the bytes actually encode — i.e. nothing has been edited away from
+/// the canonical form. A divergence is the cleanest signal we have
+/// today that a user edited the text without updating the bytes (or
+/// vice versa); a stricter "would the edited text re-encode to the
+/// same length" check needs a text assembler we don't ship yet.
+#[must_use]
+pub fn verify_intel_text(bitness: Bitness, text: &str, bytes: &[u8], rip: u64) -> VerifyAsm {
+    let mut decoder = Decoder::with_ip(bitness.as_u32(), bytes, rip, DecoderOptions::NONE);
+    let mut count = 0usize;
+    let mut first: Option<Instruction> = None;
+    while decoder.can_decode() {
+        let insn = decoder.decode();
+        if insn.is_invalid() {
+            return VerifyAsm::Undecodable;
+        }
+        if first.is_none() {
+            first = Some(insn);
+        }
+        count += 1;
+    }
+    let Some(insn) = first else {
+        return VerifyAsm::Undecodable;
+    };
+    if count != 1 {
+        return VerifyAsm::MultipleInsns { count };
+    }
+    let canonical = format_intel(&insn);
+    if normalize(text) == normalize(&canonical) {
+        VerifyAsm::Match
+    } else {
+        VerifyAsm::Diverged { canonical }
+    }
+}
+
+/// Lower-case + strip all whitespace. The canonical form iced emits is
+/// inconsistent about spaces (no space after a comma in operands; space
+/// between mnemonic and first operand), and we don't want benign user
+/// whitespace edits to surface as warnings — only the actual tokens.
+fn normalize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if !c.is_ascii_whitespace() {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
 /// Errors produced by decode / encode / round-trip helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -273,6 +340,50 @@ mod tests {
         ];
         let insns = roundtrip_bytes(Bitness::Bits64, &bytes, 0x1000).unwrap();
         assert_eq!(insns.len(), 6);
+    }
+
+    #[test]
+    fn verify_matches_canonical_form() {
+        let bytes = [0xc3]; // ret
+        match verify_intel_text(Bitness::Bits64, "ret", &bytes, 0x1000) {
+            VerifyAsm::Match => {}
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_tolerates_whitespace_and_case() {
+        let bytes = [0x48, 0x89, 0xd8]; // mov rax, rbx
+        match verify_intel_text(Bitness::Bits64, "MOV  RAX,   RBX", &bytes, 0x1000) {
+            VerifyAsm::Match => {}
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_diverges_when_text_disagrees() {
+        let bytes = [0xc3]; // ret
+        match verify_intel_text(Bitness::Bits64, "nop", &bytes, 0x1000) {
+            VerifyAsm::Diverged { canonical } => {
+                assert_eq!(canonical, "ret");
+            }
+            other => panic!("expected Diverged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_rejects_multi_insn_byte_sequence() {
+        // ret; ret  — two instructions in one @asm line is wrong
+        let bytes = [0xc3, 0xc3];
+        let result = verify_intel_text(Bitness::Bits64, "ret", &bytes, 0x1000);
+        assert!(matches!(result, VerifyAsm::MultipleInsns { count: 2 }));
+    }
+
+    #[test]
+    fn verify_rejects_undecodable_bytes() {
+        let bytes = [0x06]; // invalid in 64-bit mode
+        let result = verify_intel_text(Bitness::Bits64, "ret", &bytes, 0x1000);
+        assert!(matches!(result, VerifyAsm::Undecodable));
     }
 
     #[test]
