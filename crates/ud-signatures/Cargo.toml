@@ -1,0 +1,14 @@
+[package]
+name = "ud-signatures"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Byte-pattern signature database for recognizing well-known functions (CRT helpers, libc primitives, …)."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

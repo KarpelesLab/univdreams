@@ -134,6 +134,37 @@ fn eh_frame_adds_coverage_beyond_symbol_table() {
     }
 }
 
+/// CRT helpers (`deregister_tm_clones`, `register_tm_clones`,
+/// `__do_global_dtors_aux`, `frame_dummy`) are inserted by GCC's
+/// linker into `.text` but are absent from `.symtab` and `.eh_frame`
+/// for our fixtures. Signature matching has to be the source.
+#[test]
+fn crt_helpers_named_via_signatures() {
+    let path = workspace_root().join("testdata/hello-gcc13-O0");
+    let Some(map) = discover_fixture(&path) else {
+        eprintln!("note: {} unavailable; skipping", path.display());
+        return;
+    };
+
+    let by_source: std::collections::HashMap<&str, &Vec<FunctionSource>> =
+        map.iter().map(|f| (f.name.as_str(), &f.sources)).collect();
+
+    for required in &[
+        "deregister_tm_clones",
+        "register_tm_clones",
+        "__do_global_dtors_aux",
+        "frame_dummy",
+    ] {
+        let sources = by_source
+            .get(required)
+            .unwrap_or_else(|| panic!("expected `{required}` discovered"));
+        assert!(
+            sources.contains(&FunctionSource::Signature),
+            "expected `{required}` to be tagged Signature, got {sources:?}"
+        );
+    }
+}
+
 /// Functions covered by both .eh_frame and the symbol table should
 /// record both sources, with the symbol-table name winning.
 #[test]

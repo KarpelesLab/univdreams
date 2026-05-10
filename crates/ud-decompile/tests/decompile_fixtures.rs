@@ -76,19 +76,21 @@ fn hello_fixture_includes_main_and_start() {
         return;
     };
     let names = function_names(&ast);
-    for required in &["_start", "main"] {
+    for required in &[
+        "_start",
+        "main",
+        "_init",
+        "_fini",
+        "deregister_tm_clones",
+        "register_tm_clones",
+        "__do_global_dtors_aux",
+        "frame_dummy",
+    ] {
         assert!(
             names.contains(required),
             "expected `{required}` in {names:?}"
         );
     }
-    // _init has no recorded size in our fixtures — surfaces as a Comment item.
-    assert!(
-        ast.items
-            .iter()
-            .any(|i| matches!(i, Item::Comment(c) if c.contains("_init"))),
-        "expected an explanatory note for _init"
-    );
 }
 
 #[test]
