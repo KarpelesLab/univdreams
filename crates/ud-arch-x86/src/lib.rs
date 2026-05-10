@@ -186,6 +186,48 @@ pub fn try_lift_prologue_pattern(insns: &[DecodedInsn]) -> Option<LiftedPrologue
     })
 }
 
+/// One recognised SysV-x64 epilogue at the tail of a function or
+/// shared between branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiftedEpilogue {
+    /// Number of trailing instructions matched.
+    pub insns_consumed: usize,
+    /// Symbolic kind: `"std"` for `leave; ret`, `"std-pop-rbp"` for
+    /// `pop rbp; ret`.
+    pub kind: &'static str,
+}
+
+/// Try to recognize the trailing instructions of `insns` as a stack-
+/// frame-tearing-down epilogue:
+///
+/// * `leave; ret`     → `"std"`
+/// * `pop rbp; ret`   → `"std-pop-rbp"`
+///
+/// Used when [`try_lift_return_pattern`] doesn't fire (e.g. the last
+/// block has no value-setter — the return value was set in an earlier
+/// block by a non-trivial expression). Lifting just the epilogue still
+/// removes the boilerplate from the decompile output.
+#[must_use]
+pub fn try_lift_epilogue_pattern(insns: &[DecodedInsn]) -> Option<LiftedEpilogue> {
+    if insns.len() < 2 {
+        return None;
+    }
+    let last = insns.last()?;
+    if last.original_bytes.as_slice() != [0xc3] {
+        return None;
+    }
+    let prev = &insns[insns.len() - 2].original_bytes;
+    let kind = match prev.as_slice() {
+        [0xc9] => "std",         // leave
+        [0x5d] => "std-pop-rbp", // pop rbp
+        _ => return None,
+    };
+    Some(LiftedEpilogue {
+        insns_consumed: 2,
+        kind,
+    })
+}
+
 /// Try to recognize the trailing instructions of `insns` as a
 /// "return with literal, then jump to a shared epilogue" pattern.
 ///
@@ -708,6 +750,39 @@ mod tests {
         let bytes = [0x48, 0x89, 0xd8, 0xc3];
         let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
         assert!(try_lift_return_pattern(&insns).is_none());
+    }
+
+    #[test]
+    fn lift_epilogue_recognizes_leave_ret() {
+        let bytes = [0xc9, 0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_epilogue_pattern(&insns).unwrap();
+        assert_eq!(lifted.kind, "std");
+        assert_eq!(lifted.insns_consumed, 2);
+    }
+
+    #[test]
+    fn lift_epilogue_recognizes_pop_rbp_ret() {
+        let bytes = [0x5d, 0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_epilogue_pattern(&insns).unwrap();
+        assert_eq!(lifted.kind, "std-pop-rbp");
+        assert_eq!(lifted.insns_consumed, 2);
+    }
+
+    #[test]
+    fn lift_epilogue_rejects_bare_ret() {
+        let bytes = [0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert!(try_lift_epilogue_pattern(&insns).is_none());
+    }
+
+    #[test]
+    fn lift_epilogue_rejects_non_teardown_predecessor() {
+        // mov rax, rbx; ret — not an epilogue
+        let bytes = [0x48, 0x89, 0xd8, 0xc3];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert!(try_lift_epilogue_pattern(&insns).is_none());
     }
 
     #[test]

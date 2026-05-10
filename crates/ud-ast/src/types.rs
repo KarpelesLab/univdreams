@@ -161,6 +161,12 @@ pub enum Stmt {
     /// (`"std"` / `"std-no-cf"` / `"std-noframe"`); `bytes` carries
     /// every encoded byte for round-trip.
     Prologue { kind: String, bytes: Vec<u8> },
+
+    /// `@epilogue("kind", [bytes])` — a recognised function epilogue,
+    /// typically `leave; ret` or `pop rbp; ret`. Used at the tail of
+    /// the last block when no [`Stmt::Return`] consumed those bytes
+    /// (e.g. the return value was computed in an earlier block).
+    Epilogue { kind: String, bytes: Vec<u8> },
 }
 
 impl Stmt {

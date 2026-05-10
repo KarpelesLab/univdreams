@@ -133,6 +133,16 @@ fn emit_fn_indented(out: &mut String, f: &FnDecl, depth: usize) {
                 }
                 writeln!(out, "])").unwrap();
             }
+            Stmt::Epilogue { kind, bytes } => {
+                write!(out, "{body_indent}@epilogue({}, [", quote_string(kind)).unwrap();
+                for (i, b) in bytes.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write!(out, "0x{b:02x}").unwrap();
+                }
+                writeln!(out, "])").unwrap();
+            }
         }
     }
     writeln!(out, "{indent}}}").unwrap();

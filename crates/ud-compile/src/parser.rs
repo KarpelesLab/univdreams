@@ -455,6 +455,14 @@ impl Parser {
                             self.expect(&TokenKind::RParen, "`)` to close `@prologue`")?;
                             body.push(Stmt::Prologue { kind, bytes });
                         }
+                        "epilogue" => {
+                            self.expect(&TokenKind::LParen, "`(` after `@epilogue`")?;
+                            let kind = self.expect_string("epilogue kind string")?;
+                            self.expect(&TokenKind::Comma, "`,` after epilogue kind")?;
+                            let bytes = self.parse_byte_list()?;
+                            self.expect(&TokenKind::RParen, "`)` to close `@epilogue`")?;
+                            body.push(Stmt::Epilogue { kind, bytes });
+                        }
                         other => {
                             return Err(ParseError::UnknownDirective {
                                 name: other.to_string(),
