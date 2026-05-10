@@ -112,6 +112,54 @@ pub fn try_lift_return_pattern(insns: &[DecodedInsn]) -> Option<LiftedReturn> {
     })
 }
 
+/// Try to recognize the trailing instructions of `insns` as a
+/// "return with literal, then jump to a shared epilogue" pattern.
+///
+/// gcc emits this for functions with multiple return sites and a
+/// single `leave; ret` (or `pop rbp; ret`) tail block. Each
+/// non-final block ends with `mov eax, IMM; jmp <epilogue_addr>` (or
+/// `xor eax, eax; jmp <epilogue_addr>`); the lifter matches that
+/// pattern and folds it into a single `Stmt::Return`. The shared
+/// epilogue itself is left as `@asm` since it doesn't carry a value
+/// — it's just `[leave|pop rbp;] ret`.
+///
+/// Recognised forms (working backwards from the final `jmp`):
+///
+/// * `mov eax, IMM32; jmp short rel8 -> epilogue_addr`
+/// * `mov eax, IMM32; jmp near rel32 -> epilogue_addr`
+/// * `xor eax, eax;   jmp short rel8 -> epilogue_addr`
+/// * `xor eax, eax;   jmp near rel32 -> epilogue_addr`
+///
+/// Only matches when the final instruction is a direct jump whose
+/// `near_branch_target()` equals `epilogue_addr`.
+#[must_use]
+pub fn try_lift_return_via_jmp(insns: &[DecodedInsn], epilogue_addr: u64) -> Option<LiftedReturn> {
+    if insns.len() < 2 {
+        return None;
+    }
+
+    let last = insns.last()?;
+    if last.iced.flow_control() != FlowControl::UnconditionalBranch {
+        return None;
+    }
+    if last.iced.near_branch_target() != epilogue_addr {
+        return None;
+    }
+
+    // The instruction before the jmp must be a value-setter.
+    let setter = &insns[insns.len() - 2].original_bytes;
+    let value = match setter.as_slice() {
+        [0xb8, b0, b1, b2, b3] => u64::from(u32::from_le_bytes([*b0, *b1, *b2, *b3])),
+        [0x31, 0xc0] => 0,
+        _ => return None,
+    };
+
+    Some(LiftedReturn {
+        insns_consumed: 2,
+        value,
+    })
+}
+
 /// Like [`direct_call_target`], but for unconditional direct branches
 /// (`jmp rel32` / `jmp short rel8`). Useful for spotting tail calls
 /// when the target lives in another discovered function.
@@ -534,6 +582,34 @@ mod tests {
         let bytes = [0x48, 0x89, 0xd8, 0xc3];
         let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
         assert!(try_lift_return_pattern(&insns).is_none());
+    }
+
+    #[test]
+    fn lift_return_via_jmp_recognizes_mov_jmp_short() {
+        // mov eax, 1; jmp short +0x14
+        // Block at 0x1000, jmp short rel8 lands at 0x1009 + signed 0x14 = 0x101d
+        let bytes = [0xb8, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x14];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_return_via_jmp(&insns, 0x101b).unwrap();
+        assert_eq!(lifted.value, 1);
+        assert_eq!(lifted.insns_consumed, 2);
+    }
+
+    #[test]
+    fn lift_return_via_jmp_rejects_wrong_target() {
+        let bytes = [0xb8, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x14];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        // pass a non-matching epilogue address
+        assert!(try_lift_return_via_jmp(&insns, 0x9999).is_none());
+    }
+
+    #[test]
+    fn lift_return_via_jmp_rejects_non_setter() {
+        // mov rax, rbx; jmp +5
+        let bytes = [0x48, 0x89, 0xd8, 0xeb, 0x05];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let target = insns.last().unwrap().iced.near_branch_target();
+        assert!(try_lift_return_via_jmp(&insns, target).is_none());
     }
 
     #[test]

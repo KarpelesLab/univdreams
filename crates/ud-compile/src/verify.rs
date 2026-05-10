@@ -84,40 +84,48 @@ fn verify_fn_body(f: &ud_ast::FnDecl, section: Option<&str>, out: &mut Vec<AsmWa
     let base_addr = f.addr.unwrap_or(0);
     let mut cursor = base_addr;
     for (i, stmt) in f.body.iter().enumerate() {
-        if let Stmt::Asm { text, bytes } = stmt {
-            if bytes.is_empty() {
-                cursor = cursor.saturating_add(0);
-                continue;
+        match stmt {
+            Stmt::Asm { text, bytes } => {
+                if bytes.is_empty() {
+                    continue;
+                }
+                let location = AsmLocation {
+                    function: Some(f.name.clone()),
+                    section: section.map(str::to_string),
+                    stmt_index: i,
+                };
+                match verify_intel_text(Bitness::Bits64, text, bytes, cursor) {
+                    VerifyAsm::Match => {}
+                    VerifyAsm::Diverged { canonical } => {
+                        out.push(AsmWarning::Divergence {
+                            location,
+                            text: text.clone(),
+                            canonical,
+                        });
+                    }
+                    VerifyAsm::Undecodable => {
+                        out.push(AsmWarning::Undecodable {
+                            location,
+                            text: text.clone(),
+                        });
+                    }
+                    VerifyAsm::MultipleInsns { count } => {
+                        out.push(AsmWarning::MultipleInsns {
+                            location,
+                            text: text.clone(),
+                            count,
+                        });
+                    }
+                }
+                cursor = cursor.saturating_add(bytes.len() as u64);
             }
-            let location = AsmLocation {
-                function: Some(f.name.clone()),
-                section: section.map(str::to_string),
-                stmt_index: i,
-            };
-            match verify_intel_text(Bitness::Bits64, text, bytes, cursor) {
-                VerifyAsm::Match => {}
-                VerifyAsm::Diverged { canonical } => {
-                    out.push(AsmWarning::Divergence {
-                        location,
-                        text: text.clone(),
-                        canonical,
-                    });
-                }
-                VerifyAsm::Undecodable => {
-                    out.push(AsmWarning::Undecodable {
-                        location,
-                        text: text.clone(),
-                    });
-                }
-                VerifyAsm::MultipleInsns { count } => {
-                    out.push(AsmWarning::MultipleInsns {
-                        location,
-                        text: text.clone(),
-                        count,
-                    });
-                }
+            // @return is structurally a multi-instruction group with
+            // its own pinned bytes; advance the cursor by the byte
+            // count so subsequent @asm RIPs stay correct.
+            Stmt::Return { bytes, .. } => {
+                cursor = cursor.saturating_add(bytes.len() as u64);
             }
-            cursor = cursor.saturating_add(bytes.len() as u64);
+            Stmt::Comment(_) => {}
         }
     }
 }
