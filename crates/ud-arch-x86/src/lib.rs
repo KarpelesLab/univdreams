@@ -163,9 +163,26 @@ pub fn try_lift_prologue_pattern(insns: &[DecodedInsn]) -> Option<LiftedPrologue
     };
 
     if bytes_at(start) != Some(push_bp) {
-        // Not a frame-setting prologue. Recognise lone `endbr64` /
-        // `endbr32` at the start of a leaf function as a noframe
-        // prologue.
+        // Not a frame-setting prologue. Recognise:
+        // * lone `endbr64` / `endbr32` at the start of a leaf
+        //   function as a noframe prologue.
+        // * a bare `sub rsp/esp, IMM` (the CRT-stub idiom for `_init`
+        //   and friends: align the stack, no `push rbp`).
+        let bare_sub_matched = matches!(
+            bytes_at(start),
+            Some(
+                &[0x48, 0x83, 0xec, _]
+                    | &[0x48, 0x81, 0xec, _, _, _, _]
+                    | &[0x83, 0xec, _]
+                    | &[0x81, 0xec, _, _, _, _]
+            )
+        );
+        if bare_sub_matched {
+            return Some(LiftedPrologue {
+                insns_consumed: start + 1,
+                kind: if has_endbr { "thin" } else { "thin-no-cf" },
+            });
+        }
         if has_endbr {
             return Some(LiftedPrologue {
                 insns_consumed: 1,
@@ -214,8 +231,10 @@ pub struct LiftedEpilogue {
 /// Try to recognize the trailing instructions of `insns` as a stack-
 /// frame-tearing-down epilogue:
 ///
-/// * `leave; ret`     → `"std"`
-/// * `pop rbp; ret`   → `"std-pop-rbp"`
+/// * `leave; ret`                  → `"std"`
+/// * `pop rbp; ret`                → `"std-pop-rbp"`
+/// * `add rsp/esp, IMM; ret`       → `"thin"`
+/// * `add rsp/esp, IMM; pop rbp; ret` → `"thin-pop-rbp"`
 ///
 /// Used when [`try_lift_return_pattern`] doesn't fire (e.g. the last
 /// block has no value-setter — the return value was set in an earlier
@@ -231,15 +250,50 @@ pub fn try_lift_epilogue_pattern(insns: &[DecodedInsn]) -> Option<LiftedEpilogue
         return None;
     }
     let prev = &insns[insns.len() - 2].original_bytes;
-    let kind = match prev.as_slice() {
-        [0xc9] => "std",         // leave
-        [0x5d] => "std-pop-rbp", // pop rbp
-        _ => return None,
+
+    // Two-instruction tails: leave/ret, pop rbp/ret.
+    let two_kind = match prev.as_slice() {
+        [0xc9] => Some("std"),         // leave
+        [0x5d] => Some("std-pop-rbp"), // pop rbp
+        _ => None,
     };
-    Some(LiftedEpilogue {
-        insns_consumed: 2,
-        kind,
-    })
+    if let Some(kind) = two_kind {
+        // Check if it can be widened to a thin form (`add rsp, IMM`
+        // immediately before the `pop rbp`/`leave`). Only for
+        // `pop rbp`, since `leave` already restores rsp.
+        if kind == "std-pop-rbp" && insns.len() >= 3 {
+            let before_pop = insns[insns.len() - 3].original_bytes.as_slice();
+            if is_add_rsp_imm(before_pop) {
+                return Some(LiftedEpilogue {
+                    insns_consumed: 3,
+                    kind: "thin-pop-rbp",
+                });
+            }
+        }
+        return Some(LiftedEpilogue {
+            insns_consumed: 2,
+            kind,
+        });
+    }
+
+    // `add rsp, IMM; ret` — bare CRT-stub epilogue.
+    if is_add_rsp_imm(prev.as_slice()) {
+        return Some(LiftedEpilogue {
+            insns_consumed: 2,
+            kind: "thin",
+        });
+    }
+    None
+}
+
+fn is_add_rsp_imm(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        [0x48, 0x83, 0xc4, _]
+            | [0x48, 0x81, 0xc4, _, _, _, _]
+            | [0x83, 0xc4, _]
+            | [0x81, 0xc4, _, _, _, _]
+    )
 }
 
 /// Try to recognize the trailing instructions of `insns` as a
