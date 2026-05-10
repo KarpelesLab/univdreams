@@ -265,6 +265,14 @@ fn build_stmt_slice(
             i += consumed;
             continue;
         }
+        // 6. Bare store chain — STA dst1; STA dst2 (or STX, STY).
+        //    With no preceding load, the source is the register
+        //    itself, holding whatever was last computed.
+        if let Some((move_stmt, consumed)) = try_lift_store_chain(local, i, resolver) {
+            out.push(move_stmt);
+            i += consumed;
+            continue;
+        }
         // 5. Plain @asm.
         let ins = local[i];
         if let Some(lbl) = labels.get(&ins.addr.0) {
@@ -354,6 +362,57 @@ fn try_lift_move(
     let src = format_operand(load, resolver);
     let dst = dsts.join(" = ");
     Some((Stmt::Move { dst, src, bytes }, j - i))
+}
+
+/// If `local[i..]` is `STA dst1; STA dst2 [; STA dst3 ...]`
+/// (or STX/STY variants) with no preceding load that consumed the
+/// register's value, return `(Stmt::Move, consumed)`. The source
+/// is the register name (`"A"`, `"X"`, `"Y"`); the destination is
+/// `"dst1 = dst2 = …"`.
+fn try_lift_store_chain(
+    local: &[&DecodedInsn],
+    i: usize,
+    resolver: SymbolResolver,
+) -> Option<(Stmt, usize)> {
+    let first = local.get(i)?;
+    let (store_mn, reg_name) = match first.mnemonic {
+        Mnemonic::STA => (Mnemonic::STA, "A"),
+        Mnemonic::STX => (Mnemonic::STX, "X"),
+        Mnemonic::STY => (Mnemonic::STY, "Y"),
+        _ => return None,
+    };
+    // Need at least two stores; a single store still reads naturally
+    // as `@asm("STA addr", …)`.
+    let second = local.get(i + 1)?;
+    if second.mnemonic != store_mn {
+        return None;
+    }
+    let mut dsts = vec![format_operand(first, resolver)];
+    let mut bytes = first.original_bytes.clone();
+    let mut j = i + 1;
+    while let Some(ins) = local.get(j) {
+        if ins.mnemonic != store_mn {
+            break;
+        }
+        if matches!(
+            ins.mode,
+            AddressingMode::Implied | AddressingMode::Accumulator | AddressingMode::IllegalOperand
+        ) {
+            break;
+        }
+        dsts.push(format_operand(ins, resolver));
+        bytes.extend_from_slice(&ins.original_bytes);
+        j += 1;
+    }
+    let dst = dsts.join(" = ");
+    Some((
+        Stmt::Move {
+            dst,
+            src: reg_name.to_string(),
+            bytes,
+        },
+        j - i,
+    ))
 }
 
 /// Render only the operand part of an instruction (everything that
