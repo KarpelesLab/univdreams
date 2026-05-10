@@ -187,11 +187,24 @@ fn build_stmt_slice(
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < local.len() {
-        // 1. Back-branch do-while.
+        // 1. Back-branch do-while. The instruction right before the
+        // back-branch is often a flag-setter (CMP/CPX/CPY/BIT, or a
+        // load whose loaded value is being tested for zero); when so,
+        // bundle it into tail_bytes so the loop reads "do { … } while
+        // (CMP X; BNE)".
         if let Some((j, tail)) = find_back_branch_target(local, i) {
-            let body = build_stmt_slice(&local[i..j], entries, labels, resolver);
-            let tail_bytes = tail.original_bytes.clone();
-            let cond_text = format_branch_cond(tail, entries, labels, resolver);
+            let bundle_fs = j > i + 1 && is_flag_setter(local[j - 1]);
+            let body_end = if bundle_fs { j - 1 } else { j };
+            let body = build_stmt_slice(&local[i..body_end], entries, labels, resolver);
+            let tail_text = format_branch_cond(tail, entries, labels, resolver);
+            let (cond_text, mut tail_bytes) = if bundle_fs {
+                let fs = local[j - 1];
+                let fs_text = format_insn_with(fs, resolver);
+                (format!("{fs_text}; {tail_text}"), fs.original_bytes.clone())
+            } else {
+                (tail_text, Vec::new())
+            };
+            tail_bytes.extend_from_slice(&tail.original_bytes);
             out.push(Stmt::Loop {
                 entry_jmp_bytes: None,
                 tail_bytes,
@@ -203,8 +216,11 @@ fn build_stmt_slice(
         }
         // 2. Forward conditional branch — try if/else first.
         if let Some((target_idx, branch)) = find_forward_branch_target(local, i) {
-            let cond_text = format_branch_cond(branch, entries, labels, resolver);
-            let cond_bytes = branch.original_bytes.clone();
+            // Bundle the preceding flag-setter (if it was just
+            // emitted as a plain @asm into `out`) so the @if_branch
+            // cond_text reads like a complete predicate.
+            let (cond_text, cond_bytes) =
+                build_if_cond(&mut out, local, i, branch, entries, labels, resolver);
             if let Some(x_idx) = find_jmp_over_else(local, target_idx) {
                 let then_body =
                     build_stmt_slice(&local[i + 1..target_idx], entries, labels, resolver);
@@ -291,6 +307,66 @@ fn try_lift_bare_call(local: &[&DecodedInsn], i: usize, entries: &HashSet<u64>) 
         args: Vec::new(),
         bytes: jsr.original_bytes.clone(),
     })
+}
+
+/// Build the `(cond_text, cond_bytes)` for an `@if_branch` whose
+/// conditional Bcc is `branch` at `local[i]`.
+///
+/// If the previously-emitted statement (`out.last()`) is a plain
+/// `@asm` representing the immediately preceding flag-setter
+/// (`local[i - 1]`), and that flag-setter is the kind that justifies
+/// the Bcc that follows (CMP, CPX, CPY, BIT, plus the LDA/LDX/LDY
+/// "test for zero" idiom), pop it from `out` and merge its bytes /
+/// text into the condition.
+fn build_if_cond(
+    out: &mut Vec<Stmt>,
+    local: &[&DecodedInsn],
+    i: usize,
+    branch: &DecodedInsn,
+    entries: &HashSet<u64>,
+    labels: &HashMap<u64, String>,
+    resolver: SymbolResolver,
+) -> (String, Vec<u8>) {
+    let branch_text = format_insn_with(branch, resolver);
+    let branch_text = if let Some(annot) = call_annotation(branch, entries, labels) {
+        format!("{branch_text}  ; {annot}")
+    } else {
+        branch_text
+    };
+
+    if i > 0 && is_flag_setter(local[i - 1]) {
+        let prev = local[i - 1];
+        let bundle_match = matches!(
+            out.last(),
+            Some(Stmt::Asm { bytes, .. }) if bytes == &prev.original_bytes,
+        );
+        if bundle_match {
+            out.pop();
+            let prev_text = format_insn_with(prev, resolver);
+            let mut bytes = prev.original_bytes.clone();
+            bytes.extend_from_slice(&branch.original_bytes);
+            return (format!("{prev_text}; {branch_text}"), bytes);
+        }
+    }
+    (branch_text, branch.original_bytes.clone())
+}
+
+/// Is `ins` an instruction whose primary effect (in this context)
+/// is setting the flag bits that a following Bcc tests against?
+/// CMP/CPX/CPY/BIT are pure tests. LDA/LDX/LDY are dual-purpose:
+/// they load a register and incidentally set Z/N, which 6502 code
+/// regularly relies on for "is the loaded value zero" branches.
+fn is_flag_setter(ins: &DecodedInsn) -> bool {
+    matches!(
+        ins.mnemonic,
+        Mnemonic::CMP
+            | Mnemonic::CPX
+            | Mnemonic::CPY
+            | Mnemonic::BIT
+            | Mnemonic::LDA
+            | Mnemonic::LDX
+            | Mnemonic::LDY
+    )
 }
 
 /// If `local[target_idx - 1]` is `JMP $X` (absolute direct) whose
