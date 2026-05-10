@@ -187,8 +187,10 @@ pub fn try_lift_prologue_pattern(insns: &[DecodedInsn]) -> Option<LiftedPrologue
     // (0x48); 32-bit forms drop it.
     let stack_sub_matched = matches!(
         (is_64, bytes_at(start)),
-        (true, Some(&[0x48, 0x83, 0xec, _] | &[0x48, 0x81, 0xec, _, _, _, _]))
-            | (false, Some(&[0x83, 0xec, _] | &[0x81, 0xec, _, _, _, _]))
+        (
+            true,
+            Some(&[0x48, 0x83, 0xec, _] | &[0x48, 0x81, 0xec, _, _, _, _])
+        ) | (false, Some(&[0x83, 0xec, _] | &[0x81, 0xec, _, _, _, _]))
     );
     let consumed_after_frame = if stack_sub_matched { start + 1 } else { start };
 

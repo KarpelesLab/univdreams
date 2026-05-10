@@ -750,6 +750,25 @@ fn call_annotation(
 /// as the string literal itself.
 fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
     match value {
+        // A "Const" arg may actually be an absolute address into a
+        // data section — e.g. i386 cdecl pushes a string's address
+        // as `mov [esp], IMM` where IMM is the .rdata offset. Try
+        // to resolve as a string first, fall back to decimal.
+        ArgValue::Const(n) if *n > 0 => {
+            #[allow(clippy::cast_sign_loss)]
+            let addr = *n as u64;
+            if let Some(name) = ctx.name_at.get(&addr) {
+                return format!("&{name}");
+            }
+            if let Some((section_name, data, off)) = ctx.data.section_at(addr) {
+                if is_string_data_section(section_name) {
+                    if let Some(s) = read_cstring_at(data, off) {
+                        return format!("{:?}", shorten_for_display(s));
+                    }
+                }
+            }
+            n.to_string()
+        }
         ArgValue::Const(n) => n.to_string(),
         ArgValue::Lea { addr } => {
             if let Some(name) = ctx.name_at.get(addr) {

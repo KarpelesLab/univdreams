@@ -38,10 +38,33 @@ impl DataLookup for ud_format_elf::Elf64File {
 
 impl DataLookup for ud_format_pe::PeFile {
     fn section_at(&self, vaddr: u64) -> Option<(&str, &[u8], usize)> {
-        // The PE section table stores RVAs (image-relative addrs).
-        // x86 rip-relative loads in PE code reference RVAs at decode
-        // time too, so we match `vaddr` directly against
-        // `virtual_address`.
+        // PE addresses come in two flavours and we accept either:
+        //
+        // * RVA (image-relative): matches `section.virtual_address`
+        //   directly — typical of operands inside a function body
+        //   that iced sets up with the function's RVA as IP.
+        // * VA (full virtual address = ImageBase + RVA): typical of
+        //   immediate operands like `mov [esp], 0x40A00D` where the
+        //   compiler emitted the absolute address of a string.
+        //
+        // We try matching as RVA first; if it doesn't land in any
+        // section, retry by subtracting `image_base`.
+        if let Some(hit) = self.section_at_rva(vaddr) {
+            return Some(hit);
+        }
+        if vaddr >= self.image_base {
+            return self.section_at_rva(vaddr - self.image_base);
+        }
+        None
+    }
+}
+
+trait PeFileExt {
+    fn section_at_rva(&self, rva: u64) -> Option<(&str, &[u8], usize)>;
+}
+
+impl PeFileExt for ud_format_pe::PeFile {
+    fn section_at_rva(&self, rva: u64) -> Option<(&str, &[u8], usize)> {
         for (idx, sh) in self.sections.iter().enumerate() {
             let start = u64::from(sh.virtual_address);
             let size = u64::from(sh.virtual_size.max(sh.size_of_raw_data));
@@ -49,14 +72,11 @@ impl DataLookup for ud_format_pe::PeFile {
                 continue;
             }
             let end = start.checked_add(size)?;
-            if vaddr < start || vaddr >= end {
+            if rva < start || rva >= end {
                 continue;
             }
             let data = self.section_data(idx)?;
-            let offset = (vaddr - start) as usize;
-            // Stay inside the section's on-disk extent — `.bss`-
-            // style sections have a virtual_size that exceeds
-            // size_of_raw_data and no physical bytes past data.len().
+            let offset = (rva - start) as usize;
             if offset >= data.len() {
                 return None;
             }

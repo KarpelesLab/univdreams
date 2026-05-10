@@ -143,6 +143,10 @@ struct Analyzer {
     /// Currently-known values for arg registers (and RAX for call
     /// results). Cleared at each window boundary.
     regs: HashMap<Register, ArgValue>,
+    /// Currently-known values written to the i386 cdecl stack-arg
+    /// slots: `[esp]`, `[esp+4]`, `[esp+8]`, … Keyed by the offset
+    /// from `esp`. Cleared after each call window.
+    stack_args: HashMap<i32, ArgValue>,
     /// Index right after the previous call (or 0 at block start).
     /// Determines which instructions are foldable into the next call.
     setup_start: usize,
@@ -222,6 +226,16 @@ impl Analyzer {
                 None => break,
             }
         }
+        // i386 cdecl: when no integer arg registers were touched but
+        // we saw `mov [esp+OFF], val` writes, fall back to the stack
+        // sequence at offsets 0, 4, 8, … as the integer args.
+        if args.is_empty() {
+            let mut off = 0i32;
+            while let Some(v) = self.stack_args.get(&off).cloned() {
+                args.push(v);
+                off += 4;
+            }
+        }
         for r in xmm_arg_regs {
             match self.regs.get(&full_reg(r)).cloned() {
                 Some(v) => args.push(v),
@@ -239,16 +253,48 @@ impl Analyzer {
         // value lives in RAX for integer/pointer returns and in XMM0
         // for float/double returns; we don't know which, so both
         // get the `PrevCallResult` tag so downstream `mov reg, rax`
-        // / `movq reg, xmm0` chains can pick it up.
+        // / `movq reg, xmm0` chains can pick it up. Stack arg slots
+        // are also invalidated — cdecl callers leave the values on
+        // the stack but reuse the slots for the next call's setup.
         self.regs.clear();
         self.regs.insert(Register::RAX, ArgValue::PrevCallResult);
         self.regs.insert(Register::XMM0, ArgValue::PrevCallResult);
+        self.stack_args.clear();
         self.saw_any_call = true;
         self.setup_start = idx + 1;
     }
 
     fn handle_mov(&mut self, insn: &Instruction) -> bool {
-        if insn.op_count() != 2 || insn.op0_kind() != OpKind::Register {
+        if insn.op_count() != 2 {
+            return false;
+        }
+        // `mov [esp+OFF], src` — i386 cdecl stack-arg setup. Track
+        // the value at that slot and keep the window open.
+        if insn.op0_kind() == OpKind::Memory
+            && insn.memory_base() == Register::ESP
+            && insn.memory_index() == Register::None
+        {
+            let val = match insn.op1_kind() {
+                OpKind::Register => match self.regs.get(&full_reg(insn.op1_register())).cloned() {
+                    Some(v) => v,
+                    None => return false,
+                },
+                OpKind::Immediate8
+                | OpKind::Immediate16
+                | OpKind::Immediate32
+                | OpKind::Immediate64
+                | OpKind::Immediate8to16
+                | OpKind::Immediate8to32
+                | OpKind::Immediate8to64
+                | OpKind::Immediate32to64 => ArgValue::Const(read_signed_immediate(insn)),
+                _ => return false,
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let off = insn.memory_displacement64() as i32;
+            self.stack_args.insert(off, val);
+            return true;
+        }
+        if insn.op0_kind() != OpKind::Register {
             return false;
         }
         let dst = insn.op0_register();

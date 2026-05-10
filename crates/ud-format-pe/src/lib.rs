@@ -190,6 +190,11 @@ pub struct PeFile {
     pub e_lfanew: u32,
     /// COFF header values.
     pub coff: CoffHeader,
+    /// `ImageBase` from the optional header — the run-time virtual
+    /// address the loader maps the file to. Section RVAs are added
+    /// to this to form full VAs at run time. Zero when the file has
+    /// no optional header (object files).
+    pub image_base: u64,
     /// Section header table, in declaration order.
     pub sections: Vec<SectionHeader>,
     /// The complete file bytes; this is what `write_to_vec`
@@ -237,6 +242,7 @@ impl PeFile {
         let opt_off = coff_off + COFF_HEADER_SIZE;
         let opt_size = coff.size_of_optional_header as usize;
         ensure_len(bytes, opt_off as u64, opt_size as u64)?;
+        let mut image_base: u64 = 0;
         let kind = if opt_size == 0 {
             // Object files have no optional header. Default to PE32+
             // for typing purposes; the kind is informational only.
@@ -245,8 +251,23 @@ impl PeFile {
             ensure_len(bytes, opt_off as u64, 2)?;
             let magic = read_u16(bytes, opt_off);
             match magic {
-                OPTIONAL_HEADER_MAGIC_PE32 => PeKind::Pe32,
-                OPTIONAL_HEADER_MAGIC_PE32_PLUS => PeKind::Pe32Plus,
+                OPTIONAL_HEADER_MAGIC_PE32 => {
+                    // PE32 ImageBase is at offset 28 within the
+                    // optional header (4 bytes). The first 24 bytes
+                    // cover Magic + version + sizes + entry/code/data
+                    // RVAs.
+                    if opt_size >= 32 {
+                        image_base = u64::from(read_u32(bytes, opt_off + 28));
+                    }
+                    PeKind::Pe32
+                }
+                OPTIONAL_HEADER_MAGIC_PE32_PLUS => {
+                    // PE32+ ImageBase is at offset 24, 8 bytes.
+                    if opt_size >= 32 {
+                        image_base = read_u64(bytes, opt_off + 24);
+                    }
+                    PeKind::Pe32Plus
+                }
                 other => return Err(Error::UnsupportedOptionalMagic(other)),
             }
         };
@@ -272,6 +293,7 @@ impl PeFile {
             kind,
             e_lfanew,
             coff,
+            image_base,
             sections,
             raw: bytes.to_vec(),
         })
@@ -445,6 +467,10 @@ fn read_u16(bytes: &[u8], off: usize) -> u16 {
 
 fn read_u32(bytes: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
+}
+
+fn read_u64(bytes: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
 }
 
 /// Decode the 8-byte name field of a COFF symbol entry.
