@@ -219,6 +219,20 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
         }
+        Stmt::LocalCompound {
+            dst,
+            op,
+            src,
+            bytes,
+        } => {
+            write!(out, "{indent}@local_compound(").unwrap();
+            emit_signed_hex(out, *dst);
+            write!(out, ", {}, ", quote_string(op)).unwrap();
+            emit_signed_hex(out, *src);
+            out.push_str(", [");
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
     }
 }
 

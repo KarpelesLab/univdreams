@@ -245,6 +245,23 @@ pub enum Stmt {
         bytes: Vec<u8>,
     },
 
+    /// `@local_compound(dst, op, src, [bytes])` — a multi-instruction
+    /// pattern of the shape `[rbp+dst] op= [rbp+src]`. Either:
+    ///
+    /// * 2-insn form: `mov reg, [rbp+src]; <op> [rbp+dst], reg`
+    ///   for ops with a memory-destination form (add, sub, and, or, xor),
+    /// * 3-insn form: `mov reg, [rbp+dst]; <op> reg, [rbp+src];
+    ///   mov [rbp+dst], reg` for ops without one (imul).
+    ///
+    /// The pinned `bytes` cover the whole sequence; the lower path
+    /// re-emits them verbatim.
+    LocalCompound {
+        dst: i64,
+        op: String,
+        src: i64,
+        bytes: Vec<u8>,
+    },
+
     /// A structured loop with the test at the bottom. Canonical
     /// gcc -O0 shape:
     ///

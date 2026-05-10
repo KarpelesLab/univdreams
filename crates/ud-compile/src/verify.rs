@@ -140,7 +140,8 @@ fn verify_stmts(
             | Stmt::ArgSpill { bytes, .. }
             | Stmt::Call { bytes, .. }
             | Stmt::LocalSet { bytes, .. }
-            | Stmt::LocalArith { bytes, .. } => {
+            | Stmt::LocalArith { bytes, .. }
+            | Stmt::LocalCompound { bytes, .. } => {
                 *cursor = cursor.saturating_add(bytes.len() as u64);
             }
             Stmt::IfBranch {

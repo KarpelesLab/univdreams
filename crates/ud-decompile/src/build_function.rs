@@ -312,9 +312,11 @@ fn emit_block_stmts(
         call_end_idx.insert(site.call_idx, end_idx);
     }
 
-    for (offset, insn) in block.insns[prologue_consumed..asm_count].iter().enumerate() {
-        let global_idx = prologue_consumed + offset;
+    let mut global_idx = prologue_consumed;
+    while global_idx < asm_count {
+        let insn = &block.insns[global_idx];
         if consumed_by_call.contains(&global_idx) {
+            global_idx += 1;
             continue;
         }
         if let Some(site) = call_at.get(&global_idx) {
@@ -344,6 +346,7 @@ fn emit_block_stmts(
                 };
                 out.push(Stmt::Comment(format!("result -> {dest}")));
             }
+            global_idx += 1;
             continue;
         }
 
@@ -357,6 +360,22 @@ fn emit_block_stmts(
                 arg_index,
                 bytes: insn.original_bytes.clone(),
             });
+            global_idx += 1;
+            continue;
+        }
+        // Multi-instruction compound stack-slot op:
+        // `[rbp+dst] op= [rbp+src]`. The window must stay within
+        // the current asm range, must not cross a call boundary,
+        // and none of its instructions may already be consumed.
+        if let Some(consumed) = try_lift_local_compound(
+            block,
+            global_idx,
+            asm_count,
+            &consumed_by_call,
+            &call_at,
+            out,
+        ) {
+            global_idx += consumed;
             continue;
         }
         // Lift `mov [rbp+disp], IMM` (local being initialised or
@@ -367,6 +386,7 @@ fn emit_block_stmts(
                 value,
                 bytes: insn.original_bytes.clone(),
             });
+            global_idx += 1;
             continue;
         }
         // Lift `add/sub dword ptr [rbp+disp], IMM` into
@@ -379,6 +399,7 @@ fn emit_block_stmts(
                 value,
                 bytes: insn.original_bytes.clone(),
             });
+            global_idx += 1;
             continue;
         }
         out.push(Stmt::asm(
@@ -393,6 +414,7 @@ fn emit_block_stmts(
         if let Some(annotation) = lea_target_annotation(insn, ctx.data, ctx.name_at) {
             out.push(Stmt::Comment(annotation));
         }
+        global_idx += 1;
     }
 
     if cfg.truncate_trailing > 0 {
@@ -1093,4 +1115,42 @@ fn arg_spill_lift_index(insn: &DecodedInsn, signature: Option<&Signature>) -> Op
         return None;
     }
     Some(idx)
+}
+
+/// Try to fold an instruction window starting at `start` into a
+/// single `Stmt::LocalCompound`. Returns the number of instructions
+/// consumed on success.
+fn try_lift_local_compound(
+    block: &BasicBlock<DecodedInsn>,
+    start: usize,
+    asm_count: usize,
+    consumed_by_call: &HashSet<usize>,
+    call_at: &HashMap<usize, &CallSite>,
+    out: &mut Vec<Stmt>,
+) -> Option<usize> {
+    let max_window = (asm_count - start).min(3);
+    if max_window < 2 {
+        return None;
+    }
+    for k in start..start + max_window {
+        if consumed_by_call.contains(&k) || call_at.contains_key(&k) {
+            return None;
+        }
+    }
+    let window: Vec<_> = block.insns[start..start + max_window]
+        .iter()
+        .map(|i| i.iced)
+        .collect();
+    let (consumed, dst, op, src) = ud_arch_x86::match_local_compound(&window)?;
+    let mut bytes = Vec::new();
+    for j in start..start + consumed {
+        bytes.extend_from_slice(&block.insns[j].original_bytes);
+    }
+    out.push(Stmt::LocalCompound {
+        dst,
+        op: op.to_string(),
+        src,
+        bytes,
+    });
+    Some(consumed)
 }

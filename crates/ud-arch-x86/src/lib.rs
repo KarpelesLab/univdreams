@@ -488,6 +488,134 @@ pub fn match_local_arith_immediate(insn: &Instruction) -> Option<(i64, &'static 
     Some((signed_memory_displacement(insn), op, value))
 }
 
+/// If the instruction window starts with a recognised compound
+/// stack-slot pattern (`[rbp+dst] op= [rbp+src]`), return
+/// `(consumed, dst, op, src)`.
+///
+/// Two shapes are handled:
+///
+/// * 2-insn (`add`, `sub`, `and`, `or`, `xor`) —
+///   `mov reg, [rbp+src]; <op> [rbp+dst], reg`.
+///   Possible because these ops have a memory-destination form.
+///
+/// * 3-insn (`imul`) —
+///   `mov reg, [rbp+dst]; imul reg, [rbp+src]; mov [rbp+dst], reg`.
+///   `imul` has no memory-destination form, so the compiler routes
+///   through a register.
+///
+/// The temp register must be the same across the window, the memory
+/// operands must all be `[rbp/ebp+disp]` with no index, and (for the
+/// 3-insn form) the dst displacement must match between the load and
+/// the store-back. Returns `None` for any other shape.
+#[must_use]
+pub fn match_local_compound(insns: &[Instruction]) -> Option<(usize, i64, &'static str, i64)> {
+    if insns.len() >= 2 {
+        let i0 = &insns[0];
+        let i1 = &insns[1];
+        if let Some(out) = match_compound_two(i0, i1) {
+            return Some(out);
+        }
+    }
+    if insns.len() >= 3 {
+        let i0 = &insns[0];
+        let i1 = &insns[1];
+        let i2 = &insns[2];
+        if let Some(out) = match_compound_three(i0, i1, i2) {
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn is_rbp_local(insn: &Instruction) -> bool {
+    insn.op_count() == 2
+        && matches!(insn.memory_base(), Register::RBP | Register::EBP)
+        && insn.memory_index() == Register::None
+}
+
+fn match_compound_two(
+    i0: &Instruction,
+    i1: &Instruction,
+) -> Option<(usize, i64, &'static str, i64)> {
+    if i0.mnemonic() != Mnemonic::Mov {
+        return None;
+    }
+    if i0.op_count() != 2 || i0.op0_kind() != OpKind::Register || i0.op1_kind() != OpKind::Memory {
+        return None;
+    }
+    if !is_rbp_local(i0) {
+        return None;
+    }
+    let op = match i1.mnemonic() {
+        Mnemonic::Add => "+=",
+        Mnemonic::Sub => "-=",
+        Mnemonic::And => "&=",
+        Mnemonic::Or => "|=",
+        Mnemonic::Xor => "^=",
+        _ => return None,
+    };
+    if i1.op_count() != 2 || i1.op0_kind() != OpKind::Memory || i1.op1_kind() != OpKind::Register {
+        return None;
+    }
+    if !is_rbp_local(i1) {
+        return None;
+    }
+    if i0.op0_register() != i1.op1_register() {
+        return None;
+    }
+    let src = signed_memory_displacement(i0);
+    let dst = signed_memory_displacement(i1);
+    Some((2, dst, op, src))
+}
+
+fn match_compound_three(
+    i0: &Instruction,
+    i1: &Instruction,
+    i2: &Instruction,
+) -> Option<(usize, i64, &'static str, i64)> {
+    if i0.mnemonic() != Mnemonic::Mov {
+        return None;
+    }
+    if i0.op_count() != 2 || i0.op0_kind() != OpKind::Register || i0.op1_kind() != OpKind::Memory {
+        return None;
+    }
+    if !is_rbp_local(i0) {
+        return None;
+    }
+    let op = match i1.mnemonic() {
+        Mnemonic::Imul => "*=",
+        _ => return None,
+    };
+    if i1.op_count() != 2 || i1.op0_kind() != OpKind::Register || i1.op1_kind() != OpKind::Memory {
+        return None;
+    }
+    if !is_rbp_local(i1) {
+        return None;
+    }
+    if i0.op0_register() != i1.op0_register() {
+        return None;
+    }
+    if i2.mnemonic() != Mnemonic::Mov {
+        return None;
+    }
+    if i2.op_count() != 2 || i2.op0_kind() != OpKind::Memory || i2.op1_kind() != OpKind::Register {
+        return None;
+    }
+    if !is_rbp_local(i2) {
+        return None;
+    }
+    if i2.op1_register() != i0.op0_register() {
+        return None;
+    }
+    let dst_load = signed_memory_displacement(i0);
+    let src = signed_memory_displacement(i1);
+    let dst_store = signed_memory_displacement(i2);
+    if dst_load != dst_store {
+        return None;
+    }
+    Some((3, dst_load, op, src))
+}
+
 /// If `insn` is a `mov [rbp/ebp+disp], IMM` — a stack-frame local
 /// being initialised or assigned a literal — return the signed
 /// displacement and the immediate value. The displacement honours

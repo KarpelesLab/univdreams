@@ -576,6 +576,25 @@ impl Parser {
                     bytes,
                 })
             }
+            "local_compound" => {
+                self.expect(&TokenKind::LParen, "`(` after `@local_compound`")?;
+                #[allow(clippy::cast_possible_wrap)]
+                let dst = self.expect_int("local-compound dst displacement")? as i64;
+                self.expect(&TokenKind::Comma, "`,` after `@local_compound` dst")?;
+                let op = self.expect_string("local-compound op string (e.g. \"+=\")")?;
+                self.expect(&TokenKind::Comma, "`,` after `@local_compound` op")?;
+                #[allow(clippy::cast_possible_wrap)]
+                let src = self.expect_int("local-compound src displacement")? as i64;
+                self.expect(&TokenKind::Comma, "`,` after `@local_compound` src")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@local_compound`")?;
+                Ok(Stmt::LocalCompound {
+                    dst,
+                    op,
+                    src,
+                    bytes,
+                })
+            }
             other => Err(ParseError::UnknownDirective {
                 name: other.to_string(),
                 line: dir_tok.line,
