@@ -174,21 +174,47 @@ fn relative_offset(insn: &DecodedInsn) -> u64 {
 /// the decompile path when emitting `@asm("text", [bytes])`.
 #[must_use]
 pub fn format_insn(insn: &DecodedInsn) -> String {
+    format_insn_with(insn, |_| None)
+}
+
+/// Render `insn` with an optional address → symbol resolver. When
+/// the resolver returns `Some(name)` for the instruction's memory
+/// operand (zero-page or absolute), the symbolic name is substituted
+/// for the numeric address. Returning `None` produces the same
+/// output as [`format_insn`].
+pub fn format_insn_with(
+    insn: &DecodedInsn,
+    resolve: impl Fn(u16) -> Option<&'static str>,
+) -> String {
     let m = mnemonic_name(insn.mnemonic);
     let next = insn.addr.0.wrapping_add(insn.original_bytes.len() as u64);
+    let resolved = resolve(insn.operand);
+    let addr16 = |alt: String| -> String { resolved.map_or(alt, str::to_string) };
     match insn.mode {
         AddressingMode::Implied => m.to_string(),
         AddressingMode::Accumulator => format!("{m} A"),
         AddressingMode::Immediate => format!("{m} #${:02X}", insn.operand),
-        AddressingMode::ZeroPage => format!("{m} ${:02X}", insn.operand),
-        AddressingMode::ZeroPageX => format!("{m} ${:02X},X", insn.operand),
-        AddressingMode::ZeroPageY => format!("{m} ${:02X},Y", insn.operand),
-        AddressingMode::Absolute => format!("{m} ${:04X}", insn.operand),
-        AddressingMode::AbsoluteX => format!("{m} ${:04X},X", insn.operand),
-        AddressingMode::AbsoluteY => format!("{m} ${:04X},Y", insn.operand),
-        AddressingMode::Indirect => format!("{m} (${:04X})", insn.operand),
-        AddressingMode::IndirectX => format!("{m} (${:02X},X)", insn.operand),
-        AddressingMode::IndirectY => format!("{m} (${:02X}),Y", insn.operand),
+        AddressingMode::ZeroPage => format!("{m} {}", addr16(format!("${:02X}", insn.operand))),
+        AddressingMode::ZeroPageX => {
+            format!("{m} {},X", addr16(format!("${:02X}", insn.operand)))
+        }
+        AddressingMode::ZeroPageY => {
+            format!("{m} {},Y", addr16(format!("${:02X}", insn.operand)))
+        }
+        AddressingMode::Absolute => format!("{m} {}", addr16(format!("${:04X}", insn.operand))),
+        AddressingMode::AbsoluteX => {
+            format!("{m} {},X", addr16(format!("${:04X}", insn.operand)))
+        }
+        AddressingMode::AbsoluteY => {
+            format!("{m} {},Y", addr16(format!("${:04X}", insn.operand)))
+        }
+        AddressingMode::Indirect => format!("{m} ({})", addr16(format!("${:04X}", insn.operand))),
+        AddressingMode::IndirectX => {
+            format!("{m} ({},X)", addr16(format!("${:02X}", insn.operand)))
+        }
+        AddressingMode::IndirectY => {
+            format!("{m} ({}),Y", addr16(format!("${:02X}", insn.operand)))
+        }
         AddressingMode::Relative => {
             let tgt = next.wrapping_add(relative_offset(insn)) & 0xFFFF;
             format!("{m} ${tgt:04X}")

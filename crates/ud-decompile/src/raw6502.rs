@@ -22,7 +22,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use ud_arch_6502::{classify, decode_range, format_insn, AddressingMode, DecodedInsn, InsnKind};
+use ud_arch_6502::{
+    classify, decode_range, format_insn_with, AddressingMode, DecodedInsn, InsnKind,
+};
 use ud_ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
 use ud_format_raw::RawImage;
 
@@ -149,7 +151,7 @@ fn discover_labels(insns: &[DecodedInsn], entries: &[u64]) -> HashMap<u64, Strin
 
 /// Build the body for one function: every instruction with address
 /// in `[start, end)`, plus comment statements at branch-target
-/// labels.
+/// labels, plus structured `@loop` blocks for tight do-while patterns.
 fn build_body_range(
     insns: &[DecodedInsn],
     start: u64,
@@ -158,21 +160,85 @@ fn build_body_range(
     entries: &[u64],
 ) -> Vec<Stmt> {
     let entry_set: HashSet<u64> = entries.iter().copied().collect();
+    let local: Vec<&DecodedInsn> = insns
+        .iter()
+        .filter(|i| i.addr.0 >= start && i.addr.0 < end)
+        .collect();
+    build_stmt_slice(&local, &entry_set, labels)
+}
+
+/// Recursive body builder: detect tight do-while loops (back-branch
+/// to an earlier address in the slice) and recurse into their body
+/// so nested loops are also lifted.
+fn build_stmt_slice(
+    local: &[&DecodedInsn],
+    entries: &HashSet<u64>,
+    labels: &HashMap<u64, String>,
+) -> Vec<Stmt> {
     let mut out = Vec::new();
-    for ins in insns.iter().filter(|i| i.addr.0 >= start && i.addr.0 < end) {
-        // Label for this address (if any).
+    let mut i = 0usize;
+    while i < local.len() {
+        if let Some((j, tail)) = find_back_branch_target(local, i) {
+            let body = build_stmt_slice(&local[i..j], entries, labels);
+            let tail_bytes = tail.original_bytes.clone();
+            let cond_text = format_branch_cond(tail, entries, labels);
+            out.push(Stmt::Loop {
+                entry_jmp_bytes: None,
+                tail_bytes,
+                cond_text,
+                body,
+            });
+            i = j + 1;
+            continue;
+        }
+        let ins = local[i];
         if let Some(lbl) = labels.get(&ins.addr.0) {
             out.push(Stmt::Comment(format!("{lbl}:")));
         }
-        let mut text = format_insn(ins);
-        // Annotate JSR/JMP with the symbolic name of the target
-        // when we know one.
-        if let Some(annot) = call_annotation(ins, &entry_set, labels) {
-            text = format!("{text}  ; {annot}");
-        }
-        out.push(Stmt::asm(text, ins.original_bytes.clone()));
+        out.push(asm_stmt(ins, entries, labels));
+        i += 1;
     }
     out
+}
+
+/// If a back-branch loop opens at `local[start_idx]`, return
+/// `(branch_idx, branch_insn)`. The branch must be a
+/// conditional Bcc whose taken target equals `local[start_idx].addr`,
+/// and must appear *after* `start_idx` in the function body.
+fn find_back_branch_target<'a>(
+    local: &[&'a DecodedInsn],
+    start_idx: usize,
+) -> Option<(usize, &'a DecodedInsn)> {
+    let head_addr = local[start_idx].addr.0;
+    for (j, ins) in local.iter().enumerate().skip(start_idx + 1) {
+        if let InsnKind::Branch { taken, .. } = classify(ins) {
+            if taken == head_addr {
+                return Some((j, ins));
+            }
+        }
+    }
+    None
+}
+
+fn asm_stmt(ins: &DecodedInsn, entries: &HashSet<u64>, labels: &HashMap<u64, String>) -> Stmt {
+    let mut text = format_insn_with(ins, apple1_symbol);
+    if let Some(annot) = call_annotation(ins, entries, labels) {
+        text = format!("{text}  ; {annot}");
+    }
+    Stmt::asm(text, ins.original_bytes.clone())
+}
+
+fn format_branch_cond(
+    ins: &DecodedInsn,
+    entries: &HashSet<u64>,
+    labels: &HashMap<u64, String>,
+) -> String {
+    let base = format_insn_with(ins, apple1_symbol);
+    if let Some(annot) = call_annotation(ins, entries, labels) {
+        format!("{base}  ; {annot}")
+    } else {
+        base
+    }
 }
 
 /// If `ins` targets a known entry or label, return its symbolic
@@ -201,8 +267,29 @@ fn call_annotation(
             })
         }
         InsnKind::Branch { taken, .. } if ins.mode == AddressingMode::Relative => {
-            labels.get(&taken).map(|n| format!("-> {n}"))
+            labels.get(&taken).map(|n| format!("-> {n}")).or_else(|| {
+                if entries.contains(&taken) {
+                    Some(format!("-> {}", function_name(taken, u64::MAX)))
+                } else {
+                    None
+                }
+            })
         }
+        _ => None,
+    }
+}
+
+/// Apple I symbol resolver for the PIA-mapped keyboard / display
+/// registers. Returns `None` for any address outside this region —
+/// callers display those as `$XXXX` raw addresses.
+///
+/// References: Apple I Operation Manual, p. 4-5.
+fn apple1_symbol(addr: u16) -> Option<&'static str> {
+    match addr {
+        0xD010 => Some("KBD"),
+        0xD011 => Some("KBDCR"),
+        0xD012 => Some("DSP"),
+        0xD013 => Some("DSPCR"),
         _ => None,
     }
 }
