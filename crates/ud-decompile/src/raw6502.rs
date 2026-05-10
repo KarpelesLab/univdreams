@@ -273,6 +273,14 @@ fn build_stmt_slice(
             i += consumed;
             continue;
         }
+        // 7. Consecutive accumulator shifts (LSR A or ASL A) — the
+        //    "shift A by N" idiom used to extract a nibble or position
+        //    bits. Collapse into a single multi-byte @asm.
+        if let Some((stmt, consumed)) = try_lift_acc_shift_chain(local, i) {
+            out.push(stmt);
+            i += consumed;
+            continue;
+        }
         // 5. Plain @asm.
         let ins = local[i];
         if let Some(lbl) = labels.get(&ins.addr.0) {
@@ -362,6 +370,39 @@ fn try_lift_move(
     let src = format_operand(load, resolver);
     let dst = dsts.join(" = ");
     Some((Stmt::Move { dst, src, bytes }, j - i))
+}
+
+/// If `local[i..]` is two or more consecutive `LSR A` or `ASL A`
+/// (accumulator-mode shifts), collapse them into a single
+/// `@asm("LSR A xN", [bytes])` carrying all the shift bytes.
+/// Returns `(stmt, consumed_count)`.
+///
+/// This is the canonical "shift A by N to extract a nibble or
+/// position bits" idiom — `LSR A x4` in PRBYTE, `ASL A x4` in
+/// the hex-digit shifter.
+fn try_lift_acc_shift_chain(local: &[&DecodedInsn], i: usize) -> Option<(Stmt, usize)> {
+    let first = local.get(i)?;
+    let op_text = match (first.mnemonic, first.mode) {
+        (Mnemonic::ASL, AddressingMode::Accumulator) => "ASL A",
+        (Mnemonic::LSR, AddressingMode::Accumulator) => "LSR A",
+        _ => return None,
+    };
+    let second = local.get(i + 1)?;
+    if second.mnemonic != first.mnemonic || second.mode != first.mode {
+        return None;
+    }
+    let mut bytes = first.original_bytes.clone();
+    let mut count = 1usize;
+    let mut j = i + 1;
+    while let Some(ins) = local.get(j) {
+        if ins.mnemonic != first.mnemonic || ins.mode != first.mode {
+            break;
+        }
+        bytes.extend_from_slice(&ins.original_bytes);
+        count += 1;
+        j += 1;
+    }
+    Some((Stmt::asm(format!("{op_text} x{count}"), bytes), count))
 }
 
 /// If `local[i..]` is `STA dst1; STA dst2 [; STA dst3 ...]`
