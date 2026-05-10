@@ -1,12 +1,12 @@
 //! Build the `FnDecl` AST node for a lifted function.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ud_arch_x86::{
     arg_spill_index, direct_call_target, direct_lea_rip_target, direct_unconditional_branch_target,
-    format_intel, try_lift_epilogue_pattern, try_lift_if_branch_head, try_lift_prologue_pattern,
-    try_lift_return_pattern, try_lift_return_via_jmp, try_lift_value_block, DecodedInsn,
-    ExprRenderCtx,
+    format_intel, identify_call_sites, try_lift_epilogue_pattern, try_lift_if_branch_head,
+    try_lift_prologue_pattern, try_lift_return_pattern, try_lift_return_via_jmp,
+    try_lift_value_block, ArgValue, CallSite, DecodedInsn, ExprRenderCtx,
 };
 use ud_ast::{FnDecl, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
@@ -170,6 +170,7 @@ struct EmitCtx<'a> {
 /// the first block, per-instruction `@asm` lines (with call-target /
 /// arg-spill annotations), then either the trailing-tail lift
 /// (`Stmt::Return` / `Stmt::Epilogue`) or a terminator comment.
+#[allow(clippy::too_many_lines)]
 fn emit_block_stmts(
     out: &mut Vec<Stmt>,
     block: &BasicBlock<DecodedInsn>,
@@ -212,7 +213,53 @@ fn emit_block_stmts(
         .len()
         .saturating_sub(tail_consumed + cfg.truncate_trailing);
 
-    for insn in &block.insns[prologue_consumed..asm_count] {
+    // Pre-pass: identify direct-call sites in this block so we can
+    // fold their arg-setup + call into a single `@call` directive.
+    // We only consider sites whose `call_idx` falls within the
+    // emitted-as-asm range — anything past `asm_count` belongs to a
+    // tail lift (`@return_expr` etc.) that already owns those bytes.
+    let call_sites = identify_call_sites(&block.insns);
+    let mut call_at: HashMap<usize, &CallSite> = HashMap::new();
+    let mut consumed_by_call: HashSet<usize> = HashSet::new();
+    for site in &call_sites {
+        if site.call_idx >= asm_count {
+            continue;
+        }
+        let setup_start = site.setup_start.max(prologue_consumed);
+        if setup_start > site.call_idx {
+            continue;
+        }
+        call_at.insert(site.call_idx, site);
+        for i in setup_start..site.call_idx {
+            consumed_by_call.insert(i);
+        }
+    }
+
+    for (offset, insn) in block.insns[prologue_consumed..asm_count].iter().enumerate() {
+        let global_idx = prologue_consumed + offset;
+        if consumed_by_call.contains(&global_idx) {
+            continue;
+        }
+        if let Some(site) = call_at.get(&global_idx) {
+            let setup_start = site.setup_start.max(prologue_consumed);
+            let mut bytes = Vec::new();
+            for j in setup_start..=site.call_idx {
+                bytes.extend_from_slice(&block.insns[j].original_bytes);
+            }
+            let name = ctx
+                .name_at
+                .get(&site.call_target)
+                .cloned()
+                .unwrap_or_else(|| format!("sub_{:x}", site.call_target));
+            let args = site
+                .args
+                .iter()
+                .map(|a| render_arg_value(a, ctx))
+                .collect::<Vec<_>>();
+            out.push(Stmt::Call { name, args, bytes });
+            continue;
+        }
+
         // Lift `mov [rbp+disp], REG_arg` into `@arg_spill(N, [bytes])`
         // when the function has a parameter at that arg index. The
         // directive subsumes both the `@asm` and the
@@ -658,6 +705,52 @@ fn call_annotation(
         }
     }
     None
+}
+
+/// Render an [`ArgValue`] into a human-readable string for the
+/// `@call(name, [args], [bytes])` directive.
+///
+/// This is intentionally low-fidelity — the strings are
+/// informational; the pinned bytes on the `Stmt::Call` are
+/// authoritative for round-trip. Renderings prioritise readability
+/// over preserving operand semantics: a `lea` to a function address
+/// renders as `&function`, a `lea` to a `.rodata` C-string renders
+/// as the string literal itself.
+fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
+    match value {
+        ArgValue::Const(n) => n.to_string(),
+        ArgValue::Lea { addr } => {
+            if let Some(name) = ctx.name_at.get(addr) {
+                return format!("&{name}");
+            }
+            if let Some((section_name, data, off)) = find_section_at(ctx.elf, *addr) {
+                if is_string_data_section(section_name) {
+                    if let Some(s) = read_cstring_at(data, off) {
+                        return format!("{:?}", shorten_for_display(s));
+                    }
+                }
+                return format!("{section_name} @ 0x{addr:x}");
+            }
+            format!("&0x{addr:x}")
+        }
+        ArgValue::GlobalLoad { addr } => {
+            if let Some(name) = ctx.name_at.get(addr) {
+                return format!("*{name}");
+            }
+            if let Some((section_name, _, _)) = find_section_at(ctx.elf, *addr) {
+                return format!("*{section_name} @ 0x{addr:x}");
+            }
+            format!("*0x{addr:x}")
+        }
+        ArgValue::StackLoad { displacement } => {
+            if *displacement < 0 {
+                format!("[rbp-0x{:x}]", displacement.unsigned_abs())
+            } else {
+                format!("[rbp+0x{displacement:x}]")
+            }
+        }
+        ArgValue::PrevCallResult => "result".into(),
+    }
 }
 
 /// If `insn` is a `lea reg, [rip+disp]` whose target lives in a

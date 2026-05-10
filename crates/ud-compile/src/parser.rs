@@ -503,6 +503,27 @@ impl Parser {
                 self.expect(&TokenKind::RParen, "`)` to close `@return_expr`")?;
                 Ok(Stmt::ReturnExpr { text, bytes })
             }
+            "call" => {
+                self.expect(&TokenKind::LParen, "`(` after `@call`")?;
+                let name = self.expect_string("call target name")?;
+                self.expect(&TokenKind::Comma, "`,` after `@call` name")?;
+                self.expect(&TokenKind::LBracket, "`[` to open arg list")?;
+                let mut args = Vec::new();
+                if self.peek().kind != TokenKind::RBracket {
+                    args.push(self.expect_string("arg expression string")?);
+                    while self.eat_kind(&TokenKind::Comma) {
+                        if self.peek().kind == TokenKind::RBracket {
+                            break;
+                        }
+                        args.push(self.expect_string("arg expression string")?);
+                    }
+                }
+                self.expect(&TokenKind::RBracket, "`]` to close arg list")?;
+                self.expect(&TokenKind::Comma, "`,` after `@call` args")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@call`")?;
+                Ok(Stmt::Call { name, args, bytes })
+            }
             "arg_spill" => {
                 self.expect(&TokenKind::LParen, "`(` after `@arg_spill`")?;
                 let idx = self.expect_int("argument index")?;

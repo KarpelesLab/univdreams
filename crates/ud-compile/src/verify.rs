@@ -137,7 +137,8 @@ fn verify_stmts(
             | Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. }
             | Stmt::ReturnExpr { bytes, .. }
-            | Stmt::ArgSpill { bytes, .. } => {
+            | Stmt::ArgSpill { bytes, .. }
+            | Stmt::Call { bytes, .. } => {
                 *cursor = cursor.saturating_add(bytes.len() as u64);
             }
             Stmt::IfBranch {

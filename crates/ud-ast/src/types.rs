@@ -184,6 +184,20 @@ pub enum Stmt {
     /// doesn't appear in the directive shape.
     ArgSpill { arg_index: u32, bytes: Vec<u8> },
 
+    /// `@call("name", [args], [bytes])` — a recognised direct-call
+    /// site whose preceding `mov reg, …` / `lea reg, …` instructions
+    /// have been folded into the args list. Each arg is a
+    /// human-readable rendering (string literal, integer constant,
+    /// global address, `&function` reference, or `result` for a
+    /// previous call's return value); the pinned bytes cover both
+    /// the arg-setup instructions and the call itself, so the lower
+    /// path emits the original instruction sequence verbatim.
+    Call {
+        name: String,
+        args: Vec<String>,
+        bytes: Vec<u8>,
+    },
+
     /// A structured `cmp/test + jcc` head plus its branches:
     ///
     /// ```text

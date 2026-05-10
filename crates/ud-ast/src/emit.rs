@@ -143,6 +143,18 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
         }
+        Stmt::Call { name, args, bytes } => {
+            write!(out, "{indent}@call({}, [", quote_string(name)).unwrap();
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&quote_string(a));
+            }
+            out.push_str("], [");
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
         Stmt::IfBranch {
             cond_text,
             cond_bytes,
