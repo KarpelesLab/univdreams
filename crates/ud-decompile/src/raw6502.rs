@@ -70,11 +70,12 @@ pub fn decompile_raw_6502(image: &RawImage) -> Result<UdFile> {
 
     let entries = discover_entries(&insns, reset_addr, image.start(), code_end);
     let labels = discover_labels(&insns, &entries);
+    let resolver = pick_resolver(image);
 
     let mut items: Vec<Item> = Vec::new();
     for (idx, &entry) in entries.iter().enumerate() {
         let end = entries.get(idx + 1).copied().unwrap_or(code_end);
-        let body = build_body_range(&insns, entry, end, &labels, &entries);
+        let body = build_body_range(&insns, entry, end, &labels, &entries, resolver);
         let name = function_name(entry, reset_addr);
         items.push(Item::Function(FnDecl {
             addr: Some(entry),
@@ -158,13 +159,14 @@ fn build_body_range(
     end: u64,
     labels: &HashMap<u64, String>,
     entries: &[u64],
+    resolver: SymbolResolver,
 ) -> Vec<Stmt> {
     let entry_set: HashSet<u64> = entries.iter().copied().collect();
     let local: Vec<&DecodedInsn> = insns
         .iter()
         .filter(|i| i.addr.0 >= start && i.addr.0 < end)
         .collect();
-    build_stmt_slice(&local, &entry_set, labels)
+    build_stmt_slice(&local, &entry_set, labels, resolver)
 }
 
 /// Recursive body builder. In priority order:
@@ -180,15 +182,16 @@ fn build_stmt_slice(
     local: &[&DecodedInsn],
     entries: &HashSet<u64>,
     labels: &HashMap<u64, String>,
+    resolver: SymbolResolver,
 ) -> Vec<Stmt> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < local.len() {
         // 1. Back-branch do-while.
         if let Some((j, tail)) = find_back_branch_target(local, i) {
-            let body = build_stmt_slice(&local[i..j], entries, labels);
+            let body = build_stmt_slice(&local[i..j], entries, labels, resolver);
             let tail_bytes = tail.original_bytes.clone();
-            let cond_text = format_branch_cond(tail, entries, labels);
+            let cond_text = format_branch_cond(tail, entries, labels, resolver);
             out.push(Stmt::Loop {
                 entry_jmp_bytes: None,
                 tail_bytes,
@@ -198,13 +201,28 @@ fn build_stmt_slice(
             i = j + 1;
             continue;
         }
-        // 2. Forward conditional branch.
+        // 2. Forward conditional branch — try if/else first.
         if let Some((target_idx, branch)) = find_forward_branch_target(local, i) {
-            let then_body = build_stmt_slice(&local[i + 1..target_idx], entries, labels);
-            let cond_text = format_branch_cond(branch, entries, labels);
+            let cond_text = format_branch_cond(branch, entries, labels, resolver);
+            let cond_bytes = branch.original_bytes.clone();
+            if let Some(x_idx) = find_jmp_over_else(local, target_idx) {
+                let then_body =
+                    build_stmt_slice(&local[i + 1..target_idx], entries, labels, resolver);
+                let else_stmts =
+                    build_stmt_slice(&local[target_idx..x_idx], entries, labels, resolver);
+                out.push(Stmt::IfBranch {
+                    cond_text,
+                    cond_bytes,
+                    then_body,
+                    else_body: Some(else_stmts),
+                });
+                i = x_idx;
+                continue;
+            }
+            let then_body = build_stmt_slice(&local[i + 1..target_idx], entries, labels, resolver);
             out.push(Stmt::IfBranch {
                 cond_text,
-                cond_bytes: branch.original_bytes.clone(),
+                cond_bytes,
                 then_body,
                 else_body: None,
             });
@@ -223,12 +241,12 @@ fn build_stmt_slice(
             i += 1;
             continue;
         }
-        // 4. Plain @asm.
+        // 5. Plain @asm.
         let ins = local[i];
         if let Some(lbl) = labels.get(&ins.addr.0) {
             out.push(Stmt::Comment(format!("{lbl}:")));
         }
-        out.push(asm_stmt(ins, entries, labels));
+        out.push(asm_stmt(ins, entries, labels, resolver));
         i += 1;
     }
     out
@@ -273,6 +291,29 @@ fn try_lift_bare_call(local: &[&DecodedInsn], i: usize, entries: &HashSet<u64>) 
         args: Vec::new(),
         bytes: jsr.original_bytes.clone(),
     })
+}
+
+/// If `local[target_idx - 1]` is `JMP $X` (absolute direct) whose
+/// target `X` is the address of `local[x_idx]` for some
+/// `x_idx > target_idx`, return `x_idx`. This is the marker that
+/// the bytes `[target_idx, x_idx)` are the else-body of an if/else
+/// pair whose Bcc skips into the else, and whose then path ends
+/// with this `JMP` over the else.
+fn find_jmp_over_else(local: &[&DecodedInsn], target_idx: usize) -> Option<usize> {
+    if target_idx == 0 {
+        return None;
+    }
+    let jmp = local[target_idx - 1];
+    let InsnKind::JumpDirect { target: jmp_target } = classify(jmp) else {
+        return None;
+    };
+    // Must be a forward jump landing strictly after the target.
+    local
+        .iter()
+        .enumerate()
+        .skip(target_idx + 1)
+        .find(|(_, ins)| ins.addr.0 == jmp_target)
+        .map(|(idx, _)| idx)
 }
 
 /// If `local[start_idx]` is a forward conditional branch whose
@@ -331,8 +372,13 @@ fn find_back_branch_target<'a>(
     None
 }
 
-fn asm_stmt(ins: &DecodedInsn, entries: &HashSet<u64>, labels: &HashMap<u64, String>) -> Stmt {
-    let mut text = format_insn_with(ins, apple1_symbol);
+fn asm_stmt(
+    ins: &DecodedInsn,
+    entries: &HashSet<u64>,
+    labels: &HashMap<u64, String>,
+    resolver: SymbolResolver,
+) -> Stmt {
+    let mut text = format_insn_with(ins, resolver);
     if let Some(annot) = call_annotation(ins, entries, labels) {
         text = format!("{text}  ; {annot}");
     }
@@ -343,8 +389,9 @@ fn format_branch_cond(
     ins: &DecodedInsn,
     entries: &HashSet<u64>,
     labels: &HashMap<u64, String>,
+    resolver: SymbolResolver,
 ) -> String {
-    let base = format_insn_with(ins, apple1_symbol);
+    let base = format_insn_with(ins, resolver);
     if let Some(annot) = call_annotation(ins, entries, labels) {
         format!("{base}  ; {annot}")
     } else {
@@ -390,9 +437,13 @@ fn call_annotation(
     }
 }
 
+/// A function pointer that maps a 16-bit address to its symbolic
+/// name, or `None` if unknown. Plugged into [`format_insn_with`]
+/// when rendering `@asm` text.
+type SymbolResolver = fn(u16) -> Option<&'static str>;
+
 /// Apple I symbol resolver for the PIA-mapped keyboard / display
-/// registers. Returns `None` for any address outside this region —
-/// callers display those as `$XXXX` raw addresses.
+/// registers. Returns `None` for any address outside this region.
 ///
 /// References: Apple I Operation Manual, p. 4-5.
 fn apple1_symbol(addr: u16) -> Option<&'static str> {
@@ -402,6 +453,48 @@ fn apple1_symbol(addr: u16) -> Option<&'static str> {
         0xD012 => Some("DSP"),
         0xD013 => Some("DSPCR"),
         _ => None,
+    }
+}
+
+/// WozMon symbol resolver: Apple I I/O plus the zero-page
+/// variables Wozniak named in his 1976 source.
+///
+/// Source: Wozniak's commented assembly listing (e.g. the
+/// `wozmon.s` shipped alongside the binary fixture).
+fn wozmon_symbol(addr: u16) -> Option<&'static str> {
+    match addr {
+        // Apple I PIA-mapped I/O.
+        0xD010 => Some("KBD"),
+        0xD011 => Some("KBDCR"),
+        0xD012 => Some("DSP"),
+        0xD013 => Some("DSPCR"),
+        // WozMon zero-page variables.
+        0x0024 => Some("XAML"),
+        0x0025 => Some("XAMH"),
+        0x0026 => Some("STL"),
+        0x0027 => Some("STH"),
+        0x0028 => Some("L"),
+        0x0029 => Some("H"),
+        0x002A => Some("YSAV"),
+        0x002B => Some("MODE"),
+        // WozMon's input buffer ($0200-$027F).
+        0x0200 => Some("IN"),
+        _ => None,
+    }
+}
+
+/// Pick a program-aware symbol resolver based on image shape.
+/// A 256-byte image at $FF00 whose reset vector points back to
+/// $FF00 is WozMon; otherwise we fall back to the Apple I I/O
+/// resolver. Both are guaranteed to include the I/O range.
+fn pick_resolver(image: &RawImage) -> SymbolResolver {
+    let looks_like_wozmon = image.bytes.len() == 0x100
+        && image.load_addr == 0xFF00
+        && image.read_u16_le(0xFFFC).ok() == Some(0xFF00);
+    if looks_like_wozmon {
+        wozmon_symbol
+    } else {
+        apple1_symbol
     }
 }
 
