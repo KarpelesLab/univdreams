@@ -23,6 +23,7 @@ path = "src/lib.rs"
 ud-core = { path = "../ud-core" }
 ud-ast = { path = "../ud-ast" }
 ud-format-elf = { path = "../ud-format-elf" }
+ud-format-pe = { path = "../ud-format-pe" }
 ud-decompile = { path = "../ud-decompile" }
 ud-compile = { path = "../ud-compile" }
 clap = { version = "4", features = ["derive"] }

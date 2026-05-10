@@ -53,8 +53,14 @@ fn pipeline_bytes(bytes: &[u8]) -> Vec<u8> {
         if let Ok(elf) = ud_format_elf::Elf64File::parse(bytes) {
             return elf.write_to_vec();
         }
-        // ELF64-LE that we still can't parse (e.g. malformed header sizes).
+        // ELF that we still can't parse (e.g. malformed header sizes).
         // Fall through to byte-copy so the round-trip contract holds.
+    }
+    if ud_format_pe::is_pe(bytes) {
+        if let Ok(pe) = ud_format_pe::PeFile::parse(bytes) {
+            return pe.write_to_vec();
+        }
+        // PE-shaped but invalid; fall through to byte-copy.
     }
     bytes.to_vec()
 }
