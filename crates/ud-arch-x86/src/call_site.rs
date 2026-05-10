@@ -56,6 +56,76 @@ pub struct CallSite {
     pub call_idx: usize,
 }
 
+/// One recognised post-call result spill: the instruction(s) that
+/// move the call's return value into a stack slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostCallSpill {
+    /// Stack-slot displacement the result lands at (`[rbp+displacement]`).
+    pub displacement: i64,
+    /// Number of trailing instructions matched (1 or 2).
+    pub insns_consumed: usize,
+}
+
+/// If the instructions starting at `after_idx` form a recognised
+/// "spill the call's return value to a local stack slot" sequence,
+/// return the displacement of that slot.
+///
+/// Recognised patterns:
+///
+/// * `mov [rbp+disp], rax`   — int/pointer return spill.
+/// * `mov [rbp+disp], eax`   — 32-bit int return spill.
+/// * `movq rax, xmm0; mov [rbp+disp], rax` — float/double return
+///   rerouted through rax then stored.
+#[must_use]
+pub fn detect_post_call_spill(insns: &[DecodedInsn], after_idx: usize) -> Option<PostCallSpill> {
+    let first = insns.get(after_idx)?;
+    let m = first.iced.mnemonic();
+    if m == Mnemonic::Movq && is_movq_rax_from_xmm0(&first.iced) {
+        let second = insns.get(after_idx + 1)?;
+        let disp = parse_rbp_store(&second.iced, &[Register::RAX])?;
+        return Some(PostCallSpill {
+            displacement: disp,
+            insns_consumed: 2,
+        });
+    }
+    if m == Mnemonic::Mov {
+        let disp = parse_rbp_store(&first.iced, &[Register::RAX, Register::EAX])?;
+        return Some(PostCallSpill {
+            displacement: disp,
+            insns_consumed: 1,
+        });
+    }
+    None
+}
+
+fn is_movq_rax_from_xmm0(insn: &Instruction) -> bool {
+    insn.op_count() == 2
+        && insn.op0_kind() == OpKind::Register
+        && insn.op0_register() == Register::RAX
+        && insn.op1_kind() == OpKind::Register
+        && insn.op1_register() == Register::XMM0
+}
+
+fn parse_rbp_store(insn: &Instruction, allowed_src: &[Register]) -> Option<i64> {
+    if insn.op_count() != 2 {
+        return None;
+    }
+    if insn.op0_kind() != OpKind::Memory
+        || insn.memory_base() != Register::RBP
+        || insn.memory_index() != Register::None
+    {
+        return None;
+    }
+    if insn.op1_kind() != OpKind::Register {
+        return None;
+    }
+    if !allowed_src.contains(&insn.op1_register()) {
+        return None;
+    }
+    #[allow(clippy::cast_possible_wrap)]
+    Some(insn.memory_displacement64() as i64)
+}
+
 /// Walk `insns` forward, returning every direct call site whose
 /// arg-setup we could resolve.
 #[must_use]
@@ -165,11 +235,14 @@ impl Analyzer {
             call_idx: idx,
         });
 
-        // After the call: arg registers are clobbered, RAX carries
-        // the call's return value (informational), and the next
-        // setup window begins at idx + 1.
+        // After the call: arg registers are clobbered. The return
+        // value lives in RAX for integer/pointer returns and in XMM0
+        // for float/double returns; we don't know which, so both
+        // get the `PrevCallResult` tag so downstream `mov reg, rax`
+        // / `movq reg, xmm0` chains can pick it up.
         self.regs.clear();
         self.regs.insert(Register::RAX, ArgValue::PrevCallResult);
+        self.regs.insert(Register::XMM0, ArgValue::PrevCallResult);
         self.saw_any_call = true;
         self.setup_start = idx + 1;
     }
@@ -370,6 +443,35 @@ mod tests {
         assert_eq!(sites.len(), 1);
         // mov rax,[rip+0x100] resolves with rip-after = 0x1007 → 0x1107.
         assert_eq!(sites[0].args, vec![ArgValue::GlobalLoad { addr: 0x1107 }]);
+    }
+
+    #[test]
+    fn detect_post_call_spill_recognizes_movq_then_mov() {
+        // movq rax, xmm0           ; 66 48 0f 7e c0
+        // mov [rbp-8], rax         ; 48 89 45 f8
+        let bytes = [0x66, 0x48, 0x0f, 0x7e, 0xc0, 0x48, 0x89, 0x45, 0xf8];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let spill = detect_post_call_spill(&insns, 0).expect("should match");
+        assert_eq!(spill.displacement, -8);
+        assert_eq!(spill.insns_consumed, 2);
+    }
+
+    #[test]
+    fn detect_post_call_spill_recognizes_direct_mov_rax() {
+        // mov [rbp-0x10], rax      ; 48 89 45 f0
+        let bytes = [0x48, 0x89, 0x45, 0xf0];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let spill = detect_post_call_spill(&insns, 0).expect("should match");
+        assert_eq!(spill.displacement, -0x10);
+        assert_eq!(spill.insns_consumed, 1);
+    }
+
+    #[test]
+    fn detect_post_call_spill_rejects_unrelated_mov() {
+        // mov rdi, rax — register-to-register, no store.
+        let bytes = [0x48, 0x89, 0xc7];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert!(detect_post_call_spill(&insns, 0).is_none());
     }
 
     #[test]

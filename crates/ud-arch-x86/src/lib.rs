@@ -29,7 +29,9 @@ use ud_ir::ArchInsn;
 mod call_site;
 mod expr;
 mod lift;
-pub use call_site::{identify_call_sites, ArgValue, CallSite};
+pub use call_site::{
+    detect_post_call_spill, identify_call_sites, ArgValue, CallSite, PostCallSpill,
+};
 pub use expr::{try_lift_value_block, ExprRenderCtx, LiftedValueBlock, ValueExpr};
 pub use lift::{lift_function, LiftError};
 

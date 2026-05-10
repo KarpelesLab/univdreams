@@ -3,10 +3,11 @@
 use std::collections::{HashMap, HashSet};
 
 use ud_arch_x86::{
-    arg_spill_index, direct_call_target, direct_lea_rip_target, direct_unconditional_branch_target,
-    format_intel, identify_call_sites, try_lift_epilogue_pattern, try_lift_if_branch_head,
-    try_lift_prologue_pattern, try_lift_return_pattern, try_lift_return_via_jmp,
-    try_lift_value_block, ArgValue, CallSite, DecodedInsn, ExprRenderCtx,
+    arg_spill_index, detect_post_call_spill, direct_call_target, direct_lea_rip_target,
+    direct_unconditional_branch_target, format_intel, identify_call_sites,
+    try_lift_epilogue_pattern, try_lift_if_branch_head, try_lift_prologue_pattern,
+    try_lift_return_pattern, try_lift_return_via_jmp, try_lift_value_block, ArgValue, CallSite,
+    DecodedInsn, ExprRenderCtx,
 };
 use ud_ast::{FnDecl, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
@@ -221,7 +222,9 @@ fn emit_block_stmts(
     let call_sites = identify_call_sites(&block.insns);
     let mut call_at: HashMap<usize, &CallSite> = HashMap::new();
     let mut consumed_by_call: HashSet<usize> = HashSet::new();
-    for site in &call_sites {
+    let mut call_end_idx: HashMap<usize, usize> = HashMap::new();
+    let mut post_call_spill: HashMap<usize, i64> = HashMap::new();
+    for (site_idx, site) in call_sites.iter().enumerate() {
         if site.call_idx >= asm_count {
             continue;
         }
@@ -233,6 +236,24 @@ fn emit_block_stmts(
         for i in setup_start..site.call_idx {
             consumed_by_call.insert(i);
         }
+        // Try to fold the post-call result-spill into this call's
+        // bytes. Skip when the spill instructions would overlap the
+        // next call's setup window — those belong to the next call.
+        let mut end_idx = site.call_idx;
+        if let Some(spill) = detect_post_call_spill(&block.insns, site.call_idx + 1) {
+            let spill_end = site.call_idx + spill.insns_consumed;
+            let next_setup_start = call_sites
+                .get(site_idx + 1)
+                .map_or(usize::MAX, |s| s.setup_start);
+            if spill_end < next_setup_start && spill_end < asm_count {
+                for i in (site.call_idx + 1)..=spill_end {
+                    consumed_by_call.insert(i);
+                }
+                post_call_spill.insert(site.call_idx, spill.displacement);
+                end_idx = spill_end;
+            }
+        }
+        call_end_idx.insert(site.call_idx, end_idx);
     }
 
     for (offset, insn) in block.insns[prologue_consumed..asm_count].iter().enumerate() {
@@ -242,8 +263,10 @@ fn emit_block_stmts(
         }
         if let Some(site) = call_at.get(&global_idx) {
             let setup_start = site.setup_start.max(prologue_consumed);
+            let end_idx = *call_end_idx.get(&site.call_idx).unwrap_or(&site.call_idx);
+            let spill_disp = post_call_spill.get(&site.call_idx).copied();
             let mut bytes = Vec::new();
-            for j in setup_start..=site.call_idx {
+            for j in setup_start..=end_idx {
                 bytes.extend_from_slice(&block.insns[j].original_bytes);
             }
             let name = ctx
@@ -257,6 +280,14 @@ fn emit_block_stmts(
                 .map(|a| render_arg_value(a, ctx))
                 .collect::<Vec<_>>();
             out.push(Stmt::Call { name, args, bytes });
+            if let Some(disp) = spill_disp {
+                let dest = if disp < 0 {
+                    format!("[rbp-0x{:x}]", disp.unsigned_abs())
+                } else {
+                    format!("[rbp+0x{disp:x}]")
+                };
+                out.push(Stmt::Comment(format!("result -> {dest}")));
+            }
             continue;
         }
 
