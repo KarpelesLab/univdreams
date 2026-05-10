@@ -150,20 +150,22 @@ pub struct LiftedPrologue {
 #[must_use]
 pub fn try_lift_prologue_pattern(insns: &[DecodedInsn]) -> Option<LiftedPrologue> {
     let endbr64: &[u8] = &[0xf3, 0x0f, 0x1e, 0xfa];
-    let push_rbp: &[u8] = &[0x55];
-    let mov_rbp_rsp: &[u8] = &[0x48, 0x89, 0xe5];
+    let endbr32: &[u8] = &[0xf3, 0x0f, 0x1e, 0xfb];
+    let push_bp: &[u8] = &[0x55]; // push rbp / push ebp share the same opcode
+    let mov_rbp_rsp_64: &[u8] = &[0x48, 0x89, 0xe5];
+    let mov_ebp_esp_32: &[u8] = &[0x89, 0xe5];
 
     let bytes_at = |i: usize| insns.get(i).map(|d| d.original_bytes.as_slice());
 
-    let (has_endbr, mut start) = if bytes_at(0) == Some(endbr64) {
-        (true, 1)
-    } else {
-        (false, 0)
+    let (has_endbr, mut start) = match bytes_at(0) {
+        Some(b) if b == endbr64 || b == endbr32 => (true, 1),
+        _ => (false, 0),
     };
 
-    if bytes_at(start) != Some(push_rbp) {
-        // Not a frame-setting prologue. Recognise lone `endbr64` at
-        // the start of a leaf function as a noframe prologue.
+    if bytes_at(start) != Some(push_bp) {
+        // Not a frame-setting prologue. Recognise lone `endbr64` /
+        // `endbr32` at the start of a leaf function as a noframe
+        // prologue.
         if has_endbr {
             return Some(LiftedPrologue {
                 insns_consumed: 1,
@@ -174,17 +176,21 @@ pub fn try_lift_prologue_pattern(insns: &[DecodedInsn]) -> Option<LiftedPrologue
     }
     start += 1;
 
-    if bytes_at(start) != Some(mov_rbp_rsp) {
-        return None;
-    }
+    let is_64 = match bytes_at(start) {
+        Some(b) if b == mov_rbp_rsp_64 => true,
+        Some(b) if b == mov_ebp_esp_32 => false,
+        _ => return None,
+    };
     start += 1;
 
-    // Optional `sub rsp, IMM8` (3 bytes: 48 83 ec ??) or
-    // `sub rsp, IMM32` (7 bytes: 48 81 ec ?? ?? ?? ??).
-    let consumed_after_frame = match bytes_at(start) {
-        Some(&[0x48, 0x83, 0xec, _] | &[0x48, 0x81, 0xec, _, _, _, _]) => start + 1,
-        _ => start,
-    };
+    // Optional `sub rsp/esp, IMM`. 64-bit forms carry a REX.W prefix
+    // (0x48); 32-bit forms drop it.
+    let stack_sub_matched = matches!(
+        (is_64, bytes_at(start)),
+        (true, Some(&[0x48, 0x83, 0xec, _] | &[0x48, 0x81, 0xec, _, _, _, _]))
+            | (false, Some(&[0x83, 0xec, _] | &[0x81, 0xec, _, _, _, _]))
+    );
+    let consumed_after_frame = if stack_sub_matched { start + 1 } else { start };
 
     Some(LiftedPrologue {
         insns_consumed: consumed_after_frame,

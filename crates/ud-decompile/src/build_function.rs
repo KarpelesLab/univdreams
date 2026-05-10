@@ -836,7 +836,15 @@ fn lea_target_annotation(
 fn is_string_data_section(name: &str) -> bool {
     matches!(
         name,
-        ".rodata" | ".rodata.str1.1" | ".rodata.str1.8" | ".data.rel.ro" | ".data.rel.ro.local"
+        // ELF (gcc/clang on Linux/BSD).
+        ".rodata"
+            | ".rodata.str1.1"
+            | ".rodata.str1.8"
+            | ".data.rel.ro"
+            | ".data.rel.ro.local"
+        // PE/COFF (mingw, MSVC).
+            | ".rdata"
+            | ".rdata$zzz"
     )
 }
 
