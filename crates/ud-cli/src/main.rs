@@ -154,10 +154,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Decompile { input, out } => {
             let bytes =
                 std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
-            let elf = ud_format_elf::Elf64File::parse(&bytes)
-                .with_context(|| format!("parse {} as ELF64-LE", input.display()))?;
-            let source = ud_decompile::decompile_to_text(&elf)
-                .with_context(|| format!("decompile {}", input.display()))?;
+            let source = if ud_format_elf::is_elf64_le(&bytes) {
+                let elf = ud_format_elf::Elf64File::parse(&bytes)
+                    .with_context(|| format!("parse {} as ELF", input.display()))?;
+                ud_decompile::decompile_to_text(&elf)
+                    .with_context(|| format!("decompile {}", input.display()))?
+            } else if ud_format_pe::is_pe(&bytes) {
+                let pe = ud_format_pe::PeFile::parse(&bytes)
+                    .with_context(|| format!("parse {} as PE", input.display()))?;
+                ud_decompile::decompile_pe_to_text(&pe)
+            } else {
+                anyhow::bail!(
+                    "unrecognised binary format: {} (expected ELF or PE)",
+                    input.display()
+                );
+            };
             if let Some(path) = out {
                 std::fs::write(&path, source)
                     .with_context(|| format!("write {}", path.display()))?;

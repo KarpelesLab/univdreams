@@ -16,6 +16,7 @@ ud-core = { path = "../ud-core" }
 ud-ir = { path = "../ud-ir" }
 ud-ast = { path = "../ud-ast" }
 ud-format-elf = { path = "../ud-format-elf" }
+ud-format-pe = { path = "../ud-format-pe" }
 ud-arch-x86 = { path = "../ud-arch-x86" }
 ud-analysis = { path = "../ud-analysis" }
 ud-debug = { path = "../ud-debug" }

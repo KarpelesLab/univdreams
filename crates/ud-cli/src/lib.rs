@@ -98,18 +98,22 @@ pub struct DiffContext {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceRoundTripError {
-    #[error("input is not ELF64-LE")]
-    NotElf64Le,
+    #[error("input is not a recognised binary format")]
+    UnknownFormat,
     #[error(transparent)]
     Io(std::io::Error),
     #[error(transparent)]
     Decompile(#[from] ud_decompile::Error),
     #[error(transparent)]
     ElfFormat(#[from] ud_format_elf::Error),
+    #[error(transparent)]
+    PeFormat(#[from] ud_format_pe::Error),
     #[error("parse of decompile output failed: {0}")]
     Parse(String),
     #[error(transparent)]
-    Lower(#[from] ud_compile::ElfLowerError),
+    ElfLower(#[from] ud_compile::ElfLowerError),
+    #[error(transparent)]
+    PeLower(#[from] ud_compile::PeLowerError),
 }
 
 /// Run `input` through the full source pipeline:
@@ -124,17 +128,29 @@ pub fn roundtrip_through_source(
     output: &Path,
 ) -> std::result::Result<SourceRoundTripReport, SourceRoundTripError> {
     let input_bytes = std::fs::read(input).map_err(SourceRoundTripError::Io)?;
-    if !ud_format_elf::is_elf64_le(&input_bytes) {
-        return Err(SourceRoundTripError::NotElf64Le);
-    }
 
-    let elf = ud_format_elf::Elf64File::parse(&input_bytes)?;
-    let ast = ud_decompile::decompile(&elf)?;
-    let text = ud_ast::emit(&ast);
-    let parsed =
-        ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
-    let warnings = ud_compile::verify_asm(&parsed);
-    let rebuilt = ud_compile::lower_to_elf(&parsed)?;
+    let (text, warnings, rebuilt) = if ud_format_elf::is_elf64_le(&input_bytes) {
+        let elf = ud_format_elf::Elf64File::parse(&input_bytes)?;
+        let ast = ud_decompile::decompile(&elf)?;
+        let text = ud_ast::emit(&ast);
+        let parsed =
+            ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_compile::verify_asm(&parsed);
+        let rebuilt = ud_compile::lower_to_elf(&parsed)?;
+        (text, warnings, rebuilt)
+    } else if ud_format_pe::is_pe(&input_bytes) {
+        let pe = ud_format_pe::PeFile::parse(&input_bytes)?;
+        let ast = ud_decompile::decompile_pe(&pe);
+        let text = ud_ast::emit(&ast);
+        let parsed =
+            ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_compile::verify_asm(&parsed);
+        let rebuilt = ud_compile::lower_to_pe(&parsed)?;
+        (text, warnings, rebuilt)
+    } else {
+        return Err(SourceRoundTripError::UnknownFormat);
+    };
+    let _ = text; // kept for future debug surfacing
 
     std::fs::write(output, &rebuilt).map_err(SourceRoundTripError::Io)?;
 

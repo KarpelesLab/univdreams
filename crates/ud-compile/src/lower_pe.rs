@@ -1,0 +1,183 @@
+//! Lower a parsed `.ud` file whose `@module.format` says `"pe"`
+//! back to a complete PE binary.
+//!
+//! The contract this enforces:
+//!
+//! ```text
+//! lower_to_pe(parse(decompile_pe_to_text(pe))) == pe-bytes
+//! ```
+//!
+//! v0 strategy: the decompile path emits one `@raw(file_offset,
+//! [bytes])` per contiguous byte range covering the entire input.
+//! Lower walks those `@raw` items in file-offset order and
+//! concatenates them into a single buffer of the size declared by
+//! `@module.build.file_size`. Any gap, overlap, or size mismatch is
+//! a hard error — those would silently corrupt the round-trip.
+//!
+//! Functions / `@section` / `@call` / etc. are not yet meaningful
+//! for PE input; those land when a future iteration replaces the
+//! flat `@raw` blocks with structured items.
+
+use ud_ast::{Field, Item, Module, UdFile, Value};
+
+/// Errors specific to the PE lower path.
+#[derive(Debug, thiserror::Error)]
+pub enum PeLowerError {
+    #[error("missing field `{field}` in `@module.build`")]
+    MissingField { field: String },
+
+    #[error(
+        "field `@module.build.{field}` has wrong shape: expected {expected}, got something else"
+    )]
+    WrongShape { field: String, expected: String },
+
+    #[error("integer value 0x{value:x} for field `{field}` is out of range for {target}")]
+    ValueOutOfRange {
+        field: String,
+        value: u64,
+        target: &'static str,
+    },
+
+    #[error("`@module.format` is not `\"pe\"` (got {got:?})")]
+    NotPe { got: String },
+
+    #[error("`@raw(0x{addr:x}, …)` is past the declared file_size {file_size}")]
+    RawPastEnd { addr: u64, file_size: u64 },
+
+    #[error("`@raw(0x{addr:x}, [{len} bytes])` would overflow past file_size {file_size}")]
+    RawOverflows { addr: u64, len: u64, file_size: u64 },
+
+    #[error(
+        "@raw blocks at file offsets 0x{a_addr:x} and 0x{b_addr:x} overlap (cursor was at 0x{cursor:x})"
+    )]
+    OverlappingRaws {
+        a_addr: u64,
+        b_addr: u64,
+        cursor: u64,
+    },
+
+    #[error("byte range gap: cursor at 0x{cursor:x} but next `@raw` is at 0x{next_addr:x}")]
+    GapInCoverage { cursor: u64, next_addr: u64 },
+
+    #[error(
+        "@raw blocks covered 0x{covered:x} bytes but `@module.build.file_size` says 0x{file_size:x}"
+    )]
+    CoverageSizeMismatch { covered: u64, file_size: u64 },
+
+    #[error("`@module.format` field is missing — can't tell which lower path to use")]
+    UnknownFormat,
+}
+
+/// Lower a `.ud` file describing a PE image to its bytes.
+pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
+    let format = read_string(&file.module, "format").ok_or(PeLowerError::UnknownFormat)?;
+    if format != "pe" {
+        return Err(PeLowerError::NotPe { got: format });
+    }
+
+    let build = build_block(&file.module)?;
+    let file_size = read_int(build, "file_size")?;
+
+    let mut out = vec![0u8; file_size as usize];
+
+    // Collect all `@raw` items in file-offset order. Strict: every
+    // byte in [0, file_size) must be covered by exactly one @raw.
+    let mut raws: Vec<(u64, &[u8])> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Raw { addr, bytes } => Some((*addr, bytes.as_slice())),
+            _ => None,
+        })
+        .collect();
+    raws.sort_by_key(|(addr, _)| *addr);
+
+    let mut cursor: u64 = 0;
+    for (addr, bytes) in &raws {
+        let len = bytes.len() as u64;
+        let end = addr.checked_add(len).ok_or(PeLowerError::RawOverflows {
+            addr: *addr,
+            len,
+            file_size,
+        })?;
+        if end > file_size {
+            return Err(PeLowerError::RawOverflows {
+                addr: *addr,
+                len,
+                file_size,
+            });
+        }
+        if *addr < cursor {
+            return Err(PeLowerError::OverlappingRaws {
+                a_addr: cursor.saturating_sub(1),
+                b_addr: *addr,
+                cursor,
+            });
+        }
+        if *addr > cursor {
+            return Err(PeLowerError::GapInCoverage {
+                cursor,
+                next_addr: *addr,
+            });
+        }
+        let off = *addr as usize;
+        out[off..off + bytes.len()].copy_from_slice(bytes);
+        cursor = end;
+    }
+
+    if cursor != file_size {
+        return Err(PeLowerError::CoverageSizeMismatch {
+            covered: cursor,
+            file_size,
+        });
+    }
+
+    Ok(out)
+}
+
+/// `@module.build` block accessor.
+fn build_block(module: &Module) -> Result<&[Field], PeLowerError> {
+    for f in &module.fields {
+        if f.name == "build" {
+            if let Value::Block(fields) = &f.value {
+                return Ok(fields);
+            }
+            return Err(PeLowerError::WrongShape {
+                field: "build".into(),
+                expected: "block".into(),
+            });
+        }
+    }
+    Err(PeLowerError::MissingField {
+        field: "build".into(),
+    })
+}
+
+fn read_int(fields: &[Field], name: &str) -> Result<u64, PeLowerError> {
+    for f in fields {
+        if f.name == name {
+            if let Value::Int(n) = &f.value {
+                return Ok(*n);
+            }
+            return Err(PeLowerError::WrongShape {
+                field: name.into(),
+                expected: "integer".into(),
+            });
+        }
+    }
+    Err(PeLowerError::MissingField { field: name.into() })
+}
+
+fn read_string(module: &Module, name: &str) -> Option<String> {
+    module.fields.iter().find_map(|f| {
+        if f.name == name {
+            if let Value::String(s) = &f.value {
+                Some(s.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    })
+}
