@@ -154,6 +154,13 @@ pub enum Stmt {
     /// `bytes` carries every encoded byte of those instructions
     /// concatenated, so the lower path just emits the bytes.
     Return { value: u64, bytes: Vec<u8> },
+
+    /// `@prologue("kind", [bytes])` — a recognised function prologue,
+    /// typically `endbr64; push rbp; mov rbp, rsp; sub rsp, IMM` or
+    /// a close variant. `kind` is a descriptive label
+    /// (`"std"` / `"std-no-cf"` / `"std-noframe"`); `bytes` carries
+    /// every encoded byte for round-trip.
+    Prologue { kind: String, bytes: Vec<u8> },
 }
 
 impl Stmt {

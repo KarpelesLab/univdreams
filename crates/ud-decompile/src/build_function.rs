@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use ud_arch_x86::{
     arg_spill_index, direct_call_target, direct_unconditional_branch_target, format_intel,
-    try_lift_return_pattern, try_lift_return_via_jmp, DecodedInsn, LiftedReturn,
+    try_lift_prologue_pattern, try_lift_return_pattern, try_lift_return_via_jmp, DecodedInsn,
+    LiftedReturn,
 };
 use ud_ast::{FnDecl, Param, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
@@ -37,12 +38,32 @@ pub fn build_function(
             body.push(Stmt::Comment(format!("block: 0x{:x}", block.addr.0)));
         }
 
+        // First block only: try to lift a leading prologue. We skip
+        // the consumed instructions when emitting @asm.
+        let prologue_consumed = if i == 0 {
+            if let Some(lifted) = try_lift_prologue_pattern(&block.insns) {
+                let bytes: Vec<u8> = block.insns[..lifted.insns_consumed]
+                    .iter()
+                    .flat_map(|insn| insn.original_bytes.iter().copied())
+                    .collect();
+                body.push(Stmt::Prologue {
+                    kind: lifted.kind.to_string(),
+                    bytes,
+                });
+                lifted.insns_consumed
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         // Number of trailing instructions that get folded into a
         // single Stmt::Return for this block; emit the rest as @asm.
         let consumed = lifts[i].map_or(0, |l| l.insns_consumed);
         let asm_count = block.insns.len() - consumed;
 
-        for insn in &block.insns[..asm_count] {
+        for insn in &block.insns[prologue_consumed..asm_count] {
             body.push(Stmt::asm(
                 format_intel(&insn.iced),
                 insn.original_bytes.clone(),

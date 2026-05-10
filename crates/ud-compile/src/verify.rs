@@ -119,10 +119,10 @@ fn verify_fn_body(f: &ud_ast::FnDecl, section: Option<&str>, out: &mut Vec<AsmWa
                 }
                 cursor = cursor.saturating_add(bytes.len() as u64);
             }
-            // @return is structurally a multi-instruction group with
-            // its own pinned bytes; advance the cursor by the byte
-            // count so subsequent @asm RIPs stay correct.
-            Stmt::Return { bytes, .. } => {
+            // @return / @prologue are structurally multi-instruction
+            // groups with their own pinned bytes; advance the cursor
+            // by the byte count so subsequent @asm RIPs stay correct.
+            Stmt::Return { bytes, .. } | Stmt::Prologue { bytes, .. } => {
                 cursor = cursor.saturating_add(bytes.len() as u64);
             }
             Stmt::Comment(_) => {}

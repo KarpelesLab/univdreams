@@ -362,6 +362,7 @@ impl Parser {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_fn(&mut self, addr: Option<u64>) -> Result<Item, ParseError> {
         let kw_tok = self.peek().clone();
         let kw = self.expect_ident("`fn`")?;
@@ -445,6 +446,14 @@ impl Parser {
                             let bytes = self.parse_byte_list()?;
                             self.expect(&TokenKind::RParen, "`)` to close `@return`")?;
                             body.push(Stmt::Return { value, bytes });
+                        }
+                        "prologue" => {
+                            self.expect(&TokenKind::LParen, "`(` after `@prologue`")?;
+                            let kind = self.expect_string("prologue kind string")?;
+                            self.expect(&TokenKind::Comma, "`,` after prologue kind")?;
+                            let bytes = self.parse_byte_list()?;
+                            self.expect(&TokenKind::RParen, "`)` to close `@prologue`")?;
+                            body.push(Stmt::Prologue { kind, bytes });
                         }
                         other => {
                             return Err(ParseError::UnknownDirective {

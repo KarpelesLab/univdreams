@@ -208,9 +208,9 @@ fn count_asm_stmts(items: &[Item]) -> usize {
                 for stmt in &f.body {
                     match stmt {
                         Stmt::Asm { .. } => n += 1,
-                        Stmt::Return { bytes, .. } => {
+                        Stmt::Return { bytes, .. } | Stmt::Prologue { bytes, .. } => {
                             let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, bytes, 0)
-                                .expect("decode @return bytes");
+                                .expect("decode @return/@prologue bytes");
                             n += insns.len();
                         }
                         Stmt::Comment(_) => {}

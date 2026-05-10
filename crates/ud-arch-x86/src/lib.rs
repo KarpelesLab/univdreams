@@ -112,6 +112,80 @@ pub fn try_lift_return_pattern(insns: &[DecodedInsn]) -> Option<LiftedReturn> {
     })
 }
 
+/// One recognised SysV-x64 prologue at the entry of a function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiftedPrologue {
+    /// Number of leading instructions matched.
+    pub insns_consumed: usize,
+    /// Symbolic kind name. Today: `"std"` (full standard prologue with
+    /// `endbr64` and a frame), `"std-no-cf"` (no `endbr64`),
+    /// `"std-noframe"` (just `endbr64`).
+    pub kind: &'static str,
+}
+
+/// Try to recognize the leading instructions of `insns` as a
+/// canonical SysV-x64 prologue at function entry.
+///
+/// Recognised forms (greediest first):
+///
+/// * `endbr64; push rbp; mov rbp, rsp; sub rsp, IMM` → `"std"`
+///   (full prologue with cf-protection and a stack frame)
+/// * `push rbp; mov rbp, rsp; sub rsp, IMM` → `"std-no-cf"`
+///   (older toolchain or `-fno-cf-protection`)
+/// * `endbr64; push rbp; mov rbp, rsp` → `"std"` (frame, no
+///   stack-allocated locals)
+/// * `push rbp; mov rbp, rsp` → `"std-no-cf"`
+/// * `endbr64` alone at the top of a leaf function → `"std-noframe"`
+///
+/// Bytes are matched literally — instruction-encoding choices are
+/// pinned, so the lifter only fires on the exact byte sequences gcc
+/// emits at `-O0`. Other compilers / optimization levels add new
+/// patterns to this DB.
+#[must_use]
+pub fn try_lift_prologue_pattern(insns: &[DecodedInsn]) -> Option<LiftedPrologue> {
+    let endbr64: &[u8] = &[0xf3, 0x0f, 0x1e, 0xfa];
+    let push_rbp: &[u8] = &[0x55];
+    let mov_rbp_rsp: &[u8] = &[0x48, 0x89, 0xe5];
+
+    let bytes_at = |i: usize| insns.get(i).map(|d| d.original_bytes.as_slice());
+
+    let (has_endbr, mut start) = if bytes_at(0) == Some(endbr64) {
+        (true, 1)
+    } else {
+        (false, 0)
+    };
+
+    if bytes_at(start) != Some(push_rbp) {
+        // Not a frame-setting prologue. Recognise lone `endbr64` at
+        // the start of a leaf function as a noframe prologue.
+        if has_endbr {
+            return Some(LiftedPrologue {
+                insns_consumed: 1,
+                kind: "std-noframe",
+            });
+        }
+        return None;
+    }
+    start += 1;
+
+    if bytes_at(start) != Some(mov_rbp_rsp) {
+        return None;
+    }
+    start += 1;
+
+    // Optional `sub rsp, IMM8` (3 bytes: 48 83 ec ??) or
+    // `sub rsp, IMM32` (7 bytes: 48 81 ec ?? ?? ?? ??).
+    let consumed_after_frame = match bytes_at(start) {
+        Some(&[0x48, 0x83, 0xec, _] | &[0x48, 0x81, 0xec, _, _, _, _]) => start + 1,
+        _ => start,
+    };
+
+    Some(LiftedPrologue {
+        insns_consumed: consumed_after_frame,
+        kind: if has_endbr { "std" } else { "std-no-cf" },
+    })
+}
+
 /// Try to recognize the trailing instructions of `insns` as a
 /// "return with literal, then jump to a shared epilogue" pattern.
 ///
@@ -634,6 +708,56 @@ mod tests {
         let bytes = [0x48, 0x89, 0xd8, 0xc3];
         let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
         assert!(try_lift_return_pattern(&insns).is_none());
+    }
+
+    #[test]
+    fn lift_prologue_full_std() {
+        // endbr64; push rbp; mov rbp,rsp; sub rsp,0x10
+        let bytes = [
+            0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x10,
+        ];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_prologue_pattern(&insns).unwrap();
+        assert_eq!(lifted.kind, "std");
+        assert_eq!(lifted.insns_consumed, 4);
+    }
+
+    #[test]
+    fn lift_prologue_without_sub() {
+        // endbr64; push rbp; mov rbp,rsp (no sub rsp)
+        let bytes = [0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0x48, 0x89, 0xe5];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_prologue_pattern(&insns).unwrap();
+        assert_eq!(lifted.kind, "std");
+        assert_eq!(lifted.insns_consumed, 3);
+    }
+
+    #[test]
+    fn lift_prologue_no_cf_protection() {
+        // push rbp; mov rbp,rsp; sub rsp,0x20  (no endbr64)
+        let bytes = [0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_prologue_pattern(&insns).unwrap();
+        assert_eq!(lifted.kind, "std-no-cf");
+        assert_eq!(lifted.insns_consumed, 3);
+    }
+
+    #[test]
+    fn lift_prologue_noframe() {
+        // Lone endbr64 (leaf function, no frame setup)
+        let bytes = [0xf3, 0x0f, 0x1e, 0xfa, 0x31, 0xc0, 0xc3]; // endbr64; xor eax,eax; ret
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let lifted = try_lift_prologue_pattern(&insns).unwrap();
+        assert_eq!(lifted.kind, "std-noframe");
+        assert_eq!(lifted.insns_consumed, 1);
+    }
+
+    #[test]
+    fn lift_prologue_rejects_nonstandard() {
+        // mov rax, rbx — not a prologue
+        let bytes = [0x48, 0x89, 0xd8];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert!(try_lift_prologue_pattern(&insns).is_none());
     }
 
     #[test]
