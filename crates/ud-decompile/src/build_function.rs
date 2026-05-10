@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 
 use ud_arch_x86::{
-    direct_call_target, direct_unconditional_branch_target, format_intel, try_lift_return_pattern,
-    try_lift_return_via_jmp, DecodedInsn, LiftedReturn,
+    arg_spill_index, direct_call_target, direct_unconditional_branch_target, format_intel,
+    try_lift_return_pattern, try_lift_return_via_jmp, DecodedInsn, LiftedReturn,
 };
-use ud_ast::{FnDecl, Signature, Stmt, Type};
+use ud_ast::{FnDecl, Param, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
 use ud_ir::{Function, Terminator};
 
@@ -48,6 +48,9 @@ pub fn build_function(
                 insn.original_bytes.clone(),
             ));
             if let Some(annotation) = call_annotation(insn, f.addr.0, func_end, name_at) {
+                body.push(Stmt::Comment(annotation));
+            }
+            if let Some(annotation) = arg_spill_annotation(insn, signature.as_ref()) {
                 body.push(Stmt::Comment(annotation));
             }
         }
@@ -172,4 +175,44 @@ fn call_annotation(
         }
     }
     None
+}
+
+/// If `insn` is a mov of a SysV-x64 argument register to a stack slot
+/// AND the function has a parameter at that argument's index, return
+/// a comment string naming the parameter. The decompiler appends the
+/// returned string as a `Stmt::Comment` after the insn's `@asm` line.
+fn arg_spill_annotation(insn: &DecodedInsn, signature: Option<&Signature>) -> Option<String> {
+    let idx = arg_spill_index(&insn.iced)?;
+    let sig = signature?;
+    let param = sig.params.get(idx as usize)?;
+    Some(format_param_annotation(idx, param))
+}
+
+fn format_param_annotation(idx: u32, param: &Param) -> String {
+    let ty = format_type(&param.ty);
+    if param.name.is_empty() {
+        format!("arg {idx}: {ty}")
+    } else {
+        format!("arg {idx}: {} ({ty})", param.name)
+    }
+}
+
+fn format_type(t: &Type) -> String {
+    match t {
+        Type::Void => "void".into(),
+        Type::I8 => "i8".into(),
+        Type::I16 => "i16".into(),
+        Type::I32 => "i32".into(),
+        Type::I64 => "i64".into(),
+        Type::U8 => "u8".into(),
+        Type::U16 => "u16".into(),
+        Type::U32 => "u32".into(),
+        Type::U64 => "u64".into(),
+        Type::F32 => "f32".into(),
+        Type::F64 => "f64".into(),
+        Type::Bool => "bool".into(),
+        Type::Char => "char".into(),
+        Type::Pointer(inner) => format!("ptr<{}>", format_type(inner)),
+        Type::Unknown => "unknown".into(),
+    }
 }

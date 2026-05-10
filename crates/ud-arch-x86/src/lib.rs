@@ -21,7 +21,7 @@
 
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, FlowControl, Formatter,
-    Instruction, InstructionBlock, IntelFormatter,
+    Instruction, InstructionBlock, IntelFormatter, Mnemonic, OpKind, Register,
 };
 use ud_core::VAddr;
 use ud_ir::ArchInsn;
@@ -157,6 +157,58 @@ pub fn try_lift_return_via_jmp(insns: &[DecodedInsn], epilogue_addr: u64) -> Opt
     Some(LiftedReturn {
         insns_consumed: 2,
         value,
+    })
+}
+
+/// If `insn` is an "argument spill" — `mov [rbp+disp], REG` (or
+/// `movss/movsd [rbp+disp], xmm`) where `REG` is one of the SysV
+/// x86-64 argument-passing registers — return that argument's
+/// 0-based index.
+///
+/// SysV x86-64 calling convention:
+///
+/// | Arg index | Int / ptr | Float (xmm) |
+/// |-----------|-----------|-------------|
+/// | 0         | rdi/edi/di/dil | xmm0  |
+/// | 1         | rsi/esi/si/sil | xmm1  |
+/// | 2         | rdx/edx/dx/dl  | xmm2  |
+/// | 3         | rcx/ecx/cx/cl  | xmm3  |
+/// | 4         | r8/r8d/r8w/r8b | xmm4  |
+/// | 5         | r9/r9d/r9w/r9b | xmm5  |
+///
+/// Used by the decompiler to annotate `mov [rbp-N], edi` (etc.) at
+/// function entry with the corresponding parameter name from DWARF.
+#[must_use]
+pub fn arg_spill_index(insn: &Instruction) -> Option<u32> {
+    let m = insn.mnemonic();
+    if !matches!(m, Mnemonic::Mov | Mnemonic::Movss | Mnemonic::Movsd) {
+        return None;
+    }
+    if insn.op_count() < 2 {
+        return None;
+    }
+    if insn.op0_kind() != OpKind::Memory {
+        return None;
+    }
+    if insn.memory_base() != Register::RBP {
+        return None;
+    }
+    if insn.op1_kind() != OpKind::Register {
+        return None;
+    }
+    sysv_arg_index(insn.op_register(1))
+}
+
+#[allow(clippy::match_same_arms)] // each line is one register width
+fn sysv_arg_index(reg: Register) -> Option<u32> {
+    Some(match reg {
+        Register::RDI | Register::EDI | Register::DI | Register::DIL | Register::XMM0 => 0,
+        Register::RSI | Register::ESI | Register::SI | Register::SIL | Register::XMM1 => 1,
+        Register::RDX | Register::EDX | Register::DX | Register::DL | Register::XMM2 => 2,
+        Register::RCX | Register::ECX | Register::CX | Register::CL | Register::XMM3 => 3,
+        Register::R8 | Register::R8D | Register::R8W | Register::R8L | Register::XMM4 => 4,
+        Register::R9 | Register::R9D | Register::R9W | Register::R9L | Register::XMM5 => 5,
+        _ => return None,
     })
 }
 
@@ -582,6 +634,38 @@ mod tests {
         let bytes = [0x48, 0x89, 0xd8, 0xc3];
         let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
         assert!(try_lift_return_pattern(&insns).is_none());
+    }
+
+    #[test]
+    fn arg_spill_recognizes_int_register_to_stack() {
+        // mov [rbp-4], edi
+        let bytes = [0x89, 0x7d, 0xfc];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert_eq!(arg_spill_index(&insns[0].iced), Some(0));
+    }
+
+    #[test]
+    fn arg_spill_recognizes_xmm_register_to_stack() {
+        // movsd [rbp-0x10], xmm0
+        let bytes = [0xf2, 0x0f, 0x11, 0x45, 0xf0];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert_eq!(arg_spill_index(&insns[0].iced), Some(0));
+    }
+
+    #[test]
+    fn arg_spill_rejects_non_arg_register() {
+        // mov [rbp-4], eax (eax is not a SysV arg register)
+        let bytes = [0x89, 0x45, 0xfc];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert_eq!(arg_spill_index(&insns[0].iced), None);
+    }
+
+    #[test]
+    fn arg_spill_rejects_non_rbp_dst() {
+        // mov [rax-4], edi (not rbp-relative)
+        let bytes = [0x89, 0x78, 0xfc];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        assert_eq!(arg_spill_index(&insns[0].iced), None);
     }
 
     #[test]
