@@ -85,7 +85,13 @@ impl Analyzer {
     fn step(&mut self, idx: usize, insn: &Instruction, out: &mut Vec<CallSite>) {
         match insn.mnemonic() {
             Mnemonic::Call => self.handle_call(idx, insn, out),
-            Mnemonic::Mov => {
+            Mnemonic::Mov
+            | Mnemonic::Movq
+            | Mnemonic::Movd
+            | Mnemonic::Movss
+            | Mnemonic::Movsd
+            | Mnemonic::Movaps
+            | Mnemonic::Movapd => {
                 if !self.handle_mov(insn) {
                     self.break_window(idx + 1);
                 }
@@ -115,7 +121,13 @@ impl Analyzer {
             return;
         }
 
-        let arg_regs = [
+        // SysV-x64 splits args by class: integers go into the GPR
+        // sequence, doubles/floats into the XMM sequence. We can't
+        // recover the original C-source interleaving without type
+        // info, so we append all int args first then all float args
+        // — wrong for `f(int, double, int, double)` but right for
+        // every fixture today.
+        let int_arg_regs = [
             Register::RDI,
             Register::RSI,
             Register::RDX,
@@ -123,8 +135,24 @@ impl Analyzer {
             Register::R8,
             Register::R9,
         ];
+        let xmm_arg_regs = [
+            Register::XMM0,
+            Register::XMM1,
+            Register::XMM2,
+            Register::XMM3,
+            Register::XMM4,
+            Register::XMM5,
+            Register::XMM6,
+            Register::XMM7,
+        ];
         let mut args = Vec::new();
-        for r in arg_regs {
+        for r in int_arg_regs {
+            match self.regs.get(&full_reg(r)).cloned() {
+                Some(v) => args.push(v),
+                None => break,
+            }
+        }
+        for r in xmm_arg_regs {
             match self.regs.get(&full_reg(r)).cloned() {
                 Some(v) => args.push(v),
                 None => break,
@@ -309,6 +337,39 @@ mod tests {
             sites[1].args,
             vec![ArgValue::Const(1), ArgValue::PrevCallResult]
         );
+    }
+
+    #[test]
+    fn lifts_xmm_arg_via_movsd_load() {
+        // movsd xmm0, [rbp-0x10]  ; f2 0f 10 45 f0
+        // call f                   ; e8 00 00 00 00
+        let bytes = [0xf2, 0x0f, 0x10, 0x45, 0xf0, 0xe8, 0x00, 0x00, 0x00, 0x00];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let sites = identify_call_sites(&insns);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(
+            sites[0].args,
+            vec![ArgValue::StackLoad {
+                displacement: -0x10
+            }]
+        );
+    }
+
+    #[test]
+    fn lifts_xmm_arg_via_movq_from_rax() {
+        // mov rax, [rip+0x100]     ; 48 8b 05 00 01 00 00
+        // movq xmm0, rax            ; 66 48 0f 6e c0
+        // call f                    ; e8 00 00 00 00
+        let bytes = [
+            0x48, 0x8b, 0x05, 0x00, 0x01, 0x00, 0x00, // mov rax, [rip+0x100]
+            0x66, 0x48, 0x0f, 0x6e, 0xc0, // movq xmm0, rax
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call rel32
+        ];
+        let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
+        let sites = identify_call_sites(&insns);
+        assert_eq!(sites.len(), 1);
+        // mov rax,[rip+0x100] resolves with rip-after = 0x1007 → 0x1107.
+        assert_eq!(sites[0].args, vec![ArgValue::GlobalLoad { addr: 0x1107 }]);
     }
 
     #[test]
