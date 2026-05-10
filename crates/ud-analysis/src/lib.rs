@@ -22,11 +22,13 @@
 
 mod eh_frame;
 mod function_map;
+mod plt;
 mod signatures;
 mod symbols;
 
 pub use eh_frame::{discover_from_eh_frame, EhFrameError};
 pub use function_map::{Function, FunctionMap, FunctionSource};
+pub use plt::{discover_plt_thunks, PltError};
 pub use signatures::discover_from_signatures;
 pub use symbols::{discover_from_symbol_tables, SymbolError};
 
@@ -40,6 +42,8 @@ pub enum Error {
     Symbol(#[from] SymbolError),
     #[error(transparent)]
     EhFrame(#[from] EhFrameError),
+    #[error(transparent)]
+    Plt(#[from] PltError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -61,6 +65,9 @@ pub fn discover_functions(elf: &Elf64File) -> Result<FunctionMap> {
         map.insert(f);
     }
     for f in discover_from_signatures(elf) {
+        map.insert(f);
+    }
+    for f in discover_plt_thunks(elf)? {
         map.insert(f);
     }
     for f in discover_from_symbol_tables(elf)? {

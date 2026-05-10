@@ -42,6 +42,9 @@ pub const SHT_STRTAB: u32 = 3;
 /// executables and shared objects).
 pub const SHT_DYNSYM: u32 = 11;
 
+/// `sh_type` for a relocation table with explicit addends (`Elf64_Rela`).
+pub const SHT_RELA: u32 = 4;
+
 /// `sh_flags` bit indicating the section contains executable instructions.
 pub const SHF_EXECINSTR: u64 = 0x4;
 

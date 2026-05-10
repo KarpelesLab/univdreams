@@ -23,12 +23,15 @@ pub enum FunctionSource {
     /// primitives, …). Yields a meaningful name; placed above
     /// `EhFrame` so the name overrides eh_frame's placeholder.
     Signature = 2,
+    /// Resolved as a `.plt` thunk via `.rela.plt` → `.dynsym`. Yields
+    /// the imported symbol's name (e.g. `printf`).
+    Plt = 3,
     /// Read from `.dynsym` (dynamic linker's symbol table).
-    DynSym = 3,
+    DynSym = 4,
     /// Read from `.symtab` (full symbol table; absent in stripped binaries).
-    SymTab = 4,
+    SymTab = 5,
     /// Provided by the user via an override file.
-    UserOverride = 5,
+    UserOverride = 6,
 }
 
 /// A discovered function.
@@ -47,9 +50,23 @@ pub struct Function {
 
 impl Function {
     fn merge_in(&mut self, other: Function) {
-        if other.size > 0 && self.size == 0 {
+        // Size precedence: a [`FunctionSource::Plt`] record is
+        // size-authoritative — each PLT thunk is exactly `sh_entsize`
+        // bytes and the relocation linkage doesn't lie about the
+        // boundary. Whatever else discovery thinks the function spans
+        // (e.g. an `.eh_frame` FDE that swallows the whole `.plt.sec`
+        // section as one function), the PLT size wins. Otherwise we
+        // never let zero overwrite non-zero.
+        let other_is_plt_authoritative =
+            other.sources.contains(&FunctionSource::Plt) && other.size > 0;
+        let self_is_plt_authoritative =
+            self.sources.contains(&FunctionSource::Plt) && self.size > 0;
+        let take_other_size = (other_is_plt_authoritative && !self_is_plt_authoritative)
+            || (other.size > 0 && self.size == 0);
+        if take_other_size {
             self.size = other.size;
         }
+
         // Highest-confidence source wins the name.
         let highest_existing = self.sources.iter().copied().max();
         let incoming = other.sources.iter().copied().max();
