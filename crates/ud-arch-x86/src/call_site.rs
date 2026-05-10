@@ -147,6 +147,12 @@ struct Analyzer {
     /// slots: `[esp]`, `[esp+4]`, `[esp+8]`, … Keyed by the offset
     /// from `esp`. Cleared after each call window.
     stack_args: HashMap<i32, ArgValue>,
+    /// Value currently on the x87 FPU stack top (st0). Set by
+    /// `fld qword ptr [mem]`; consumed by `fstp qword ptr [mem]`.
+    /// We only model the top — `-O0` cdecl float-arg passing
+    /// shuffles via st0 a single value at a time, which is the
+    /// dominant pattern.
+    fpu_top: Option<ArgValue>,
     /// Index right after the previous call (or 0 at block start).
     /// Determines which instructions are foldable into the next call.
     setup_start: usize,
@@ -172,6 +178,16 @@ impl Analyzer {
             }
             Mnemonic::Lea => {
                 if !self.handle_lea(insn) {
+                    self.break_window(idx + 1);
+                }
+            }
+            Mnemonic::Fld => {
+                if !self.handle_fld(insn) {
+                    self.break_window(idx + 1);
+                }
+            }
+            Mnemonic::Fstp => {
+                if !self.handle_fstp(insn) {
                     self.break_window(idx + 1);
                 }
             }
@@ -227,13 +243,22 @@ impl Analyzer {
             }
         }
         // i386 cdecl: when no integer arg registers were touched but
-        // we saw `mov [esp+OFF], val` writes, fall back to the stack
-        // sequence at offsets 0, 4, 8, … as the integer args.
-        if args.is_empty() {
-            let mut off = 0i32;
-            while let Some(v) = self.stack_args.get(&off).cloned() {
-                args.push(v);
-                off += 4;
+        // we saw `mov [esp+OFF], val` / `fstp [esp+OFF]` writes,
+        // fall back to those slots in offset order. We skip
+        // unset offsets so a `printf("%s %f", str, v)` style call
+        // — which leaves slot 8 untouched (the second half of the
+        // double at [esp+4..+12]) — surfaces as
+        // [str, v, sqrt_result] rather than stopping at the gap.
+        if args.is_empty() && !self.stack_args.is_empty() {
+            let mut offsets: Vec<i32> = self.stack_args.keys().copied().collect();
+            offsets.sort_unstable();
+            for off in offsets {
+                if off < 0 {
+                    continue;
+                }
+                if let Some(v) = self.stack_args.get(&off).cloned() {
+                    args.push(v);
+                }
             }
         }
         for r in xmm_arg_regs {
@@ -250,15 +275,16 @@ impl Analyzer {
         });
 
         // After the call: arg registers are clobbered. The return
-        // value lives in RAX for integer/pointer returns and in XMM0
-        // for float/double returns; we don't know which, so both
-        // get the `PrevCallResult` tag so downstream `mov reg, rax`
-        // / `movq reg, xmm0` chains can pick it up. Stack arg slots
-        // are also invalidated — cdecl callers leave the values on
-        // the stack but reuse the slots for the next call's setup.
+        // value lives in RAX for integer/pointer returns, XMM0 for
+        // SysV-x64 float/double returns, or x87 st0 for i386 cdecl
+        // float/double returns. We don't know which up front, so
+        // tag all three landing spots with `PrevCallResult` so any
+        // downstream copy chain can pick it up. Stack arg slots
+        // and fpu_top are otherwise invalidated.
         self.regs.clear();
         self.regs.insert(Register::RAX, ArgValue::PrevCallResult);
         self.regs.insert(Register::XMM0, ArgValue::PrevCallResult);
+        self.fpu_top = Some(ArgValue::PrevCallResult);
         self.stack_args.clear();
         self.saw_any_call = true;
         self.setup_start = idx + 1;
@@ -317,9 +343,8 @@ impl Analyzer {
                     Register::RIP => ArgValue::GlobalLoad {
                         addr: insn.memory_displacement64(),
                     },
-                    Register::RBP => ArgValue::StackLoad {
-                        #[allow(clippy::cast_possible_wrap)]
-                        displacement: insn.memory_displacement64() as i64,
+                    Register::RBP | Register::EBP => ArgValue::StackLoad {
+                        displacement: signed_displacement(insn),
                     },
                     _ => return false,
                 }
@@ -358,6 +383,58 @@ impl Analyzer {
         true
     }
 
+    /// `fld qword ptr [mem]` (or float / 80-bit variants): push the
+    /// memory operand's value onto the FPU stack top. Modelled
+    /// values: `[rip+disp]` global loads, `[rbp/ebp+disp]` stack
+    /// loads. Other memory shapes leave `fpu_top = None` but don't
+    /// break the window — `-O0` code interleaves a few unmodelled
+    /// loads with the modelled ones.
+    fn handle_fld(&mut self, insn: &Instruction) -> bool {
+        if insn.op_count() != 1 || insn.op0_kind() != OpKind::Memory {
+            return true; // ignore stack-to-stack fld; window stays open
+        }
+        if insn.memory_index() != Register::None {
+            self.fpu_top = None;
+            return true;
+        }
+        self.fpu_top = match insn.memory_base() {
+            // RIP-relative or absolute addressing — both are treated
+            // as a global memory load. iced surfaces absolute i386
+            // operands with `memory_base == None`.
+            Register::RIP | Register::None => Some(ArgValue::GlobalLoad {
+                addr: insn.memory_displacement64(),
+            }),
+            Register::RBP | Register::EBP => Some(ArgValue::StackLoad {
+                displacement: signed_displacement(insn),
+            }),
+            _ => None,
+        };
+        true
+    }
+
+    /// `fstp qword ptr [mem]`: pop the FPU stack top and store it
+    /// to memory. When the destination is `[esp+OFF]`, record it
+    /// as the corresponding cdecl stack-arg slot. After fstp the
+    /// FPU top is invalidated regardless.
+    fn handle_fstp(&mut self, insn: &Instruction) -> bool {
+        if insn.op_count() != 1 || insn.op0_kind() != OpKind::Memory {
+            self.fpu_top = None;
+            return true;
+        }
+        if insn.memory_index() == Register::None
+            && (insn.memory_base() == Register::ESP || insn.memory_base() == Register::RSP)
+        {
+            if let Some(val) = self.fpu_top.take() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let off = insn.memory_displacement64() as i32;
+                self.stack_args.insert(off, val);
+                return true;
+            }
+        }
+        self.fpu_top = None;
+        true
+    }
+
     fn break_window(&mut self, next_setup_start: usize) {
         // Anything we can't model invalidates pending arg setup —
         // the next call must start its window fresh. RAX's "prev
@@ -380,6 +457,8 @@ fn full_reg(reg: Register) -> Register {
         full
     }
 }
+
+pub(crate) use crate::signed_memory_displacement as signed_displacement;
 
 #[allow(clippy::cast_possible_wrap)]
 fn read_signed_immediate(insn: &Instruction) -> i64 {

@@ -682,11 +682,11 @@ fn collect_slot_to_name(
         if param.name.is_empty() {
             continue;
         }
-        // The arg-spill helper validates the destination is `[rbp+disp]`,
-        // so memory_displacement64() is meaningful here. Cast u64 -> i64
-        // round-trips two's-complement signed displacements.
-        #[allow(clippy::cast_possible_wrap)]
-        let disp = insn.iced.memory_displacement64() as i64;
+        // arg-spill validates the destination is `[rbp/ebp+disp]`,
+        // so the memory operand is meaningful. Use the
+        // addressing-aware helper so 32-bit `[ebp-0x20]` doesn't
+        // come back as a positive-looking 0xffffffe0.
+        let disp = ud_arch_x86::signed_memory_displacement(&insn.iced);
         out.insert(disp, param.name.clone());
     }
     out

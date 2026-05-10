@@ -417,6 +417,39 @@ pub fn direct_unconditional_branch_target(insn: &Instruction) -> Option<u64> {
     }
 }
 
+/// Read the memory operand's displacement as a signed 64-bit value,
+/// honouring the addressing mode's actual width.
+///
+/// iced's `memory_displacement64()` returns the displacement
+/// "extended to 64 bits" but in 32-bit addressing mode (e.g. when
+/// the base is `EBP`/`ESP`) it doesn't sign-extend small negative
+/// displacements past bit 31 — `[ebp-0x20]` comes back as
+/// `0x00000000_ffffffe0` rather than `0xffffffff_ffffffe0`. We
+/// detect 32-bit addressing via the base register and re-extend
+/// from i32 in that case.
+#[must_use]
+#[allow(clippy::cast_possible_wrap)]
+pub fn signed_memory_displacement(insn: &Instruction) -> i64 {
+    let raw = insn.memory_displacement64();
+    let is_32bit_addressing = matches!(
+        insn.memory_base(),
+        Register::EAX
+            | Register::EBX
+            | Register::ECX
+            | Register::EDX
+            | Register::ESI
+            | Register::EDI
+            | Register::EBP
+            | Register::ESP
+            | Register::EIP
+    );
+    if is_32bit_addressing {
+        i64::from(raw as i32)
+    } else {
+        raw as i64
+    }
+}
+
 /// If `insn` is a `lea reg, [rip+disp]` (compiler-typical
 /// "load address of a global / string-constant"), return the absolute
 /// virtual address of the target. Returns `None` for non-`lea`s, or
