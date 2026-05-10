@@ -5,6 +5,8 @@
 //! without spawning a subprocess.
 
 use std::path::Path;
+
+use ud_compile::AsmWarning;
 use ud_core::{assert_bytes_equal, Error, Result};
 
 /// Run the round-trip pipeline on `input`, write the result to `output`,
@@ -55,6 +57,84 @@ fn pipeline_bytes(bytes: &[u8]) -> Vec<u8> {
         // Fall through to byte-copy so the round-trip contract holds.
     }
     bytes.to_vec()
+}
+
+/// Result of [`roundtrip_through_source`].
+#[derive(Debug, Clone)]
+pub struct SourceRoundTripReport {
+    /// Whether the rebuilt bytes equal the input bytes.
+    pub byte_identical: bool,
+    /// Length of the input in bytes.
+    pub input_len: usize,
+    /// Length of the rebuilt bytes.
+    pub output_len: usize,
+    /// Offset of the first byte that differs, when the round-trip
+    /// failed; `None` when the result is byte-identical.
+    pub first_diff_offset: Option<usize>,
+    /// `verify_asm` findings produced during the round-trip. Empty
+    /// for a clean decompile output; populated when the `.ud`
+    /// in-flight had `@asm` lines whose text disagreed with their
+    /// pinned bytes.
+    pub warnings: Vec<AsmWarning>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SourceRoundTripError {
+    #[error("input is not ELF64-LE")]
+    NotElf64Le,
+    #[error(transparent)]
+    Io(std::io::Error),
+    #[error(transparent)]
+    Decompile(#[from] ud_decompile::Error),
+    #[error(transparent)]
+    ElfFormat(#[from] ud_format_elf::Error),
+    #[error("parse of decompile output failed: {0}")]
+    Parse(String),
+    #[error(transparent)]
+    Lower(#[from] ud_compile::ElfLowerError),
+}
+
+/// Run `input` through the full source pipeline:
+/// decompile → text → parse → verify_asm → lower_to_elf → write.
+///
+/// Always emits the rebuilt binary. Verification warnings are collected
+/// in the report and don't fail the call. Byte differences between input
+/// and rebuilt also don't fail the call — they appear in the report so
+/// the caller can decide what to do (warn, abort, persist anyway).
+pub fn roundtrip_through_source(
+    input: &Path,
+    output: &Path,
+) -> std::result::Result<SourceRoundTripReport, SourceRoundTripError> {
+    let input_bytes = std::fs::read(input).map_err(SourceRoundTripError::Io)?;
+    if !ud_format_elf::is_elf64_le(&input_bytes) {
+        return Err(SourceRoundTripError::NotElf64Le);
+    }
+
+    let elf = ud_format_elf::Elf64File::parse(&input_bytes)?;
+    let ast = ud_decompile::decompile(&elf)?;
+    let text = ud_ast::emit(&ast);
+    let parsed =
+        ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+    let warnings = ud_compile::verify_asm(&parsed);
+    let rebuilt = ud_compile::lower_to_elf(&parsed)?;
+
+    std::fs::write(output, &rebuilt).map_err(SourceRoundTripError::Io)?;
+
+    let first_diff_offset = first_byte_diff(&input_bytes, &rebuilt);
+    Ok(SourceRoundTripReport {
+        byte_identical: first_diff_offset.is_none() && input_bytes.len() == rebuilt.len(),
+        input_len: input_bytes.len(),
+        output_len: rebuilt.len(),
+        first_diff_offset,
+        warnings,
+    })
+}
+
+fn first_byte_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x != y)
+        .or_else(|| (a.len() != b.len()).then_some(a.len().min(b.len())))
 }
 
 #[cfg(test)]

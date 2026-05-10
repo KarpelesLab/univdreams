@@ -20,8 +20,15 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the full pipeline (decompile then compile) and verify byte-equality
-    /// with the input. The compile half is currently the identity; full
-    /// round-trip via the source language lands when the parser is online.
+    /// with the input.
+    ///
+    /// Without `--through-source`, routes through `ud-format-elf`'s
+    /// parse + write-to-vec — defends the format-level round-trip.
+    ///
+    /// With `--through-source`, routes through the full source pipeline:
+    /// decompile → emit → parse → lower_to_elf. Surfaces verify-asm
+    /// warnings and a byte-diff offset when the result diverges; never
+    /// fails on warnings, only on hard pipeline errors.
     Roundtrip {
         /// Input binary.
         input: PathBuf,
@@ -29,6 +36,11 @@ enum Command {
         /// Where to write the rebuilt binary. Defaults to `<input>.rebuilt`.
         #[arg(long)]
         out: Option<PathBuf>,
+
+        /// Route through the source language (decompile → text → parse →
+        /// lower_to_elf) instead of the format-level path.
+        #[arg(long)]
+        through_source: bool,
     },
 
     /// Decompile a binary to `.ud` source.
@@ -68,21 +80,63 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Roundtrip { input, out } => {
+        Command::Roundtrip {
+            input,
+            out,
+            through_source,
+        } => {
             let output = out.unwrap_or_else(|| {
                 let mut p = input.clone().into_os_string();
                 p.push(".rebuilt");
                 PathBuf::from(p)
             });
-            ud_cli::roundtrip(&input, &output).with_context(|| {
-                format!(
-                    "round-trip from {} to {}",
-                    input.display(),
-                    output.display()
-                )
-            })?;
-            println!("round-trip ok: {} == {}", input.display(), output.display());
-            Ok(())
+            if through_source {
+                let report =
+                    ud_cli::roundtrip_through_source(&input, &output).with_context(|| {
+                        format!(
+                            "source round-trip from {} to {}",
+                            input.display(),
+                            output.display()
+                        )
+                    })?;
+                for w in &report.warnings {
+                    eprintln!("warning: {}", format_warning(w));
+                }
+                if !report.warnings.is_empty() {
+                    eprintln!("({} verify warning(s))", report.warnings.len());
+                }
+                if report.byte_identical {
+                    println!(
+                        "source round-trip ok: {} == {} ({} bytes)",
+                        input.display(),
+                        output.display(),
+                        report.input_len,
+                    );
+                } else {
+                    let offset = report
+                        .first_diff_offset
+                        .map_or("?".into(), |o| format!("0x{o:x}"));
+                    println!(
+                        "source round-trip differs: {} != {} (input {} bytes, output {} bytes; first diff at {})",
+                        input.display(),
+                        output.display(),
+                        report.input_len,
+                        report.output_len,
+                        offset,
+                    );
+                }
+                Ok(())
+            } else {
+                ud_cli::roundtrip(&input, &output).with_context(|| {
+                    format!(
+                        "round-trip from {} to {}",
+                        input.display(),
+                        output.display()
+                    )
+                })?;
+                println!("round-trip ok: {} == {}", input.display(), output.display());
+                Ok(())
+            }
         }
         Command::Decompile { input, out } => {
             let bytes =
