@@ -28,6 +28,7 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+mod aarch64;
 mod build_function;
 mod build_module;
 mod data_lookup;
@@ -42,7 +43,14 @@ use ud_analysis::{discover_functions, FunctionMap};
 use ud_arch_x86::{decode, lift_function, Bitness};
 use ud_ast::{Item, UdFile};
 use ud_debug::DebugFunction;
-use ud_format_elf::{Elf64File, ElfClass, Shdr64, EM_386, EM_X86_64};
+use ud_format_elf::{Elf64File, ElfClass, Shdr64, EM_386, EM_AARCH64, EM_X86_64};
+
+/// Which arch backend to drive for a given ELF.
+#[derive(Debug, Clone, Copy)]
+enum Arch {
+    X86 { bitness: Bitness },
+    Aarch64,
+}
 
 /// Errors surfaced by the top-level entry point.
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +69,9 @@ pub enum Error {
 
     #[error(transparent)]
     Debug(#[from] ud_debug::DebugError),
+
+    #[error(transparent)]
+    Aarch64Decode(ud_arch_aarch64::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -68,9 +79,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Build the AST for `elf`. The structural form is the primary output
 /// of decompilation; [`decompile_to_text`] is a thin convenience.
 pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
-    let bitness = match (elf.class, elf.ehdr.e_machine) {
-        (ElfClass::Elf64, EM_X86_64) => Bitness::Bits64,
-        (ElfClass::Elf32, EM_386) => Bitness::Bits32,
+    let arch = match (elf.class, elf.ehdr.e_machine) {
+        (ElfClass::Elf64, EM_X86_64) => Arch::X86 {
+            bitness: Bitness::Bits64,
+        },
+        (ElfClass::Elf32, EM_386) => Arch::X86 {
+            bitness: Bitness::Bits32,
+        },
+        (ElfClass::Elf64, EM_AARCH64) => Arch::Aarch64,
         _ => return Err(Error::UnsupportedMachine(elf.ehdr.e_machine)),
     };
 
@@ -108,7 +124,7 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
             .section_name(idx)
             .map_or_else(|| format!("section{idx}"), str::to_string);
         let section_items =
-            build_section_items(elf, sh, data, &map, &debug_by_addr, &name_at, bitness)?;
+            build_section_items(elf, sh, data, &map, &debug_by_addr, &name_at, arch)?;
         items.push(Item::Section {
             name,
             addr: sh.sh_addr,
@@ -160,7 +176,7 @@ fn build_section_items(
     map: &FunctionMap,
     debug_by_addr: &HashMap<u64, DebugFunction>,
     name_at: &HashMap<u64, String>,
-    bitness: Bitness,
+    arch: Arch,
 ) -> Result<Vec<Item>> {
     let section_start = sh.sh_addr;
     let section_end = sh.sh_addr.saturating_add(sh.sh_size);
@@ -193,12 +209,21 @@ fn build_section_items(
         let lo = (f.addr.0 - section_start) as usize;
         let hi = lo + f.size as usize;
         let slice = &data[lo..hi];
-        let insns = decode(bitness, slice, f.addr.0)?;
-        let lifted = lift_function(f.name.clone(), &insns)?;
-        let debug = debug_by_addr.get(&f.addr.0);
-        out.push(Item::Function(build_function::build_function(
-            &lifted, debug, name_at, elf,
-        )));
+        let fn_decl = match arch {
+            Arch::X86 { bitness } => {
+                let insns = decode(bitness, slice, f.addr.0)?;
+                let lifted = lift_function(f.name.clone(), &insns)?;
+                let debug = debug_by_addr.get(&f.addr.0);
+                build_function::build_function(&lifted, debug, name_at, elf)
+            }
+            Arch::Aarch64 => {
+                let insns =
+                    ud_arch_aarch64::decode(slice, f.addr.0).map_err(Error::Aarch64Decode)?;
+                let lifted = ud_arch_aarch64::lift_function(f.name.clone(), &insns);
+                aarch64::build_function(&lifted, name_at)
+            }
+        };
+        out.push(Item::Function(fn_decl));
         cursor = f.addr.0.saturating_add(f.size);
     }
 

@@ -18,6 +18,7 @@ ud-ast = { path = "../ud-ast" }
 ud-format-elf = { path = "../ud-format-elf" }
 ud-format-pe = { path = "../ud-format-pe" }
 ud-arch-x86 = { path = "../ud-arch-x86" }
+ud-arch-aarch64 = { path = "../ud-arch-aarch64" }
 ud-analysis = { path = "../ud-analysis" }
 ud-debug = { path = "../ud-debug" }
 thiserror = "2"

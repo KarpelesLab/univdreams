@@ -7,6 +7,7 @@ members = [
     "crates/ud-format-elf",
     "crates/ud-format-pe",
     "crates/ud-arch-x86",
+    "crates/ud-arch-aarch64",
     "crates/ud-signatures",
     "crates/ud-debug",
     "crates/ud-analysis",

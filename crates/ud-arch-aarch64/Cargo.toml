@@ -1,0 +1,17 @@
+[package]
+name = "ud-arch-aarch64"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AArch64 instruction decoder + minimal lifter for univdreams."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ud-core = { path = "../ud-core" }
+ud-ir = { path = "../ud-ir" }
+thiserror = "2"
