@@ -19,7 +19,9 @@
 //! address expression. Either way the rendered call reads as code,
 //! not as raw push/pop opcodes.
 
-use ud_arch_x86::{format_intel, DecodedInsn, FlowControl, Mnemonic};
+use ud_arch_x86::{
+    detect_post_call_spill, format_intel, CodeSize, DecodedInsn, FlowControl, Mnemonic,
+};
 use ud_ast::Stmt;
 
 use super::{Candidate, Pattern, PatternCtx};
@@ -37,6 +39,15 @@ impl Pattern for StackArgCall {
         insns: &[DecodedInsn],
         start: usize,
     ) -> Option<Candidate> {
+        // i386 only. x86-64 SysV passes args in registers and has a
+        // dedicated analyzer (ud_arch_x86::call_site) feeding the
+        // inline `call_at` map; lifting bare calls here would
+        // override its richer output.
+        let first = insns.get(start)?;
+        if first.iced.code_size() != CodeSize::Code32 {
+            return None;
+        }
+
         // Scan forward from `start` accumulating `push` instructions
         // until we hit a `call`. Anything else aborts the window.
         let mut args: Vec<String> = Vec::new();
@@ -52,24 +63,53 @@ impl Pattern for StackArgCall {
             }
             // Saw the call. Must be a Call flow-control insn.
             if ins.iced.flow_control() == FlowControl::Call {
-                // Need at least one push to be worth lifting —
-                // zero-arg call sites are handled by the existing
-                // x86 call_site analyzer when applicable.
+                // A bare call (no preceding push) gets handled by
+                // the existing call_site analyzer's `call_at`
+                // path, which coordinates with consumed_by_call.
+                // Lifting it here would steal an arg-setup mov the
+                // analyzer had already absorbed and lose those
+                // bytes.
                 if args.is_empty() {
                     return None;
                 }
                 bytes.extend_from_slice(&ins.original_bytes);
+                // The post-call result spill (`mov [ebp+N], eax`)
+                // is normally folded into the inline `call_at`'s
+                // bytes. When we preempt that path we have to
+                // absorb the spill ourselves; otherwise its bytes
+                // get skipped via `consumed_by_call` with nothing
+                // emitting them.
+                let mut consumed_extra = 0usize;
+                let mut spill_comment: Option<String> = None;
+                if let Some(spill) = detect_post_call_spill(insns, i + 1) {
+                    for j in 0..spill.insns_consumed {
+                        if let Some(s) = insns.get(i + 1 + j) {
+                            bytes.extend_from_slice(&s.original_bytes);
+                        }
+                    }
+                    consumed_extra = spill.insns_consumed;
+                    let dest = if spill.displacement < 0 {
+                        format!("[rbp-0x{:x}]", spill.displacement.unsigned_abs())
+                    } else {
+                        format!("[rbp+0x{:x}]", spill.displacement)
+                    };
+                    spill_comment = Some(format!("result -> {dest}"));
+                }
                 // Args were pushed right-to-left; reverse for
                 // natural left-to-right reading order.
                 args.reverse();
                 let name = render_call_target(ins, ctx);
-                let consumed = i + 1 - start;
+                let consumed = (i + 1 - start) + consumed_extra;
+                let mut stmts: Vec<Stmt> = vec![Stmt::Call { name, args, bytes }];
+                if let Some(c) = spill_comment {
+                    stmts.push(Stmt::Comment(c));
+                }
                 return Some(Candidate {
                     pattern: self.name(),
                     start,
                     consumed,
                     priority: 200,
-                    stmts: vec![Stmt::Call { name, args, bytes }],
+                    stmts,
                 });
             }
             return None;

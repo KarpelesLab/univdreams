@@ -23,7 +23,7 @@ use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Formatter, InstructionBlock,
     IntelFormatter,
 };
-pub use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
+pub use iced_x86::{CodeSize, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use ud_core::VAddr;
 use ud_ir::ArchInsn;
 

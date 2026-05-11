@@ -42,11 +42,13 @@ use ud_arch_x86::DecodedInsn;
 use ud_ast::Stmt;
 
 mod arith;
+mod imul;
 mod lea;
 mod mov;
 mod mov_extend;
 mod stack_arg_call;
 mod tail_jmp;
+mod unary;
 mod xor_zero;
 
 /// Context handed to every pattern. Carries the function-name map
@@ -122,6 +124,8 @@ fn registry() -> Vec<&'static dyn Pattern> {
         &mov_extend::MovExtend,
         &lea::Lea,
         &arith::Arith,
+        &unary::Unary,
+        &imul::Imul,
     ]
 }
 
