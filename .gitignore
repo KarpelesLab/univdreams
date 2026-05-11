@@ -7,3 +7,9 @@ Cargo.lock
 *.swp
 *.swo
 *~
+
+# External fixtures fetched by scripts/fetch-test-fixtures.sh
+# from URLs listed in testdata/external/MANIFEST. The manifest
+# itself is committed; the downloads are not.
+/testdata/external/*
+!/testdata/external/MANIFEST
