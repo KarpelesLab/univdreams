@@ -450,6 +450,14 @@ impl Parser {
                     let stmt = self.parse_stmt_at_directive(&dir_name, &dir_tok)?;
                     body.push(stmt);
                 }
+                TokenKind::Ident(name) if name == "if" => {
+                    let stmt = self.parse_if_stmt()?;
+                    body.push(stmt);
+                }
+                TokenKind::Ident(name) if name == "do" => {
+                    let stmt = self.parse_do_while_stmt()?;
+                    body.push(stmt);
+                }
                 TokenKind::Ident(_) => {
                     let stmt = self.parse_call_stmt()?;
                     body.push(stmt);
@@ -593,6 +601,121 @@ impl Parser {
         let raw = self.src[seg_start..seg_end].trim().to_string();
         if !raw.is_empty() {
             out.push(raw);
+        }
+    }
+
+    /// Parse `if (cond) [bytes] { then } [else { else_body }]`.
+    /// The `if` ident has not been consumed yet.
+    fn parse_if_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // consume `if`
+        self.expect(&TokenKind::LParen, "`(` after `if`")?;
+        let cond_text = self.parse_paren_inner()?;
+        self.expect(&TokenKind::RParen, "`)` to close `if` condition")?;
+        let cond_bytes = self.parse_byte_list()?;
+        self.expect(&TokenKind::LBrace, "`{` to open `if` then-body")?;
+        let then_body = self.parse_stmt_list_until_rbrace()?;
+        self.expect(&TokenKind::RBrace, "`}` to close `if` then-body")?;
+        let else_body = if matches!(&self.peek().kind, TokenKind::Ident(n) if n == "else") {
+            self.bump(); // consume `else`
+            self.expect(&TokenKind::LBrace, "`{` after `else`")?;
+            let stmts = self.parse_stmt_list_until_rbrace()?;
+            self.expect(&TokenKind::RBrace, "`}` to close `else` body")?;
+            Some(stmts)
+        } else {
+            None
+        };
+        Ok(Stmt::IfBranch {
+            cond_text,
+            cond_bytes,
+            then_body,
+            else_body,
+        })
+    }
+
+    /// Parse `do [entry=[bytes]] { body } while (cond) [bytes]`.
+    /// The `do` ident has not been consumed yet.
+    fn parse_do_while_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // consume `do`
+        let entry_jmp_bytes = if matches!(&self.peek().kind, TokenKind::Ident(n) if n == "entry") {
+            self.bump(); // consume `entry`
+            self.expect(&TokenKind::Eq, "`=` after `entry`")?;
+            Some(self.parse_byte_list()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::LBrace, "`{` to open `do` body")?;
+        let body = self.parse_stmt_list_until_rbrace()?;
+        self.expect(&TokenKind::RBrace, "`}` to close `do` body")?;
+        let while_tok = self.peek().clone();
+        let TokenKind::Ident(ref name) = while_tok.kind else {
+            return Err(ParseError::Expected {
+                expected: "`while` after do-body".into(),
+                got: describe(&while_tok.kind),
+                line: while_tok.line,
+                col: while_tok.col,
+            });
+        };
+        if name != "while" {
+            return Err(ParseError::Expected {
+                expected: "`while`".into(),
+                got: format!("identifier `{name}`"),
+                line: while_tok.line,
+                col: while_tok.col,
+            });
+        }
+        self.bump(); // consume `while`
+        self.expect(&TokenKind::LParen, "`(` after `while`")?;
+        let cond_text = self.parse_paren_inner()?;
+        self.expect(&TokenKind::RParen, "`)` to close `while` condition")?;
+        let tail_bytes = self.parse_byte_list()?;
+        Ok(Stmt::Loop {
+            cond_text,
+            entry_jmp_bytes,
+            tail_bytes,
+            body,
+        })
+    }
+
+    /// Snip the raw source text between a `(` (already consumed) and
+    /// its matching `)`. Tracks paren depth so `(XAML, X)` etc.
+    /// survives intact. Leaves the `)` unconsumed.
+    fn parse_paren_inner(&mut self) -> Result<String, ParseError> {
+        let start_pos = self.peek().start;
+        // Empty cond: caller sees `)` immediately.
+        if self.peek().kind == TokenKind::RParen {
+            return Ok(String::new());
+        }
+        // A single quoted-string token uses the parsed value so
+        // escapes (e.g. for x86 printf-style args) survive.
+        if let TokenKind::String(s) = &self.peek().kind {
+            let s = s.clone();
+            self.bump();
+            if self.peek().kind == TokenKind::RParen {
+                return Ok(s);
+            }
+            // Else fall through to raw-text capture from `start_pos`.
+        }
+        let mut depth = 0i32;
+        loop {
+            let tok = self.peek().clone();
+            match &tok.kind {
+                TokenKind::LParen | TokenKind::LBracket => {
+                    depth += 1;
+                    self.bump();
+                }
+                TokenKind::RParen | TokenKind::RBracket if depth > 0 => {
+                    depth -= 1;
+                    self.bump();
+                }
+                TokenKind::RParen => {
+                    let end_pos = tok.start;
+                    return Ok(self.src[start_pos..end_pos].trim().to_string());
+                }
+                TokenKind::Eof => return Err(ParseError::UnexpectedEof),
+                _ => {
+                    self.bump();
+                }
+            }
         }
     }
 
@@ -886,6 +1009,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Eq => "`=`".into(),
         TokenKind::Hash => "`#`".into(),
         TokenKind::Dollar => "`$`".into(),
+        TokenKind::Semicolon => "`;`".into(),
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::String(_) => "a string literal".into(),
         TokenKind::Int(n) => format!("integer 0x{n:x}"),

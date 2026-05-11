@@ -166,18 +166,14 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             then_body,
             else_body,
         } => {
-            write!(out, "{indent}@if_branch({}, [", quote_string(cond_text)).unwrap();
+            write!(out, "{indent}if ({}) [", render_cond(cond_text)).unwrap();
             emit_byte_list(out, cond_bytes);
-            writeln!(out, "]) {{").unwrap();
-            let arm_indent = format!("{indent}    ");
-            let arm_body_indent = format!("{indent}        ");
-            writeln!(out, "{arm_indent}@then {{").unwrap();
-            emit_stmts(out, then_body, &arm_body_indent);
-            writeln!(out, "{arm_indent}}}").unwrap();
+            writeln!(out, "] {{").unwrap();
+            let body_indent = format!("{indent}    ");
+            emit_stmts(out, then_body, &body_indent);
             if let Some(else_body) = else_body {
-                writeln!(out, "{arm_indent}@else {{").unwrap();
-                emit_stmts(out, else_body, &arm_body_indent);
-                writeln!(out, "{arm_indent}}}").unwrap();
+                writeln!(out, "{indent}}} else {{").unwrap();
+                emit_stmts(out, else_body, &body_indent);
             }
             writeln!(out, "{indent}}}").unwrap();
         }
@@ -187,18 +183,18 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             tail_bytes,
             body,
         } => {
-            write!(out, "{indent}@loop(").unwrap();
+            write!(out, "{indent}do").unwrap();
             if let Some(jmp_bytes) = entry_jmp_bytes {
-                out.push_str("entry_jmp=[");
+                out.push_str(" entry=[");
                 emit_byte_list(out, jmp_bytes);
-                out.push_str("], ");
+                out.push(']');
             }
-            write!(out, "{}, [", quote_string(cond_text)).unwrap();
-            emit_byte_list(out, tail_bytes);
-            writeln!(out, "]) {{").unwrap();
+            writeln!(out, " {{").unwrap();
             let body_indent = format!("{indent}    ");
             emit_stmts(out, body, &body_indent);
-            writeln!(out, "{indent}}}").unwrap();
+            write!(out, "{indent}}} while ({}) [", render_cond(cond_text)).unwrap();
+            emit_byte_list(out, tail_bytes);
+            writeln!(out, "]").unwrap();
         }
         Stmt::LocalSet { slot, value, bytes } => {
             write!(out, "{indent}@local_set(").unwrap();
@@ -260,6 +256,45 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             writeln!(out, "])").unwrap();
         }
     }
+}
+
+/// Render an `if`/`while` condition text. Conds are typically the
+/// raw 6502 assembly form (`CMP X; BEQ tgt`). If the text is safe
+/// to emit unquoted (ASCII-graphic-or-space, balanced parens, no
+/// stray `)` that would close the condition early) it is emitted
+/// raw; otherwise it goes back into a quoted string.
+fn render_cond(s: &str) -> String {
+    if cond_is_unquoted_safe(s) {
+        s.to_string()
+    } else {
+        quote_string(s)
+    }
+}
+
+fn cond_is_unquoted_safe(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut depth = 0i32;
+    for c in s.chars() {
+        // Allow space + tab inside conds (the inline `;` annotations
+        // have leading whitespace), but no control chars or newlines.
+        if c.is_control() {
+            return false;
+        }
+        match c {
+            '"' | '\\' => return false,
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// Heuristic: is this arg safe to emit unquoted in a call
@@ -584,15 +619,12 @@ mod tests {
         };
         let out = emit(&f);
         assert!(
-            out.contains(
-                "    @if_branch(\"cmp [rbp-4],1; jne\", [0x83, 0x7d, 0xfc, 0x01, 0x75, 0x07]) {\n"
-            ),
+            out.contains("    if (cmp [rbp-4],1; jne) [0x83, 0x7d, 0xfc, 0x01, 0x75, 0x07] {\n"),
             "actual: {out}"
         );
-        assert!(out.contains("        @then {\n"));
-        assert!(out.contains("            @asm(\"ret\", [0xc3])\n"));
-        assert!(out.contains("        @else {\n"));
-        assert!(out.contains("            @asm(\"nop\", [0x90])\n"));
+        assert!(out.contains("        @asm(\"ret\", [0xc3])\n"));
+        assert!(out.contains("    } else {\n"));
+        assert!(out.contains("        @asm(\"nop\", [0x90])\n"));
     }
 
     #[test]
@@ -612,8 +644,8 @@ mod tests {
             })],
         };
         let out = emit(&f);
-        assert!(out.contains("        @then {\n"));
-        assert!(!out.contains("@else"), "should not emit @else: {out}");
+        assert!(out.contains("    if ("));
+        assert!(!out.contains("else"), "should not emit else: {out}");
     }
 
     #[test]

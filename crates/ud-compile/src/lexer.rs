@@ -45,6 +45,10 @@ pub enum TokenKind {
     /// `$` — the 6502 hex-literal sigil that appears in call arg
     /// text like `A=$D012` or `A=#$0D`. Also a "skip me" token.
     Dollar,
+    /// `;` — appears inside if/while cond text as an instruction
+    /// separator (`CMP X; BNE tgt`). Lexer-recognised so the
+    /// raw-text-capture parser can snip the inner text.
+    Semicolon,
     /// An identifier or keyword.
     Ident(String),
     /// A double-quoted string literal (already unescaped).
@@ -181,6 +185,7 @@ impl<'a> Lexer<'a> {
             '=' => TokenKind::Eq,
             '#' => TokenKind::Hash,
             '$' => TokenKind::Dollar,
+            ';' => TokenKind::Semicolon,
             '/' if self.peek_char() == Some('/') => {
                 self.bump(); // consume the second '/'
                 self.read_line_comment()
