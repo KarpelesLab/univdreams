@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use ud_arch_x86::{decode, lift_function, Bitness};
+use ud_arch_x86::{lift_function, Bitness};
 use ud_ast::{Field, Item, Module, UdFile, Value};
 use ud_format_pe::{
     CoffSymbol, PeExport, PeFile, PeKind, COFF_SYM_CLASS_EXTERNAL, COFF_SYM_CLASS_STATIC,
@@ -481,16 +481,17 @@ fn emit_section_with_function_split(
         let hi = start + next_off as usize;
         let func_bytes = &bytes[lo..hi];
 
-        // Try to lift the function body. Falls back to a per-
-        // function `@raw` block on any failure (decoder rejection,
-        // unsupported machine type, etc.) so the round-trip
-        // property holds even when we can't yet structure the
-        // function.
+        // Try to lift the function body. Returns the fn item plus
+        // an optional trailing `@raw` covering bytes the decoder
+        // couldn't reach (jump tables, padding, data-in-code).
+        // Falls back to a per-function `@raw` block on hard
+        // failures (zero decoded bytes, unsupported machine type,
+        // CFG construction failure).
         if let Some(bn) = bitness {
-            if let Some(item) =
+            if let Some(emitted) =
                 lift_pe_function(pe, &f.name, lo as u64, f.rva, bn, func_bytes, &name_at)
             {
-                items.push(item);
+                items.extend(emitted);
                 continue;
             }
         }
@@ -561,6 +562,13 @@ fn pe_name_at(pe: &PeFile) -> HashMap<u64, String> {
 /// Decode + lift + build one PE function's body as a structured
 /// `FnDecl`. Returns `None` on any decoder rejection so the caller
 /// can fall back to a per-function `@raw` block.
+/// Lift one PE function, tolerating a decoder failure mid-stream.
+///
+/// Returns a list of items: a `Function` for the bytes the decoder
+/// could reach, followed by an `@raw` for the trailing bytes it
+/// couldn't (jump tables embedded after a `ret`, alignment padding,
+/// or true data-in-code). Returns `None` when there's nothing to
+/// lift — empty decode result or a CFG construction failure.
 fn lift_pe_function(
     pe: &PeFile,
     name: &str,
@@ -569,16 +577,28 @@ fn lift_pe_function(
     bitness: Bitness,
     func_bytes: &[u8],
     name_at: &HashMap<u64, String>,
-) -> Option<Item> {
-    let insns = decode(bitness, func_bytes, u64::from(rva)).ok()?;
+) -> Option<Vec<Item>> {
+    let insns = ud_arch_x86::decode_tolerant(bitness, func_bytes, u64::from(rva));
+    if insns.is_empty() {
+        return None;
+    }
+    let consumed: usize = insns.iter().map(|i| i.original_bytes.len()).sum();
     let lifted = lift_function(name.to_string(), &insns).ok()?;
     let fn_decl = build_function::build_function(&lifted, None, name_at, pe);
-    Some(Item::Function(ud_ast::FnDecl {
+    let mut out = Vec::with_capacity(2);
+    out.push(Item::Function(ud_ast::FnDecl {
         addr: Some(file_offset),
         name: name.to_string(),
         signature: fn_decl.signature,
         body: fn_decl.body,
-    }))
+    }));
+    if consumed < func_bytes.len() {
+        out.push(Item::Raw {
+            addr: file_offset + consumed as u64,
+            bytes: func_bytes[consumed..].to_vec(),
+        });
+    }
+    Some(out)
 }
 
 /// `.ud` identifiers must start with an alpha character or `_` and
