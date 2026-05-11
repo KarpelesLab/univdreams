@@ -282,6 +282,14 @@ fn build_stmt_slice(
             i = j + 1;
             continue;
         }
+        // 2a. 16-bit increment: `INC lo; BNE +2; INC hi`. Has to
+        //     come before the generic forward-branch lifter, which
+        //     would otherwise wrap the BNE+INC as `@if_branch`.
+        if let Some((stmt, consumed)) = try_lift_inc16(local, i, resolver) {
+            out.push(stmt);
+            i += consumed;
+            continue;
+        }
         // 2. Forward conditional branch — try if/else first.
         if let Some((target_idx, branch)) = find_forward_branch_target(local, i) {
             // Bundle the preceding flag-setter (if it was just
@@ -367,7 +375,19 @@ fn build_stmt_slice(
             i += consumed;
             continue;
         }
-        // 5. Plain @asm.
+        // 8. Flag-setter immediately followed by a conditional
+        //    branch whose taken target is out of the current slice
+        //    (so the forward-/back-branch lifters skipped it).
+        //    Bundle the pair into one @asm so the test reads with
+        //    its branch instead of as two separate lines.
+        if let Some((stmt, consumed)) =
+            try_bundle_cond_to_outer(local, i, entries, labels, resolver)
+        {
+            out.push(stmt);
+            i += consumed;
+            continue;
+        }
+        // 9. Plain @asm.
         let ins = local[i];
         if let Some(lbl) = labels.get(&ins.addr.0) {
             out.push(Stmt::Comment(format!("{lbl}:")));
@@ -376,6 +396,58 @@ fn build_stmt_slice(
         i += 1;
     }
     out
+}
+
+/// `flag-setter; Bcc <out-of-slice>` — collapse the pair into a
+/// single `@asm("FLAG; BCC tgt", [bytes])` so the comparison and
+/// the branch read together. Only fires when the branch target
+/// lives *outside* the current slice; in-slice branches are
+/// handled by the back- and forward-branch lifters that wrap the
+/// pair into `@loop` / `@if_branch` with body content.
+fn try_bundle_cond_to_outer(
+    local: &[&DecodedInsn],
+    i: usize,
+    entries: &HashSet<u64>,
+    labels: &HashMap<u64, String>,
+    resolver: SymbolResolver,
+) -> Option<(Stmt, usize)> {
+    let fs = local.get(i)?;
+    if !is_flag_setter(fs) {
+        return None;
+    }
+    let bcc = local.get(i + 1)?;
+    if !matches!(
+        bcc.mnemonic,
+        Mnemonic::BCC
+            | Mnemonic::BCS
+            | Mnemonic::BEQ
+            | Mnemonic::BMI
+            | Mnemonic::BNE
+            | Mnemonic::BPL
+            | Mnemonic::BVC
+            | Mnemonic::BVS,
+    ) {
+        return None;
+    }
+    // Skip if the branch target is inside this slice — the loop /
+    // if_branch lifters will (or already did) handle it with body
+    // content; bundling here would steal the structure.
+    let InsnKind::Branch { taken, .. } = classify(bcc) else {
+        return None;
+    };
+    if local.iter().any(|ins| ins.addr.0 == taken) {
+        return None;
+    }
+    let fs_text = format_insn_with(fs, resolver);
+    let bcc_text = format_insn_with(bcc, resolver);
+    let cond_text = if let Some(annot) = call_annotation(bcc, entries, labels) {
+        format!("{fs_text}; {bcc_text}  ; {annot}")
+    } else {
+        format!("{fs_text}; {bcc_text}")
+    };
+    let mut bytes = fs.original_bytes.clone();
+    bytes.extend_from_slice(&bcc.original_bytes);
+    Some((Stmt::asm(cond_text, bytes), 2))
 }
 
 /// If `local[i]` is `LDA <anything>` (immediate, zero-page,
@@ -484,6 +556,46 @@ fn try_lift_move(
     let src = format_operand(load, resolver);
     let dst = dsts.join(" = ");
     Some((Stmt::Move { dst, src, bytes }, j - i))
+}
+
+/// If `local[i..i+3]` matches the canonical 16-bit increment
+/// pattern (`INC lo; BNE +2; INC hi`), return a `Stmt::Inc16`
+/// with the combined bytes. The `BNE` must skip exactly the
+/// `INC hi` so the byte sequence is the well-known 5-byte form
+/// `E6 lo D0 02 E6 hi`.
+fn try_lift_inc16(
+    local: &[&DecodedInsn],
+    i: usize,
+    resolver: SymbolResolver,
+) -> Option<(Stmt, usize)> {
+    let inc_lo = local.get(i)?;
+    if inc_lo.mnemonic != Mnemonic::INC {
+        return None;
+    }
+    let bne = local.get(i + 1)?;
+    if bne.mnemonic != Mnemonic::BNE {
+        return None;
+    }
+    let inc_hi = local.get(i + 2)?;
+    if inc_hi.mnemonic != Mnemonic::INC {
+        return None;
+    }
+    let InsnKind::Branch { taken, .. } = classify(bne) else {
+        return None;
+    };
+    let after_inc_hi = inc_hi
+        .addr
+        .0
+        .wrapping_add(inc_hi.original_bytes.len() as u64);
+    if taken != after_inc_hi {
+        return None;
+    }
+    let lo = format_operand(inc_lo, resolver);
+    let hi = format_operand(inc_hi, resolver);
+    let mut bytes = inc_lo.original_bytes.clone();
+    bytes.extend_from_slice(&bne.original_bytes);
+    bytes.extend_from_slice(&inc_hi.original_bytes);
+    Some((Stmt::Inc16 { lo, hi, bytes }, 3))
 }
 
 /// If `local[i..]` is two or more consecutive `LSR A` or `ASL A`
@@ -638,21 +750,31 @@ fn build_if_cond(
     (branch_text, branch.original_bytes.clone())
 }
 
-/// Is `ins` an instruction whose primary effect (in this context)
-/// is setting the flag bits that a following Bcc tests against?
-/// CMP/CPX/CPY/BIT are pure tests. LDA/LDX/LDY are dual-purpose:
-/// they load a register and incidentally set Z/N, which 6502 code
-/// regularly relies on for "is the loaded value zero" branches.
+/// Is `ins` an instruction whose result naturally feeds a following
+/// Bcc? Almost any non-store instruction touches the N/Z flags;
+/// stores (STA/STX/STY) and pure control-flow ops don't. We
+/// enumerate the affirmative list so adding instructions is a
+/// deliberate act and a store immediately before a branch doesn't
+/// get mis-bundled.
 fn is_flag_setter(ins: &DecodedInsn) -> bool {
+    use Mnemonic as M;
     matches!(
         ins.mnemonic,
-        Mnemonic::CMP
-            | Mnemonic::CPX
-            | Mnemonic::CPY
-            | Mnemonic::BIT
-            | Mnemonic::LDA
-            | Mnemonic::LDX
-            | Mnemonic::LDY
+        // Explicit tests
+        M::CMP | M::CPX | M::CPY | M::BIT
+        // Loads — set N/Z from the loaded value
+        | M::LDA | M::LDX | M::LDY
+        // Increments / decrements — set N/Z from the result
+        | M::INC | M::DEC | M::INX | M::INY | M::DEX | M::DEY
+        // Arithmetic / logical — set N/Z (and C/V where applicable)
+        | M::ADC | M::SBC | M::AND | M::ORA | M::EOR
+        // Shifts / rotates — set N/Z/C
+        | M::ASL | M::LSR | M::ROL | M::ROR
+        // Register transfers — set N/Z (TXS is the exception, it
+        // only updates SP and leaves flags alone)
+        | M::TAX | M::TAY | M::TXA | M::TYA | M::TSX
+        // Stack pull of accumulator — sets N/Z
+        | M::PLA
     )
 }
 

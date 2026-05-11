@@ -282,6 +282,16 @@ pub enum Stmt {
         bytes: Vec<u8>,
     },
 
+    /// `@inc16("lo", "hi", [bytes])` — a 16-bit increment composed
+    /// of `INC lo; BNE +2; INC hi` (with the `BNE` skipping the
+    /// high-byte INC unless the low byte just rolled over). The
+    /// canonical 6502 idiom for advancing a 16-bit pointer.
+    Inc16 {
+        lo: String,
+        hi: String,
+        bytes: Vec<u8>,
+    },
+
     /// A structured loop with the test at the bottom. Canonical
     /// gcc -O0 shape:
     ///

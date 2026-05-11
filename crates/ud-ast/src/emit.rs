@@ -248,6 +248,17 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
         }
+        Stmt::Inc16 { lo, hi, bytes } => {
+            write!(
+                out,
+                "{indent}@inc16({}, {}, [",
+                quote_string(lo),
+                quote_string(hi),
+            )
+            .unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
     }
 }
 

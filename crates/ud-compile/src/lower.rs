@@ -99,7 +99,8 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
             | Stmt::LocalSet { bytes, .. }
             | Stmt::LocalArith { bytes, .. }
             | Stmt::LocalCompound { bytes, .. }
-            | Stmt::Move { bytes, .. } => {
+            | Stmt::Move { bytes, .. }
+            | Stmt::Inc16 { bytes, .. } => {
                 out.extend_from_slice(bytes);
             }
             Stmt::IfBranch {
