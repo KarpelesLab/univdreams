@@ -1010,6 +1010,8 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Hash => "`#`".into(),
         TokenKind::Dollar => "`$`".into(),
         TokenKind::Semicolon => "`;`".into(),
+        TokenKind::Plus => "`+`".into(),
+        TokenKind::Star => "`*`".into(),
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::String(_) => "a string literal".into(),
         TokenKind::Int(n) => format!("integer 0x{n:x}"),

@@ -195,12 +195,32 @@ pub struct PeFile {
     /// to this to form full VAs at run time. Zero when the file has
     /// no optional header (object files).
     pub image_base: u64,
+    /// `AddressOfEntryPoint` from the optional header — the RVA the
+    /// loader jumps to after mapping the image. For an executable
+    /// this is `_start` / `mainCRTStartup`; for a DLL this is
+    /// `DllMain`. Zero when the file has no optional header.
+    pub address_of_entry_point: u32,
+    /// Data directories from the optional header. Index 0 is the
+    /// Export Table; index 1 the Import Table; etc. Standard PE
+    /// reserves 16 entries; we parse `NumberOfRvaAndSizes` of them.
+    pub data_directories: Vec<DataDirectory>,
     /// Section header table, in declaration order.
     pub sections: Vec<SectionHeader>,
     /// The complete file bytes; this is what `write_to_vec`
     /// returns, byte-for-byte.
     raw: Vec<u8>,
 }
+
+/// One (RVA, size) pair from the optional header's data directory
+/// array. Both fields are zero when the entry is unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataDirectory {
+    pub virtual_address: u32,
+    pub size: u32,
+}
+
+/// Index of the Export Table entry in `data_directories`.
+pub const DATA_DIR_EXPORT: usize = 0;
 
 impl PeFile {
     /// Parse a PE file. Validates the structural skeleton (DOS
@@ -243,6 +263,8 @@ impl PeFile {
         let opt_size = coff.size_of_optional_header as usize;
         ensure_len(bytes, opt_off as u64, opt_size as u64)?;
         let mut image_base: u64 = 0;
+        let mut address_of_entry_point: u32 = 0;
+        let mut data_directories: Vec<DataDirectory> = Vec::new();
         let kind = if opt_size == 0 {
             // Object files have no optional header. Default to PE32+
             // for typing purposes; the kind is informational only.
@@ -250,26 +272,45 @@ impl PeFile {
         } else {
             ensure_len(bytes, opt_off as u64, 2)?;
             let magic = read_u16(bytes, opt_off);
-            match magic {
+            // AddressOfEntryPoint sits at offset 16 in both variants.
+            if opt_size >= 20 {
+                address_of_entry_point = read_u32(bytes, opt_off + 16);
+            }
+            let (variant, data_dir_off) = match magic {
                 OPTIONAL_HEADER_MAGIC_PE32 => {
-                    // PE32 ImageBase is at offset 28 within the
-                    // optional header (4 bytes). The first 24 bytes
-                    // cover Magic + version + sizes + entry/code/data
-                    // RVAs.
+                    // PE32 ImageBase is at offset 28, 4 bytes.
                     if opt_size >= 32 {
                         image_base = u64::from(read_u32(bytes, opt_off + 28));
                     }
-                    PeKind::Pe32
+                    (PeKind::Pe32, 96usize)
                 }
                 OPTIONAL_HEADER_MAGIC_PE32_PLUS => {
                     // PE32+ ImageBase is at offset 24, 8 bytes.
                     if opt_size >= 32 {
                         image_base = read_u64(bytes, opt_off + 24);
                     }
-                    PeKind::Pe32Plus
+                    (PeKind::Pe32Plus, 112usize)
                 }
                 other => return Err(Error::UnsupportedOptionalMagic(other)),
+            };
+            // NumberOfRvaAndSizes lives at data_dir_off - 4 (right
+            // before the data directories table). Each entry is
+            // 8 bytes (RVA + size).
+            if opt_size >= data_dir_off {
+                let count_off = data_dir_off - 4;
+                let count = read_u32(bytes, opt_off + count_off) as usize;
+                let dirs_bytes_needed = count.saturating_mul(8);
+                if opt_size >= data_dir_off + dirs_bytes_needed {
+                    for i in 0..count {
+                        let off = opt_off + data_dir_off + i * 8;
+                        data_directories.push(DataDirectory {
+                            virtual_address: read_u32(bytes, off),
+                            size: read_u32(bytes, off + 4),
+                        });
+                    }
+                }
             }
+            variant
         };
 
         let sec_off = opt_off + opt_size;
@@ -294,6 +335,8 @@ impl PeFile {
             e_lfanew,
             coff,
             image_base,
+            address_of_entry_point,
+            data_directories,
             sections,
             raw: bytes.to_vec(),
         })
@@ -396,6 +439,121 @@ impl PeFile {
         out
     }
 
+    /// Translate an RVA to a file offset by finding the section that
+    /// contains it and computing `pointer_to_raw_data + (rva -
+    /// virtual_address)`. Returns `None` for RVAs outside every
+    /// section, or when the resulting offset would land past the
+    /// file's bytes.
+    #[must_use]
+    pub fn rva_to_file_offset(&self, rva: u32) -> Option<usize> {
+        for sh in &self.sections {
+            let start = sh.virtual_address;
+            let size = sh.virtual_size.max(sh.size_of_raw_data);
+            let end = start.checked_add(size)?;
+            if rva >= start && rva < end {
+                let off_in_section = rva - start;
+                if off_in_section >= sh.size_of_raw_data {
+                    return None; // lies inside virtual-only space
+                }
+                let file_off = sh.pointer_to_raw_data.checked_add(off_in_section)?;
+                if (file_off as usize) >= self.raw.len() {
+                    return None;
+                }
+                return Some(file_off as usize);
+            }
+        }
+        None
+    }
+
+    /// Read a slice of `len` bytes starting at the given RVA, or
+    /// `None` if it's outside the file. Convenience over
+    /// `rva_to_file_offset` + slicing.
+    #[must_use]
+    pub fn slice_at_rva(&self, rva: u32, len: usize) -> Option<&[u8]> {
+        let off = self.rva_to_file_offset(rva)?;
+        self.raw.get(off..off.checked_add(len)?)
+    }
+
+    /// Parse the Export Directory (data directory 0) if it exists
+    /// and is populated, returning one [`PeExport`] per advertised
+    /// export. An empty result either means "no export table" or
+    /// "table present but lists zero functions".
+    #[must_use]
+    pub fn exports(&self) -> Vec<PeExport> {
+        let Some(dir) = self.data_directories.get(DATA_DIR_EXPORT) else {
+            return Vec::new();
+        };
+        if dir.virtual_address == 0 || dir.size == 0 {
+            return Vec::new();
+        }
+        let Some(hdr) = self.slice_at_rva(dir.virtual_address, 40) else {
+            return Vec::new();
+        };
+        let ordinal_base = read_u32(hdr, 16);
+        let n_functions = read_u32(hdr, 20) as usize;
+        let n_names = read_u32(hdr, 24) as usize;
+        let addr_of_functions = read_u32(hdr, 28);
+        let addr_of_names = read_u32(hdr, 32);
+        let addr_of_name_ordinals = read_u32(hdr, 36);
+
+        // Build ordinal -> name map from the parallel name + ordinal
+        // arrays. Most exports are named; pure-ordinal exports leave
+        // their slot in this map empty.
+        let mut name_of_ordinal: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
+        if let Some(names) = self.slice_at_rva(addr_of_names, n_names.saturating_mul(4)) {
+            if let Some(ords) = self.slice_at_rva(addr_of_name_ordinals, n_names.saturating_mul(2))
+            {
+                for i in 0..n_names {
+                    let name_rva = read_u32(names, i * 4);
+                    let ord_idx = u32::from(read_u16(ords, i * 2));
+                    if let Some(name) = self.read_cstring_at_rva(name_rva) {
+                        name_of_ordinal.insert(ord_idx, name);
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(n_functions);
+        let Some(funcs) = self.slice_at_rva(addr_of_functions, n_functions.saturating_mul(4))
+        else {
+            return out;
+        };
+        for i in 0..n_functions {
+            let func_rva = read_u32(funcs, i * 4);
+            if func_rva == 0 {
+                continue; // empty slot (gap in the ordinal range)
+            }
+            // Forwarder exports: the RVA points into the Export
+            // Directory itself (so it's an ASCII redirect string,
+            // not real code). Skip those — they don't correspond
+            // to local code we can lift.
+            let dir_end = dir.virtual_address.wrapping_add(dir.size);
+            if func_rva >= dir.virtual_address && func_rva < dir_end {
+                continue;
+            }
+            out.push(PeExport {
+                ordinal: ordinal_base + i as u32,
+                rva: func_rva,
+                name: name_of_ordinal.get(&(i as u32)).cloned(),
+            });
+        }
+        out
+    }
+
+    /// Read an ASCII NUL-terminated string at `rva`, capped at a
+    /// sensible upper bound to avoid runaway scans on malformed
+    /// images. Returns `None` if the RVA can't be resolved.
+    fn read_cstring_at_rva(&self, rva: u32) -> Option<String> {
+        let off = self.rva_to_file_offset(rva)?;
+        let slice = self.raw.get(off..)?;
+        let end = slice.iter().take(512).position(|&b| b == 0).unwrap_or(0);
+        if end == 0 {
+            return None;
+        }
+        std::str::from_utf8(&slice[..end]).ok().map(str::to_string)
+    }
+
     /// Serialize back to bytes. Always byte-identical to the input
     /// in v0 — the parsed file stores the original buffer and we
     /// simply hand it back.
@@ -403,6 +561,20 @@ impl PeFile {
     pub fn write_to_vec(&self) -> Vec<u8> {
         self.raw.clone()
     }
+}
+
+/// One entry from a PE file's Export Address Table.
+#[derive(Debug, Clone)]
+pub struct PeExport {
+    /// The export's ordinal (Base + index). Always present in the
+    /// EAT.
+    pub ordinal: u32,
+    /// RVA of the export's code. Forwarder entries (which point at
+    /// a redirect string instead) are excluded by [`PeFile::exports`].
+    pub rva: u32,
+    /// Symbolic name when the export has one; `None` for ordinal-
+    /// only exports.
+    pub name: Option<String>,
 }
 
 /// Returns true if `bytes` look like a PE file (start with the DOS

@@ -49,6 +49,14 @@ pub enum TokenKind {
     /// separator (`CMP X; BNE tgt`). Lexer-recognised so the
     /// raw-text-capture parser can snip the inner text.
     Semicolon,
+    /// `+` — used in x86 effective-address operand text inside
+    /// conds and call args (`[ebp+8]`). Treated as a free
+    /// character at the lexer level; the parser doesn't need to
+    /// interpret it.
+    Plus,
+    /// `*` — x86 scaled-index syntax inside conds and call args
+    /// (`[esi+ebx*4]`). Same role as `Plus`.
+    Star,
     /// An identifier or keyword.
     Ident(String),
     /// A double-quoted string literal (already unescaped).
@@ -186,6 +194,8 @@ impl<'a> Lexer<'a> {
             '#' => TokenKind::Hash,
             '$' => TokenKind::Dollar,
             ';' => TokenKind::Semicolon,
+            '+' => TokenKind::Plus,
+            '*' => TokenKind::Star,
             '/' if self.peek_char() == Some('/') => {
                 self.bump(); // consume the second '/'
                 self.read_line_comment()

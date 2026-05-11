@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use ud_arch_x86::{decode, lift_function, Bitness};
 use ud_ast::{Field, Item, Module, UdFile, Value};
 use ud_format_pe::{
-    CoffSymbol, PeFile, PeKind, COFF_SYM_CLASS_EXTERNAL, COFF_SYM_CLASS_STATIC,
+    CoffSymbol, PeExport, PeFile, PeKind, COFF_SYM_CLASS_EXTERNAL, COFF_SYM_CLASS_STATIC,
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386,
 };
 
@@ -248,11 +248,189 @@ fn group_functions_by_section(
             rva,
         });
     }
+    // Supplement with optional-header entry point and Export
+    // Address Table entries. This is the only function source for
+    // stripped DLLs / EXEs.
+    add_pe_entry_point(pe, &mut out);
+    add_pe_exports(pe, &mut out);
+    // Walk direct `call` instructions reachable from those entries
+    // and treat every target as another function. Stripped PE has
+    // no symbol table to lean on; the call graph is the only
+    // remaining signal.
+    add_pe_call_graph_targets(pe, &mut out);
     for v in out.values_mut() {
         v.sort_by_key(|f| f.section_offset);
         v.dedup_by(|a, b| a.section_offset == b.section_offset && a.name == b.name);
     }
     out
+}
+
+/// PE `IMAGE_FILE_DLL` characteristic bit (0x2000). When set, the
+/// entry point names `DllMain`; otherwise it's a plain `_start` /
+/// `EntryPoint`.
+const IMAGE_FILE_DLL: u16 = 0x2000;
+
+/// Locate the section containing `rva` and return `(section_idx,
+/// rva - section.virtual_address)`. None if `rva` is in no section
+/// (e.g. inside a NOBITS region or past the end of the image).
+fn rva_to_section(pe: &PeFile, rva: u32) -> Option<(usize, u32)> {
+    for (idx, sh) in pe.sections.iter().enumerate() {
+        let start = sh.virtual_address;
+        let size = sh.virtual_size.max(sh.size_of_raw_data);
+        if let Some(end) = start.checked_add(size) {
+            if rva >= start && rva < end {
+                return Some((idx, rva - start));
+            }
+        }
+    }
+    None
+}
+
+fn add_pe_entry_point(
+    pe: &PeFile,
+    out: &mut std::collections::HashMap<usize, Vec<PeFunctionRecord>>,
+) {
+    let ep = pe.address_of_entry_point;
+    if ep == 0 {
+        return;
+    }
+    let Some((idx, off)) = rva_to_section(pe, ep) else {
+        return;
+    };
+    let already = out.get(&idx).is_some_and(|v| v.iter().any(|f| f.rva == ep));
+    if already {
+        return;
+    }
+    let name = if pe.coff.characteristics & IMAGE_FILE_DLL != 0 {
+        "DllMain".to_string()
+    } else {
+        "_start".to_string()
+    };
+    out.entry(idx).or_default().push(PeFunctionRecord {
+        name,
+        section_offset: off,
+        rva: ep,
+    });
+}
+
+fn add_pe_exports(pe: &PeFile, out: &mut std::collections::HashMap<usize, Vec<PeFunctionRecord>>) {
+    for export in pe.exports() {
+        let Some((idx, off)) = rva_to_section(pe, export.rva) else {
+            continue;
+        };
+        let already = out
+            .get(&idx)
+            .is_some_and(|v| v.iter().any(|f| f.rva == export.rva));
+        if already {
+            continue;
+        }
+        let name = export_function_name(&export);
+        out.entry(idx).or_default().push(PeFunctionRecord {
+            name,
+            section_offset: off,
+            rva: export.rva,
+        });
+    }
+}
+
+/// Transitive call-graph walk for stripped PE: from every seed
+/// already in `out`, decode linearly up to the next function-end
+/// instruction (RET / unconditional jump) and record every direct
+/// `call` target. Each discovered target becomes a new seed
+/// (named `sub_<rva>`). Repeat until the worklist drains.
+///
+/// The walk only follows targets that land inside the same section
+/// as the seed (typically `.text`), since cross-section targets
+/// are usually imports or jump-table references rather than local
+/// functions.
+/// Cap per-function decode length so a function with no clear exit
+/// (e.g. unreachable padding after a tail call) doesn't sweep the
+/// whole section.
+const MAX_FUNCTION_BYTES: usize = 65536;
+
+fn add_pe_call_graph_targets(
+    pe: &PeFile,
+    out: &mut std::collections::HashMap<usize, Vec<PeFunctionRecord>>,
+) {
+    let bitness = match pe.coff.machine {
+        IMAGE_FILE_MACHINE_I386 => Bitness::Bits32,
+        IMAGE_FILE_MACHINE_AMD64 => Bitness::Bits64,
+        _ => return,
+    };
+
+    // Track every RVA we've ever decided is a function so we don't
+    // re-walk the same one (cycles via recursion would loop
+    // otherwise). Seeded from whatever's already in `out`.
+    let mut known: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut worklist: Vec<u32> = Vec::new();
+    for fns in out.values() {
+        for f in fns {
+            if known.insert(f.rva) {
+                worklist.push(f.rva);
+            }
+        }
+    }
+
+    let raw = pe.raw_bytes();
+    while let Some(rva) = worklist.pop() {
+        let Some((sec_idx, _)) = rva_to_section(pe, rva) else {
+            continue;
+        };
+        let Some(sec) = pe.sections.get(sec_idx) else {
+            continue;
+        };
+        let Some(start_off) = pe.rva_to_file_offset(rva) else {
+            continue;
+        };
+        let sec_raw_end_rva = sec.virtual_address.saturating_add(sec.size_of_raw_data);
+        let in_section = (sec_raw_end_rva.saturating_sub(rva)) as usize;
+        let read_len = in_section.min(MAX_FUNCTION_BYTES);
+        let slice = &raw[start_off..start_off.saturating_add(read_len).min(raw.len())];
+        let insns = ud_arch_x86::decode_tolerant(bitness, slice, u64::from(rva));
+        if insns.is_empty() {
+            continue;
+        }
+        // Build the CFG. This is what tells us "every instruction
+        // reachable from `rva`" — including paths past early
+        // returns, follow-the-conditional-branch paths, etc.
+        let Ok(lifted) = lift_function(format!("seed_{rva:x}"), &insns) else {
+            continue;
+        };
+        for block in &lifted.blocks {
+            for ins in &block.insns {
+                let Some(target_u64) = ud_arch_x86::direct_call_target(&ins.iced) else {
+                    continue;
+                };
+                // The decoder's IP was set to `rva` (an RVA),
+                // not `image_base + rva`, so iced's computed call
+                // target is already an RVA. Just narrow to u32.
+                let Ok(target_rva) = u32::try_from(target_u64) else {
+                    continue;
+                };
+                let Some((tgt_sec, tgt_off)) = rva_to_section(pe, target_rva) else {
+                    continue;
+                };
+                if tgt_sec != sec_idx {
+                    continue;
+                }
+                if known.insert(target_rva) {
+                    out.entry(tgt_sec).or_default().push(PeFunctionRecord {
+                        name: format!("sub_{target_rva:x}"),
+                        section_offset: tgt_off,
+                        rva: target_rva,
+                    });
+                    worklist.push(target_rva);
+                }
+            }
+        }
+    }
+}
+
+fn export_function_name(export: &PeExport) -> String {
+    export
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("Ord_{}", export.ordinal))
 }
 
 /// Emit one section whose contents are split by COFF function

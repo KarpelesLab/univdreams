@@ -50,6 +50,26 @@ pub fn direct_call_target(insn: &Instruction) -> Option<u64> {
     }
 }
 
+/// Heuristic: does this instruction terminate a function?
+/// Returns, unconditional branches (direct or indirect), and the
+/// rare hardware traps (`int`, `ud2`, etc.) all qualify.
+/// Conditional branches don't — they can still flow into later
+/// instructions in the same function.
+///
+/// Used by the PE / ELF function-discovery passes to bound linear
+/// decoding of a newly-seeded function.
+#[must_use]
+pub fn is_function_terminator(insn: &Instruction) -> bool {
+    matches!(
+        insn.flow_control(),
+        FlowControl::Return
+            | FlowControl::UnconditionalBranch
+            | FlowControl::IndirectBranch
+            | FlowControl::Interrupt
+            | FlowControl::Exception,
+    )
+}
+
 /// One recognised return-with-literal pattern at the tail of a
 /// function: how many trailing instructions matched, and the literal
 /// integer value the function returns.
@@ -910,6 +930,35 @@ pub fn decode(bitness: Bitness, bytes: &[u8], rip: u64) -> Result<Vec<DecodedIns
         });
     }
     Ok(out)
+}
+
+/// Like [`decode`] but tolerates a decoder failure mid-stream: on
+/// hitting an invalid byte the walk stops and returns every
+/// instruction successfully decoded up to that point plus the
+/// failure offset. Used by function-discovery passes that scan
+/// past data-in-code regions (e.g. jump-table embedded inside a
+/// `.text` section).
+#[must_use]
+pub fn decode_tolerant(bitness: Bitness, bytes: &[u8], rip: u64) -> Vec<DecodedInsn> {
+    let mut decoder = Decoder::with_ip(bitness.as_u32(), bytes, rip, DecoderOptions::NONE);
+    let mut out = Vec::new();
+    while decoder.can_decode() {
+        let pos = decoder.position();
+        let insn = decoder.decode();
+        if insn.is_invalid() {
+            break;
+        }
+        let len = insn.len();
+        let end = pos.saturating_add(len);
+        if end > bytes.len() {
+            break;
+        }
+        out.push(DecodedInsn {
+            iced: insn,
+            original_bytes: bytes[pos..end].to_vec(),
+        });
+    }
+    out
 }
 
 /// Re-emit a decoded instruction stream using each instruction's
