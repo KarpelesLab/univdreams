@@ -37,6 +37,14 @@ pub enum TokenKind {
     Gt,
     /// `=` (used in named directive arguments like `entry_jmp=[bytes]`).
     Eq,
+    /// `#` — the 6502 immediate-operand sigil that appears in call
+    /// arg text like `A=#$0D`. Not interpreted by the parser; only
+    /// recognised so the lexer doesn't reject these characters in
+    /// the source.
+    Hash,
+    /// `$` — the 6502 hex-literal sigil that appears in call arg
+    /// text like `A=$D012` or `A=#$0D`. Also a "skip me" token.
+    Dollar,
     /// An identifier or keyword.
     Ident(String),
     /// A double-quoted string literal (already unescaped).
@@ -55,6 +63,13 @@ pub struct Token {
     pub kind: TokenKind,
     pub line: u32,
     pub col: u32,
+    /// Byte offset of this token's first character in the input
+    /// string. Combined with `end` it lets the parser snip raw text
+    /// out of the source — used by the call-statement parser to
+    /// preserve the exact unquoted argument text the user wrote.
+    pub start: usize,
+    /// Byte offset just past this token's last character.
+    pub end: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,10 +153,13 @@ impl<'a> Lexer<'a> {
         let line = self.line;
         let col = self.col;
         let Some((start, ch)) = self.bump() else {
+            let eof_pos = self.src.len();
             return Ok(Token {
                 kind: TokenKind::Eof,
                 line,
                 col,
+                start: eof_pos,
+                end: eof_pos,
             });
         };
         let kind = match ch {
@@ -161,6 +179,8 @@ impl<'a> Lexer<'a> {
             '<' => TokenKind::Lt,
             '>' => TokenKind::Gt,
             '=' => TokenKind::Eq,
+            '#' => TokenKind::Hash,
+            '$' => TokenKind::Dollar,
             '/' if self.peek_char() == Some('/') => {
                 self.bump(); // consume the second '/'
                 self.read_line_comment()
@@ -179,7 +199,20 @@ impl<'a> Lexer<'a> {
                 });
             }
         };
-        Ok(Token { kind, line, col })
+        let end = self.current_byte_pos();
+        Ok(Token {
+            kind,
+            line,
+            col,
+            start,
+            end,
+        })
+    }
+
+    /// Byte position of the next character to be consumed, or
+    /// `src.len()` at EOF.
+    fn current_byte_pos(&mut self) -> usize {
+        self.iter.peek().map_or(self.src.len(), |&(p, _)| p)
     }
 
     fn read_line_comment(&mut self) -> TokenKind {

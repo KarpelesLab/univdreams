@@ -30,18 +30,23 @@ pub enum ParseError {
 /// Parse `input` into an AST. Returns the first error encountered.
 pub fn parse(input: &str) -> Result<UdFile, ParseError> {
     let tokens = tokenize(input)?;
-    let mut p = Parser::new(tokens);
+    let mut p = Parser::new(input.to_string(), tokens);
     p.parse_file()
 }
 
 struct Parser {
+    src: String,
     tokens: Vec<Token>,
     pos: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+    fn new(src: String, tokens: Vec<Token>) -> Self {
+        Self {
+            src,
+            tokens,
+            pos: 0,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -462,26 +467,127 @@ impl Parser {
     /// name(arg, …) [bytes]
     /// ```
     ///
-    /// `arg`s are quoted strings (free-form text — typically
-    /// `"A=#$0D"`-style for the 6502 backend, or `"reg=value"` for
-    /// x86). Trailing `[bytes]` pins the lowered encoding for
+    /// `arg`s are free-form text — typically `A=#$0D` for 6502 or
+    /// `0x4008` / `result` for x86. They can also be quoted strings
+    /// when they contain characters the lexer wouldn't otherwise
+    /// recognise (whitespace, embedded quotes, escapes). The
+    /// trailing `[bytes]` pins the lowered encoding for
     /// byte-identical round-trip.
+    ///
+    /// Implementation: we tokenise normally, walk over the args
+    /// with paren-balance tracking, and snip the raw source text
+    /// for each top-level comma-separated segment. This lets
+    /// `A=(XAML,X)` or `*.data @ 0x4008` survive without escaping.
     fn parse_call_stmt(&mut self) -> Result<Stmt, ParseError> {
         let name = self.expect_ident("call target name")?;
         self.expect(&TokenKind::LParen, "`(` after call target name")?;
         let mut args = Vec::new();
+        // Empty arg list: `name()`.
         if self.peek().kind != TokenKind::RParen {
-            args.push(self.expect_string("call argument string")?);
-            while self.eat_kind(&TokenKind::Comma) {
-                if self.peek().kind == TokenKind::RParen {
-                    break;
-                }
-                args.push(self.expect_string("call argument string")?);
-            }
+            self.collect_call_args(&mut args)?;
         }
         self.expect(&TokenKind::RParen, "`)` to close call argument list")?;
         let bytes = self.parse_byte_list()?;
         Ok(Stmt::Call { name, args, bytes })
+    }
+
+    /// Walk tokens until the matching `)` of the current call
+    /// argument list, splitting on top-level commas.
+    ///
+    /// Each segment becomes one element of `out`:
+    ///
+    /// * If the segment is exactly one quoted-string token, the
+    ///   AST gets the *parsed* string (escapes resolved) so the
+    ///   AST canonical content survives a round-trip via text.
+    /// * Otherwise, the AST gets the raw source-text slice spanning
+    ///   the segment — preserves `A=#$0D`, `A=(XAML,X)`, etc.
+    ///   verbatim.
+    fn collect_call_args(&mut self, out: &mut Vec<String>) -> Result<(), ParseError> {
+        let mut depth = 0i32;
+        let mut seg_start = self.peek().start;
+        let mut seg_string: Option<String> = None;
+        let mut seg_token_count = 0usize;
+        loop {
+            let tok = self.peek().clone();
+            match &tok.kind {
+                TokenKind::LParen | TokenKind::LBracket => {
+                    depth += 1;
+                    seg_token_count += 1;
+                    self.bump();
+                }
+                TokenKind::RParen | TokenKind::RBracket if depth > 0 => {
+                    depth -= 1;
+                    seg_token_count += 1;
+                    self.bump();
+                }
+                TokenKind::RParen => {
+                    let seg_end = tok.start;
+                    self.flush_call_arg(
+                        out,
+                        seg_start,
+                        seg_end,
+                        seg_string.as_deref(),
+                        seg_token_count,
+                    );
+                    return Ok(());
+                }
+                TokenKind::Comma if depth == 0 => {
+                    let seg_end = tok.start;
+                    self.flush_call_arg(
+                        out,
+                        seg_start,
+                        seg_end,
+                        seg_string.as_deref(),
+                        seg_token_count,
+                    );
+                    self.bump();
+                    seg_start = self.peek().start;
+                    seg_string = None;
+                    seg_token_count = 0;
+                }
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof);
+                }
+                TokenKind::String(s) => {
+                    if seg_token_count == 0 {
+                        seg_string = Some(s.clone());
+                    } else {
+                        seg_string = None;
+                    }
+                    seg_token_count += 1;
+                    self.bump();
+                }
+                _ => {
+                    seg_string = None;
+                    seg_token_count += 1;
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    fn flush_call_arg(
+        &self,
+        out: &mut Vec<String>,
+        seg_start: usize,
+        seg_end: usize,
+        seg_string: Option<&str>,
+        token_count: usize,
+    ) {
+        if token_count == 0 {
+            // Trailing comma or empty list — emit nothing.
+            return;
+        }
+        if let Some(s) = seg_string {
+            if token_count == 1 {
+                out.push(s.to_string());
+                return;
+            }
+        }
+        let raw = self.src[seg_start..seg_end].trim().to_string();
+        if !raw.is_empty() {
+            out.push(raw);
+        }
     }
 
     /// Dispatch on the directive name after a leading `@` inside a
@@ -762,6 +868,8 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Lt => "`<`".into(),
         TokenKind::Gt => "`>`".into(),
         TokenKind::Eq => "`=`".into(),
+        TokenKind::Hash => "`#`".into(),
+        TokenKind::Dollar => "`$`".into(),
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::String(_) => "a string literal".into(),
         TokenKind::Int(n) => format!("integer 0x{n:x}"),

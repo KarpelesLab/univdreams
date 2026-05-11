@@ -150,7 +150,11 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(&quote_string(a));
+                if arg_is_unquoted_safe(a) {
+                    out.push_str(a);
+                } else {
+                    out.push_str(&quote_string(a));
+                }
             }
             out.push_str(") [");
             emit_byte_list(out, bytes);
@@ -245,6 +249,40 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             writeln!(out, "])").unwrap();
         }
     }
+}
+
+/// Heuristic: is this arg safe to emit unquoted in a call
+/// statement? Rules:
+///
+/// * Non-empty.
+/// * All ASCII graphic chars (no whitespace, no control chars, no
+///   embedded `"` or `\\`).
+/// * Parens / brackets balanced.
+/// * No top-level `,`, `)`, or `]` — those would be parsed as the
+///   end of the arg / arg list.
+fn arg_is_unquoted_safe(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut depth = 0i32;
+    for c in s.chars() {
+        if !c.is_ascii_graphic() {
+            return false;
+        }
+        match c {
+            '"' | '\\' => return false,
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 fn emit_signed_hex(out: &mut String, n: i64) {
