@@ -439,9 +439,13 @@ impl Parser {
                     let stmt = self.parse_stmt_at_directive(&dir_name, &dir_tok)?;
                     body.push(stmt);
                 }
+                TokenKind::Ident(_) => {
+                    let stmt = self.parse_call_stmt()?;
+                    body.push(stmt);
+                }
                 other => {
                     return Err(ParseError::Expected {
-                        expected: "`@asm`, `// comment`, or `}`".into(),
+                        expected: "`@asm`, `// comment`, function call, or `}`".into(),
                         got: describe(&other),
                         line: self.peek().line,
                         col: self.peek().col,
@@ -450,6 +454,34 @@ impl Parser {
             }
         }
         Ok(body)
+    }
+
+    /// Parse a function-call statement:
+    ///
+    /// ```text
+    /// name(arg, …) [bytes]
+    /// ```
+    ///
+    /// `arg`s are quoted strings (free-form text — typically
+    /// `"A=#$0D"`-style for the 6502 backend, or `"reg=value"` for
+    /// x86). Trailing `[bytes]` pins the lowered encoding for
+    /// byte-identical round-trip.
+    fn parse_call_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let name = self.expect_ident("call target name")?;
+        self.expect(&TokenKind::LParen, "`(` after call target name")?;
+        let mut args = Vec::new();
+        if self.peek().kind != TokenKind::RParen {
+            args.push(self.expect_string("call argument string")?);
+            while self.eat_kind(&TokenKind::Comma) {
+                if self.peek().kind == TokenKind::RParen {
+                    break;
+                }
+                args.push(self.expect_string("call argument string")?);
+            }
+        }
+        self.expect(&TokenKind::RParen, "`)` to close call argument list")?;
+        let bytes = self.parse_byte_list()?;
+        Ok(Stmt::Call { name, args, bytes })
     }
 
     /// Dispatch on the directive name after a leading `@` inside a
@@ -503,27 +535,6 @@ impl Parser {
                 let bytes = self.parse_byte_list()?;
                 self.expect(&TokenKind::RParen, "`)` to close `@return_expr`")?;
                 Ok(Stmt::ReturnExpr { text, bytes })
-            }
-            "call" => {
-                self.expect(&TokenKind::LParen, "`(` after `@call`")?;
-                let name = self.expect_string("call target name")?;
-                self.expect(&TokenKind::Comma, "`,` after `@call` name")?;
-                self.expect(&TokenKind::LBracket, "`[` to open arg list")?;
-                let mut args = Vec::new();
-                if self.peek().kind != TokenKind::RBracket {
-                    args.push(self.expect_string("arg expression string")?);
-                    while self.eat_kind(&TokenKind::Comma) {
-                        if self.peek().kind == TokenKind::RBracket {
-                            break;
-                        }
-                        args.push(self.expect_string("arg expression string")?);
-                    }
-                }
-                self.expect(&TokenKind::RBracket, "`]` to close arg list")?;
-                self.expect(&TokenKind::Comma, "`,` after `@call` args")?;
-                let bytes = self.parse_byte_list()?;
-                self.expect(&TokenKind::RParen, "`)` to close `@call`")?;
-                Ok(Stmt::Call { name, args, bytes })
             }
             "arg_spill" => {
                 self.expect(&TokenKind::LParen, "`(` after `@arg_spill`")?;
