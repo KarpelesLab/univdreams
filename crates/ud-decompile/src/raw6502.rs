@@ -367,6 +367,15 @@ fn build_stmt_slice(
             i += consumed;
             continue;
         }
+        // 6b. Single bare store — `STA dst` becomes
+        //     `@move("dst", "A", …)`. The chain lifter requires two
+        //     adjacent stores; this picks up the lone-store case so
+        //     `STA MODE` reads as `MODE = A` rather than as @asm.
+        if let Some(move_stmt) = try_lift_single_store(local, i, resolver) {
+            out.push(move_stmt);
+            i += 1;
+            continue;
+        }
         // 7. Consecutive accumulator shifts (LSR A or ASL A) — the
         //    "shift A by N" idiom used to extract a nibble or position
         //    bits. Collapse into a single multi-byte @asm.
@@ -680,6 +689,36 @@ fn try_lift_store_chain(
         },
         j - i,
     ))
+}
+
+/// Single `STA dst` / `STX dst` / `STY dst` → `@move("dst", "reg",
+/// [bytes])`. Catches lone stores that aren't part of a multi-store
+/// fanout. Implied / accumulator / illegal modes can't be stores
+/// and are skipped.
+fn try_lift_single_store(
+    local: &[&DecodedInsn],
+    i: usize,
+    resolver: SymbolResolver,
+) -> Option<Stmt> {
+    let ins = local.get(i)?;
+    let reg = match ins.mnemonic {
+        Mnemonic::STA => "A",
+        Mnemonic::STX => "X",
+        Mnemonic::STY => "Y",
+        _ => return None,
+    };
+    if matches!(
+        ins.mode,
+        AddressingMode::Implied | AddressingMode::Accumulator | AddressingMode::IllegalOperand
+    ) {
+        return None;
+    }
+    let dst = format_operand(ins, resolver);
+    Some(Stmt::Move {
+        dst,
+        src: reg.to_string(),
+        bytes: ins.original_bytes.clone(),
+    })
 }
 
 /// Render only the operand part of an instruction (everything that
