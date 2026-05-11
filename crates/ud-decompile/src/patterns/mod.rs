@@ -41,6 +41,10 @@ use std::collections::HashMap;
 use ud_arch_x86::DecodedInsn;
 use ud_ast::Stmt;
 
+mod arith;
+mod lea;
+mod mov;
+mod mov_extend;
 mod stack_arg_call;
 mod tail_jmp;
 mod xor_zero;
@@ -112,8 +116,12 @@ pub trait Pattern: Sync {
 fn registry() -> Vec<&'static dyn Pattern> {
     vec![
         &stack_arg_call::StackArgCall,
-        &xor_zero::XorZero,
         &tail_jmp::TailJmp,
+        &xor_zero::XorZero,
+        &mov::Mov,
+        &mov_extend::MovExtend,
+        &lea::Lea,
+        &arith::Arith,
     ]
 }
 
