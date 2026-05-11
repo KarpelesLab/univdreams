@@ -25,7 +25,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use ud_arch_6502::{
     classify, decode_range, format_insn_with, AddressingMode, DecodedInsn, InsnKind, Mnemonic,
 };
-use ud_ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
+use ud_ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
 use ud_format_raw::RawImage;
 
 /// 6502 reset / NMI / IRQ vectors live at $FFFA-$FFFF. Six bytes.
@@ -71,16 +71,18 @@ pub fn decompile_raw_6502(image: &RawImage) -> Result<UdFile> {
     let entries = discover_entries(&insns, reset_addr, image.start(), code_end);
     let labels = discover_labels(&insns, &entries);
     let resolver = pick_resolver(image);
+    let signatures = infer_signatures(&insns, &entries);
 
     let mut items: Vec<Item> = Vec::new();
     for (idx, &entry) in entries.iter().enumerate() {
         let end = entries.get(idx + 1).copied().unwrap_or(code_end);
-        let body = build_body_range(&insns, entry, end, &labels, &entries, resolver);
+        let body = build_body_range(&insns, entry, end, &labels, &entries, resolver, &signatures);
         let name = function_name(entry, reset_addr);
+        let signature = signatures.get(&entry).cloned();
         items.push(Item::Function(FnDecl {
             addr: Some(entry),
             name,
-            signature: None,
+            signature,
             body,
         }));
     }
@@ -125,6 +127,69 @@ fn discover_entries(
     set.into_iter().filter(|a| insn_addrs.contains(a)).collect()
 }
 
+/// For each discovered entry, decide whether it takes an `A`
+/// parameter by looking at its first instruction: if that
+/// instruction *reads* the accumulator (without first writing it),
+/// the function is consuming the caller's `A` and we attach a
+/// one-param signature `(a: u8 @A)`.
+///
+/// This is a v0 calling-convention inference: it catches all three
+/// WozMon subroutines (ECHO writes via `STA DSP`, PRBYTE pushes via
+/// `PHA`, PRHEX runs `AND #$0F`) and stays silent for `reset`
+/// (whose first instruction is `CLD`, no A read).
+fn infer_signatures(insns: &[DecodedInsn], entries: &[u64]) -> HashMap<u64, Signature> {
+    let mut out = HashMap::new();
+    for &entry in entries {
+        let Some(first) = insns.iter().find(|i| i.addr.0 == entry) else {
+            continue;
+        };
+        if reads_accumulator(first) {
+            out.insert(
+                entry,
+                Signature {
+                    params: vec![Param {
+                        name: "a".into(),
+                        ty: Type::U8,
+                        location: Some("A".into()),
+                    }],
+                    return_type: Type::Void,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Does executing this single instruction read the accumulator?
+/// Used by signature inference: the first instruction in a callee
+/// reading A means the function takes A as input.
+fn reads_accumulator(ins: &DecodedInsn) -> bool {
+    use Mnemonic as M;
+    if matches!(
+        ins.mnemonic,
+        M::ADC
+            | M::AND
+            | M::EOR
+            | M::ORA
+            | M::SBC
+            | M::CMP
+            | M::STA
+            | M::TAX
+            | M::TAY
+            | M::PHA
+            | M::BIT,
+    ) {
+        return true;
+    }
+    matches!(
+        (ins.mnemonic, ins.mode),
+        (
+            M::ASL | M::LSR | M::ROL | M::ROR,
+            AddressingMode::Accumulator
+        )
+    )
+}
+
 /// Collect addresses that are branch / `JMP` / fall-through targets
 /// other than function entries. These become `// LABEL_xxxx:`
 /// comments inside the owning function body.
@@ -160,13 +225,14 @@ fn build_body_range(
     labels: &HashMap<u64, String>,
     entries: &[u64],
     resolver: SymbolResolver,
+    signatures: &HashMap<u64, Signature>,
 ) -> Vec<Stmt> {
     let entry_set: HashSet<u64> = entries.iter().copied().collect();
     let local: Vec<&DecodedInsn> = insns
         .iter()
         .filter(|i| i.addr.0 >= start && i.addr.0 < end)
         .collect();
-    build_stmt_slice(&local, &entry_set, labels, resolver)
+    build_stmt_slice(&local, &entry_set, labels, resolver, signatures)
 }
 
 /// Recursive body builder. In priority order:
@@ -178,11 +244,13 @@ fn build_body_range(
 ///    `then_body`.
 /// 3. `LDA #imm; JSR known` — lift to a single `@call`.
 /// 4. Fall back to a label comment + `@asm` line.
+#[allow(clippy::too_many_lines)]
 fn build_stmt_slice(
     local: &[&DecodedInsn],
     entries: &HashSet<u64>,
     labels: &HashMap<u64, String>,
     resolver: SymbolResolver,
+    signatures: &HashMap<u64, Signature>,
 ) -> Vec<Stmt> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -195,7 +263,7 @@ fn build_stmt_slice(
         if let Some((j, tail)) = find_back_branch_target(local, i) {
             let bundle_fs = j > i + 1 && is_flag_setter(local[j - 1]);
             let body_end = if bundle_fs { j - 1 } else { j };
-            let body = build_stmt_slice(&local[i..body_end], entries, labels, resolver);
+            let body = build_stmt_slice(&local[i..body_end], entries, labels, resolver, signatures);
             let tail_text = format_branch_cond(tail, entries, labels, resolver);
             let (cond_text, mut tail_bytes) = if bundle_fs {
                 let fs = local[j - 1];
@@ -222,10 +290,20 @@ fn build_stmt_slice(
             let (cond_text, cond_bytes) =
                 build_if_cond(&mut out, local, i, branch, entries, labels, resolver);
             if let Some(x_idx) = find_jmp_over_else(local, target_idx) {
-                let then_body =
-                    build_stmt_slice(&local[i + 1..target_idx], entries, labels, resolver);
-                let else_stmts =
-                    build_stmt_slice(&local[target_idx..x_idx], entries, labels, resolver);
+                let then_body = build_stmt_slice(
+                    &local[i + 1..target_idx],
+                    entries,
+                    labels,
+                    resolver,
+                    signatures,
+                );
+                let else_stmts = build_stmt_slice(
+                    &local[target_idx..x_idx],
+                    entries,
+                    labels,
+                    resolver,
+                    signatures,
+                );
                 out.push(Stmt::IfBranch {
                     cond_text,
                     cond_bytes,
@@ -235,7 +313,13 @@ fn build_stmt_slice(
                 i = x_idx;
                 continue;
             }
-            let then_body = build_stmt_slice(&local[i + 1..target_idx], entries, labels, resolver);
+            let then_body = build_stmt_slice(
+                &local[i + 1..target_idx],
+                entries,
+                labels,
+                resolver,
+                signatures,
+            );
             out.push(Stmt::IfBranch {
                 cond_text,
                 cond_bytes,
@@ -245,8 +329,10 @@ fn build_stmt_slice(
             i = target_idx;
             continue;
         }
-        // 3. LDA <src>; JSR known_target → @call with A=<src>.
-        if let Some(call_stmt) = try_lift_imm_call(local, i, entries, resolver) {
+        // 3. LDA <src>; JSR known_target → @call. If the callee has
+        //    a signature placing its first param in `A`, drop the
+        //    "A=" prefix so the call reads as `sub_FFEF(#$0D)`.
+        if let Some(call_stmt) = try_lift_imm_call(local, i, entries, resolver, signatures) {
             out.push(call_stmt);
             i += 2;
             continue;
@@ -302,6 +388,7 @@ fn try_lift_imm_call(
     i: usize,
     entries: &HashSet<u64>,
     resolver: SymbolResolver,
+    signatures: &HashMap<u64, Signature>,
 ) -> Option<Stmt> {
     let lda = local.get(i)?;
     if lda.mnemonic != Mnemonic::LDA {
@@ -323,9 +410,22 @@ fn try_lift_imm_call(
     let mut bytes = lda.original_bytes.clone();
     bytes.extend_from_slice(&jsr.original_bytes);
     let src_text = format_operand(lda, resolver);
+    // If the callee's signature places its first parameter in A,
+    // the register tag belongs to the function definition — the
+    // call site just passes the value.
+    let callee_takes_a = signatures
+        .get(&target)
+        .and_then(|s| s.params.first())
+        .and_then(|p| p.location.as_deref())
+        == Some("A");
+    let arg = if callee_takes_a {
+        src_text
+    } else {
+        format!("A={src_text}")
+    };
     Some(Stmt::Call {
         name: function_name(target, u64::MAX),
-        args: vec![format!("A={src_text}")],
+        args: vec![arg],
         bytes,
     })
 }

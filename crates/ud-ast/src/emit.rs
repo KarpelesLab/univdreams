@@ -347,6 +347,9 @@ fn emit_params(out: &mut String, params: &[Param]) {
         }
         write!(out, "{}: ", p.name).unwrap();
         emit_type(out, &p.ty);
+        if let Some(loc) = &p.location {
+            write!(out, " @{loc}").unwrap();
+        }
     }
 }
 

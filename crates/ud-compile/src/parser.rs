@@ -184,7 +184,13 @@ impl Parser {
             let name = self.expect_ident("parameter name")?;
             self.expect(&TokenKind::Colon, "`:` after parameter name")?;
             let ty = self.parse_type()?;
-            out.push(Param { name, ty });
+            // Optional `@LOC` calling-convention location suffix.
+            let location = if self.eat_kind(&TokenKind::At) {
+                Some(self.expect_ident("calling-convention location after `@`")?)
+            } else {
+                None
+            };
+            out.push(Param { name, ty, location });
             if !self.eat_kind(&TokenKind::Comma) {
                 break;
             }

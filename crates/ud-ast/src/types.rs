@@ -92,10 +92,16 @@ pub struct Signature {
 }
 
 /// One typed parameter in a function signature.
+///
+/// `location` carries the calling-convention slot the value is
+/// passed in — for the 6502 backend this is a register name like
+/// `"A"` / `"X"` / `"Y"`. When `Some`, the parameter renders as
+/// `name: ty @LOC`. When `None`, just `name: ty`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
+    pub location: Option<String>,
 }
 
 /// A type expressible in `.ud` source.

@@ -130,6 +130,7 @@ where
             params.push(Param {
                 name: pname,
                 ty: pty,
+                location: None,
             });
         }
     }
