@@ -292,21 +292,58 @@ fn build_stmt_slice(
         }
         // 2. Forward conditional branch — try if/else first.
         if let Some((target_idx, branch)) = find_forward_branch_target(local, i) {
-            // Bundle the preceding flag-setter (if it was just
-            // emitted as a plain @asm into `out`) so the @if_branch
-            // cond_text reads like a complete predicate.
-            let (cond_text, cond_bytes) =
-                build_if_cond(&mut out, local, i, branch, entries, labels, resolver);
-            if let Some(x_idx) = find_jmp_over_else(local, target_idx) {
+            // Defer: if any later Bcc back-branches into the
+            // proposed `@if_branch` body, the outer `@loop` should
+            // wrap it instead. Recognising that here means the
+            // address-print loop in WozMon (whose BCS back-branches
+            // into the @then body of a forward BEQ) stays a `@loop`
+            // rather than getting split between an `@if_branch` and
+            // a bare `@asm` BCS.
+            if back_branch_into_range(local, i + 1, target_idx) {
+                // Don't wrap as @if_branch — the body contains a
+                // back-branch target that belongs to an enclosing
+                // @loop. Still bundle the preceding flag-setter
+                // with the Bcc into one @asm so the test+branch
+                // reads as a single line.
+                let (bundled_text, bundled_bytes) =
+                    build_if_cond(&mut out, local, i, branch, entries, labels, resolver);
+                out.push(Stmt::asm(bundled_text, bundled_bytes));
+                i += 1;
+                continue;
+            }
+            #[allow(clippy::collapsible_else_if)]
+            {
+                // Bundle the preceding flag-setter (if it was just
+                // emitted as a plain @asm into `out`) so the @if_branch
+                // cond_text reads like a complete predicate.
+                let (cond_text, cond_bytes) =
+                    build_if_cond(&mut out, local, i, branch, entries, labels, resolver);
+                if let Some(x_idx) = find_jmp_over_else(local, target_idx) {
+                    let then_body = build_stmt_slice(
+                        &local[i + 1..target_idx],
+                        entries,
+                        labels,
+                        resolver,
+                        signatures,
+                    );
+                    let else_stmts = build_stmt_slice(
+                        &local[target_idx..x_idx],
+                        entries,
+                        labels,
+                        resolver,
+                        signatures,
+                    );
+                    out.push(Stmt::IfBranch {
+                        cond_text,
+                        cond_bytes,
+                        then_body,
+                        else_body: Some(else_stmts),
+                    });
+                    i = x_idx;
+                    continue;
+                }
                 let then_body = build_stmt_slice(
                     &local[i + 1..target_idx],
-                    entries,
-                    labels,
-                    resolver,
-                    signatures,
-                );
-                let else_stmts = build_stmt_slice(
-                    &local[target_idx..x_idx],
                     entries,
                     labels,
                     resolver,
@@ -316,26 +353,11 @@ fn build_stmt_slice(
                     cond_text,
                     cond_bytes,
                     then_body,
-                    else_body: Some(else_stmts),
+                    else_body: None,
                 });
-                i = x_idx;
+                i = target_idx;
                 continue;
-            }
-            let then_body = build_stmt_slice(
-                &local[i + 1..target_idx],
-                entries,
-                labels,
-                resolver,
-                signatures,
-            );
-            out.push(Stmt::IfBranch {
-                cond_text,
-                cond_bytes,
-                then_body,
-                else_body: None,
-            });
-            i = target_idx;
-            continue;
+            } // close the @if_branch wrap block
         }
         // 3. LDA <src>; JSR known_target → @call. If the callee has
         //    a signature placing its first param in `A`, drop the
@@ -815,6 +837,27 @@ fn is_flag_setter(ins: &DecodedInsn) -> bool {
         // Stack pull of accumulator — sets N/Z
         | M::PLA
     )
+}
+
+/// Does any conditional branch at position ≥ `range_end` of the
+/// local slice back-branch into `local[range_start..range_end]`?
+/// Used by the forward-branch lifter to decide whether wrapping
+/// the range as `@if_branch`'s then-body would steal a
+/// back-branch target from an enclosing `@loop`.
+fn back_branch_into_range(local: &[&DecodedInsn], range_start: usize, range_end: usize) -> bool {
+    if range_start >= range_end || range_end > local.len() {
+        return false;
+    }
+    let low = local[range_start].addr.0;
+    let high = local[range_end - 1].addr.0;
+    for ins in local.iter().skip(range_end) {
+        if let InsnKind::Branch { taken, .. } = classify(ins) {
+            if taken >= low && taken <= high {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// If `local[target_idx - 1]` is `JMP $X` (absolute direct) whose
