@@ -20,9 +20,10 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, FlowControl, Formatter,
-    Instruction, InstructionBlock, IntelFormatter, Mnemonic, OpKind, Register,
+    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Formatter, InstructionBlock,
+    IntelFormatter,
 };
+pub use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
 use ud_core::VAddr;
 use ud_ir::ArchInsn;
 

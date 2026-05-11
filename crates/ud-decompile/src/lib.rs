@@ -32,6 +32,7 @@ mod aarch64;
 mod build_function;
 mod build_module;
 mod data_lookup;
+mod patterns;
 pub mod pe;
 pub mod raw6502;
 

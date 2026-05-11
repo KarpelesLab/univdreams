@@ -312,11 +312,28 @@ fn emit_block_stmts(
         call_end_idx.insert(site.call_idx, end_idx);
     }
 
+    // Run the pattern catalog once for this block. Pattern matches
+    // claim their instruction ranges first; the inline pattern chain
+    // below picks up whatever survives.
+    let pattern_ctx = crate::patterns::PatternCtx {
+        fn_addr_start: ctx.fn_addr_start,
+        fn_addr_end: ctx.fn_addr_end,
+        name_at: ctx.name_at,
+    };
+    let pattern_matches = crate::patterns::apply_patterns(&pattern_ctx, &block.insns);
+
     let mut global_idx = prologue_consumed;
     while global_idx < asm_count {
         let insn = &block.insns[global_idx];
         if consumed_by_call.contains(&global_idx) {
             global_idx += 1;
+            continue;
+        }
+        if let Some(m) = pattern_matches.get(&global_idx) {
+            for stmt in &m.stmts {
+                out.push(stmt.clone());
+            }
+            global_idx += m.consumed;
             continue;
         }
         if let Some(site) = call_at.get(&global_idx) {
