@@ -24,7 +24,7 @@ impl Pattern for Imul {
 
     fn tentative(
         &self,
-        _ctx: &PatternCtx,
+        ctx: &PatternCtx,
         insns: &[DecodedInsn],
         start: usize,
     ) -> Option<Candidate> {
@@ -36,12 +36,17 @@ impl Pattern for Imul {
         let full = format_intel(&ins.iced);
         let rest = full.strip_prefix("imul ")?;
         let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let sp = ctx.sp_delta_at.get(&ins.iced.ip()).copied();
+        let parts: Vec<String> = parts
+            .iter()
+            .map(|p| ud_arch_x86::rename_operand_in_ctx(p, sp))
+            .collect();
         let (dst, src) = match op_count {
             2 => {
                 if parts.len() != 2 {
                     return None;
                 }
-                let dst = parts[0].to_string();
+                let dst = parts[0].clone();
                 let src = format!("{} * {}", parts[0], parts[1]);
                 (dst, src)
             }
@@ -49,7 +54,7 @@ impl Pattern for Imul {
                 if parts.len() != 3 {
                     return None;
                 }
-                let dst = parts[0].to_string();
+                let dst = parts[0].clone();
                 let src = format!("{} * {}", parts[1], parts[2]);
                 (dst, src)
             }

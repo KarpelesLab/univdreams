@@ -217,10 +217,31 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
     let mut n = 0;
     for stmt in stmts {
         match stmt {
-            Stmt::Asm { .. } => n += 1,
+            Stmt::Asm { bytes, .. } => {
+                // Some `@asm` lines combine multiple x86 instructions
+                // — e.g. the `cmp_jcc` pattern folds an adjacent
+                // `cmp/test + jcc` pair into one line — so count the
+                // actual instruction encodings rather than stmts.
+                if bytes.is_empty() {
+                    n += 1;
+                } else {
+                    let insns =
+                        ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, bytes, 0)
+                            .expect("decode asm bytes");
+                    n += insns.len();
+                }
+            }
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. }
+            | Stmt::Save { bytes, .. }
+            | Stmt::Restore { bytes, .. }
+            | Stmt::IfReturn { bytes, .. }
+            | Stmt::Goto { bytes, .. }
+            | Stmt::IfGoto { bytes, .. }
+            | Stmt::Switch { bytes, .. }
+            | Stmt::SehInstall { bytes }
+            | Stmt::SehRestore { bytes }
             | Stmt::ReturnExpr { bytes, .. }
             | Stmt::ArgSpill { bytes, .. }
             | Stmt::Call { bytes, .. } => {
@@ -228,12 +249,34 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
                     .expect("decode lifted-block bytes");
                 n += insns.len();
             }
+            #[allow(clippy::match_same_arms)]
+            Stmt::Label { .. } => {}
             Stmt::IfBranch {
                 cond_bytes,
+                attrs,
+                pre_body,
                 then_body,
                 else_body,
                 ..
             } => {
+                // Separated cmp/jcc lifts route the cmp's bytes
+                // through the `head_bytes` attribute — count those
+                // too so the total still matches the original insn
+                // count.
+                for a in attrs {
+                    if a.key == "head_bytes" {
+                        if let ud_ast::AttrValue::ByteList(b) = &a.value {
+                            let insns = ud_arch_x86::decode(
+                                ud_arch_x86::Bitness::Bits64,
+                                b,
+                                0,
+                            )
+                            .expect("decode head_bytes attribute");
+                            n += insns.len();
+                        }
+                    }
+                }
+                n += count_stmts(pre_body);
                 let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, cond_bytes, 0)
                     .expect("decode if-branch cond bytes");
                 n += insns.len();

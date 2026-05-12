@@ -7,6 +7,7 @@ use ud_ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, 
 
 use crate::lexer::{tokenize, LexError, Token, TokenKind};
 
+
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error(transparent)]
@@ -267,6 +268,74 @@ impl Parser {
         Ok(out)
     }
 
+    /// Parse `#[key=value, key=value, …]`. Returns the empty vec when
+    /// the next token isn't `#`. Trailing comma allowed.
+    fn parse_attrs(&mut self) -> Result<Vec<ud_ast::Attribute>, ParseError> {
+        if self.peek().kind != TokenKind::Hash {
+            return Ok(Vec::new());
+        }
+        self.expect(&TokenKind::Hash, "`#` to open attribute list")?;
+        self.expect(&TokenKind::LBracket, "`[` after `#`")?;
+        let mut out = Vec::new();
+        if self.peek().kind == TokenKind::RBracket {
+            self.bump();
+            return Ok(out);
+        }
+        loop {
+            let key = self.expect_ident("attribute key")?;
+            // Bare-flag attrs (`#[naked]`) skip the `=value` part;
+            // the next token is either a separator or the
+            // closing bracket.
+            let value = if matches!(
+                self.peek().kind,
+                TokenKind::Comma | TokenKind::RBracket
+            ) {
+                ud_ast::AttrValue::Flag
+            } else {
+                self.expect(&TokenKind::Eq, "`=` after attribute key")?;
+                self.parse_attr_value()?
+            };
+            out.push(ud_ast::Attribute { key, value });
+            if !self.eat_kind(&TokenKind::Comma) {
+                break;
+            }
+            if self.peek().kind == TokenKind::RBracket {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBracket, "`]` to close attribute list")?;
+        Ok(out)
+    }
+
+    /// Parse one attribute value: string, integer, or `[byte, …]`
+    /// byte list. The byte-list form is the only one usable for
+    /// load-bearing attributes (`head_bytes=[…]`).
+    fn parse_attr_value(&mut self) -> Result<ud_ast::AttrValue, ParseError> {
+        let tok = self.peek().clone();
+        match &tok.kind {
+            TokenKind::String(s) => {
+                let s = s.clone();
+                self.bump();
+                Ok(ud_ast::AttrValue::String(s))
+            }
+            TokenKind::Int(n) => {
+                let n = *n;
+                self.bump();
+                Ok(ud_ast::AttrValue::Int(n))
+            }
+            TokenKind::LBracket => {
+                let bytes = self.parse_byte_list()?;
+                Ok(ud_ast::AttrValue::ByteList(bytes))
+            }
+            other => Err(ParseError::Expected {
+                expected: "an attribute value (string, integer, or `[bytes]`)".into(),
+                got: describe(other),
+                line: tok.line,
+                col: tok.col,
+            }),
+        }
+    }
+
     fn parse_value(&mut self) -> Result<Value, ParseError> {
         let tok = self.peek().clone();
         match &tok.kind {
@@ -419,16 +488,61 @@ impl Parser {
             }),
         };
 
+        // Optional `#[…]` attribute list after the signature.
+        let attrs = self.parse_attrs()?;
         self.expect(&TokenKind::LBrace, "`{` to open function body")?;
+        // Leading `let NAME: TYPE [@reg];` declarations describe the
+        // variables and registers the function uses. They precede
+        // every other statement and end as soon as the next token
+        // isn't another `let`.
+        let locals = self.parse_local_decls()?;
         let body = self.parse_stmt_list_until_rbrace()?;
         self.expect(&TokenKind::RBrace, "`}` to close function body")?;
 
         Ok(Item::Function(FnDecl {
             addr,
             name,
+            attrs,
             signature,
+            locals,
             body,
         }))
+    }
+
+    /// Parse a contiguous run of `let NAME: TYPE [@reg];` lines.
+    /// Returns the empty vec when the next token isn't `let`.
+    fn parse_local_decls(&mut self) -> Result<Vec<ud_ast::LocalDecl>, ParseError> {
+        let mut out = Vec::new();
+        loop {
+            let is_let = matches!(&self.peek().kind, TokenKind::Ident(n) if n == "let");
+            if !is_let {
+                return Ok(out);
+            }
+            self.bump(); // consume `let`
+            let name = self.expect_ident("local variable name")?;
+            self.expect(&TokenKind::Colon, "`:` after local variable name")?;
+            let ty = self.parse_type()?;
+            // Optional `@reg` marker. We don't have a structured
+            // "kind" attribute syntax, so we treat `@reg` as a
+            // dedicated marker word — matching the spelling the
+            // emitter uses.
+            let kind = if self.eat_kind(&TokenKind::At) {
+                let marker = self.expect_ident("local-decl marker after `@`")?;
+                if marker != "reg" {
+                    return Err(ParseError::Expected {
+                        expected: "`reg` after `@` in local declaration".into(),
+                        got: format!("identifier `{marker}`"),
+                        line: self.peek().line,
+                        col: self.peek().col,
+                    });
+                }
+                ud_ast::LocalKind::Register
+            } else {
+                ud_ast::LocalKind::Stack
+            };
+            self.expect(&TokenKind::Semicolon, "`;` to close `let` declaration")?;
+            out.push(ud_ast::LocalDecl { name, ty, kind });
+        }
     }
 
     /// Parse a sequence of statements until a `}` is the next token
@@ -458,8 +572,33 @@ impl Parser {
                     let stmt = self.parse_do_while_stmt()?;
                     body.push(stmt);
                 }
-                TokenKind::Ident(_) => {
-                    let stmt = self.parse_call_stmt()?;
+                TokenKind::Ident(name) if name == "goto" => {
+                    let stmt = self.parse_goto_stmt()?;
+                    body.push(stmt);
+                }
+                TokenKind::Ident(name) if name == "switch" => {
+                    let stmt = self.parse_switch_stmt()?;
+                    body.push(stmt);
+                }
+                TokenKind::Ident(name) if is_label_name(name.as_str()) => {
+                    // Disambiguate `label_HEX:` (a marker) from
+                    // `label_HEX = …` (a stmt whose lhs happens to
+                    // start with `label_`). Only consume as a label
+                    // when the next token is `:`.
+                    let next_kind = self
+                        .tokens
+                        .get(self.pos + 1)
+                        .map(|t| t.kind.clone());
+                    if matches!(next_kind, Some(TokenKind::Colon)) {
+                        let stmt = self.parse_label_stmt()?;
+                        body.push(stmt);
+                    } else {
+                        let stmt = self.parse_call_or_move_stmt()?;
+                        body.push(stmt);
+                    }
+                }
+                TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::LParen => {
+                    let stmt = self.parse_call_or_move_stmt()?;
                     body.push(stmt);
                 }
                 other => {
@@ -473,6 +612,197 @@ impl Parser {
             }
         }
         Ok(body)
+    }
+
+    /// Pick between call and assignment statement based on the
+    /// initial tokens. Three shapes are supported:
+    ///
+    /// * `name(args) [bytes]`           — direct call with an Ident name.
+    /// * `[mem-expr](args) [bytes]`     — indirect call through memory
+    ///   (the call target itself is a bracketed addressing expression).
+    /// * `dst = src [bytes]`            — assignment / move, where the
+    ///   destination may be any of: a bare Ident, a `[mem-expr]`
+    ///   (e.g. `[ebp+8]`), or a `(reg,reg)` 6502-style operand.
+    ///
+    /// The discriminator is: skip past a leading delimited expression
+    /// (anything starting with `[` or `(`) and look at the next token.
+    /// If it's `(`, this is a call; otherwise a move.
+    /// Probe the token stream starting at the current `Ident` for
+    /// the `Ident (-> Ident)+ (` shape that thiscall lifting
+    /// produces (`this->f_2a4(…)`, `this->f_8->run(…)`, …).
+    /// Stops at any other token (including `=`, which would mean
+    /// a Move statement).
+    fn lookahead_is_method_call(&self) -> bool {
+        let mut i = self.pos + 1;
+        let mut saw_arrow_ident = false;
+        loop {
+            let arrow = self.tokens.get(i).map(|t| &t.kind);
+            if !matches!(arrow, Some(TokenKind::Arrow)) {
+                break;
+            }
+            i += 1;
+            if !matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+                return false;
+            }
+            i += 1;
+            saw_arrow_ident = true;
+        }
+        if !saw_arrow_ident {
+            return false;
+        }
+        matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::LParen))
+    }
+
+    fn parse_call_or_move_stmt(&mut self) -> Result<Stmt, ParseError> {
+        // Statement begins with `Ident`. Direct call when the next
+        // token is `(`, or when a `Ident -> Ident (` chain (a C++
+        // method call lifted from thiscall) follows. Otherwise an
+        // assignment.
+        if matches!(self.peek().kind, TokenKind::Ident(_)) {
+            let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
+            if matches!(next, Some(TokenKind::LParen)) {
+                return self.parse_call_stmt();
+            }
+            // `obj->method(…)` shape: probe several `Arrow Ident`
+            // pairs (e.g., `this->f_8->run()`).
+            if self.lookahead_is_method_call() {
+                return self.parse_call_stmt();
+            }
+            return self.parse_move_stmt();
+        }
+        // Statement begins with `[` or `(`. Find the matching close
+        // delimiter; if the token right after is `(`, the leading
+        // bracketed expression names the call target. Otherwise this
+        // is a move whose destination is the bracketed expression.
+        let close_idx = self.find_matching_close(self.pos);
+        if let Some(close) = close_idx {
+            if matches!(
+                self.tokens.get(close + 1).map(|t| &t.kind),
+                Some(TokenKind::LParen)
+            ) {
+                return self.parse_call_stmt();
+            }
+        }
+        self.parse_move_stmt()
+    }
+
+    /// Walk tokens starting at the `[` or `(` at `open_idx` and return
+    /// the index of the matching close delimiter. Returns `None` if
+    /// the open is missing or the delimiters are unbalanced.
+    fn find_matching_close(&self, open_idx: usize) -> Option<usize> {
+        let open_kind = match self.tokens.get(open_idx).map(|t| &t.kind)? {
+            TokenKind::LParen => TokenKind::LParen,
+            TokenKind::LBracket => TokenKind::LBracket,
+            _ => return None,
+        };
+        let close_kind = match open_kind {
+            TokenKind::LParen => TokenKind::RParen,
+            TokenKind::LBracket => TokenKind::RBracket,
+            _ => unreachable!(),
+        };
+        let mut depth = 0i32;
+        let mut i = open_idx;
+        while i < self.tokens.len() {
+            match &self.tokens[i].kind {
+                TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                k if *k == close_kind => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                TokenKind::RParen | TokenKind::RBracket => depth -= 1,
+                TokenKind::Eof | TokenKind::RBrace => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Parse `<dst> = <src> [bytes]`. Both sides are raw source
+    /// text snipped between token boundaries — the contents can
+    /// include arbitrary x86 effective-address syntax
+    /// (`[ebp+8]`, `[esi+ebx*4]`), hex literals with a trailing
+    /// `h`, and chained destinations (`KBDCR = DSPCR`).
+    ///
+    /// The scan is bounded to the statement's starting line so it
+    /// doesn't reach into the next statement. The split between
+    /// `dst` and `src` is the *last* `=` at depth zero on that
+    /// line, so cascade dsts (`a = b = c`) survive. The byte list
+    /// is the last top-level `[…]` that contains only integers
+    /// and commas — this excludes memory-expression `[…]`s and
+    /// hex-literal blocks like `[1C201030h]`.
+    fn parse_move_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let stmt_start_tok = self.peek().clone();
+        let stmt_line = stmt_start_tok.line;
+        let stmt_start = stmt_start_tok.start;
+        // Walk on this line and collect:
+        //   - last `=` at depth 0
+        //   - last `[…]` at depth 0 whose contents look like a
+        //     byte list (only `Int`s and commas).
+        // `Stmt::Move` always emits on a single line, so the scan is
+        // bounded to `stmt_line`. Crossing the line boundary would let
+        // the scan capture tokens from the next statement (e.g. an
+        // `if (cond) [cond_bytes]` whose byte list would otherwise be
+        // mis-identified as this move's byte list, dropping the real
+        // bytes and leaving the parser stranded at the `{`).
+        let mut depth = 0i32;
+        let mut last_eq_idx: Option<usize> = None;
+        let mut byte_list_idx: Option<usize> = None;
+        let mut probe = self.pos;
+        while probe < self.tokens.len() {
+            let tok = &self.tokens[probe];
+            if tok.line != stmt_line {
+                break;
+            }
+            match &tok.kind {
+                TokenKind::LBracket if depth == 0 => {
+                    if is_byte_list_block(&self.tokens, probe) {
+                        byte_list_idx = Some(probe);
+                    }
+                    depth += 1;
+                }
+                TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket => depth -= 1,
+                TokenKind::Eq if depth == 0 => last_eq_idx = Some(probe),
+                TokenKind::Eof | TokenKind::Comment(_) | TokenKind::RBrace => break,
+                _ => {}
+            }
+            probe += 1;
+        }
+        let last_eq_tok = last_eq_idx
+            .map(|i| self.tokens[i].clone())
+            .ok_or_else(|| ParseError::Expected {
+                expected: "`=` in assignment statement".into(),
+                got: describe(&self.peek().kind),
+                line: self.peek().line,
+                col: self.peek().col,
+            })?;
+        let bytes_tok = byte_list_idx
+            .map(|i| self.tokens[i].clone())
+            .ok_or_else(|| ParseError::Expected {
+                expected: "`[bytes]` after assignment source".into(),
+                got: describe(&self.peek().kind),
+                line: self.peek().line,
+                col: self.peek().col,
+            })?;
+        if bytes_tok.start <= last_eq_tok.start {
+            return Err(ParseError::Expected {
+                expected: "`[bytes]` after `=` in assignment".into(),
+                got: describe(&bytes_tok.kind),
+                line: bytes_tok.line,
+                col: bytes_tok.col,
+            });
+        }
+        let dst = self.src[stmt_start..last_eq_tok.start].trim().to_string();
+        let src = self.src[last_eq_tok.end..bytes_tok.start].trim().to_string();
+        // Advance to the byte list and parse it.
+        while self.pos < self.tokens.len() && self.peek().start < bytes_tok.start {
+            self.bump();
+        }
+        let bytes = self.parse_byte_list()?;
+        Ok(Stmt::Move { dst, src, bytes })
     }
 
     /// Parse a function-call statement:
@@ -492,8 +822,55 @@ impl Parser {
     /// with paren-balance tracking, and snip the raw source text
     /// for each top-level comma-separated segment. This lets
     /// `A=(XAML,X)` or `*.data @ 0x4008` survive without escaping.
+    /// Parse the name preceding a call's argument list. Two shapes:
+    ///
+    /// * `name` — a bare identifier (the direct-call shape).
+    /// * `[mem-expr]` — a bracketed addressing expression (indirect
+    ///   call through memory). The raw source text between `[` and
+    ///   the matching `]` (inclusive of both) is returned verbatim.
+    fn parse_call_target_name(&mut self) -> Result<String, ParseError> {
+        let tok = self.peek().clone();
+        if let TokenKind::Ident(n) = &tok.kind {
+            let start = tok.start;
+            let mut name = n.clone();
+            self.bump();
+            // Consume any `-> Ident` chain (C++ method-call form
+            // surfaced by thiscall lifting). Capture the raw text
+            // so `this->f_2a4` survives intact as the call target.
+            while matches!(self.peek().kind, TokenKind::Arrow) {
+                self.bump();
+                if let TokenKind::Ident(_) = &self.peek().kind {
+                    let end = self.peek().end;
+                    self.bump();
+                    name = self.src[start..end].to_string();
+                } else {
+                    break;
+                }
+            }
+            return Ok(name);
+        }
+        if matches!(tok.kind, TokenKind::LBracket) {
+            let start = tok.start;
+            let close = self
+                .find_matching_close(self.pos)
+                .ok_or(ParseError::UnexpectedEof)?;
+            let end = self.tokens[close].end;
+            let text = self.src[start..end].to_string();
+            while self.pos < self.tokens.len() && self.pos <= close {
+                self.bump();
+            }
+            return Ok(text);
+        }
+        Err(ParseError::Expected {
+            expected: "a call target name (identifier or `[…]`)".into(),
+            got: describe(&tok.kind),
+            line: tok.line,
+            col: tok.col,
+        })
+    }
+
     fn parse_call_stmt(&mut self) -> Result<Stmt, ParseError> {
-        let name = self.expect_ident("call target name")?;
+        let name = self.parse_call_target_name()?;
         self.expect(&TokenKind::LParen, "`(` after call target name")?;
         let mut args = Vec::new();
         // Empty arg list: `name()`.
@@ -604,18 +981,40 @@ impl Parser {
         }
     }
 
-    /// Parse `if (cond) [bytes] { then } [else { else_body }]`.
+    /// Parse `if (cond) [#[attrs]] [bytes] { body } [else { else_body }]`.
     /// The `if` ident has not been consumed yet.
+    ///
+    /// Two body shapes are accepted:
+    ///
+    /// * **Simple**: `{ stmt; stmt; … }` — every stmt becomes
+    ///   `then_body`; no `pre_body` and (typically) no attrs. This is
+    ///   the historical form for adjacent cmp/jcc.
+    /// * **Arms**: `{ pre_stmts; @then { … } [@else { … }] }` — any
+    ///   leading stmts before `@then` become `pre_body`; the `@then`
+    ///   arm is `then_body`. The body switches into arms mode the
+    ///   moment a `@then` directive is encountered.
     fn parse_if_stmt(&mut self) -> Result<Stmt, ParseError> {
         self.bump(); // consume `if`
         self.expect(&TokenKind::LParen, "`(` after `if`")?;
         let cond_text = self.parse_paren_inner()?;
         self.expect(&TokenKind::RParen, "`)` to close `if` condition")?;
+        // Early-return form: `if (cond) return [value]; [bytes]`.
+        if matches!(&self.peek().kind, TokenKind::Ident(n) if n == "return") {
+            return self.parse_if_return_tail(cond_text);
+        }
+        // Conditional-goto form: `if (cond) goto label_HEX; [bytes]`.
+        if matches!(&self.peek().kind, TokenKind::Ident(n) if n == "goto") {
+            return self.parse_if_goto_tail(cond_text);
+        }
+        let attrs = self.parse_attrs()?;
         let cond_bytes = self.parse_byte_list()?;
-        self.expect(&TokenKind::LBrace, "`{` to open `if` then-body")?;
-        let then_body = self.parse_stmt_list_until_rbrace()?;
-        self.expect(&TokenKind::RBrace, "`}` to close `if` then-body")?;
-        let else_body = if matches!(&self.peek().kind, TokenKind::Ident(n) if n == "else") {
+        self.expect(&TokenKind::LBrace, "`{` to open `if` body")?;
+        let (pre_body, then_body, else_body_in_braces) =
+            self.parse_if_body_with_optional_arms()?;
+        self.expect(&TokenKind::RBrace, "`}` to close `if` body")?;
+        let else_body = if else_body_in_braces.is_some() {
+            else_body_in_braces
+        } else if matches!(&self.peek().kind, TokenKind::Ident(n) if n == "else") {
             self.bump(); // consume `else`
             self.expect(&TokenKind::LBrace, "`{` after `else`")?;
             let stmts = self.parse_stmt_list_until_rbrace()?;
@@ -624,12 +1023,313 @@ impl Parser {
         } else {
             None
         };
+        // When `pre_body` carries intervening insns (the separated
+        // cmp/jcc shape) the IfBranch needs a `head_bytes` attribute
+        // to know the cmp's encoded bytes. If the source omitted
+        // the attribute, derive it from the cond text — the
+        // canonical Intel encoding is reconstructible for the
+        // common cmp/test forms. Callers shouldn't have to spell
+        // out every byte the profile already implies.
+        let attrs = ensure_head_bytes(&cond_text, &pre_body, attrs);
         Ok(Stmt::IfBranch {
             cond_text,
             cond_bytes,
+            attrs,
+            pre_body,
             then_body,
             else_body,
         })
+    }
+
+    /// Parse the tail of an `if (cond) goto label_HEX; [bytes]`.
+    fn parse_if_goto_tail(&mut self, cond_text: String) -> Result<Stmt, ParseError> {
+        self.bump(); // consume `goto`
+        let label_tok = self.peek().clone();
+        let label_name = self.expect_ident("label name (e.g. `label_1234`)")?;
+        let Some(target_addr) = parse_label_addr(&label_name) else {
+            return Err(ParseError::Expected {
+                expected: "label name of the form `label_<hex>`".into(),
+                got: format!("`{label_name}`"),
+                line: label_tok.line,
+                col: label_tok.col,
+            });
+        };
+        self.expect(&TokenKind::Semicolon, "`;` after `goto` target")?;
+        let bytes = self.parse_byte_list()?;
+        Ok(Stmt::IfGoto {
+            cond_text,
+            target_addr,
+            bytes,
+        })
+    }
+
+    /// Parse `switch (sel) [bytes] { case N: goto label_HEX; … default: goto label_HEX; }`.
+    fn parse_switch_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // `switch`
+        self.expect(&TokenKind::LParen, "`(` after `switch`")?;
+        let selector = self.parse_paren_inner()?;
+        self.expect(&TokenKind::RParen, "`)` to close `switch` selector")?;
+        let bytes = self.parse_byte_list()?;
+        self.expect(&TokenKind::LBrace, "`{` to open `switch` body")?;
+        let mut case_table: Vec<(u64, u64)> = Vec::new();
+        let mut default_addr: Option<u64> = None;
+        loop {
+            if self.peek().kind == TokenKind::RBrace {
+                break;
+            }
+            let kw_tok = self.peek().clone();
+            let kw = self.expect_ident("`case` or `default`")?;
+            match kw.as_str() {
+                "case" => {
+                    let value = self.expect_int("case value")?;
+                    self.expect(&TokenKind::Colon, "`:` after case value")?;
+                    let goto_tok = self.peek().clone();
+                    let goto_kw = self.expect_ident("`goto`")?;
+                    if goto_kw != "goto" {
+                        return Err(ParseError::Expected {
+                            expected: "`goto` after case label".into(),
+                            got: format!("`{goto_kw}`"),
+                            line: goto_tok.line,
+                            col: goto_tok.col,
+                        });
+                    }
+                    let lbl_tok = self.peek().clone();
+                    let lbl_name = self.expect_ident("label name")?;
+                    let Some(target) = parse_label_addr(&lbl_name) else {
+                        return Err(ParseError::Expected {
+                            expected: "label name `label_<hex>`".into(),
+                            got: format!("`{lbl_name}`"),
+                            line: lbl_tok.line,
+                            col: lbl_tok.col,
+                        });
+                    };
+                    self.expect(&TokenKind::Semicolon, "`;` after case target")?;
+                    case_table.push((value, target));
+                }
+                "default" => {
+                    self.expect(&TokenKind::Colon, "`:` after `default`")?;
+                    let goto_tok = self.peek().clone();
+                    let goto_kw = self.expect_ident("`goto`")?;
+                    if goto_kw != "goto" {
+                        return Err(ParseError::Expected {
+                            expected: "`goto` after `default`".into(),
+                            got: format!("`{goto_kw}`"),
+                            line: goto_tok.line,
+                            col: goto_tok.col,
+                        });
+                    }
+                    let lbl_tok = self.peek().clone();
+                    let lbl_name = self.expect_ident("label name")?;
+                    let Some(target) = parse_label_addr(&lbl_name) else {
+                        return Err(ParseError::Expected {
+                            expected: "label name `label_<hex>`".into(),
+                            got: format!("`{lbl_name}`"),
+                            line: lbl_tok.line,
+                            col: lbl_tok.col,
+                        });
+                    };
+                    self.expect(&TokenKind::Semicolon, "`;` after `default` target")?;
+                    default_addr = Some(target);
+                }
+                _ => {
+                    return Err(ParseError::Expected {
+                        expected: "`case` or `default`".into(),
+                        got: format!("`{kw}`"),
+                        line: kw_tok.line,
+                        col: kw_tok.col,
+                    });
+                }
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}` to close `switch` body")?;
+        // Verify case values are 0..=N contiguous (the only shape
+        // we currently emit). Build the parallel-to-table `cases`
+        // vec from the sorted entries.
+        case_table.sort_by_key(|(v, _)| *v);
+        let cases: Vec<u64> = case_table.iter().map(|(_, t)| *t).collect();
+        let default_addr = default_addr.unwrap_or(0);
+        Ok(Stmt::Switch {
+            selector,
+            cases,
+            default_addr,
+            bytes,
+        })
+    }
+
+    /// Parse a top-level `goto label_HEX; [bytes]` statement.
+    fn parse_goto_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // consume `goto`
+        let label_tok = self.peek().clone();
+        let label_name = self.expect_ident("label name (e.g. `label_1234`)")?;
+        let Some(target_addr) = parse_label_addr(&label_name) else {
+            return Err(ParseError::Expected {
+                expected: "label name of the form `label_<hex>`".into(),
+                got: format!("`{label_name}`"),
+                line: label_tok.line,
+                col: label_tok.col,
+            });
+        };
+        self.expect(&TokenKind::Semicolon, "`;` after `goto` target")?;
+        let bytes = self.parse_byte_list()?;
+        Ok(Stmt::Goto { target_addr, bytes })
+    }
+
+    /// Parse a `label_HEX:` marker — no bytes, just a position
+    /// in the source for `goto` / `if (cond) goto` to refer to.
+    /// The caller has already verified the next token is the
+    /// `label_…` identifier.
+    fn parse_label_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let label_tok = self.peek().clone();
+        let label_name = self.expect_ident("label name")?;
+        let Some(addr) = parse_label_addr(&label_name) else {
+            return Err(ParseError::Expected {
+                expected: "label name of the form `label_<hex>`".into(),
+                got: format!("`{label_name}`"),
+                line: label_tok.line,
+                col: label_tok.col,
+            });
+        };
+        self.expect(&TokenKind::Colon, "`:` after label name")?;
+        Ok(Stmt::Label { addr })
+    }
+
+    /// Parse the tail of an early-return `if`:
+    /// `return [value]; [bytes]`. Called by [`parse_if_stmt`] when
+    /// the token immediately after the condition's `)` is the
+    /// `return` keyword.
+    fn parse_if_return_tail(&mut self, cond_text: String) -> Result<Stmt, ParseError> {
+        self.bump(); // consume `return`
+        // Optional value expression — anything up to the `;`.
+        let value_text = if self.peek().kind == TokenKind::Semicolon {
+            String::new()
+        } else {
+            self.parse_until_semicolon()?
+        };
+        self.expect(&TokenKind::Semicolon, "`;` after `return` value")?;
+        let bytes = self.parse_byte_list()?;
+        Ok(Stmt::IfReturn {
+            cond_text,
+            value_text,
+            bytes,
+        })
+    }
+
+    /// Snip the source text between the current position and the
+    /// next `;` (which is left unconsumed for the caller to expect).
+    /// Used for the value expression in an
+    /// `if (...) return EXPR; [bytes]` shape so EXPR's original
+    /// spacing/spelling survives the round-trip.
+    fn parse_until_semicolon(&mut self) -> Result<String, ParseError> {
+        let start_pos = self.peek().start;
+        loop {
+            match self.peek().kind {
+                TokenKind::Semicolon => break,
+                TokenKind::Eof => return Err(ParseError::UnexpectedEof),
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        let end_pos = self.peek().start;
+        Ok(self.src[start_pos..end_pos].trim().to_string())
+    }
+
+    /// Parse the body of an `if (…) { … }`. Walks until the closing
+    /// brace (which the caller consumes). Returns the parts as a
+    /// `(pre_body, then_body, else_body)` triple.
+    ///
+    /// Body interpretation:
+    /// * As long as no `@then` is seen, statements accumulate into
+    ///   `pre_body` (which, by convention, is the simple form's
+    ///   `then_body` reinterpretation — see below).
+    /// * The first `@then { … }` directive switches mode: everything
+    ///   before it is `pre_body`, the directive's body becomes
+    ///   `then_body`. An optional `@else { … }` directive can follow.
+    /// * If no `@then` directive appears anywhere, the accumulated
+    ///   statements were the simple form — they're the `then_body`
+    ///   and `pre_body` is empty.
+    #[allow(clippy::type_complexity)]
+    fn parse_if_body_with_optional_arms(
+        &mut self,
+    ) -> Result<(Vec<Stmt>, Vec<Stmt>, Option<Vec<Stmt>>), ParseError> {
+        let mut accumulated: Vec<Stmt> = Vec::new();
+        let mut then_body: Option<Vec<Stmt>> = None;
+        let mut else_body: Option<Vec<Stmt>> = None;
+        loop {
+            // Probe for `@then` / `@else` directives.
+            if self.peek().kind == TokenKind::At {
+                let next_ident = self.tokens.get(self.pos + 1).cloned();
+                if let Some(tok) = &next_ident {
+                    if let TokenKind::Ident(name) = &tok.kind {
+                        if name == "then" || name == "else" {
+                            self.bump(); // `@`
+                            let arm_name = self.expect_ident("`then` or `else`")?;
+                            self.expect(
+                                &TokenKind::LBrace,
+                                "`{` to open `@then` / `@else` arm",
+                            )?;
+                            let arm = self.parse_stmt_list_until_rbrace()?;
+                            self.expect(&TokenKind::RBrace, "`}` to close arm")?;
+                            match arm_name.as_str() {
+                                "then" => then_body = Some(arm),
+                                "else" => else_body = Some(arm),
+                                _ => unreachable!(),
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+            if self.peek().kind == TokenKind::RBrace {
+                break;
+            }
+            // Parse one statement and add to accumulated.
+            let body = self.parse_stmt_list_one()?;
+            accumulated.push(body);
+        }
+        match then_body {
+            Some(then_body) => Ok((accumulated, then_body, else_body)),
+            None => Ok((Vec::new(), accumulated, else_body)),
+        }
+    }
+
+    /// Parse exactly one statement. Wrapper around the loop body of
+    /// `parse_stmt_list_until_rbrace` so we can reuse the dispatch
+    /// logic in `parse_if_body_with_optional_arms`.
+    fn parse_stmt_list_one(&mut self) -> Result<Stmt, ParseError> {
+        match self.peek().kind.clone() {
+            TokenKind::Eof => Err(ParseError::UnexpectedEof),
+            TokenKind::Comment(text) => {
+                self.bump();
+                Ok(Stmt::Comment(text))
+            }
+            TokenKind::At => {
+                self.bump();
+                let dir_tok = self.peek().clone();
+                let dir_name = self.expect_ident("statement directive name")?;
+                self.parse_stmt_at_directive(&dir_name, &dir_tok)
+            }
+            TokenKind::Ident(name) if name == "if" => self.parse_if_stmt(),
+            TokenKind::Ident(name) if name == "do" => self.parse_do_while_stmt(),
+            TokenKind::Ident(name) if name == "goto" => self.parse_goto_stmt(),
+            TokenKind::Ident(name) if is_label_name(name.as_str()) => {
+                let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
+                if matches!(next_kind, Some(TokenKind::Colon)) {
+                    self.parse_label_stmt()
+                } else {
+                    self.parse_call_or_move_stmt()
+                }
+            }
+            TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::LParen => {
+                self.parse_call_or_move_stmt()
+            }
+            other => Err(ParseError::Expected {
+                expected: "`@asm`, `// comment`, function call, or `}`".into(),
+                got: describe(&other),
+                line: self.peek().line,
+                col: self.peek().col,
+            }),
+        }
     }
 
     /// Parse `do [entry=[bytes]] { body } while (cond) [bytes]`.
@@ -750,18 +1450,114 @@ impl Parser {
             "prologue" => {
                 self.expect(&TokenKind::LParen, "`(` after `@prologue`")?;
                 let kind = self.expect_string("prologue kind string")?;
+                // Three shapes accepted:
+                //   "kind"                       — all-defaults structured form
+                //   "kind", [bytes]              — legacy byte form
+                //   "kind", saves: [...], …      — structured form with params
+                if self.peek().kind == TokenKind::RParen {
+                    self.bump();
+                    let params = ud_ast::PrologueParams::default();
+                    let bytes = encode_prologue_bytes(&kind, &params);
+                    return Ok(Stmt::Prologue {
+                        kind,
+                        params: Some(params),
+                        bytes,
+                    });
+                }
                 self.expect(&TokenKind::Comma, "`,` after prologue kind")?;
-                let bytes = self.parse_byte_list()?;
-                self.expect(&TokenKind::RParen, "`)` to close `@prologue`")?;
-                Ok(Stmt::Prologue { kind, bytes })
+                if self.peek().kind == TokenKind::LBracket {
+                    let bytes = self.parse_byte_list()?;
+                    self.expect(&TokenKind::RParen, "`)` to close `@prologue`")?;
+                    Ok(Stmt::Prologue {
+                        kind,
+                        params: None,
+                        bytes,
+                    })
+                } else {
+                    let params = self.parse_prologue_params()?;
+                    self.expect(&TokenKind::RParen, "`)` to close `@prologue`")?;
+                    let bytes = encode_prologue_bytes(&kind, &params);
+                    Ok(Stmt::Prologue {
+                        kind,
+                        params: Some(params),
+                        bytes,
+                    })
+                }
             }
             "epilogue" => {
                 self.expect(&TokenKind::LParen, "`(` after `@epilogue`")?;
                 let kind = self.expect_string("epilogue kind string")?;
+                if self.peek().kind == TokenKind::RParen {
+                    self.bump();
+                    let params = ud_ast::EpilogueParams::default();
+                    let bytes = encode_epilogue_bytes(&params);
+                    return Ok(Stmt::Epilogue {
+                        kind,
+                        params: Some(params),
+                        bytes,
+                    });
+                }
                 self.expect(&TokenKind::Comma, "`,` after epilogue kind")?;
+                if self.peek().kind == TokenKind::LBracket {
+                    let bytes = self.parse_byte_list()?;
+                    self.expect(&TokenKind::RParen, "`)` to close `@epilogue`")?;
+                    Ok(Stmt::Epilogue {
+                        kind,
+                        params: None,
+                        bytes,
+                    })
+                } else {
+                    let params = self.parse_epilogue_params()?;
+                    self.expect(&TokenKind::RParen, "`)` to close `@epilogue`")?;
+                    let bytes = encode_epilogue_bytes(&params);
+                    Ok(Stmt::Epilogue {
+                        kind,
+                        params: Some(params),
+                        bytes,
+                    })
+                }
+            }
+            "save" => {
+                self.expect(&TokenKind::LParen, "`(` after `@save`")?;
+                let reg = self.expect_string("save register name")?;
+                self.expect(&TokenKind::Comma, "`,` after `@save` register")?;
                 let bytes = self.parse_byte_list()?;
-                self.expect(&TokenKind::RParen, "`)` to close `@epilogue`")?;
-                Ok(Stmt::Epilogue { kind, bytes })
+                self.expect(&TokenKind::RParen, "`)` to close `@save`")?;
+                Ok(Stmt::Save { reg, bytes })
+            }
+            "restore" => {
+                self.expect(&TokenKind::LParen, "`(` after `@restore`")?;
+                let reg = self.expect_string("restore register name")?;
+                self.expect(&TokenKind::Comma, "`,` after `@restore` register")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@restore`")?;
+                Ok(Stmt::Restore { reg, bytes })
+            }
+            "seh_install" => {
+                self.expect(&TokenKind::LParen, "`(` after `@seh_install`")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@seh_install`")?;
+                Ok(Stmt::SehInstall { bytes })
+            }
+            "seh_restore" => {
+                self.expect(&TokenKind::LParen, "`(` after `@seh_restore`")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@seh_restore`")?;
+                Ok(Stmt::SehRestore { bytes })
+            }
+            "if_return" => {
+                self.expect(&TokenKind::LParen, "`(` after `@if_return`")?;
+                let cond_text = self.expect_string("if_return condition text")?;
+                self.expect(&TokenKind::Comma, "`,` after `@if_return` condition")?;
+                let value_text = self.expect_string("if_return return-value text")?;
+                self.expect(&TokenKind::Comma, "`,` after `@if_return` value")?;
+                let bytes = self.parse_byte_list()?;
+                self.expect(&TokenKind::RParen, "`)` to close `@if_return`")?;
+                Ok(Stmt::IfReturn {
+                    cond_text,
+                    value_text,
+                    bytes,
+                })
             }
             "return_expr" => {
                 self.expect(&TokenKind::LParen, "`(` after `@return_expr`")?;
@@ -986,10 +1782,233 @@ impl Parser {
         Ok(Stmt::IfBranch {
             cond_text,
             cond_bytes,
+            attrs: Vec::new(),
+            pre_body: Vec::new(),
             then_body,
             else_body,
         })
     }
+}
+
+/// Does the `[…]` block opening at `tokens[lbracket_idx]` look
+/// like a byte list (a flat run of `Int`s separated by `,` and
+/// terminated by `]`)? Used by `parse_move_stmt` to distinguish
+/// the trailing byte list from operand-side memory expressions
+/// like `[ebp+8]` or `[1C201030h]`.
+fn is_byte_list_block(tokens: &[Token], lbracket_idx: usize) -> bool {
+    if !matches!(tokens.get(lbracket_idx).map(|t| &t.kind), Some(TokenKind::LBracket)) {
+        return false;
+    }
+    let mut i = lbracket_idx + 1;
+    // `[]` is a valid empty byte list.
+    if matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::RBracket)) {
+        return true;
+    }
+    loop {
+        match tokens.get(i).map(|t| &t.kind) {
+            Some(TokenKind::Int(_)) => i += 1,
+            _ => return false,
+        }
+        match tokens.get(i).map(|t| &t.kind) {
+            Some(TokenKind::Comma) => i += 1,
+            Some(TokenKind::RBracket) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// Add a derived `head_bytes` attribute when the IfBranch needs one
+/// and the source didn't supply it.
+///
+/// The source language treats `head_bytes` as a hint the parser can
+/// recover from the cmp/test text alone — when the file omits it,
+/// the canonical Intel encoding for the operands stands in. This
+/// keeps the surface form compact while preserving byte identity:
+/// emit drops the attribute whenever the encoder would reproduce
+/// the same bytes, and we put it back here so the lower path always
+/// sees a non-empty `head_bytes` for separated cmp/jcc shapes.
+fn ensure_head_bytes(
+    cond_text: &str,
+    pre_body: &[Stmt],
+    mut attrs: Vec<ud_ast::Attribute>,
+) -> Vec<ud_ast::Attribute> {
+    if pre_body.is_empty() {
+        return attrs;
+    }
+    if attrs.iter().any(|a| a.key == "head_bytes") {
+        return attrs;
+    }
+    let Some(bytes) = ud_arch_x86::encode_head_from_cond_text(cond_text) else {
+        return attrs;
+    };
+    attrs.push(ud_ast::Attribute {
+        key: "head_bytes".into(),
+        value: ud_ast::AttrValue::ByteList(bytes),
+    });
+    attrs
+}
+
+/// Encode a prologue's structured form back to bytes. Mirrors
+/// the lift-side decode via `ud_arch_x86::encode_prologue`. The
+/// kind string carries the bit-width via convention: legacy
+/// labels (`std`, `std-no-cf`) without a `64-` prefix are 32-bit;
+/// 64-bit kinds use the `64-` prefix (e.g. `64-std`). For now,
+/// callers always use 32-bit since the structured-form codec is
+/// wired in only for x86-32 inputs.
+fn encode_prologue_bytes(_kind: &str, params: &ud_ast::PrologueParams) -> Vec<u8> {
+    let cb = ud_arch_x86::CodecBits::Bits32;
+    ud_arch_x86::encode_prologue(&prologue_to_codec(params), cb)
+}
+
+fn encode_epilogue_bytes(params: &ud_ast::EpilogueParams) -> Vec<u8> {
+    let cb = ud_arch_x86::CodecBits::Bits32;
+    ud_arch_x86::encode_epilogue(&epilogue_to_codec(params), cb)
+}
+
+fn prologue_to_codec(p: &ud_ast::PrologueParams) -> ud_arch_x86::StructuredPrologue {
+    ud_arch_x86::StructuredPrologue {
+        saves: p.saves.clone(),
+        saves_after: p.saves_after.clone(),
+        frame: p.frame,
+        sub_esp: p.sub_esp,
+        cf_protect: p.cf_protect,
+    }
+}
+
+fn epilogue_to_codec(e: &ud_ast::EpilogueParams) -> ud_arch_x86::StructuredEpilogue {
+    ud_arch_x86::StructuredEpilogue {
+        saves: e.saves.clone(),
+        leave: e.leave,
+        pop_frame: e.pop_frame,
+        add_esp: e.add_esp,
+        ret_imm: e.ret_imm,
+    }
+}
+
+impl Parser {
+    /// Parse the trailing `, saves: [...], frame, sub: 0xN, …`
+    /// portion of a structured `@prologue` directive. The caller
+    /// has already consumed the kind string and the comma after.
+    fn parse_prologue_params(&mut self) -> Result<ud_ast::PrologueParams, ParseError> {
+        let mut p = ud_ast::PrologueParams::default();
+        loop {
+            // Stop when we reach the closing `)` of the directive.
+            if self.peek().kind == TokenKind::RParen {
+                break;
+            }
+            let kw_tok = self.peek().clone();
+            let kw = self.expect_ident("prologue field name")?;
+            match kw.as_str() {
+                "saves" => {
+                    self.expect(&TokenKind::Colon, "`:` after `saves`")?;
+                    p.saves = self.parse_register_list()?;
+                }
+                "saves_after" => {
+                    self.expect(&TokenKind::Colon, "`:` after `saves_after`")?;
+                    p.saves_after = self.parse_register_list()?;
+                }
+                "frame" => {
+                    p.frame = true;
+                }
+                "sub" => {
+                    self.expect(&TokenKind::Colon, "`:` after `sub`")?;
+                    p.sub_esp = self.expect_int("sub_esp value")? as u32;
+                }
+                "cf" => {
+                    p.cf_protect = true;
+                }
+                other => {
+                    return Err(ParseError::Expected {
+                        expected: "`saves`, `frame`, `sub`, `cf`, or `)`".into(),
+                        got: format!("`{other}`"),
+                        line: kw_tok.line,
+                        col: kw_tok.col,
+                    });
+                }
+            }
+            if self.peek().kind == TokenKind::Comma {
+                self.bump();
+            }
+        }
+        Ok(p)
+    }
+
+    /// Parse the trailing `, saves: [...], leave, ret_imm: 0xN`
+    /// portion of a structured `@epilogue` directive.
+    fn parse_epilogue_params(&mut self) -> Result<ud_ast::EpilogueParams, ParseError> {
+        let mut e = ud_ast::EpilogueParams::default();
+        loop {
+            if self.peek().kind == TokenKind::RParen {
+                break;
+            }
+            let kw_tok = self.peek().clone();
+            let kw = self.expect_ident("epilogue field name")?;
+            match kw.as_str() {
+                "saves" => {
+                    self.expect(&TokenKind::Colon, "`:` after `saves`")?;
+                    e.saves = self.parse_register_list()?;
+                }
+                "leave" => {
+                    e.leave = true;
+                }
+                "pop_frame" => {
+                    e.pop_frame = true;
+                }
+                "add" => {
+                    self.expect(&TokenKind::Colon, "`:` after `add`")?;
+                    e.add_esp = self.expect_int("add_esp value")? as u32;
+                }
+                "ret_imm" => {
+                    self.expect(&TokenKind::Colon, "`:` after `ret_imm`")?;
+                    e.ret_imm = self.expect_int("ret_imm value")? as u16;
+                }
+                other => {
+                    return Err(ParseError::Expected {
+                        expected: "`saves`, `leave`, `pop_frame`, `add`, `ret_imm`, or `)`".into(),
+                        got: format!("`{other}`"),
+                        line: kw_tok.line,
+                        col: kw_tok.col,
+                    });
+                }
+            }
+            if self.peek().kind == TokenKind::Comma {
+                self.bump();
+            }
+        }
+        Ok(e)
+    }
+
+    fn parse_register_list(&mut self) -> Result<Vec<String>, ParseError> {
+        self.expect(&TokenKind::LBracket, "`[` to open register list")?;
+        let mut out = Vec::new();
+        if self.peek().kind != TokenKind::RBracket {
+            loop {
+                let name = self.expect_ident("register name")?;
+                out.push(name);
+                if !self.eat_kind(&TokenKind::Comma) {
+                    break;
+                }
+                if self.peek().kind == TokenKind::RBracket {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RBracket, "`]` to close register list")?;
+        Ok(out)
+    }
+}
+
+/// `label_<hex>` ⇒ parsed address. Used by goto/label parsers
+/// to roundtrip the address through a textual marker.
+fn parse_label_addr(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("label_")?;
+    u64::from_str_radix(rest, 16).ok()
+}
+
+/// Identifier-name predicate matching the `label_<hex>` shape
+/// used by the goto/label rendering.
+fn is_label_name(name: &str) -> bool {
+    parse_label_addr(name).is_some()
 }
 
 fn describe(kind: &TokenKind) -> String {
@@ -1012,6 +2031,14 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Semicolon => "`;`".into(),
         TokenKind::Plus => "`+`".into(),
         TokenKind::Star => "`*`".into(),
+        TokenKind::Ampersand => "`&`".into(),
+        TokenKind::Pipe => "`|`".into(),
+        TokenKind::Caret => "`^`".into(),
+        TokenKind::Tilde => "`~`".into(),
+        TokenKind::Bang => "`!`".into(),
+        TokenKind::Minus => "`-`".into(),
+        TokenKind::Slash => "`/`".into(),
+        TokenKind::Percent => "`%`".into(),
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::String(_) => "a string literal".into(),
         TokenKind::Int(n) => format!("integer 0x{n:x}"),
@@ -1263,6 +2290,7 @@ fn f() {
             cond_bytes,
             then_body,
             else_body,
+            ..
         } = &fn_.body[0]
         else {
             panic!("expected IfBranch, got {:?}", fn_.body[0]);

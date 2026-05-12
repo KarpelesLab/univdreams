@@ -57,6 +57,31 @@ pub enum TokenKind {
     /// `*` — x86 scaled-index syntax inside conds and call args
     /// (`[esi+ebx*4]`). Same role as `Plus`.
     Star,
+    /// `/` — division operator surfaced inside lifted x87 / SSE
+    /// expressions (`st0 = st0 / qword ptr [mem]`). Free char at
+    /// the lexer level; the parser captures it via raw-source
+    /// snipping inside the `dst = src` text.
+    Slash,
+    /// `%` — modulo operator from idiv/imod lifts. Free char.
+    Percent,
+    /// `&` — address-of prefix used in lifted `lea` (`&[ebp+8]`).
+    /// Free char at the lexer level.
+    Ampersand,
+    /// `|` and `^` — bitwise-or and xor in lifted arithmetic
+    /// (`eax = eax | 5`, `eax = eax ^ 0x10`). Free chars.
+    Pipe,
+    Caret,
+    /// `~` — bitwise NOT in lifted `not` (`eax = ~eax`).
+    Tilde,
+    /// `!` — leading char of the `!=` operator in C-style cond text.
+    /// The parser uses raw-source snipping inside `if (…)` so `!` is
+    /// only lexed for the lexer's benefit, not consumed structurally.
+    Bang,
+    /// `-` — used in arithmetic source text like `eax - 5` or in
+    /// `eax = -eax` (negate). `-N` (negative-number literal) is
+    /// still parsed as one `Int` token by `read_number`; this
+    /// arm only fires when `-` isn't followed by a digit.
+    Minus,
     /// An identifier or keyword.
     Ident(String),
     /// A double-quoted string literal (already unescaped).
@@ -196,14 +221,22 @@ impl<'a> Lexer<'a> {
             ';' => TokenKind::Semicolon,
             '+' => TokenKind::Plus,
             '*' => TokenKind::Star,
+            '&' => TokenKind::Ampersand,
+            '|' => TokenKind::Pipe,
+            '^' => TokenKind::Caret,
+            '~' => TokenKind::Tilde,
+            '!' => TokenKind::Bang,
             '/' if self.peek_char() == Some('/') => {
                 self.bump(); // consume the second '/'
                 self.read_line_comment()
             }
+            '/' => TokenKind::Slash,
+            '%' => TokenKind::Percent,
             '"' => self.read_string(line, col)?,
             '-' if self.peek_char().is_some_and(|c| c.is_ascii_digit()) => {
                 self.read_number(start, line, col)?
             }
+            '-' => TokenKind::Minus,
             c if c.is_ascii_digit() => self.read_number(start, line, col)?,
             c if is_ident_start(c) => self.read_ident(start),
             other => {

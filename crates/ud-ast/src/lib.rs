@@ -22,4 +22,7 @@ mod emit;
 mod types;
 
 pub use emit::emit;
-pub use types::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
+pub use types::{
+    AttrValue, Attribute, EpilogueParams, Field, FnDecl, Item, LocalDecl, LocalKind, Module,
+    Param, PrologueParams, Signature, Stmt, Type, UdFile, Value,
+};

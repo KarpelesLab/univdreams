@@ -82,7 +82,9 @@ pub fn decompile_raw_6502(image: &RawImage) -> Result<UdFile> {
         items.push(Item::Function(FnDecl {
             addr: Some(entry),
             name,
+            attrs: Vec::new(),
             signature,
+            locals: Vec::new(),
             body,
         }));
     }
@@ -336,6 +338,8 @@ fn build_stmt_slice(
                     out.push(Stmt::IfBranch {
                         cond_text,
                         cond_bytes,
+                        attrs: Vec::new(),
+                        pre_body: Vec::new(),
                         then_body,
                         else_body: Some(else_stmts),
                     });
@@ -352,6 +356,8 @@ fn build_stmt_slice(
                 out.push(Stmt::IfBranch {
                     cond_text,
                     cond_bytes,
+                    attrs: Vec::new(),
+                    pre_body: Vec::new(),
                     then_body,
                     else_body: None,
                 });

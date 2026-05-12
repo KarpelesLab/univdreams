@@ -15,7 +15,24 @@
 //!   the source language; once `@raw` and `@pad` directives land, the
 //!   top-level `lower_to_bytes` will produce a complete binary image.
 
-use ud_ast::{FnDecl, Item, Stmt, UdFile};
+use ud_ast::{AttrValue, Attribute, FnDecl, Item, Stmt, UdFile};
+
+/// Read the `head_bytes` attribute off an `IfBranch`. Returns `None`
+/// when the attribute is missing (the adjacent-cmp case) or holds an
+/// inappropriate value type — the lower path treats both as "no head
+/// bytes". A separately-validated parser is responsible for rejecting
+/// malformed inputs.
+fn head_bytes_attr(attrs: &[Attribute]) -> Option<&[u8]> {
+    attrs.iter().find_map(|a| {
+        if a.key != "head_bytes" {
+            return None;
+        }
+        match &a.value {
+            AttrValue::ByteList(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    })
+}
 
 /// One function lowered to bytes.
 #[derive(Debug, Clone)]
@@ -64,10 +81,125 @@ pub enum LowerError {
 }
 
 /// Lower one [`FnDecl`] to its byte sequence.
+///
+/// When the function's body lacks a leading `Stmt::Prologue` or
+/// trailing `Stmt::Epilogue` AND the function is not flagged
+/// `#[naked]`, the compiler-profile defaults are auto-generated
+/// and their bytes prepended / appended at lower time. This
+/// matches the rendering side: the emitter omits @prologue /
+/// @epilogue when their structured params equal the auto-default
+/// for the function's profile.
 pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
     let mut out = Vec::new();
+    let has_prologue = matches!(f.body.first(), Some(Stmt::Prologue { .. }));
+    let has_epilogue = matches!(f.body.last(), Some(Stmt::Epilogue { .. }));
+    // `#[autogen]` is the explicit opt-IN: the decompiler set it
+    // when it dropped a matched-default prologue/epilogue. Without
+    // this marker, lower emits the body verbatim — no MSVC-style
+    // bytes get injected into GCC or hand-written functions.
+    let autogen = f.attrs.iter().any(|a| {
+        a.key == "autogen" && matches!(a.value, ud_ast::AttrValue::Flag)
+    });
+    if !has_prologue && autogen {
+        let prefix = auto_prologue_bytes(f);
+        out.extend_from_slice(&prefix);
+    }
     lower_stmts_into(&f.name, &f.body, &mut out)?;
+    if !has_epilogue && autogen {
+        let suffix = auto_epilogue_bytes(f);
+        out.extend_from_slice(&suffix);
+    }
     Ok(out)
+}
+
+/// Compute the default prologue's bytes for a function with
+/// no explicit `@prologue`. Mirrors what the decompiler dropped
+/// from the body — same inputs, same algorithm, same bytes.
+fn auto_prologue_bytes(f: &FnDecl) -> Vec<u8> {
+    let profile = profile_inputs_from_fn(f);
+    let prologue = ud_arch_x86::default_prologue(&profile);
+    ud_arch_x86::encode_prologue(&prologue, ud_arch_x86::CodecBits::Bits32)
+}
+
+/// Pair to [`auto_prologue_bytes`].
+fn auto_epilogue_bytes(f: &FnDecl) -> Vec<u8> {
+    let profile = profile_inputs_from_fn(f);
+    let epilogue = ud_arch_x86::default_epilogue(&profile);
+    ud_arch_x86::encode_epilogue(&epilogue, ud_arch_x86::CodecBits::Bits32)
+}
+
+/// Distill a `FnDecl` into the inputs the prologue/epilogue
+/// default-computer needs. Mirrors the decompile-side helper
+/// in `ud_decompile::build_function::profile_inputs_from_fn` —
+/// same algorithm both sides so the defaults match.
+fn profile_inputs_from_fn(f: &FnDecl) -> ud_arch_x86::ProfileInputs {
+    let abi = f
+        .attrs
+        .iter()
+        .find_map(|a| match (&a.key, &a.value) {
+            (k, ud_ast::AttrValue::String(s)) if k == "abi" => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    // `#[noframe]` opts the function out of MSVC /Oy- default
+    // (frame pointer always). The decompiler emits this when the
+    // no-frame variant of the default prologue/epilogue matches.
+    let noframe = f.attrs.iter().any(|a| {
+        a.key == "noframe" && matches!(a.value, ud_ast::AttrValue::Flag)
+    });
+    let mut uses_ebx = false;
+    let mut uses_esi = false;
+    let mut uses_edi = false;
+    let mut max_neg_off: u32 = 0;
+    let mut stack_arg_count: u32 = 0;
+    for local in &f.locals {
+        match local.kind {
+            ud_ast::LocalKind::Register => match local.name.as_str() {
+                "ebx" => uses_ebx = true,
+                "esi" => uses_esi = true,
+                "edi" => uses_edi = true,
+                _ => {}
+            },
+            ud_ast::LocalKind::Stack => {
+                if let Some(rest) = local.name.strip_prefix("var_") {
+                    if let Ok(n) = u32::from_str_radix(rest, 16) {
+                        if n > max_neg_off {
+                            max_neg_off = n;
+                        }
+                    }
+                } else if let Some(rest) = local.name.strip_prefix("arg_") {
+                    if u32::from_str_radix(rest, 16).is_ok() {
+                        stack_arg_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    // MSVC /Oy- default keeps a frame pointer in nearly every
+    // function. The opt-out is the `#[noframe]` flag, which the
+    // decompiler emits when the no-frame default variant matched
+    // the observed prologue/epilogue. (Whether to auto-inject at
+    // all is gated by `#[autogen]` upstream in `lower_function_bytes`.)
+    let frame_required = !noframe;
+    // Canonical MSVC x86 save order: ebx → esi → edi.
+    let mut saves_used: Vec<String> = Vec::new();
+    if uses_ebx {
+        saves_used.push("ebx".into());
+    }
+    if uses_esi {
+        saves_used.push("esi".into());
+    }
+    if uses_edi {
+        saves_used.push("edi".into());
+    }
+    ud_arch_x86::ProfileInputs {
+        saves_used,
+        frame_required,
+        sub_esp: max_neg_off,
+        cf_protect: false,
+        stack_arg_count,
+        abi,
+    }
 }
 
 /// Recursive worker: lower a flat statement list into `out`,
@@ -93,6 +225,14 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. }
+            | Stmt::Save { bytes, .. }
+            | Stmt::Restore { bytes, .. }
+            | Stmt::IfReturn { bytes, .. }
+            | Stmt::Goto { bytes, .. }
+            | Stmt::IfGoto { bytes, .. }
+            | Stmt::Switch { bytes, .. }
+            | Stmt::SehInstall { bytes }
+            | Stmt::SehRestore { bytes }
             | Stmt::ReturnExpr { bytes, .. }
             | Stmt::ArgSpill { bytes, .. }
             | Stmt::Call { bytes, .. }
@@ -103,12 +243,30 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
             | Stmt::Inc16 { bytes, .. } => {
                 out.extend_from_slice(bytes);
             }
+            // Combined with Comment below — both zero-byte.
+            #[allow(clippy::match_same_arms)]
+            Stmt::Label { .. } => {}
             Stmt::IfBranch {
                 cond_bytes,
+                attrs,
+                pre_body,
                 then_body,
                 else_body,
                 ..
             } => {
+                // Byte layout (separated cmp/jcc case):
+                //   head_bytes  ← #[head_bytes=…] attribute (cmp/test)
+                //   pre_body    ← intervening flag-preserving insns
+                //   cond_bytes  ← the jcc itself
+                //   then_body
+                //   else_body
+                // For the adjacent (canonical) case `head_bytes` is
+                // absent and `pre_body` is empty, so this collapses to
+                // the historical `cond_bytes; then_body; else_body`.
+                if let Some(head_bytes) = head_bytes_attr(attrs) {
+                    out.extend_from_slice(head_bytes);
+                }
+                lower_stmts_into(fn_name, pre_body, out)?;
                 out.extend_from_slice(cond_bytes);
                 lower_stmts_into(fn_name, then_body, out)?;
                 if let Some(else_body) = else_body {
@@ -255,6 +413,8 @@ mod tests {
         let f = FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
+            attrs: Vec::new(),
+            locals: Vec::new(),
             signature: None,
             body: vec![
                 Stmt::asm("endbr64", vec![0xf3, 0x0f, 0x1e, 0xfa]),
@@ -270,10 +430,14 @@ mod tests {
         let f = FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
+            attrs: Vec::new(),
+            locals: Vec::new(),
             signature: None,
             body: vec![Stmt::IfBranch {
                 cond_text: "cmp eax,0; je".into(),
                 cond_bytes: vec![0x83, 0xf8, 0x00, 0x74, 0x01],
+                attrs: Vec::new(),
+                pre_body: Vec::new(),
                 then_body: vec![Stmt::asm("ret", vec![0xc3])],
                 else_body: Some(vec![Stmt::asm("nop", vec![0x90])]),
             }],
@@ -288,10 +452,14 @@ mod tests {
         let f = FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
+            attrs: Vec::new(),
+            locals: Vec::new(),
             signature: None,
             body: vec![Stmt::IfBranch {
                 cond_text: "test rax,rax; je".into(),
                 cond_bytes: vec![0x48, 0x85, 0xc0, 0x74, 0x02],
+                attrs: Vec::new(),
+                pre_body: Vec::new(),
                 then_body: vec![Stmt::asm("call rax", vec![0xff, 0xd0])],
                 else_body: None,
             }],
@@ -306,6 +474,8 @@ mod tests {
         let f = FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
+            attrs: Vec::new(),
+            locals: Vec::new(),
             signature: None,
             body: vec![
                 Stmt::asm("ret", vec![0xc3]),
@@ -320,6 +490,8 @@ mod tests {
         let f = FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
+            attrs: Vec::new(),
+            locals: Vec::new(),
             signature: None,
             body: vec![Stmt::asm_text("ret")],
         };
@@ -343,6 +515,8 @@ mod tests {
             Item::Function(FnDecl {
                 addr: Some(0x1000),
                 name: "f".into(),
+                attrs: Vec::new(),
+                locals: Vec::new(),
                 signature: None,
                 body: vec![Stmt::asm("ret", vec![0xc3])],
             }),
@@ -361,6 +535,8 @@ mod tests {
             Item::Function(FnDecl {
                 addr: Some(0x1000),
                 name: "f".into(),
+                attrs: Vec::new(),
+                locals: Vec::new(),
                 signature: None,
                 body: vec![Stmt::asm("ret", vec![0xc3])],
             }),
@@ -410,6 +586,8 @@ mod tests {
                 Item::Function(FnDecl {
                     addr: Some(0x1000),
                     name: "a".into(),
+                    attrs: Vec::new(),
+                    locals: Vec::new(),
                     signature: None,
                     body: vec![Stmt::asm("ret", vec![0xc3])],
                 }),
@@ -417,6 +595,8 @@ mod tests {
                 Item::Function(FnDecl {
                     addr: Some(0x2000),
                     name: "b".into(),
+                    attrs: Vec::new(),
+                    locals: Vec::new(),
                     signature: None,
                     body: vec![Stmt::asm("ret", vec![0xc3])],
                 }),

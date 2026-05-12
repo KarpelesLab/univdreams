@@ -24,7 +24,7 @@ impl Pattern for MovExtend {
 
     fn tentative(
         &self,
-        _ctx: &PatternCtx,
+        ctx: &PatternCtx,
         insns: &[DecodedInsn],
         start: usize,
     ) -> Option<Candidate> {
@@ -36,6 +36,9 @@ impl Pattern for MovExtend {
             _ => return None,
         };
         let (dst, src) = super::mov::split_two_operands(&format_intel(&ins.iced), prefix)?;
+        let sp = ctx.sp_delta_at.get(&ins.iced.ip()).copied();
+        let dst = ud_arch_x86::rename_operand_in_ctx(&dst, sp);
+        let src = ud_arch_x86::rename_operand_in_ctx(&src, sp);
         // Preserve the extend mnemonic in the source operand so the
         // reader can tell zero-extend from sign-extend without
         // reading the bytes.

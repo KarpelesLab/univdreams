@@ -222,6 +222,9 @@ pub struct DataDirectory {
 /// Index of the Export Table entry in `data_directories`.
 pub const DATA_DIR_EXPORT: usize = 0;
 
+/// Index of the Import Table entry in `data_directories`.
+pub const DATA_DIR_IMPORT: usize = 1;
+
 impl PeFile {
     /// Parse a PE file. Validates the structural skeleton (DOS
     /// header, PE signature, COFF + optional + section headers) but
@@ -541,6 +544,99 @@ impl PeFile {
         out
     }
 
+    /// Parse the Import Directory (data directory 1) if it exists
+    /// and is populated, returning one [`PeImport`] per IAT slot
+    /// across every imported DLL. Each entry records the slot's
+    /// run-time virtual address, the DLL the symbol comes from,
+    /// and either a name (for by-name imports) or an ordinal (for
+    /// by-ordinal imports).
+    ///
+    /// Returns an empty vector when there's no import table, or
+    /// when the table is malformed (missing INT/IAT data).
+    #[must_use]
+    pub fn imports(&self) -> Vec<PeImport> {
+        let Some(dir) = self.data_directories.get(DATA_DIR_IMPORT) else {
+            return Vec::new();
+        };
+        if dir.virtual_address == 0 || dir.size == 0 {
+            return Vec::new();
+        }
+        // Thunk entry size: 4 bytes for PE32, 8 for PE32+.
+        let thunk_size = match self.kind {
+            PeKind::Pe32 => 4usize,
+            PeKind::Pe32Plus => 8usize,
+        };
+        let mut out: Vec<PeImport> = Vec::new();
+        // Each descriptor is 20 bytes; walk until we hit the
+        // all-zero terminator.
+        let mut desc_rva = dir.virtual_address;
+        for _ in 0..1024 {
+            // Bound the walk so a malformed binary can't run forever.
+            let Some(desc) = self.slice_at_rva(desc_rva, 20) else {
+                break;
+            };
+            let original_first_thunk = read_u32(desc, 0);
+            let _time_date_stamp = read_u32(desc, 4);
+            let _forwarder_chain = read_u32(desc, 8);
+            let name_rva = read_u32(desc, 12);
+            let first_thunk = read_u32(desc, 16);
+            if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
+                break;
+            }
+            let dll_name = self.read_cstring_at_rva(name_rva).unwrap_or_default();
+            // Walk INT for names, IAT slot addresses come from
+            // the FirstThunk RVA + ImageBase + slot offset. If
+            // OriginalFirstThunk is zero (some linkers omit it
+            // for "bound" imports), fall back to FirstThunk.
+            let int_rva = if original_first_thunk != 0 {
+                original_first_thunk
+            } else {
+                first_thunk
+            };
+            for idx in 0..1u32 << 20 {
+                let off = (idx as usize).saturating_mul(thunk_size);
+                let Some(thunk_bytes) = self.slice_at_rva(
+                    int_rva.wrapping_add(off as u32),
+                    thunk_size,
+                ) else {
+                    break;
+                };
+                let thunk_val: u64 = match self.kind {
+                    PeKind::Pe32 => u64::from(read_u32(thunk_bytes, 0)),
+                    PeKind::Pe32Plus => read_u64(thunk_bytes, 0),
+                };
+                if thunk_val == 0 {
+                    break;
+                }
+                let iat_va = self.image_base
+                    + u64::from(first_thunk.wrapping_add(off as u32));
+                let ordinal_flag: u64 = match self.kind {
+                    PeKind::Pe32 => 0x8000_0000,
+                    PeKind::Pe32Plus => 0x8000_0000_0000_0000,
+                };
+                let (ordinal, name) = if thunk_val & ordinal_flag != 0 {
+                    (Some((thunk_val & 0xFFFF) as u16), None)
+                } else {
+                    // Low bits are an RVA to IMAGE_IMPORT_BY_NAME:
+                    // 2-byte hint then the NUL-terminated name.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let by_name_rva = (thunk_val & 0xFFFF_FFFF) as u32;
+                    let name = self
+                        .read_cstring_at_rva(by_name_rva.wrapping_add(2));
+                    (None, name)
+                };
+                out.push(PeImport {
+                    iat_va,
+                    dll_name: dll_name.clone(),
+                    name,
+                    ordinal,
+                });
+            }
+            desc_rva = desc_rva.wrapping_add(20);
+        }
+        out
+    }
+
     /// Read an ASCII NUL-terminated string at `rva`, capped at a
     /// sensible upper bound to avoid runaway scans on malformed
     /// images. Returns `None` if the RVA can't be resolved.
@@ -561,6 +657,27 @@ impl PeFile {
     pub fn write_to_vec(&self) -> Vec<u8> {
         self.raw.clone()
     }
+}
+
+/// One entry from a PE file's Import Address Table (IAT). Names
+/// the imported symbol the loader will patch into `iat_va` at
+/// run time. Either `name` or `ordinal` is set (an import is
+/// either by-name or by-ordinal); rarely both, never neither.
+#[derive(Debug, Clone)]
+pub struct PeImport {
+    /// Run-time virtual address of the IAT slot — what the
+    /// loader writes the resolved function pointer into, and
+    /// what `call dword ptr [iat_va]` references in code.
+    pub iat_va: u64,
+    /// Name of the DLL that provides the symbol (e.g. `"KERNEL32.dll"`).
+    /// Empty when the import descriptor's Name RVA didn't
+    /// resolve to a readable string.
+    pub dll_name: String,
+    /// Symbol name when the import is by-name.
+    pub name: Option<String>,
+    /// Ordinal when the import is by-ordinal. Common for some
+    /// system DLLs (e.g. WS2_32 uses ordinals for many entries).
+    pub ordinal: Option<u16>,
 }
 
 /// One entry from a PE file's Export Address Table.

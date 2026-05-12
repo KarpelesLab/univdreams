@@ -17,6 +17,16 @@ pub trait DataLookup {
     /// for the section that contains `vaddr`, or `None` when no
     /// section's `[start, end)` range covers it.
     fn section_at(&self, vaddr: u64) -> Option<(&str, &[u8], usize)>;
+
+    /// Run-time `ImageBase` / preferred load address for this
+    /// file. PE returns the optional-header `ImageBase`; ELF
+    /// returns 0 (sections carry their own absolute VAs). Used
+    /// by the switch-table lifter to convert absolute pointers
+    /// stored in jump-table entries to the RVA form the rest of
+    /// the pipeline uses for in-function labels.
+    fn image_base(&self) -> u64 {
+        0
+    }
 }
 
 impl DataLookup for ud_format_elf::Elf64File {
@@ -37,6 +47,10 @@ impl DataLookup for ud_format_elf::Elf64File {
 }
 
 impl DataLookup for ud_format_pe::PeFile {
+    fn image_base(&self) -> u64 {
+        self.image_base
+    }
+
     fn section_at(&self, vaddr: u64) -> Option<(&str, &[u8], usize)> {
         // PE addresses come in two flavours and we accept either:
         //

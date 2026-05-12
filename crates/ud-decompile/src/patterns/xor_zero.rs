@@ -61,10 +61,12 @@ mod tests {
 
     fn ctx() -> PatternCtx<'static> {
         let map: &'static HashMap<u64, String> = Box::leak(Box::new(HashMap::new()));
+        let sp_map: &'static HashMap<u64, i64> = Box::leak(Box::new(HashMap::new()));
         PatternCtx {
             fn_addr_start: 0,
             fn_addr_end: u64::MAX,
             name_at: map,
+            sp_delta_at: sp_map,
         }
     }
 

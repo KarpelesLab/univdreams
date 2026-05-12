@@ -38,6 +38,45 @@ pub enum Value {
     Block(Vec<Field>),
 }
 
+/// A `#[key=value]` annotation. Attributes live on structural
+/// elements (functions, conditionals, …) and carry metadata that is
+/// either:
+///
+/// * **Informational**: hints for the reader / downstream tooling
+///   (`#[compiler="msvc15"]`, `#[abi="stdcall"]`) — they don't change
+///   the lower-path output.
+/// * **Load-bearing**: bytes / decisions that the lower path
+///   consumes (`#[head_bytes=[…]]` on a separated cmp/jcc `if`, so
+///   the cmp bytes land at the right offset relative to the
+///   intervening statements).
+///
+/// Round-trip rule: attributes round-trip verbatim. The `@module`
+/// header's optional `defaults: { … }` block can shadow any attribute
+/// here; the emitter omits an attribute when it equals the module
+/// default, the parser supplies the default when an attribute is
+/// missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribute {
+    pub key: String,
+    pub value: AttrValue,
+}
+
+/// Right-hand side of an attribute. Kept small on purpose — every
+/// new variant has to round-trip through emit + parse + lower.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttrValue {
+    /// `"…"` — quoted string.
+    String(String),
+    /// `0x…` or decimal integer.
+    Int(u64),
+    /// `[0x01, 0x02, …]` — used by `head_bytes` and friends.
+    ByteList(Vec<u8>),
+    /// Bare flag, e.g. `#[naked]` — no `=value` part. Renders
+    /// as just the key name; parses from any attribute that
+    /// omits the `=` sign.
+    Flag,
+}
+
 /// An item in the file: at the top level, or nested inside an
 /// [`Item::Section`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,9 +118,44 @@ pub struct FnDecl {
     /// clarity.
     pub addr: Option<u64>,
     pub name: String,
+    /// `#[…]` attributes attached to the `fn` keyword. Carry per-
+    /// function profile info (`abi`, `cc`, `saves`, …); module-level
+    /// `defaults` in the `@module` header can shadow these.
+    pub attrs: Vec<Attribute>,
     /// Typed parameters and return type, when known.
     pub signature: Option<Signature>,
+    /// Variable / register declarations at the top of the function
+    /// body. Stack slots discovered from `[ebp±N]` accesses get a
+    /// `Stack` decl; registers the function touches get a `Register`
+    /// decl. Purely informational today (the prologue's pinned bytes
+    /// already encode the actual stack allocation); future work can
+    /// use the size hints to drive lowering of a re-allocated frame.
+    pub locals: Vec<LocalDecl>,
     pub body: Vec<Stmt>,
+}
+
+/// One `let name: type;` entry at the head of a function body.
+///
+/// Kinds:
+/// * **Stack** — `let var_4: u32;` — backed by a stack slot at
+///   `[ebp-4]` (the name carries the offset as its hex suffix).
+/// * **Register** — `let eax: u32 @reg;` — backed by a CPU
+///   register; the name is the canonical x86 register mnemonic.
+///
+/// The type captures the largest access size seen at the slot /
+/// register in the function. Multiple-width accesses (`mov al,
+/// [ebp-1]; mov dword ptr [ebp-4], …`) pick the widest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDecl {
+    pub name: String,
+    pub ty: Type,
+    pub kind: LocalKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalKind {
+    Stack,
+    Register,
 }
 
 /// A function signature: parameter list + return type.
@@ -132,6 +206,57 @@ pub enum Type {
     Unknown,
 }
 
+/// Structured breakdown of a function prologue. Lets the source
+/// language carry semantic information (which registers got
+/// saved, whether a frame was set up, how much stack the function
+/// reserves, whether CET protection is on) instead of an opaque
+/// byte blob.
+///
+/// Used by the emitter to render
+/// `@prologue(saves: [ebx, esi, edi], frame, sub: 0x40)` style
+/// directives that drop the byte list because the parser can
+/// regenerate identical bytes via the arch's prologue codec.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrologueParams {
+    /// Callee-saved registers pushed before the frame setup, in
+    /// push order. Lowercase canonical names (`"ebx"`, `"esi"`,
+    /// `"r12"`, …).
+    pub saves: Vec<String>,
+    /// Callee-saved registers pushed AFTER the frame setup
+    /// (MSVC i386 idiom). Same naming.
+    pub saves_after: Vec<String>,
+    /// True when the prologue includes `push ebp; mov ebp, esp`
+    /// (or the 64-bit variant).
+    pub frame: bool,
+    /// Stack reservation in bytes (`sub esp, IMM`). Zero when
+    /// the function has no stack locals beyond saves.
+    pub sub_esp: u32,
+    /// True when the prologue starts with `endbr32` / `endbr64`
+    /// (Intel CET indirect-branch landing pad).
+    pub cf_protect: bool,
+}
+
+/// Structured breakdown of a function epilogue. Mirrors
+/// [`PrologueParams`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EpilogueParams {
+    /// Callee-saved registers popped, in pop order (typically
+    /// the reverse of the prologue's push order).
+    pub saves: Vec<String>,
+    /// True when the epilogue uses `leave` (atomic
+    /// `mov esp, ebp; pop ebp`).
+    pub leave: bool,
+    /// True when the epilogue pops the frame pointer with an
+    /// explicit `pop ebp` (after the named saves).
+    pub pop_frame: bool,
+    /// Stack adjustment via `add esp, IMM` before `ret`. Zero
+    /// when absent.
+    pub add_esp: u32,
+    /// Immediate operand of `ret` (callee-cleanup amount).
+    /// Zero for cdecl.
+    pub ret_imm: u16,
+}
+
 /// A statement inside a function body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
@@ -166,13 +291,108 @@ pub enum Stmt {
     /// a close variant. `kind` is a descriptive label
     /// (`"std"` / `"std-no-cf"` / `"std-noframe"`); `bytes` carries
     /// every encoded byte for round-trip.
-    Prologue { kind: String, bytes: Vec<u8> },
+    ///
+    /// `params` carries the structured breakdown (saves list,
+    /// frame flag, sub_esp value, cf_protect) when the prologue's
+    /// bytes round-trip through the canonical codec. Lets the
+    /// emitter render `@prologue(saves: [ebx, esi, edi], frame,
+    /// sub: 0x40)` without the byte list. Empty for handwritten
+    /// or non-canonical prologues where bytes are the source of
+    /// truth.
+    Prologue {
+        kind: String,
+        params: Option<PrologueParams>,
+        bytes: Vec<u8>,
+    },
 
     /// `@epilogue("kind", [bytes])` — a recognised function epilogue,
     /// typically `leave; ret` or `pop rbp; ret`. Used at the tail of
     /// the last block when no [`Stmt::Return`] consumed those bytes
     /// (e.g. the return value was computed in an earlier block).
-    Epilogue { kind: String, bytes: Vec<u8> },
+    Epilogue {
+        kind: String,
+        params: Option<EpilogueParams>,
+        bytes: Vec<u8>,
+    },
+
+    /// `@save("REG", [bytes])` — a mid-function callee-saved register
+    /// save. Pairs LIFO with a matching [`Stmt::Restore`] elsewhere in
+    /// the body; together they bracket a region where the function
+    /// borrows an extra register the prologue didn't reserve. Bytes
+    /// are exactly the `push REG` encoding.
+    Save { reg: String, bytes: Vec<u8> },
+
+    /// `@restore("REG", [bytes])` — the matching restore for a prior
+    /// [`Stmt::Save`]. Bytes are exactly the `pop REG` encoding.
+    Restore { reg: String, bytes: Vec<u8> },
+
+    /// `@if_return("cond", "value", [bytes])` — an early-return
+    /// pattern: a `test/cmp + jcc` whose taken target is a
+    /// return-shaped block elsewhere in the function. The bytes
+    /// are the original cmp/test + jcc encoding; the actual return
+    /// happens at the target block (whose bytes remain in place).
+    /// Renders as `if (cond) return value;` to convey the intent
+    /// even though the jcc semantically transfers control to a
+    /// shared cleanup tail.
+    ///
+    /// `value` is the literal/expression the target block returns,
+    /// when statically known; empty when the target's return value
+    /// can't be folded.
+    IfReturn {
+        cond_text: String,
+        value_text: String,
+        bytes: Vec<u8>,
+    },
+
+    /// `label_XXXX:` — a zero-byte marker for a jump target. The
+    /// `addr` is the run-time virtual address the label represents
+    /// (rendered as `label_<hex>`). Labels carry no bytes; they
+    /// occupy a position in the source so a [`Stmt::Goto`] or
+    /// [`Stmt::IfGoto`] elsewhere in the function can point at
+    /// them by name. Round-trip neutral.
+    Label { addr: u64 },
+
+    /// `goto label_XXXX; [bytes]` — an unconditional jump folded
+    /// from `@asm("jmp …")`. Bytes are the original `jmp` encoding
+    /// (short or near); `target_addr` is what `label_<hex>` refers
+    /// to elsewhere in the function body.
+    Goto { target_addr: u64, bytes: Vec<u8> },
+
+    /// `if (cond) goto label_XXXX; [bytes]` — a conditional jump
+    /// folded from `@asm("cmp/test …; jcc …")` whose target is a
+    /// labeled block elsewhere in the function. Bytes are the
+    /// original cmp/test + jcc encoding.
+    IfGoto {
+        cond_text: String,
+        target_addr: u64,
+        bytes: Vec<u8>,
+    },
+
+    /// `switch (selector) { case N: goto label_X; … default: goto label_D; }`
+    /// — recognized MSVC switch dispatch (bound-check `cmp reg, MAX; ja
+    /// default` followed by indirect `jmp [TABLE + reg*4]`). The
+    /// `cases` vec is parallel to the jump table; `default_addr`
+    /// is the `ja`-taken target. Bytes pin the full cmp + ja + jmp
+    /// encoding (the jump table data itself stays in the data
+    /// section, untouched).
+    Switch {
+        selector: String,
+        cases: Vec<u64>,
+        default_addr: u64,
+        bytes: Vec<u8>,
+    },
+
+    /// `@seh_install([bytes])` — MSVC's Structured Exception
+    /// Handling frame install: `mov fs:[0], esp` after pushing
+    /// the handler-frame fields. Bytes are exactly the
+    /// `mov fs:[0], esp` encoding (7 bytes on x86-32).
+    SehInstall { bytes: Vec<u8> },
+
+    /// `@seh_restore([bytes])` — pops the SEH chain back to the
+    /// previously installed handler. Bytes encode
+    /// `mov reg, [ebp-N]; mov fs:[0], reg` (or similar pop
+    /// sequence). Pairs LIFO with a prior `Stmt::SehInstall`.
+    SehRestore { bytes: Vec<u8> },
 
     /// `@return_expr("text", [bytes])` — a recognised
     /// "compute-a-value-and-fall-through-to-the-epilogue" block whose
@@ -218,11 +438,28 @@ pub enum Stmt {
     /// code follows the `@if_branch` in source order. With `Some`,
     /// both arms are real branches that converge somewhere later.
     ///
-    /// Bytes layout, exactly preserved on lower: `cond_bytes` then
-    /// bytes of `then_body`, then bytes of `else_body` if present.
+    /// Bytes layout, exactly preserved on lower (in source order):
+    ///
+    /// * `attrs["head_bytes"]` if present (the cmp/test bytes that
+    ///   live *before* the intervening insns the compiler reordered
+    ///   between the comparison and the conditional branch),
+    /// * `pre_body` statement bytes (the "intervening" insns
+    ///   between cmp and jcc — empty for the adjacent-cmp case),
+    /// * `cond_bytes` (the jcc when there's `head_bytes`; the full
+    ///   cmp+jcc when there isn't),
+    /// * `then_body` statement bytes,
+    /// * `else_body` statement bytes if present.
     IfBranch {
         cond_text: String,
         cond_bytes: Vec<u8>,
+        /// Free-form metadata. Recognised keys today: `head_bytes`
+        /// (load-bearing — see byte layout above).
+        attrs: Vec<Attribute>,
+        /// Statements that fall between the cmp/test and the jcc in
+        /// the original instruction stream. Empty for adjacent cmp +
+        /// jcc (the common case) — the field exists for the
+        /// separated-by-flag-preserving-insns case.
+        pre_body: Vec<Stmt>,
         then_body: Vec<Stmt>,
         else_body: Option<Vec<Stmt>>,
     },

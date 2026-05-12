@@ -30,7 +30,7 @@ impl Pattern for Arith {
 
     fn tentative(
         &self,
-        _ctx: &PatternCtx,
+        ctx: &PatternCtx,
         insns: &[DecodedInsn],
         start: usize,
     ) -> Option<Candidate> {
@@ -53,7 +53,11 @@ impl Pattern for Arith {
             Mnemonic::Ror => ("ror ", ">>>"),
             _ => return None,
         };
-        let (dst, src) = super::mov::split_two_operands(&format_intel(&ins.iced), prefix)?;
+        let (dst_raw, src_raw) =
+            super::mov::split_two_operands(&format_intel(&ins.iced), prefix)?;
+        let sp = ctx.sp_delta_at.get(&ins.iced.ip()).copied();
+        let dst = ud_arch_x86::rename_operand_in_ctx(&dst_raw, sp);
+        let src = ud_arch_x86::rename_operand_in_ctx(&src_raw, sp);
         // Render the assignment form so the destination's reuse is
         // explicit: `eax = eax + 5` (vs `add eax, 5`).
         let new_src = format!("{dst} {op} {src}");

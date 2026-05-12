@@ -24,7 +24,7 @@ impl Pattern for Lea {
 
     fn tentative(
         &self,
-        _ctx: &PatternCtx,
+        ctx: &PatternCtx,
         insns: &[DecodedInsn],
         start: usize,
     ) -> Option<Candidate> {
@@ -33,15 +33,19 @@ impl Pattern for Lea {
             return None;
         }
         let (dst, src) = super::mov::split_two_operands(&format_intel(&ins.iced), "lea ")?;
-        // Prepend `&` so the address-of semantics are visible.
-        let src = format!("&{src}");
+        let sp = ctx.sp_delta_at.get(&ins.iced.ip()).copied();
+        // Prepend `&` so the address-of semantics are visible. The
+        // address itself runs through slot renaming — `lea eax,
+        // [ebp+8]` reads `eax = &arg_8`, which is the right level of
+        // abstraction for a "pointer to local/arg" idiom.
+        let src = format!("&{}", ud_arch_x86::rename_operand_in_ctx(&src, sp));
         Some(Candidate {
             pattern: self.name(),
             start,
             consumed: 1,
             priority: 50,
             stmts: vec![Stmt::Move {
-                dst,
+                dst: ud_arch_x86::rename_operand_in_ctx(&dst, sp),
                 src,
                 bytes: ins.original_bytes.clone(),
             }],
@@ -57,10 +61,12 @@ mod tests {
 
     fn ctx() -> PatternCtx<'static> {
         let map: &'static HashMap<u64, String> = Box::leak(Box::new(HashMap::new()));
+        let sp_map: &'static HashMap<u64, i64> = Box::leak(Box::new(HashMap::new()));
         PatternCtx {
             fn_addr_start: 0,
             fn_addr_end: u64::MAX,
             name_at: map,
+            sp_delta_at: sp_map,
         }
     }
 

@@ -42,13 +42,18 @@ use ud_arch_x86::DecodedInsn;
 use ud_ast::Stmt;
 
 mod arith;
+mod cmp_jcc;
 mod imul;
 mod lea;
+mod load_modify_store;
+mod mem_via_reg;
 mod mov;
 mod mov_extend;
+mod simd_expr;
 mod stack_arg_call;
 mod tail_jmp;
 mod unary;
+mod x87_expr;
 mod xor_zero;
 
 /// Context handed to every pattern. Carries the function-name map
@@ -62,6 +67,12 @@ pub struct PatternCtx<'a> {
     pub fn_addr_start: u64,
     pub fn_addr_end: u64,
     pub name_at: &'a HashMap<u64, String>,
+    /// SP delta from function entry, indexed by instruction IP.
+    /// Lets patterns rename `[esp+disp]` operands to the same
+    /// `arg_X` / `var_X` naming the frame-pointer accesses use.
+    /// Empty when the caller didn't compute it (no SP-relative
+    /// rename happens then — operands stay as raw `[esp+…]`).
+    pub sp_delta_at: &'a HashMap<u64, i64>,
 }
 
 /// One tentative match produced by a pattern.
@@ -120,12 +131,17 @@ fn registry() -> Vec<&'static dyn Pattern> {
         &stack_arg_call::StackArgCall,
         &tail_jmp::TailJmp,
         &xor_zero::XorZero,
+        &load_modify_store::LoadModifyStore,
+        &mem_via_reg::MemViaReg,
         &mov::Mov,
         &mov_extend::MovExtend,
         &lea::Lea,
         &arith::Arith,
         &unary::Unary,
         &imul::Imul,
+        &cmp_jcc::CmpJcc,
+        &simd_expr::SimdExpr,
+        &x87_expr::X87Expr,
     ]
 }
 

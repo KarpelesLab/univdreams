@@ -136,6 +136,14 @@ fn verify_stmts(
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. }
+            | Stmt::Save { bytes, .. }
+            | Stmt::Restore { bytes, .. }
+            | Stmt::IfReturn { bytes, .. }
+            | Stmt::Goto { bytes, .. }
+            | Stmt::IfGoto { bytes, .. }
+            | Stmt::Switch { bytes, .. }
+            | Stmt::SehInstall { bytes }
+            | Stmt::SehRestore { bytes }
             | Stmt::ReturnExpr { bytes, .. }
             | Stmt::ArgSpill { bytes, .. }
             | Stmt::Call { bytes, .. }
@@ -146,12 +154,23 @@ fn verify_stmts(
             | Stmt::Inc16 { bytes, .. } => {
                 *cursor = cursor.saturating_add(bytes.len() as u64);
             }
+            #[allow(clippy::match_same_arms)]
+            Stmt::Label { .. } => {}
             Stmt::IfBranch {
                 cond_bytes,
+                attrs,
+                pre_body,
                 then_body,
                 else_body,
                 ..
             } => {
+                if let Some(hb) = attrs.iter().find_map(|a| match (a.key.as_str(), &a.value) {
+                    ("head_bytes", ud_ast::AttrValue::ByteList(b)) => Some(b.as_slice()),
+                    _ => None,
+                }) {
+                    *cursor = cursor.saturating_add(hb.len() as u64);
+                }
+                verify_stmts(f, section, pre_body, cursor, out);
                 *cursor = cursor.saturating_add(cond_bytes.len() as u64);
                 verify_stmts(f, section, then_body, cursor, out);
                 if let Some(else_body) = else_body {
@@ -193,6 +212,8 @@ mod tests {
         Item::Function(FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
+            attrs: Vec::new(),
+            locals: Vec::new(),
             signature: None,
             body: stmts,
         })

@@ -132,6 +132,7 @@ fn build_pe_module(pe: &PeFile) -> Module {
         field("coff", coff_block),
         field("sections", sections_value),
         field("functions", functions_value),
+        field("vtables", Value::List(scan_vtables(pe))),
     ]);
 
     Module {
@@ -143,6 +144,84 @@ fn build_pe_module(pe: &PeFile) -> Module {
             field("build", build),
         ],
     }
+}
+
+/// Scan the read-only data sections for sequences of 4-byte
+/// values that look like function pointers (each value lives
+/// inside an executable section). A run of two or more such
+/// values is reported as a candidate vtable.
+///
+/// Returns one `Value::Block({addr, count})` per vtable. The
+/// addr is the section-relative VA of the first entry; count is
+/// how many function-pointer entries the run contains. Used as
+/// informational metadata in `@module.build.vtables` so the
+/// reader can locate C++ virtual-function dispatch tables.
+fn scan_vtables(pe: &PeFile) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let bits = match pe.kind {
+        PeKind::Pe32 => 32,
+        PeKind::Pe32Plus => 64,
+    };
+    let ptr_size = if bits == 64 { 8 } else { 4 };
+    // Identify the executable sections' VA ranges. Code sections
+    // are those whose IMAGE_SCN_MEM_EXECUTE (0x2000_0000) is set.
+    let mut text_ranges: Vec<(u64, u64)> = Vec::new();
+    for sh in &pe.sections {
+        if sh.characteristics & 0x2000_0000 != 0 {
+            let start = pe.image_base + u64::from(sh.virtual_address);
+            let size = u64::from(sh.virtual_size.max(sh.size_of_raw_data));
+            text_ranges.push((start, start + size));
+        }
+    }
+    let in_text = |va: u64| text_ranges.iter().any(|(s, e)| va >= *s && va < *e);
+    // Scan data sections (writable OR initialized-data) for
+    // function-pointer runs.
+    for (idx, sh) in pe.sections.iter().enumerate() {
+        let is_data = sh.characteristics & 0x4000_0000 != 0
+            && sh.characteristics & 0x2000_0000 == 0;
+        if !is_data {
+            continue;
+        }
+        let Some(data) = pe.section_data(idx) else {
+            continue;
+        };
+        let sec_base = pe.image_base + u64::from(sh.virtual_address);
+        let mut i = 0usize;
+        while i + ptr_size <= data.len() {
+            let raw = &data[i..i + ptr_size];
+            let val = if bits == 64 {
+                u64::from_le_bytes(raw.try_into().unwrap_or([0; 8]))
+            } else {
+                u64::from(u32::from_le_bytes(raw[..4].try_into().unwrap_or([0; 4])))
+            };
+            if val != 0 && in_text(val) {
+                let run_start = i;
+                let mut count = 0usize;
+                while i + ptr_size <= data.len() {
+                    let raw = &data[i..i + ptr_size];
+                    let val = if bits == 64 {
+                        u64::from_le_bytes(raw.try_into().unwrap_or([0; 8]))
+                    } else {
+                        u64::from(u32::from_le_bytes(raw[..4].try_into().unwrap_or([0; 4])))
+                    };
+                    if val == 0 || !in_text(val) {
+                        break;
+                    }
+                    count += 1;
+                    i += ptr_size;
+                }
+                if count >= 2 {
+                    out.push(Value::Block(vec![
+                        field("addr", Value::Int(sec_base + run_start as u64)),
+                        field("count", Value::Int(count as u64)),
+                    ]));
+                }
+            } else {
+                i += ptr_size;
+            }
+        }
+    }
+    out
 }
 
 /// Build the items list. Strategy: walk file-offset order, emit
@@ -538,9 +617,15 @@ fn byte_list(bs: &[u8]) -> Value {
 }
 
 /// Build the `name_at: addr -> name` map that arch-x86's call-site
-/// analyzer uses to render call targets. For PE we key by RVA: jcc
-/// and call instruction operands carry RVAs after iced sets the IP
-/// to the function's RVA.
+/// analyzer uses to render call targets.
+///
+/// Keys are mixed: COFF symbols are keyed by RVA (matching iced's
+/// direct-call target after IP=RVA decoding), while IAT slots are
+/// keyed by their absolute virtual address (matching what an
+/// indirect `call dword ptr [VA]` operand carries in the encoded
+/// instruction). The two key spaces don't overlap in practice — an
+/// IAT slot's VA includes `image_base` (e.g. `0x1C201030` for our
+/// reference DLL), while RVAs are small section-relative offsets.
 fn pe_name_at(pe: &PeFile) -> HashMap<u64, String> {
     let mut out = HashMap::new();
     for sym in pe.coff_symbols() {
@@ -555,6 +640,47 @@ fn pe_name_at(pe: &PeFile) -> HashMap<u64, String> {
         };
         let rva = u64::from(sh.virtual_address.wrapping_add(sym.value));
         out.insert(rva, sym.name);
+    }
+    // Inject import-table entries keyed by IAT-slot VA. The
+    // rendered name for an import is just its function name; the
+    // DLL name is informational only and elided unless the same
+    // function name is imported from multiple DLLs (rare).
+    let mut name_count: HashMap<String, u32> = HashMap::new();
+    for imp in pe.imports() {
+        if let Some(name) = &imp.name {
+            *name_count.entry(name.clone()).or_default() += 1;
+        }
+    }
+    for imp in pe.imports() {
+        let label = match (&imp.name, imp.ordinal) {
+            (Some(name), _) => {
+                if name_count.get(name).copied().unwrap_or(0) > 1
+                    && !imp.dll_name.is_empty()
+                {
+                    // Strip the `.dll` suffix for the qualifier so
+                    // `KERNEL32.dll!HeapAlloc` reads as
+                    // `KERNEL32!HeapAlloc`.
+                    let stem = imp
+                        .dll_name
+                        .strip_suffix(".dll")
+                        .or_else(|| imp.dll_name.strip_suffix(".DLL"))
+                        .unwrap_or(&imp.dll_name);
+                    format!("{stem}!{name}")
+                } else {
+                    name.clone()
+                }
+            }
+            (None, Some(ord)) => {
+                let stem = imp
+                    .dll_name
+                    .strip_suffix(".dll")
+                    .or_else(|| imp.dll_name.strip_suffix(".DLL"))
+                    .unwrap_or(&imp.dll_name);
+                format!("{stem}@{ord}")
+            }
+            (None, None) => continue,
+        };
+        out.insert(imp.iat_va, label);
     }
     out
 }
@@ -589,7 +715,9 @@ fn lift_pe_function(
     out.push(Item::Function(ud_ast::FnDecl {
         addr: Some(file_offset),
         name: name.to_string(),
+        attrs: fn_decl.attrs,
         signature: fn_decl.signature,
+        locals: fn_decl.locals,
         body: fn_decl.body,
     }));
     if consumed < func_bytes.len() {

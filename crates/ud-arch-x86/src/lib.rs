@@ -23,18 +23,29 @@ use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Formatter, InstructionBlock,
     IntelFormatter,
 };
-pub use iced_x86::{CodeSize, FlowControl, Instruction, Mnemonic, OpKind, Register};
+pub use iced_x86::{
+    CodeSize, FlowControl, Instruction, InstructionInfoFactory, MemorySize, Mnemonic, OpAccess,
+    OpKind, Register, UsedRegister,
+};
 use ud_core::VAddr;
 use ud_ir::ArchInsn;
 
 mod call_site;
+mod encode_text;
 mod expr;
 mod lift;
+mod prologue_codec;
 pub use call_site::{
     detect_post_call_spill, identify_call_sites, ArgValue, CallSite, PostCallSpill,
 };
+pub use encode_text::{encode_cmp_or_test, encode_head_from_cond_text};
 pub use expr::{try_lift_value_block, ExprRenderCtx, LiftedValueBlock, ValueExpr};
 pub use lift::{lift_function, LiftError};
+pub use prologue_codec::{
+    decode_epilogue, decode_prologue, default_epilogue, default_prologue,
+    encode_epilogue, encode_prologue, epilogue_roundtrips, prologue_roundtrips,
+    CodecBits, ProfileInputs, StructuredEpilogue, StructuredPrologue,
+};
 
 /// If `insn` is a direct (relative) `call` whose target is statically
 /// known, return that target's virtual address. Indirect calls
@@ -172,69 +183,126 @@ pub struct LiftedPrologue {
 pub fn try_lift_prologue_pattern(insns: &[DecodedInsn]) -> Option<LiftedPrologue> {
     let endbr64: &[u8] = &[0xf3, 0x0f, 0x1e, 0xfa];
     let endbr32: &[u8] = &[0xf3, 0x0f, 0x1e, 0xfb];
-    let push_bp: &[u8] = &[0x55]; // push rbp / push ebp share the same opcode
-    let mov_rbp_rsp_64: &[u8] = &[0x48, 0x89, 0xe5];
-    let mov_ebp_esp_32: &[u8] = &[0x89, 0xe5];
+    // `mov ebp, esp` has two equivalent encodings: the
+    // destination-form `0x89 0xe5` (mov r/m32, r32) and the
+    // source-form `0x8b 0xec` (mov r32, r/m32). gcc / clang emit
+    // the former; MSVC/Watcom often emit the latter. The 64-bit
+    // forms add a REX.W prefix.
+    let mov_rbp_rsp_64_dst: &[u8] = &[0x48, 0x89, 0xe5];
+    let mov_rbp_rsp_64_src: &[u8] = &[0x48, 0x8b, 0xec];
+    let mov_ebp_esp_32_dst: &[u8] = &[0x89, 0xe5];
+    let mov_ebp_esp_32_src: &[u8] = &[0x8b, 0xec];
+    let is_mov_bp_sp = |b: &[u8]| {
+        b == mov_rbp_rsp_64_dst
+            || b == mov_rbp_rsp_64_src
+            || b == mov_ebp_esp_32_dst
+            || b == mov_ebp_esp_32_src
+    };
 
     let bytes_at = |i: usize| insns.get(i).map(|d| d.original_bytes.as_slice());
 
+    // Step 1: optional indirect-branch landing pad (Intel CET).
     let (has_endbr, mut start) = match bytes_at(0) {
         Some(b) if b == endbr64 || b == endbr32 => (true, 1),
         _ => (false, 0),
     };
 
-    if bytes_at(start) != Some(push_bp) {
-        // Not a frame-setting prologue. Recognise:
-        // * lone `endbr64` / `endbr32` at the start of a leaf
-        //   function as a noframe prologue.
-        // * a bare `sub rsp/esp, IMM` (the CRT-stub idiom for `_init`
-        //   and friends: align the stack, no `push rbp`).
-        let bare_sub_matched = matches!(
-            bytes_at(start),
-            Some(
-                &[0x48, 0x83, 0xec, _]
-                    | &[0x48, 0x81, 0xec, _, _, _, _]
-                    | &[0x83, 0xec, _]
-                    | &[0x81, 0xec, _, _, _, _]
-            )
-        );
-        if bare_sub_matched {
-            return Some(LiftedPrologue {
-                insns_consumed: start + 1,
-                kind: if has_endbr { "thin" } else { "thin-no-cf" },
-            });
+    // Step 2: leading run of single-byte `push reg` (opcodes
+    // 0x50..=0x57 → push eax..edi/r8..r15-low). Windows i386 routinely
+    // saves several callee-saved registers (ebx, esi, edi) before any
+    // frame setup; gcc/msvc on x86_64 can do the same with rbx/r12-r15.
+    let push_start = start;
+    let mut pushes: Vec<u8> = Vec::new();
+    while let Some(b) = bytes_at(start) {
+        if b.len() == 1 && (0x50..=0x57).contains(&b[0]) {
+            pushes.push(b[0]);
+            start += 1;
+        } else {
+            break;
         }
-        if has_endbr {
-            return Some(LiftedPrologue {
-                insns_consumed: 1,
-                kind: "std-noframe",
-            });
+    }
+
+    // Step 3: frame setup. When the final push was `push ebp/rbp`
+    // (opcode 0x55) AND it is immediately followed by `mov ebp, esp`,
+    // attribute that last push to the frame rather than to saves.
+    // Otherwise every push is a save.
+    let mut has_frame = false;
+    if matches!(pushes.last(), Some(&0x55)) {
+        if let Some(b) = bytes_at(start) {
+            if is_mov_bp_sp(b) {
+                has_frame = true;
+                start += 1;
+            }
         }
+    }
+    let mut saves_count = pushes.len() - usize::from(has_frame);
+
+    // Step 4: optional stack-locals reservation. Only meaningful when a
+    // frame was set up (or no frame and no saves — the bare CRT-stub
+    // `_init`/`_fini` idiom); a `sub esp, IMM` mid-function isn't
+    // really a prologue.
+    let sub_matched = matches!(
+        bytes_at(start),
+        Some(
+            &[0x48, 0x83, 0xec, _]
+                | &[0x48, 0x81, 0xec, _, _, _, _]
+                | &[0x83, 0xec, _]
+                | &[0x81, 0xec, _, _, _, _]
+        )
+    );
+    let has_sub = sub_matched && (has_frame || saves_count == 0);
+    if has_sub {
+        start += 1;
+    }
+
+    // Step 5: additional callee-save pushes that come *after* the
+    // frame setup. The MSVC i386 prologue often looks like
+    // `push ebp; mov ebp,esp; push esi; push edi` — the frame is
+    // set up first, then the function spills the extra callee-saved
+    // registers it'll need.
+    if has_frame {
+        while let Some(b) = bytes_at(start) {
+            if b.len() == 1 && (0x50..=0x57).contains(&b[0]) {
+                saves_count += 1;
+                start += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Step 5: classify. If nothing was consumed beyond the (optional)
+    // endbr, there's nothing to lift.
+    if !has_endbr && saves_count == 0 && !has_frame && !has_sub {
         return None;
     }
-    start += 1;
+    let _ = push_start; // kept for future use when emitting save-list text
 
-    let is_64 = match bytes_at(start) {
-        Some(b) if b == mov_rbp_rsp_64 => true,
-        Some(b) if b == mov_ebp_esp_32 => false,
-        _ => return None,
+    let kind = match (has_endbr, saves_count > 0, has_frame, has_sub) {
+        // Pure endbr leaf.
+        (true, false, false, false) => "std-noframe",
+        // CRT-stub `sub esp, N; ...; add esp, N; ret` with optional CET.
+        (true, false, false, true) => "thin",
+        (false, false, false, true) => "thin-no-cf",
+        // Frame-only (no saves). `sub esp, IMM` doesn't change the
+        // kind label — it's still a standard frame.
+        (true, false, true, _) => "std",
+        (false, false, true, _) => "std-no-cf",
+        // Saves-only (no frame).
+        (true, true, false, false) => "saves-cf",
+        (false, true, false, false) => "saves",
+        // Saves + frame.
+        (true, true, true, _) => "saves-std",
+        (false, true, true, _) => "saves-std-no-cf",
+        // Saves + sub-without-frame: unusual; label it.
+        (_, true, false, true) => "saves-thin",
+        // Guarded by the `!has_endbr && saves_count == 0 && !has_frame &&
+        // !has_sub` early-return above.
+        (false, false, false, false) => unreachable!("nothing-to-lift case already returned None"),
     };
-    start += 1;
-
-    // Optional `sub rsp/esp, IMM`. 64-bit forms carry a REX.W prefix
-    // (0x48); 32-bit forms drop it.
-    let stack_sub_matched = matches!(
-        (is_64, bytes_at(start)),
-        (
-            true,
-            Some(&[0x48, 0x83, 0xec, _] | &[0x48, 0x81, 0xec, _, _, _, _])
-        ) | (false, Some(&[0x83, 0xec, _] | &[0x81, 0xec, _, _, _, _]))
-    );
-    let consumed_after_frame = if stack_sub_matched { start + 1 } else { start };
-
     Some(LiftedPrologue {
-        insns_consumed: consumed_after_frame,
-        kind: if has_endbr { "std" } else { "std-no-cf" },
+        insns_consumed: start,
+        kind,
     })
 }
 
@@ -263,47 +331,105 @@ pub struct LiftedEpilogue {
 /// removes the boilerplate from the decompile output.
 #[must_use]
 pub fn try_lift_epilogue_pattern(insns: &[DecodedInsn]) -> Option<LiftedEpilogue> {
-    if insns.len() < 2 {
+    if insns.is_empty() {
         return None;
     }
     let last = insns.last()?;
-    if last.original_bytes.as_slice() != [0xc3] {
+    let last_b = last.original_bytes.as_slice();
+    // The trailing instruction must terminate the function:
+    //   c3       ret
+    //   c2 ww ww ret IMM16 (stdcall callee-cleans-up)
+    let is_ret_bare = last_b == [0xc3];
+    let is_ret_imm = matches!(last_b, [0xc2, _, _]);
+    if !is_ret_bare && !is_ret_imm {
         return None;
     }
-    let prev = &insns[insns.len() - 2].original_bytes;
 
-    // Two-instruction tails: leave/ret, pop rbp/ret.
-    let two_kind = match prev.as_slice() {
-        [0xc9] => Some("std"),         // leave
-        [0x5d] => Some("std-pop-rbp"), // pop rbp
-        _ => None,
-    };
-    if let Some(kind) = two_kind {
-        // Check if it can be widened to a thin form (`add rsp, IMM`
-        // immediately before the `pop rbp`/`leave`). Only for
-        // `pop rbp`, since `leave` already restores rsp.
-        if kind == "std-pop-rbp" && insns.len() >= 3 {
-            let before_pop = insns[insns.len() - 3].original_bytes.as_slice();
-            if is_add_rsp_imm(before_pop) {
+    if insns.len() >= 2 {
+        let prev = &insns[insns.len() - 2].original_bytes;
+
+        // Two-instruction tails: leave/ret, pop rbp/ret.
+        if is_ret_bare {
+            let two_kind = match prev.as_slice() {
+                [0xc9] => Some("std"),         // leave
+                [0x5d] => Some("std-pop-rbp"), // pop rbp
+                _ => None,
+            };
+            if let Some(kind) = two_kind {
+                // Check if it can be widened to a thin form (`add rsp, IMM`
+                // immediately before the `pop rbp`/`leave`). Only for
+                // `pop rbp`, since `leave` already restores rsp.
+                if kind == "std-pop-rbp" && insns.len() >= 3 {
+                    let before_pop = insns[insns.len() - 3].original_bytes.as_slice();
+                    if is_add_rsp_imm(before_pop) {
+                        return Some(LiftedEpilogue {
+                            insns_consumed: 3,
+                            kind: "thin-pop-rbp",
+                        });
+                    }
+                }
                 return Some(LiftedEpilogue {
-                    insns_consumed: 3,
-                    kind: "thin-pop-rbp",
+                    insns_consumed: 2,
+                    kind,
+                });
+            }
+
+            // `add rsp, IMM; ret` — bare CRT-stub epilogue.
+            if is_add_rsp_imm(prev.as_slice()) {
+                return Some(LiftedEpilogue {
+                    insns_consumed: 2,
+                    kind: "thin",
                 });
             }
         }
+    }
+
+    // Generic "restore saved registers + return" epilogue: a tail of
+    // pop-like instructions followed by `ret` or `ret IMM16`. Counts
+    // every preceding insn that's a `pop reg` (single-byte opcodes
+    // 0x58..=0x5f), `leave` (0xc9), or `add rsp/esp, IMM` (the manual
+    // stack-cleanup form). Common on Windows i386 (callee-saves
+    // ebx/esi/edi + leave) and useful any time a function exits
+    // through more than one block with the same teardown sequence.
+    let mut restore_count = 0usize;
+    if insns.len() >= 2 {
+        for i in (0..insns.len() - 1).rev() {
+            let b = insns[i].original_bytes.as_slice();
+            let is_pop_reg = b.len() == 1 && (0x58..=0x5f).contains(&b[0]);
+            let is_leave = b == [0xc9];
+            let is_add_rsp = is_add_rsp_imm(b);
+            if is_pop_reg || is_leave || is_add_rsp {
+                restore_count += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    if restore_count >= 1 {
+        let kind = if is_ret_imm { "saves-imm" } else { "saves" };
         return Some(LiftedEpilogue {
-            insns_consumed: 2,
+            insns_consumed: restore_count + 1,
             kind,
         });
     }
 
-    // `add rsp, IMM; ret` — bare CRT-stub epilogue.
-    if is_add_rsp_imm(prev.as_slice()) {
+    // Bare ret (or ret IMM16) with nothing in front to lift — still
+    // worth labelling. Makes function exits land on `@epilogue`
+    // consistently whether there's a frame teardown or not, and the
+    // `ret-imm` kind tells you stdcall is in play.
+    if is_ret_imm {
         return Some(LiftedEpilogue {
-            insns_consumed: 2,
-            kind: "thin",
+            insns_consumed: 1,
+            kind: "ret-imm",
         });
     }
+    if is_ret_bare {
+        return Some(LiftedEpilogue {
+            insns_consumed: 1,
+            kind: "ret",
+        });
+    }
+
     None
 }
 
@@ -399,12 +525,7 @@ pub fn try_lift_if_branch_head(insns: &[DecodedInsn]) -> Option<LiftedIfBranchHe
     if insns.len() < 2 {
         return None;
     }
-    let cmp = &insns[insns.len() - 2];
-    let jcc = &insns[insns.len() - 1];
-
-    if !matches!(cmp.iced.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
-        return None;
-    }
+    let jcc = insns.last()?;
     if jcc.iced.flow_control() != FlowControl::ConditionalBranch {
         return None;
     }
@@ -416,17 +537,345 @@ pub fn try_lift_if_branch_head(insns: &[DecodedInsn]) -> Option<LiftedIfBranchHe
         return None;
     }
 
-    let cond_text = format!("{}; {}", format_intel(&cmp.iced), format_intel(&jcc.iced));
-    let mut cond_bytes = Vec::with_capacity(cmp.original_bytes.len() + jcc.original_bytes.len());
-    cond_bytes.extend_from_slice(&cmp.original_bytes);
-    cond_bytes.extend_from_slice(&jcc.original_bytes);
+    // Adjacent cmp/test: the canonical shape. Consume both
+    // instructions; the IfBranch owns their bytes.
+    let cmp_idx = insns.len() - 2;
+    let cmp = &insns[cmp_idx];
+    if matches!(cmp.iced.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
+        let cond_text = render_cond_source(&cmp.iced, &jcc.iced);
+        let mut cond_bytes =
+            Vec::with_capacity(cmp.original_bytes.len() + jcc.original_bytes.len());
+        cond_bytes.extend_from_slice(&cmp.original_bytes);
+        cond_bytes.extend_from_slice(&jcc.original_bytes);
+        return Some(LiftedIfBranchHead {
+            insns_consumed: 2,
+            cond_text,
+            cond_bytes,
+            jcc_target: target,
+        });
+    }
 
-    Some(LiftedIfBranchHead {
-        insns_consumed: 2,
-        cond_text,
-        cond_bytes,
-        jcc_target: target,
+    // Separated cmp/test: scan backward through flag-preserving
+    // instructions (mov, lea, push, pop, etc.) for the last cmp/test.
+    // If one is found, the IfBranch owns only the jcc's bytes — the
+    // cmp/test stays as @asm at its original position in the block.
+    // This lets the if-detection fire even when the compiler
+    // interleaved unrelated setup between the comparison and the
+    // branch (a common optimised-codegen shape).
+    let mut probe = insns.len() - 2;
+    loop {
+        let ins = &insns[probe];
+        if matches!(ins.iced.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
+            let cond_text = render_cond_source(&ins.iced, &jcc.iced);
+            return Some(LiftedIfBranchHead {
+                insns_consumed: 1,
+                cond_text,
+                cond_bytes: jcc.original_bytes.clone(),
+                jcc_target: target,
+            });
+        }
+        // Any instruction that writes flags poisons the comparison —
+        // its result reaches the jcc before the older cmp/test does.
+        if ins.iced.rflags_modified() != 0 {
+            return None;
+        }
+        if probe == 0 {
+            return None;
+        }
+        probe -= 1;
+    }
+}
+
+/// Rename a memory operand to its source-language slot name —
+/// handling both frame-pointer (`[ebp+N]`) and stack-pointer
+/// (`[esp+N]`, with an optional SP delta context) forms.
+///
+/// For SP-relative accesses, `sp_delta` is the signed change in ESP
+/// from function entry at the instruction that contains the
+/// operand. The stable slot offset is `sp_delta + disp + 4` — the
+/// `+4` normalises onto the same coordinate system as the EBP-based
+/// names (where `arg_8` = first arg = `entry_ESP + 4`).
+///
+/// Returns `None` for shapes the renamer doesn't recognise (indexed
+/// addressing, non-ebp/esp bases, bare operands, mismatched
+/// addressing modes); the caller falls back to the raw text. The
+/// no-context [`rename_operand_if_slot`] is a thin wrapper that
+/// passes `sp_delta = None`.
+#[must_use]
+pub fn rename_operand_with_ctx(text: &str, sp_delta: Option<i64>) -> Option<String> {
+    if let Some(name) = rename_ebp_slot(text) {
+        return Some(name);
+    }
+    if let Some(delta) = sp_delta {
+        return rename_esp_slot(text, delta);
+    }
+    None
+}
+
+/// SP-relative slot rename. The caller-supplied `sp_delta` is the
+/// SP change relative to function entry at the point of the
+/// access; `[esp+disp]` at `sp_delta = -12` lands on
+/// `entry_ESP + 8`, which is `arg_c` in the EBP-relative
+/// convention.
+fn rename_esp_slot(text: &str, sp_delta: i64) -> Option<String> {
+    let core = text.strip_prefix("dword ptr ").unwrap_or(text);
+    let core = core.strip_prefix("qword ptr ").unwrap_or(core);
+    let inner = core
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))?
+        .trim();
+    let disp: i64 = if inner == "esp" {
+        0
+    } else if let Some(rest) = inner.strip_prefix("esp+") {
+        let off = parse_unsigned_disp(rest.trim())?;
+        i64::try_from(off).ok()?
+    } else if let Some(rest) = inner.strip_prefix("esp-") {
+        let off = parse_unsigned_disp(rest.trim())?;
+        -(i64::try_from(off).ok()?)
+    } else {
+        return None;
+    };
+    let stable = sp_delta + disp + 4;
+    if stable == 0 || stable == 4 {
+        // Saved EBP slot / return address slot — internal, not a
+        // source-language variable. Keep the raw text so the reader
+        // can tell it's the ABI's spill, not user data.
+        return None;
+    }
+    if stable >= 8 {
+        let off = u64::try_from(stable).ok()?;
+        return Some(format!("arg_{off:x}"));
+    }
+    // stable < 0 — local slot (negative offsets from the conceptual
+    // EBP-frame origin).
+    let off = u64::try_from(-stable).ok()?;
+    Some(format!("var_{off:x}"))
+}
+
+/// Compute SP delta at every instruction in `insns`. The first
+/// instruction sees delta = 0 (function entry: SP points at the
+/// return address). Subsequent deltas accumulate stack effects
+/// from `push` / `pop` / `enter` / `leave` (via iced's built-in
+/// `stack_pointer_increment`) plus the arithmetic forms `sub
+/// esp/rsp, IMM` / `add esp/rsp, IMM` which iced doesn't model.
+///
+/// Each entry maps an instruction's IP to its delta. The map is
+/// keyed by IP because patterns get instructions by reference and
+/// IP is the cheap stable identifier.
+#[must_use]
+pub fn compute_sp_delta_table(insns: &[DecodedInsn]) -> std::collections::HashMap<u64, i64> {
+    use std::collections::HashMap;
+    let mut out: HashMap<u64, i64> = HashMap::with_capacity(insns.len());
+    let mut delta: i64 = 0;
+    for ins in insns {
+        out.insert(ins.iced.ip(), delta);
+        delta = delta.saturating_add(sp_change_for(&ins.iced));
+    }
+    out
+}
+
+/// Per-instruction stack-pointer change. Uses iced's intrinsic
+/// `stack_pointer_increment` for push / pop / call / ret / enter /
+/// leave; falls back to operand inspection for `sub esp, IMM` and
+/// `add esp, IMM` which iced doesn't compute.
+#[must_use]
+pub fn sp_change_for(insn: &Instruction) -> i64 {
+    let intrinsic = i64::from(insn.stack_pointer_increment());
+    if intrinsic != 0 {
+        return intrinsic;
+    }
+    match insn.mnemonic() {
+        Mnemonic::Sub | Mnemonic::Add => {
+            if insn.op0_kind() != OpKind::Register {
+                return 0;
+            }
+            let r = insn.op0_register();
+            if r != Register::ESP && r != Register::RSP {
+                return 0;
+            }
+            let imm = match insn.op1_kind() {
+                OpKind::Immediate8to32 | OpKind::Immediate8to64 | OpKind::Immediate8 => {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let v = i64::from(insn.immediate8() as i8);
+                    v
+                }
+                OpKind::Immediate32 | OpKind::Immediate32to64 => {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let v = i64::from(insn.immediate32() as i32);
+                    v
+                }
+                _ => return 0,
+            };
+            if insn.mnemonic() == Mnemonic::Sub {
+                -imm
+            } else {
+                imm
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Rename a frame-pointer memory operand to its source-language slot
+/// name. `[ebp+N]` becomes `arg_<hex>` and `[ebp-N]` becomes
+/// `var_<hex>` — the offset (always positive) is the hex part of the
+/// name, matching the Ghidra/IDA convention. Bare `[ebp]` (offset 0)
+/// renders as `var_0`. Anything else (indexed addressing, non-EBP
+/// bases, non-memory operands, …) returns `None` so the caller can
+/// fall back to the raw text.
+///
+/// The mapping is purely syntactic — there is no ABI inference yet,
+/// just "slot at `[ebp+N]`" gets a stable name. The encoder in
+/// `encode_text` recognises both forms so byte derivation continues
+/// to work when the cond/operand text uses the named slot.
+#[must_use]
+pub fn rename_ebp_slot(text: &str) -> Option<String> {
+    let core = text.strip_prefix("dword ptr ").unwrap_or(text);
+    let core = core.strip_prefix("qword ptr ").unwrap_or(core);
+    let inner = core
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))?
+        .trim();
+    if inner == "ebp" {
+        return Some("var_0".into());
+    }
+    if let Some(rest) = inner.strip_prefix("ebp+") {
+        let offset = parse_unsigned_disp(rest.trim())?;
+        return Some(format!("arg_{offset:x}"));
+    }
+    if let Some(rest) = inner.strip_prefix("ebp-") {
+        let offset = parse_unsigned_disp(rest.trim())?;
+        return Some(format!("var_{offset:x}"));
+    }
+    None
+}
+
+/// Apply [`rename_ebp_slot`] when it matches; otherwise return the
+/// input unchanged. Useful as a one-call helper for places that want
+/// to rename operands without branching on the result.
+#[must_use]
+pub fn rename_operand_if_slot(text: &str) -> String {
+    rename_ebp_slot(text).unwrap_or_else(|| text.to_string())
+}
+
+/// Apply [`rename_operand_with_ctx`] (which handles both `[ebp+N]`
+/// and `[esp+N]` with the supplied SP delta) and return the renamed
+/// text — or the original input unchanged when no rename rule
+/// matches.
+#[must_use]
+pub fn rename_operand_in_ctx(text: &str, sp_delta: Option<i64>) -> String {
+    rename_operand_with_ctx(text, sp_delta).unwrap_or_else(|| text.to_string())
+}
+
+fn parse_unsigned_disp(s: &str) -> Option<u64> {
+    // Reject anything that's not a plain integer literal — we don't
+    // want to rename `[ebp+esi*4]` or other indexed forms.
+    if s.is_empty()
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if let Some(hex) = s.strip_suffix('h').or_else(|| s.strip_suffix('H')) {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    s.parse::<u64>().ok()
+}
+
+/// Render a `cmp` / `test` + `jcc` pair as a C-style relational
+/// expression evaluated against the source-language `if`'s body.
+///
+/// The body of an `if (cond) { … }` runs on the JCC's *not-taken*
+/// path, so we invert the jcc's branch sense to get the body-side
+/// operator. Worked examples:
+///
+/// * `test esi,esi; jne …`   →  `"esi == 0"`     (jne taken when ≠0
+///   so body runs when =0)
+/// * `cmp eax,5; jl …`        →  `"eax >= 5"`     (jl is *signed*
+///   less-than; body runs on ≥)
+/// * `cmp ebx,ecx; jb …`      →  `"ebx >=u ecx"`  (`jb` is unsigned;
+///   `u` suffix marks the comparison)
+///
+/// Falls back to the literal assembly form (`"cmp X,Y; jcc T"`) when
+/// the jcc isn't one we have a clean source-level mapping for (e.g.
+/// `js`, `jp`, `jo`). The encoder in [`encode_text`] accepts the
+/// high-level form and continues to auto-derive `head_bytes`.
+#[must_use]
+pub fn render_cond_source(cmp: &Instruction, jcc: &Instruction) -> String {
+    let cmp_text = format_intel(cmp);
+    let Some((lhs_raw, rhs_raw)) = split_cmp_test_operands(&cmp_text) else {
+        return format!("{cmp_text}; {}", format_intel(jcc));
+    };
+    let is_test = cmp.mnemonic() == Mnemonic::Test;
+    let Some(op) = body_operator_from_jcc(jcc.mnemonic()) else {
+        return format!("{cmp_text}; {}", format_intel(jcc));
+    };
+    let lhs = rename_operand_if_slot(&lhs_raw);
+    let rhs = rename_operand_if_slot(&rhs_raw);
+    // `test reg, reg` AND-s the register with itself — the result is
+    // the register's value, so the jcc effectively compares the
+    // register against zero (ZF for `==/!=`, SF for signed
+    // ordering). Render that as `reg <op> 0` instead of the
+    // redundant `reg <op> reg`. The unsigned-suffix form drops
+    // because unsigned compare-with-zero is always trivially true
+    // or false; the comparison is meaningful only in the signed
+    // interpretation. (Renames don't matter here — the same-register
+    // check fires on the raw text, before renaming.)
+    if is_test && lhs_raw == rhs_raw {
+        let signed_op = op.strip_suffix('u').unwrap_or(op);
+        return format!("{lhs} {signed_op} 0");
+    }
+    format!("{lhs} {op} {rhs}")
+}
+
+fn body_operator_from_jcc(jcc: Mnemonic) -> Option<&'static str> {
+    use Mnemonic::{Ja, Jae, Jb, Jbe, Je, Jg, Jge, Jl, Jle, Jne};
+    Some(match jcc {
+        // ZF tests — same in signed and unsigned interpretations.
+        Je => "!=",
+        Jne => "==",
+        // Signed magnitude tests. The jcc takes when its name
+        // describes the relation; body runs on the inverse.
+        Jl => ">=",
+        Jle => ">",
+        Jg => "<=",
+        Jge => "<",
+        // Unsigned magnitude tests. `u`-suffixed operators tell the
+        // reader (and the encoder) the comparison is unsigned.
+        Jb => ">=u",
+        Jbe => ">u",
+        Ja => "<=u",
+        Jae => "<u",
+        _ => return None,
     })
+}
+
+/// Split the operand portion of `format_intel(cmp_or_test)` into a
+/// `(lhs, rhs)` pair. Strips the `cmp ` / `test ` prefix; splits on
+/// the first top-level comma (commas inside `[…]` don't count, even
+/// though Intel syntax doesn't actually use them inside memory
+/// operands — be defensive).
+fn split_cmp_test_operands(formatted: &str) -> Option<(String, String)> {
+    let rest = formatted
+        .strip_prefix("cmp ")
+        .or_else(|| formatted.strip_prefix("test "))?;
+    let mut depth = 0i32;
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                let (l, r) = rest.split_at(i);
+                return Some((l.trim().to_string(), r[1..].trim().to_string()));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// If `insn` is an "argument spill" — `mov [rbp+disp], REG` (or
@@ -1219,18 +1668,27 @@ mod tests {
     }
 
     #[test]
-    fn lift_epilogue_rejects_bare_ret() {
+    fn lift_epilogue_bare_ret_is_minimal_kind() {
+        // A standalone `ret` lifts as the minimal `"ret"` epilogue —
+        // no register restore to fold in, but the kind tells the
+        // reader they're at a function exit rather than mid-flow.
         let bytes = [0xc3];
         let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
-        assert!(try_lift_epilogue_pattern(&insns).is_none());
+        let lifted = try_lift_epilogue_pattern(&insns).expect("bare ret should lift");
+        assert_eq!(lifted.kind, "ret");
+        assert_eq!(lifted.insns_consumed, 1);
     }
 
     #[test]
-    fn lift_epilogue_rejects_non_teardown_predecessor() {
-        // mov rax, rbx; ret — not an epilogue
+    fn lift_epilogue_non_teardown_predecessor_lifts_only_the_ret() {
+        // `mov rax, rbx; ret` — the mov isn't part of an epilogue
+        // (it's a value materialisation that landed before the
+        // exit), so the lift consumes only the trailing ret.
         let bytes = [0x48, 0x89, 0xd8, 0xc3];
         let insns = decode(Bitness::Bits64, &bytes, 0x1000).unwrap();
-        assert!(try_lift_epilogue_pattern(&insns).is_none());
+        let lifted = try_lift_epilogue_pattern(&insns).expect("ret should lift");
+        assert_eq!(lifted.kind, "ret");
+        assert_eq!(lifted.insns_consumed, 1);
     }
 
     #[test]
@@ -1372,8 +1830,12 @@ mod tests {
         assert_eq!(lifted.insns_consumed, 2);
         assert_eq!(lifted.jcc_target, 0x1007);
         assert_eq!(lifted.cond_bytes, bytes.to_vec());
-        assert!(lifted.cond_text.contains("cmp"));
-        assert!(lifted.cond_text.contains("jne"));
+        // `cmp X,1; jne` → body runs when X == 1 → `"X == 1"`.
+        assert!(
+            lifted.cond_text.contains("=="),
+            "got cond_text: {}",
+            lifted.cond_text
+        );
     }
 
     #[test]
@@ -1384,8 +1846,8 @@ mod tests {
         let lifted = try_lift_if_branch_head(&insns).expect("should match");
         assert_eq!(lifted.insns_consumed, 2);
         assert_eq!(lifted.jcc_target, 0x1004);
-        assert!(lifted.cond_text.contains("test"));
-        assert!(lifted.cond_text.contains("je"));
+        // `test eax,eax; je` → body runs when eax != 0 → `"eax != 0"`.
+        assert_eq!(lifted.cond_text, "eax != 0");
     }
 
     #[test]

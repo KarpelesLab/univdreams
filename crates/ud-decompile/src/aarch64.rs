@@ -33,6 +33,8 @@ pub fn build_function(f: &Function<DecodedInsn>, name_at: &HashMap<u64, String>)
     FnDecl {
         addr: Some(f.addr.0),
         name: f.name.clone(),
+        attrs: Vec::new(),
+        locals: Vec::new(),
         signature: None,
         body,
     }

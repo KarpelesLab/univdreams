@@ -18,7 +18,7 @@ impl Pattern for Unary {
 
     fn tentative(
         &self,
-        _ctx: &PatternCtx,
+        ctx: &PatternCtx,
         insns: &[DecodedInsn],
         start: usize,
     ) -> Option<Candidate> {
@@ -31,10 +31,12 @@ impl Pattern for Unary {
             _ => return None,
         };
         let full = format_intel(&ins.iced);
-        let dst = full.strip_prefix(prefix)?.trim().to_string();
-        if dst.is_empty() {
+        let dst_raw = full.strip_prefix(prefix)?.trim().to_string();
+        if dst_raw.is_empty() {
             return None;
         }
+        let sp = ctx.sp_delta_at.get(&ins.iced.ip()).copied();
+        let dst = ud_arch_x86::rename_operand_in_ctx(&dst_raw, sp);
         let src = render(&dst);
         Some(Candidate {
             pattern: self.name(),

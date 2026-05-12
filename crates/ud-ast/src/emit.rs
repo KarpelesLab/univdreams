@@ -11,7 +11,10 @@
 
 use std::fmt::Write as _;
 
-use crate::types::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
+use crate::types::{
+    AttrValue, Attribute, Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile,
+    Value,
+};
 
 /// Format an entire AST as canonical `.ud` text. Trailing newline is
 /// included; the file always ends in `\n`.
@@ -94,9 +97,44 @@ fn emit_fn_indented(out: &mut String, f: &FnDecl, depth: usize) {
             emit_type(out, &sig.return_type);
         }
     }
+    if !f.attrs.is_empty() {
+        let before = out.len();
+        // Function-level attrs have no omission rules yet.
+        out.push(' ');
+        emit_attrs(out, &f.attrs, |_| false);
+        if out.len() == before + 1 {
+            // The placeholder space we pushed wasn't needed —
+            // emit_attrs filtered everything out.
+            out.pop();
+        }
+    }
     writeln!(out, " {{").unwrap();
+    if !f.locals.is_empty() {
+        emit_locals(out, &f.locals, &body_indent);
+        // Blank line between the declarations and the body so the
+        // function reads as "vars; then code" rather than running
+        // them together.
+        if !f.body.is_empty() {
+            out.push('\n');
+        }
+    }
     emit_stmts(out, &f.body, &body_indent);
     writeln!(out, "{indent}}}").unwrap();
+}
+
+/// Render the `let name: ty;` declarations at the head of a function.
+/// Register-backed locals get a trailing `@reg` so the kind is
+/// visible at a glance.
+fn emit_locals(out: &mut String, locals: &[crate::types::LocalDecl], indent: &str) {
+    use crate::types::LocalKind;
+    for l in locals {
+        write!(out, "{indent}let {}: ", l.name).unwrap();
+        emit_type(out, &l.ty);
+        match l.kind {
+            LocalKind::Stack => writeln!(out, ";").unwrap(),
+            LocalKind::Register => writeln!(out, " @reg;").unwrap(),
+        }
+    }
 }
 
 fn emit_stmts(out: &mut String, stmts: &[Stmt], indent: &str) {
@@ -124,15 +162,96 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
         }
-        Stmt::Prologue { kind, bytes } => {
-            write!(out, "{indent}@prologue({}, [", quote_string(kind)).unwrap();
+        Stmt::Prologue { kind, params, bytes } => {
+            emit_prologue(out, indent, kind, params.as_ref(), bytes);
+        }
+        Stmt::Epilogue { kind, params, bytes } => {
+            emit_epilogue(out, indent, kind, params.as_ref(), bytes);
+        }
+        Stmt::Save { reg, bytes } => {
+            write!(out, "{indent}@save({}, [", quote_string(reg)).unwrap();
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
         }
-        Stmt::Epilogue { kind, bytes } => {
-            write!(out, "{indent}@epilogue({}, [", quote_string(kind)).unwrap();
+        Stmt::Restore { reg, bytes } => {
+            write!(out, "{indent}@restore({}, [", quote_string(reg)).unwrap();
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
+        }
+        Stmt::IfReturn {
+            cond_text,
+            value_text,
+            bytes,
+        } => {
+            // C-shaped rendering: `if (cond) return value; [bytes]`.
+            // The bytes are the original cmp/test + jcc encoding;
+            // the `return value;` form is purely informational —
+            // at runtime the jcc transfers control to a shared
+            // return tail elsewhere in the function.
+            write!(out, "{indent}if ({cond_text}) return").unwrap();
+            if !value_text.is_empty() {
+                write!(out, " {value_text}").unwrap();
+            }
+            write!(out, "; [").unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "]").unwrap();
+        }
+        Stmt::Label { addr } => {
+            // No bytes — labels are pure markers. Render dedented
+            // by one level (like C-style labels) so they're easy
+            // to scan past flow-of-control lines.
+            let outdent = if indent.len() >= 4 {
+                &indent[..indent.len() - 4]
+            } else {
+                indent
+            };
+            writeln!(out, "{outdent}label_{addr:x}:").unwrap();
+        }
+        Stmt::Goto { target_addr, bytes } => {
+            write!(out, "{indent}goto label_{target_addr:x}; [").unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "]").unwrap();
+        }
+        Stmt::IfGoto {
+            cond_text,
+            target_addr,
+            bytes,
+        } => {
+            write!(
+                out,
+                "{indent}if ({cond_text}) goto label_{target_addr:x}; ["
+            )
+            .unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "]").unwrap();
+        }
+        Stmt::SehInstall { bytes } => {
+            write!(out, "{indent}@seh_install([").unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
+        Stmt::SehRestore { bytes } => {
+            write!(out, "{indent}@seh_restore([").unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "])").unwrap();
+        }
+        Stmt::Switch {
+            selector,
+            cases,
+            default_addr,
+            bytes,
+        } => {
+            // C-shape: `switch (sel) [bytes] { case N: goto …; default: goto …; }`.
+            let body_indent = format!("{indent}    ");
+            write!(out, "{indent}switch ({selector}) [").unwrap();
+            emit_byte_list(out, bytes);
+            writeln!(out, "] {{").unwrap();
+            for (i, target) in cases.iter().enumerate() {
+                writeln!(out, "{body_indent}case {i}: goto label_{target:x};").unwrap();
+            }
+            writeln!(out, "{body_indent}default: goto label_{default_addr:x};")
+                .unwrap();
+            writeln!(out, "{indent}}}").unwrap();
         }
         Stmt::ReturnExpr { text, bytes } => {
             write!(out, "{indent}@return_expr({}, [", quote_string(text)).unwrap();
@@ -163,19 +282,21 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
         Stmt::IfBranch {
             cond_text,
             cond_bytes,
+            attrs,
+            pre_body,
             then_body,
             else_body,
         } => {
-            write!(out, "{indent}if ({}) [", render_cond(cond_text)).unwrap();
-            emit_byte_list(out, cond_bytes);
-            writeln!(out, "] {{").unwrap();
-            let body_indent = format!("{indent}    ");
-            emit_stmts(out, then_body, &body_indent);
-            if let Some(else_body) = else_body {
-                writeln!(out, "{indent}}} else {{").unwrap();
-                emit_stmts(out, else_body, &body_indent);
-            }
-            writeln!(out, "{indent}}}").unwrap();
+            emit_if_branch(
+                out,
+                cond_text,
+                cond_bytes,
+                attrs,
+                pre_body,
+                then_body,
+                else_body.as_deref(),
+                indent,
+            );
         }
         Stmt::Loop {
             cond_text,
@@ -234,15 +355,13 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             writeln!(out, "])").unwrap();
         }
         Stmt::Move { dst, src, bytes } => {
-            write!(
-                out,
-                "{indent}@move({}, {}, [",
-                quote_string(dst),
-                quote_string(src),
-            )
-            .unwrap();
+            write!(out, "{indent}").unwrap();
+            emit_move_side(out, dst);
+            out.push_str(" = ");
+            emit_move_side(out, src);
+            out.push_str(" [");
             emit_byte_list(out, bytes);
-            writeln!(out, "])").unwrap();
+            writeln!(out, "]").unwrap();
         }
         Stmt::Inc16 { lo, hi, bytes } => {
             write!(
@@ -256,6 +375,58 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             writeln!(out, "])").unwrap();
         }
     }
+}
+
+/// Render an `if`/`while` condition text. Conds are typically the
+/// raw 6502 assembly form (`CMP X; BEQ tgt`). If the text is safe
+/// Emit one side of an assignment statement: the destination or
+/// source text of a [`Stmt::Move`]. Falls back to a quoted string
+/// when the text would otherwise lex weirdly (control chars,
+/// embedded `"`, unbalanced parens, etc.); the parser accepts both
+/// forms.
+fn emit_move_side(out: &mut String, s: &str) {
+    if move_side_is_unquoted_safe(s) {
+        out.push_str(s);
+    } else {
+        out.push_str(&quote_string(s));
+    }
+}
+
+fn move_side_is_unquoted_safe(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for c in s.chars() {
+        if c.is_control() {
+            return false;
+        }
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '\\' => return false,
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    !in_string && depth == 0
 }
 
 /// Render an `if`/`while` condition text. Conds are typically the
@@ -311,24 +482,65 @@ fn arg_is_unquoted_safe(s: &str) -> bool {
         return false;
     }
     let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    // Track whether we ever saw a non-string token. The parser
+    // treats single-quoted-string-token args specially (strips
+    // outer quotes on parse), so if the whole arg is a bare
+    // `"foo"` it would round-trip asymmetrically. Reject that
+    // shape here to force auto-quoting; multi-token shapes
+    // (`&"foo"`, `[expr+"foo"]`, …) survive verbatim.
+    let mut saw_non_string = false;
     for c in s.chars() {
+        // Inside a quoted string, allow any printable char
+        // (including spaces) so `&"Hello World"` survives bare.
+        // Outside, demand graphic-ASCII so a bare space can't
+        // break token splitting on parse.
+        if in_string {
+            if c.is_control() {
+                return false;
+            }
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         if !c.is_ascii_graphic() {
             return false;
         }
         match c {
-            '"' | '\\' => return false,
-            '(' | '[' => depth += 1,
+            '"' => in_string = true,
+            '\\' => return false,
+            '(' | '[' => {
+                depth += 1;
+                saw_non_string = true;
+            }
             ')' | ']' => {
                 if depth == 0 {
                     return false;
                 }
                 depth -= 1;
+                saw_non_string = true;
             }
             ',' if depth == 0 => return false,
-            _ => {}
+            _ => {
+                saw_non_string = true;
+            }
         }
     }
-    depth == 0
+    if in_string || depth != 0 {
+        return false;
+    }
+    // Bare single-string arg → reject (parser would strip our
+    // outer quotes asymmetrically).
+    if !saw_non_string {
+        return false;
+    }
+    true
 }
 
 fn emit_signed_hex(out: &mut String, n: i64) {
@@ -346,6 +558,132 @@ fn emit_byte_list(out: &mut String, bytes: &[u8]) {
         }
         write!(out, "0x{b:02x}").unwrap();
     }
+}
+
+/// Emit `#[k1=v1, k2=v2, …]` inline. Caller positions the cursor; the
+/// trailing space (if anything follows) is the caller's job. Emits
+/// nothing when the filtered list is empty so call sites can
+/// sprinkle this in unconditionally.
+pub(crate) fn emit_attrs<F>(out: &mut String, attrs: &[Attribute], mut omit: F)
+where
+    F: FnMut(&Attribute) -> bool,
+{
+    let kept: Vec<&Attribute> = attrs.iter().filter(|a| !omit(a)).collect();
+    if kept.is_empty() {
+        return;
+    }
+    out.push_str("#[");
+    for (i, a) in kept.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&a.key);
+        // Flag attrs render bare (`#[naked]`); everything else gets
+        // an `=value` part.
+        if !matches!(a.value, AttrValue::Flag) {
+            out.push('=');
+            emit_attr_value(out, &a.value);
+        }
+    }
+    out.push(']');
+}
+
+/// Should the given attribute be omitted on emit because the
+/// surrounding context derives the same value? Today that's just
+/// the `head_bytes` attribute on an `if`: when the cond text's
+/// cmp/test portion encodes back to the same bytes (canonical Intel
+/// form), the attribute is redundant — the parser will derive
+/// identical bytes when it reads the file back.
+fn head_bytes_is_derivable(attr: &Attribute, cond_text: &str) -> bool {
+    if attr.key != "head_bytes" {
+        return false;
+    }
+    let AttrValue::ByteList(bytes) = &attr.value else {
+        return false;
+    };
+    ud_arch_x86::encode_head_from_cond_text(cond_text).is_some_and(|derived| &derived == bytes)
+}
+
+fn emit_attr_value(out: &mut String, value: &AttrValue) {
+    match value {
+        AttrValue::String(s) => out.push_str(&quote_string(s)),
+        AttrValue::Int(n) => write!(out, "0x{n:x}").unwrap(),
+        AttrValue::ByteList(bytes) => {
+            out.push('[');
+            emit_byte_list(out, bytes);
+            out.push(']');
+        }
+        // Caller-side already short-circuited to drop the `=value`
+        // for Flag attrs; if we reach here something's off — emit
+        // an empty value to keep the source valid.
+        AttrValue::Flag => {}
+    }
+}
+
+/// Emit an `if` statement.
+///
+/// Two source shapes:
+///
+/// * **Simple** — `attrs.is_empty() && pre_body.is_empty()`. Renders
+///   as `if (cond) [bytes] { then } [else { else }]` (the historical
+///   form, unchanged so the bulk of fixtures stay terse).
+/// * **Attributed** — anything else. Renders with the attribute
+///   sandwich and an explicit `@then`/`@else` arm structure so
+///   `pre_body` stmts and the cond head/tail bytes are placed in
+///   readable positions.
+#[allow(clippy::too_many_arguments)]
+fn emit_if_branch(
+    out: &mut String,
+    cond_text: &str,
+    cond_bytes: &[u8],
+    attrs: &[Attribute],
+    pre_body: &[Stmt],
+    then_body: &[Stmt],
+    else_body: Option<&[Stmt]>,
+    indent: &str,
+) {
+    let body_indent = format!("{indent}    ");
+    // Decide which attrs survive emission. `head_bytes` drops out
+    // when the cond text's cmp/test portion re-encodes to the same
+    // bytes — the parser will re-derive identical bytes from the
+    // text alone.
+    let attrs_visible_count = attrs
+        .iter()
+        .filter(|a| !head_bytes_is_derivable(a, cond_text))
+        .count();
+
+    if attrs_visible_count == 0 && pre_body.is_empty() {
+        write!(out, "{indent}if ({}) [", render_cond(cond_text)).unwrap();
+        emit_byte_list(out, cond_bytes);
+        writeln!(out, "] {{").unwrap();
+        emit_stmts(out, then_body, &body_indent);
+        if let Some(else_body) = else_body {
+            writeln!(out, "{indent}}} else {{").unwrap();
+            emit_stmts(out, else_body, &body_indent);
+        }
+        writeln!(out, "{indent}}}").unwrap();
+        return;
+    }
+    write!(out, "{indent}if ({}) ", render_cond(cond_text)).unwrap();
+    let before_attrs_len = out.len();
+    emit_attrs(out, attrs, |a| head_bytes_is_derivable(a, cond_text));
+    if out.len() > before_attrs_len {
+        out.push(' ');
+    }
+    out.push('[');
+    emit_byte_list(out, cond_bytes);
+    writeln!(out, "] {{").unwrap();
+    emit_stmts(out, pre_body, &body_indent);
+    writeln!(out, "{body_indent}@then {{").unwrap();
+    let arm_indent = format!("{body_indent}    ");
+    emit_stmts(out, then_body, &arm_indent);
+    writeln!(out, "{body_indent}}}").unwrap();
+    if let Some(else_body) = else_body {
+        writeln!(out, "{body_indent}@else {{").unwrap();
+        emit_stmts(out, else_body, &arm_indent);
+        writeln!(out, "{body_indent}}}").unwrap();
+    }
+    writeln!(out, "{indent}}}").unwrap();
 }
 
 fn emit_field(out: &mut String, f: &Field, depth: usize) {
@@ -429,6 +767,103 @@ fn _signature_used(_: &Signature) {}
 
 /// Quote a string for `.ud` output: surround in `"…"`, escape backslash
 /// and double-quote.
+/// Render a `Stmt::Prologue`. When `params` is present, emit
+/// the structured form (`saves: [...], frame, sub: 0xN, cf`)
+/// and drop the byte list — the parser regenerates identical
+/// bytes via the arch's codec. When `params` is absent, fall
+/// back to the legacy `("kind", [bytes])` form.
+fn emit_prologue(
+    out: &mut String,
+    indent: &str,
+    kind: &str,
+    params: Option<&crate::types::PrologueParams>,
+    bytes: &[u8],
+) {
+    if let Some(p) = params {
+        write!(out, "{indent}@prologue({}", quote_string(kind)).unwrap();
+        emit_prologue_params(out, p);
+        writeln!(out, ")").unwrap();
+        return;
+    }
+    write!(out, "{indent}@prologue({}, [", quote_string(kind)).unwrap();
+    emit_byte_list(out, bytes);
+    writeln!(out, "])").unwrap();
+}
+
+fn emit_epilogue(
+    out: &mut String,
+    indent: &str,
+    kind: &str,
+    params: Option<&crate::types::EpilogueParams>,
+    bytes: &[u8],
+) {
+    if let Some(e) = params {
+        write!(out, "{indent}@epilogue({}", quote_string(kind)).unwrap();
+        emit_epilogue_params(out, e);
+        writeln!(out, ")").unwrap();
+        return;
+    }
+    write!(out, "{indent}@epilogue({}, [", quote_string(kind)).unwrap();
+    emit_byte_list(out, bytes);
+    writeln!(out, "])").unwrap();
+}
+
+fn emit_prologue_params(out: &mut String, p: &crate::types::PrologueParams) {
+    if !p.saves.is_empty() {
+        out.push_str(", saves: [");
+        for (i, r) in p.saves.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(r);
+        }
+        out.push(']');
+    }
+    if p.frame {
+        out.push_str(", frame");
+    }
+    if p.sub_esp > 0 {
+        write!(out, ", sub: 0x{:x}", p.sub_esp).unwrap();
+    }
+    if !p.saves_after.is_empty() {
+        out.push_str(", saves_after: [");
+        for (i, r) in p.saves_after.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(r);
+        }
+        out.push(']');
+    }
+    if p.cf_protect {
+        out.push_str(", cf");
+    }
+}
+
+fn emit_epilogue_params(out: &mut String, e: &crate::types::EpilogueParams) {
+    if !e.saves.is_empty() {
+        out.push_str(", saves: [");
+        for (i, r) in e.saves.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(r);
+        }
+        out.push(']');
+    }
+    if e.add_esp > 0 {
+        write!(out, ", add: 0x{:x}", e.add_esp).unwrap();
+    }
+    if e.leave {
+        out.push_str(", leave");
+    } else if e.pop_frame {
+        out.push_str(", pop_frame");
+    }
+    if e.ret_imm > 0 {
+        write!(out, ", ret_imm: 0x{:x}", e.ret_imm).unwrap();
+    }
+}
+
 fn quote_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -525,6 +960,8 @@ mod tests {
             items: vec![Item::Function(FnDecl {
                 addr: Some(0x1080),
                 name: "_start".into(),
+                attrs: Vec::new(),
+                locals: Vec::new(),
                 signature: None,
                 body: vec![
                     Stmt::asm_text("endbr64"),
@@ -547,6 +984,8 @@ mod tests {
             items: vec![Item::Function(FnDecl {
                 addr: Some(0x1080),
                 name: "f".into(),
+                attrs: Vec::new(),
+                locals: Vec::new(),
                 signature: None,
                 body: vec![
                     Stmt::asm("endbr64", vec![0xf3, 0x0f, 0x1e, 0xfa]),
@@ -583,6 +1022,8 @@ mod tests {
                     Item::Function(FnDecl {
                         addr: Some(0x1000),
                         name: "f".into(),
+                        attrs: Vec::new(),
+                        locals: Vec::new(),
                         signature: None,
                         body: vec![Stmt::asm("ret", vec![0xc3])],
                     }),
@@ -608,10 +1049,14 @@ mod tests {
             items: vec![Item::Function(FnDecl {
                 addr: Some(0x1000),
                 name: "f".into(),
+                attrs: Vec::new(),
+                locals: Vec::new(),
                 signature: None,
                 body: vec![Stmt::IfBranch {
                     cond_text: "cmp [rbp-4],1; jne".into(),
                     cond_bytes: vec![0x83, 0x7d, 0xfc, 0x01, 0x75, 0x07],
+                    attrs: Vec::new(),
+                    pre_body: Vec::new(),
                     then_body: vec![Stmt::asm("ret", vec![0xc3])],
                     else_body: Some(vec![Stmt::asm("nop", vec![0x90])]),
                 }],
@@ -634,10 +1079,14 @@ mod tests {
             items: vec![Item::Function(FnDecl {
                 addr: Some(0x1000),
                 name: "f".into(),
+                attrs: Vec::new(),
+                locals: Vec::new(),
                 signature: None,
                 body: vec![Stmt::IfBranch {
                     cond_text: "test rax,rax; je".into(),
                     cond_bytes: vec![0x48, 0x85, 0xc0, 0x74, 0x02],
+                    attrs: Vec::new(),
+                    pre_body: Vec::new(),
                     then_body: vec![Stmt::asm("call rax", vec![0xff, 0xd0])],
                     else_body: None,
                 }],
