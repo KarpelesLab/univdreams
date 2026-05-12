@@ -4,6 +4,8 @@ A universal compiler **and** decompiler suite. The premise:
 
 > Given a compiled binary `B`, produce source `S` such that compiling `S` reproduces `B` **byte for byte**.
 
+**Try it in your browser:** <https://karpeleslab.github.io/univdreams/>
+
 Most decompilers paraphrase. They lose the choices a compiler made — register allocation, instruction encoding, instruction order, padding, jump-table layout — and a recompile of their output is structurally similar but not identical to the input. univdreams treats those choices as first-class information in the source language: they live in attributes/directives that pin the compiler back to the same shape on the way out.
 
 ## Status

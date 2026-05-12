@@ -16,6 +16,7 @@ members = [
     "crates/ud-decompile",
     "crates/ud-compile",
     "crates/ud-cli",
+    "crates/ud-wasm",
 ]
 
 # Additional member crates land in later phases:

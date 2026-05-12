@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>univdreams — decompile and recompile, byte for byte</title>
+<meta name="description" content="A universal compiler and decompiler suite. Given a binary B, produces source S whose recompile is byte-identical to B.">
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<header>
+<h1><a href="./">univdreams</a></h1>
+<nav>
+<a href="./playground/">Playground</a>
+<a href="https://github.com/KarpelesLab/univdreams">GitHub</a>
+</nav>
+</header>
+
+<main>
+<section class="hero">
+<p class="tagline">A universal compiler <em>and</em> decompiler suite.</p>
+<blockquote>Given a compiled binary <code>B</code>, produce source <code>S</code> such that compiling <code>S</code> reproduces <code>B</code> <strong>byte for byte</strong>.</blockquote>
+<p><a class="cta" href="./playground/">Try it in your browser →</a></p>
+</section>
+
+<section>
+<h2>The headline property</h2>
+<pre><code>lower_to_elf(parse(decompile_to_text(elf)))  ==  elf-bytes</code></pre>
+<p>Most decompilers paraphrase. They lose the choices a compiler made &mdash; register allocation, instruction encoding, instruction order, padding, jump-table layout &mdash; and a recompile of their output is structurally similar but not identical. univdreams treats those choices as first-class information in the source language: they live in attributes and directives that pin the compiler back to the same shape on the way out.</p>
+</section>
+
+<section>
+<h2>What works today</h2>
+<ul>
+<li>ELF64 and PE reader/writer with byte-identical round-trip.</li>
+<li>x86 (16/32/64) decode + dual-path emit (preserved bytes for round-trip; iced re-encode for analysis).</li>
+<li>Function discovery across <code>.symtab</code>, <code>.dynsym</code>, <code>.eh_frame</code>, signatures, and a size-filling pass.</li>
+<li>Structural lifting: if/else, switch, loops, goto + labels, calling-convention detection, prologue/epilogue codec.</li>
+<li>DWARF reader for typed function signatures.</li>
+<li>Compiler-profile defaults (MSVC <code>/Oy-</code>, <code>/Oy</code>) auto-derive prologue/epilogue bytes from <code>#[autogen]</code> / <code>#[noframe]</code> markers.</li>
+</ul>
+</section>
+
+<section>
+<h2>What it looks like</h2>
+<p>A decompiled function in <code>.ud</code> form &mdash; structured statements alongside pinned bytes that guarantee the recompile is identical:</p>
+<pre><code>@addr(0x2456)
+fn sub_2856() #[abi="stdcall", autogen] {
+    let arg_8: u32;
+    let edi: u32 @reg;
+    let esi: u32 @reg;
+    let ebx: u32 @reg;
+
+    IsBadWritePtr(arg_8, 24h, edi, esi) [0x8b, 0x5d, 0x08, 0x56, 0x57, ...]
+    if (eax != 0) return 0; [0x85, 0xc0, 0x75, 0x31]
+    IsBadReadPtr(arg_8, 24h) [0x6a, 0x24, 0x53, 0xff, 0x15, ...]
+    if (eax != 0) return 0; [0x85, 0xc0, 0x75, 0x24]
+    @epilogue("saves-imm", saves: [edi, esi, ebx], pop_frame, ret_imm: 0x4)
+}</code></pre>
+</section>
+
+<section>
+<h2>Try it</h2>
+<p>The <a href="./playground/">browser playground</a> runs the full pipeline in WebAssembly. Upload an ELF, PE, or 6502 raw image &mdash; it decompiles to <code>.ud</code>. Edit the source &mdash; it recompiles to bytes you can download. Same code path as the <code>ud</code> CLI; same round-trip guarantee.</p>
+</section>
+</main>
+
+<footer>
+<p>univdreams is open source. <a href="https://github.com/KarpelesLab/univdreams">Source on GitHub</a>.</p>
+</footer>
+</body>
+</html>

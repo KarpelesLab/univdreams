@@ -1,0 +1,2 @@
+# wasm-bindgen output lands here.
+# CI populates this directory before publishing the site.

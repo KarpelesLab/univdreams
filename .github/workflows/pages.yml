@@ -1,0 +1,68 @@
+name: Pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pin wasm-bindgen-cli to the same version the workspace resolves
+  # so the JS glue matches the runtime exactly. Bump in lockstep
+  # when ud-wasm's Cargo.lock entry changes.
+  WASM_BINDGEN_VERSION: "0.2.121"
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pages-wasm
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install --locked wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}"
+
+      - name: Build ud-wasm
+        run: cargo build --release --target wasm32-unknown-unknown -p ud-wasm
+
+      - name: Generate JS bindings
+        run: |
+          wasm-bindgen \
+            --target web \
+            --no-typescript \
+            --out-dir site/wasm \
+            target/wasm32-unknown-unknown/release/ud_wasm.wasm
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
