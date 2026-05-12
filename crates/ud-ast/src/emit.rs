@@ -46,6 +46,8 @@ fn emit_item_indented(out: &mut String, item: &Item, depth: usize) {
         Item::Comment(text) => writeln!(out, "{indent}// {text}").unwrap(),
         Item::Function(f) => emit_fn_indented(out, f, depth),
         Item::Raw { addr, bytes } => emit_raw(out, *addr, bytes, depth),
+        Item::Strings { addr, strings } => emit_strings(out, *addr, strings, depth),
+        Item::Notes { addr, entries } => emit_notes(out, *addr, entries, depth),
         Item::Section { name, addr, items } => emit_section(out, name, *addr, items, depth),
     }
 }
@@ -60,6 +62,42 @@ fn emit_raw(out: &mut String, addr: u64, bytes: &[u8], depth: usize) {
         write!(out, "0x{b:02x}").unwrap();
     }
     writeln!(out, "])").unwrap();
+}
+
+fn emit_strings(out: &mut String, addr: u64, strings: &[String], depth: usize) {
+    let indent = " ".repeat(depth * 4);
+    let inner = " ".repeat((depth + 1) * 4);
+    writeln!(out, "{indent}@strings(0x{addr:x}, [").unwrap();
+    for s in strings {
+        write!(out, "{inner}").unwrap();
+        out.push_str(&quote_string(s));
+        out.push_str(",\n");
+    }
+    writeln!(out, "{indent}])").unwrap();
+}
+
+fn emit_notes(out: &mut String, addr: u64, entries: &[crate::NoteEntry], depth: usize) {
+    let indent = " ".repeat(depth * 4);
+    let inner = " ".repeat((depth + 1) * 4);
+    let kv = " ".repeat((depth + 2) * 4);
+    writeln!(out, "{indent}@notes(0x{addr:x}, [").unwrap();
+    for e in entries {
+        writeln!(out, "{inner}{{").unwrap();
+        writeln!(out, "{kv}type: 0x{:x},", e.note_type).unwrap();
+        write!(out, "{kv}name: ").unwrap();
+        out.push_str(&quote_string(&e.name));
+        out.push_str(",\n");
+        write!(out, "{kv}desc: [").unwrap();
+        for (i, b) in e.desc.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            write!(out, "0x{b:02x}").unwrap();
+        }
+        out.push_str("],\n");
+        writeln!(out, "{inner}}},").unwrap();
+    }
+    writeln!(out, "{indent}])").unwrap();
 }
 
 fn emit_section(out: &mut String, name: &str, addr: u64, items: &[Item], depth: usize) {

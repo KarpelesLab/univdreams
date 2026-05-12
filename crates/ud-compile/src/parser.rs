@@ -267,6 +267,59 @@ impl Parser {
         Ok(out)
     }
 
+    /// Parse one `{ type: …, name: "…", desc: [bytes] }` entry inside
+    /// a `@notes(…)` directive. Trailing comma after `desc:` allowed.
+    fn parse_note_entry(&mut self) -> Result<ud_ast::NoteEntry, ParseError> {
+        self.expect(&TokenKind::LBrace, "`{` to open note entry")?;
+        let mut note_type: Option<u32> = None;
+        let mut name: Option<String> = None;
+        let mut desc: Option<Vec<u8>> = None;
+        loop {
+            if self.peek().kind == TokenKind::RBrace {
+                break;
+            }
+            let key_tok = self.peek().clone();
+            let key = self.expect_ident("note field name")?;
+            self.expect(&TokenKind::Colon, "`:` after note field name")?;
+            match key.as_str() {
+                "type" => {
+                    let n = self.expect_int("note type")?;
+                    note_type = Some(u32::try_from(n).map_err(|_| ParseError::Expected {
+                        expected: "u32 note type".into(),
+                        got: format!("integer 0x{n:x}"),
+                        line: key_tok.line,
+                        col: key_tok.col,
+                    })?);
+                }
+                "name" => name = Some(self.expect_string("note name")?),
+                "desc" => desc = Some(self.parse_byte_list()?),
+                other => {
+                    return Err(ParseError::Expected {
+                        expected: "`type`, `name`, or `desc`".into(),
+                        got: format!("`{other}`"),
+                        line: key_tok.line,
+                        col: key_tok.col,
+                    });
+                }
+            }
+            if !self.eat_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}` to close note entry")?;
+        let entry_tok = self.peek().clone();
+        Ok(ud_ast::NoteEntry {
+            note_type: note_type.ok_or_else(|| ParseError::Expected {
+                expected: "`type:` field in note entry".into(),
+                got: "no `type` key".into(),
+                line: entry_tok.line,
+                col: entry_tok.col,
+            })?,
+            name: name.unwrap_or_default(),
+            desc: desc.unwrap_or_default(),
+        })
+    }
+
     /// Parse `#[key=value, key=value, …]`. Returns the empty vec when
     /// the next token isn't `#`. Trailing comma allowed.
     fn parse_attrs(&mut self) -> Result<Vec<ud_ast::Attribute>, ParseError> {
@@ -411,6 +464,39 @@ impl Parser {
                 let bytes = self.parse_byte_list()?;
                 self.expect(&TokenKind::RParen, "`)` to close `@raw`")?;
                 Ok(Item::Raw { addr, bytes })
+            }
+            "strings" => {
+                self.expect(&TokenKind::LParen, "`(` after `@strings`")?;
+                let addr = self.expect_int("an integer address")?;
+                self.expect(&TokenKind::Comma, "`,` after `@strings` address")?;
+                self.expect(&TokenKind::LBracket, "`[` to open string list")?;
+                let mut strings = Vec::new();
+                while !matches!(self.peek().kind, TokenKind::RBracket | TokenKind::Eof) {
+                    let s = self.expect_string("a string literal")?;
+                    strings.push(s);
+                    if !self.eat_kind(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBracket, "`]` to close string list")?;
+                self.expect(&TokenKind::RParen, "`)` to close `@strings`")?;
+                Ok(Item::Strings { addr, strings })
+            }
+            "notes" => {
+                self.expect(&TokenKind::LParen, "`(` after `@notes`")?;
+                let addr = self.expect_int("an integer address")?;
+                self.expect(&TokenKind::Comma, "`,` after `@notes` address")?;
+                self.expect(&TokenKind::LBracket, "`[` to open note list")?;
+                let mut entries: Vec<ud_ast::NoteEntry> = Vec::new();
+                while !matches!(self.peek().kind, TokenKind::RBracket | TokenKind::Eof) {
+                    entries.push(self.parse_note_entry()?);
+                    if !self.eat_kind(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBracket, "`]` to close note list")?;
+                self.expect(&TokenKind::RParen, "`)` to close `@notes`")?;
+                Ok(Item::Notes { addr, entries })
             }
             "section" => {
                 self.expect(&TokenKind::LParen, "`(` after `@section`")?;

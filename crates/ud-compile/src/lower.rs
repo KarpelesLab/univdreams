@@ -315,10 +315,51 @@ fn walk_functions(items: &[Item], out: &mut Vec<LoweredFunction>) -> Result<(), 
                 });
             }
             Item::Section { items: nested, .. } => walk_functions(nested, out)?,
-            Item::Comment(_) | Item::Raw { .. } => {}
+            Item::Comment(_) | Item::Raw { .. } | Item::Strings { .. } | Item::Notes { .. } => {}
         }
     }
     Ok(())
+}
+
+/// Pack a string list into the byte layout of an ELF `SHT_STRTAB`
+/// section: each entry's UTF-8 bytes followed by a single 0x00
+/// terminator. The first entry is conventionally empty, which lowers
+/// to a single zero byte.
+fn lower_strings_bytes(strings: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for s in strings {
+        out.extend_from_slice(s.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+/// Pack a note-entry list into the byte layout of an ELF `SHT_NOTE`
+/// section: per entry an `Elf64_Nhdr` (3× little-endian `u32`:
+/// `name_size`, `desc_size`, `type`) followed by the name (with a
+/// trailing NUL, padded to a 4-byte boundary) and the descriptor
+/// (padded to a 4-byte boundary).
+fn lower_notes_bytes(entries: &[ud_ast::NoteEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for e in entries {
+        let name_bytes = e.name.as_bytes();
+        // Note: name_size in the header counts the trailing NUL.
+        let name_size = u32::try_from(name_bytes.len() + 1).unwrap_or(0);
+        let desc_size = u32::try_from(e.desc.len()).unwrap_or(0);
+        out.extend_from_slice(&name_size.to_le_bytes());
+        out.extend_from_slice(&desc_size.to_le_bytes());
+        out.extend_from_slice(&e.note_type.to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.push(0);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(&e.desc);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+    out
 }
 
 /// One section lowered to its on-disk bytes.
@@ -350,6 +391,8 @@ pub fn lower_section_bytes(
         let (item_addr, item_bytes) = match item {
             Item::Comment(_) => continue,
             Item::Raw { addr, bytes } => (*addr, bytes.clone()),
+            Item::Strings { addr, strings } => (*addr, lower_strings_bytes(strings)),
+            Item::Notes { addr, entries } => (*addr, lower_notes_bytes(entries)),
             Item::Function(f) => {
                 let addr = f.addr.ok_or_else(|| LowerError::FunctionWithoutAddr {
                     fn_name: f.name.clone(),

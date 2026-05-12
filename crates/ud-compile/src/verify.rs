@@ -75,7 +75,7 @@ fn walk(items: &[Item], section: Option<&str>, out: &mut Vec<AsmWarning>) {
         match item {
             Item::Function(f) => verify_fn_body(f, section, out),
             Item::Section { name, items, .. } => walk(items, Some(name.as_str()), out),
-            Item::Comment(_) | Item::Raw { .. } => {}
+            Item::Comment(_) | Item::Raw { .. } | Item::Strings { .. } | Item::Notes { .. } => {}
         }
     }
 }

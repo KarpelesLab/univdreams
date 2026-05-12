@@ -94,6 +94,22 @@ pub enum Item {
     /// sections (`.rodata`, `.data`, etc.).
     Raw { addr: u64, bytes: Vec<u8> },
 
+    /// `@strings(0x…, ["a", "b", …])` — a packed null-terminated
+    /// string table. Lowers to each entry's UTF-8 bytes followed by
+    /// a single 0x00 terminator, in order. Used for ELF `SHT_STRTAB`
+    /// sections (`.dynstr`, `.strtab`, `.shstrtab`) and for any
+    /// well-known single-string sections like `.interp` (which is
+    /// emitted as a one-entry list).
+    Strings { addr: u64, strings: Vec<String> },
+
+    /// `@notes(0x…, [{ type: …, name: "…", desc: [bytes] }, …])` — an
+    /// ELF note section. Each entry has a 12-byte `Elf64_Nhdr`
+    /// header (name_size, desc_size, type), a name padded to a 4-byte
+    /// boundary, and a desc padded to a 4-byte boundary. Used for
+    /// `SHT_NOTE` sections (`.note.gnu.property`, `.note.ABI-tag`,
+    /// `.note.gnu.build-id`, …).
+    Notes { addr: u64, entries: Vec<NoteEntry> },
+
     /// `@section("name", 0x…) { items… }` — group items under an ELF
     /// section. The section's start address must equal the first
     /// nested item's address; items are required to cover the section
@@ -103,6 +119,21 @@ pub enum Item {
         addr: u64,
         items: Vec<Item>,
     },
+}
+
+/// One entry inside an [`Item::Notes`] block. Mirrors the structure
+/// of an ELF note (`Elf64_Nhdr` + name + desc, each padded to a
+/// 4-byte boundary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteEntry {
+    /// Note type (`NT_GNU_PROPERTY_TYPE_0`, `NT_GNU_BUILD_ID`, …).
+    pub note_type: u32,
+    /// Owner string (`"GNU"` for GNU notes, etc.). Encoded with a
+    /// trailing NUL byte then padded to a 4-byte boundary.
+    pub name: String,
+    /// Descriptor bytes — opaque payload, padded to a 4-byte
+    /// boundary on emit.
+    pub desc: Vec<u8>,
 }
 
 /// A function declaration.

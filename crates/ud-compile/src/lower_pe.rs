@@ -107,7 +107,8 @@ pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
                 let last = owned_function_bytes.last().unwrap();
                 raws.push((addr, last.clone()));
             }
-            Item::Comment(_) | Item::Section { .. } => {}
+            Item::Comment(_) | Item::Section { .. } | Item::Strings { .. } | Item::Notes { .. } => {
+            }
         }
     }
     raws.sort_by_key(|(addr, _)| *addr);

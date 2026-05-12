@@ -171,6 +171,84 @@ fn function_lives_in_a_section(elf: &Elf64File, addr: u64, size: u64) -> bool {
     false
 }
 
+/// Decode an ELF `SHT_STRTAB` section as a list of null-terminated
+/// strings. Returns `None` when any string contains non-UTF-8 bytes
+/// or the section doesn't end on a terminator — in that case the
+/// caller falls back to the opaque `@raw` form.
+fn decode_strtab(data: &[u8]) -> Option<Vec<String>> {
+    if data.is_empty() {
+        return Some(Vec::new());
+    }
+    if *data.last().unwrap() != 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for chunk in data.split(|&b| b == 0) {
+        if chunk.is_empty() {
+            out.push(String::new());
+        } else {
+            out.push(std::str::from_utf8(chunk).ok()?.to_string());
+        }
+    }
+    // `split` on a trailing 0 produces a final empty chunk that
+    // isn't a real entry — drop it so the encode round-trips.
+    if out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    Some(out)
+}
+
+/// Decode an ELF `SHT_NOTE` section into a flat list of notes.
+/// Returns `None` on any structural mismatch (truncated header,
+/// non-UTF-8 name, padding that doesn't round-trip cleanly).
+fn decode_notes(data: &[u8]) -> Option<Vec<ud_ast::NoteEntry>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if i + 12 > data.len() {
+            return None;
+        }
+        let name_size = u32::from_le_bytes(data[i..i + 4].try_into().ok()?) as usize;
+        let desc_size = u32::from_le_bytes(data[i + 4..i + 8].try_into().ok()?) as usize;
+        let note_type = u32::from_le_bytes(data[i + 8..i + 12].try_into().ok()?);
+        i += 12;
+        if name_size == 0 || i + name_size > data.len() {
+            return None;
+        }
+        // name_size includes the trailing NUL.
+        let name_bytes = &data[i..i + name_size - 1];
+        if data[i + name_size - 1] != 0 {
+            return None;
+        }
+        let name = std::str::from_utf8(name_bytes).ok()?.to_string();
+        i += name_size;
+        // Pad to 4-byte boundary.
+        while i % 4 != 0 {
+            if i >= data.len() || data[i] != 0 {
+                return None;
+            }
+            i += 1;
+        }
+        if i + desc_size > data.len() {
+            return None;
+        }
+        let desc = data[i..i + desc_size].to_vec();
+        i += desc_size;
+        while i % 4 != 0 {
+            if i >= data.len() || data[i] != 0 {
+                return None;
+            }
+            i += 1;
+        }
+        out.push(ud_ast::NoteEntry {
+            note_type,
+            name,
+            desc,
+        });
+    }
+    Some(out)
+}
+
 /// Build the items inside one `@section` block: any functions whose
 /// address range falls inside the section, plus `@raw` blocks for
 /// every byte not covered by a function.
@@ -183,6 +261,41 @@ fn build_section_items(
     name_at: &HashMap<u64, String>,
     arch: Arch,
 ) -> Result<Vec<Item>> {
+    // Structured-form sections short-circuit before the
+    // function-coverage walk: ELF string tables and note sections
+    // have a well-defined byte layout we can faithfully decode and
+    // re-emit. When the structured decode covers the whole section
+    // cleanly, prefer it over `@raw`. Round-trip safety comes from
+    // the lower-side encoder producing the same bytes.
+    const SHT_STRTAB: u32 = 3;
+    const SHT_NOTE: u32 = 7;
+    let section_name = elf
+        .shdrs
+        .iter()
+        .position(|sh2| std::ptr::eq(sh2, sh))
+        .and_then(|idx| elf.section_name(idx))
+        .unwrap_or("");
+    // `.interp` is `SHT_PROGBITS` by sh_type but always contains a
+    // single null-terminated path to the dynamic linker. Decoding it
+    // as a one-entry `@strings` matches the lower-side encoder.
+    let is_interp = section_name == ".interp";
+    if sh.sh_type == SHT_STRTAB || is_interp {
+        if let Some(strings) = decode_strtab(data) {
+            return Ok(vec![Item::Strings {
+                addr: sh.sh_addr,
+                strings,
+            }]);
+        }
+    }
+    if sh.sh_type == SHT_NOTE {
+        if let Some(entries) = decode_notes(data) {
+            return Ok(vec![Item::Notes {
+                addr: sh.sh_addr,
+                entries,
+            }]);
+        }
+    }
+
     let section_start = sh.sh_addr;
     let section_end = sh.sh_addr.saturating_add(sh.sh_size);
 
