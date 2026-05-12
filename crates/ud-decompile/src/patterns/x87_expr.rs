@@ -94,15 +94,27 @@ enum X87Kind {
 fn classify(m: Mnemonic) -> Option<X87Shape> {
     Some(match m {
         // Loads onto the FP stack.
-        Mnemonic::Fld => X87Shape { prefix: "fld ", kind: X87Kind::Load, cast: None },
+        Mnemonic::Fld => X87Shape {
+            prefix: "fld ",
+            kind: X87Kind::Load,
+            cast: None,
+        },
         Mnemonic::Fild => X87Shape {
             prefix: "fild ",
             kind: X87Kind::Load,
             cast: Some("(f64)"),
         },
         // Stores from the FP stack.
-        Mnemonic::Fst => X87Shape { prefix: "fst ", kind: X87Kind::Store, cast: None },
-        Mnemonic::Fstp => X87Shape { prefix: "fstp ", kind: X87Kind::Store, cast: None },
+        Mnemonic::Fst => X87Shape {
+            prefix: "fst ",
+            kind: X87Kind::Store,
+            cast: None,
+        },
+        Mnemonic::Fstp => X87Shape {
+            prefix: "fstp ",
+            kind: X87Kind::Store,
+            cast: None,
+        },
         Mnemonic::Fist => X87Shape {
             prefix: "fist ",
             kind: X87Kind::Store,
@@ -114,10 +126,26 @@ fn classify(m: Mnemonic) -> Option<X87Shape> {
             cast: Some("(i64)"),
         },
         // Binary arithmetic with the FP stack top.
-        Mnemonic::Fadd => X87Shape { prefix: "fadd ", kind: X87Kind::Binary("+"), cast: None },
-        Mnemonic::Fsub => X87Shape { prefix: "fsub ", kind: X87Kind::Binary("-"), cast: None },
-        Mnemonic::Fmul => X87Shape { prefix: "fmul ", kind: X87Kind::Binary("*"), cast: None },
-        Mnemonic::Fdiv => X87Shape { prefix: "fdiv ", kind: X87Kind::Binary("/"), cast: None },
+        Mnemonic::Fadd => X87Shape {
+            prefix: "fadd ",
+            kind: X87Kind::Binary("+"),
+            cast: None,
+        },
+        Mnemonic::Fsub => X87Shape {
+            prefix: "fsub ",
+            kind: X87Kind::Binary("-"),
+            cast: None,
+        },
+        Mnemonic::Fmul => X87Shape {
+            prefix: "fmul ",
+            kind: X87Kind::Binary("*"),
+            cast: None,
+        },
+        Mnemonic::Fdiv => X87Shape {
+            prefix: "fdiv ",
+            kind: X87Kind::Binary("/"),
+            cast: None,
+        },
         Mnemonic::Fsubr => X87Shape {
             prefix: "fsubr ",
             kind: X87Kind::Binary("- /*rev*/"),

@@ -64,25 +64,20 @@ impl Pattern for MemViaReg {
         if store.iced.op0_kind() != OpKind::Memory {
             return None;
         }
-        if store.iced.op1_kind() != OpKind::Register
-            || store.iced.op1_register() != scratch
-        {
+        if store.iced.op1_kind() != OpKind::Register || store.iced.op1_register() != scratch {
             return None;
         }
         // Build the source-language operands. The load's source is
         // what we're copying *from*; the store's destination is what
         // we're copying *to*. Both get slot renaming via the
         // SP-aware helper so `[ebp-4]` reads as `var_4`, etc.
-        let (_, src) =
-            super::mov::split_two_operands(&format_intel(&load.iced), "mov ")?;
-        let (dst, _) =
-            super::mov::split_two_operands(&format_intel(&store.iced), "mov ")?;
+        let (_, src) = super::mov::split_two_operands(&format_intel(&load.iced), "mov ")?;
+        let (dst, _) = super::mov::split_two_operands(&format_intel(&store.iced), "mov ")?;
         let sp_load = ctx.sp_delta_at.get(&load.iced.ip()).copied();
         let sp_store = ctx.sp_delta_at.get(&store.iced.ip()).copied();
         let dst = ud_arch_x86::rename_operand_in_ctx(&dst, sp_store);
         let src = ud_arch_x86::rename_operand_in_ctx(&src, sp_load);
-        let mut bytes =
-            Vec::with_capacity(load.original_bytes.len() + store.original_bytes.len());
+        let mut bytes = Vec::with_capacity(load.original_bytes.len() + store.original_bytes.len());
         bytes.extend_from_slice(&load.original_bytes);
         bytes.extend_from_slice(&store.original_bytes);
         Some(Candidate {
@@ -127,7 +122,12 @@ mod tests {
         let insns = decode(Bitness::Bits32, &bytes, 0).unwrap();
         let c = MemViaReg.tentative(&ctx(), &insns, 0).expect("match");
         assert_eq!(c.consumed, 2);
-        let Some(Stmt::Move { dst, src, bytes: out }) = c.stmts.first() else {
+        let Some(Stmt::Move {
+            dst,
+            src,
+            bytes: out,
+        }) = c.stmts.first()
+        else {
             panic!("expected Stmt::Move");
         };
         assert_eq!(dst, "var_4");

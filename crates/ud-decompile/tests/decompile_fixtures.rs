@@ -225,9 +225,8 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
                 if bytes.is_empty() {
                     n += 1;
                 } else {
-                    let insns =
-                        ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, bytes, 0)
-                            .expect("decode asm bytes");
+                    let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, bytes, 0)
+                        .expect("decode asm bytes");
                     n += insns.len();
                 }
             }
@@ -266,12 +265,8 @@ fn count_stmts(stmts: &[Stmt]) -> usize {
                 for a in attrs {
                     if a.key == "head_bytes" {
                         if let ud_ast::AttrValue::ByteList(b) = &a.value {
-                            let insns = ud_arch_x86::decode(
-                                ud_arch_x86::Bitness::Bits64,
-                                b,
-                                0,
-                            )
-                            .expect("decode head_bytes attribute");
+                            let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, b, 0)
+                                .expect("decode head_bytes attribute");
                             n += insns.len();
                         }
                     }

@@ -111,8 +111,7 @@ pub fn build_function(
     // the dereferenced content is what the reader cares about,
     // not the address. Idempotent: already-substituted strings
     // pass through.
-    let string_lookup =
-        |va: u64| -> Option<String> { lookup_string_at_va(data, va) };
+    let string_lookup = |va: u64| -> Option<String> { lookup_string_at_va(data, va) };
     resolve_strings_in_body(&mut body, &string_lookup);
 
     // After forward-propagation, indirect calls routed through a
@@ -217,8 +216,12 @@ pub fn build_function(
     profile_fp.frame_required = true;
     let mut profile_nofp = base.clone();
     profile_nofp.frame_required = false;
-    let try_match = |profile: &ud_arch_x86::ProfileInputs|
-        -> (bool, bool, ud_arch_x86::StructuredPrologue, ud_arch_x86::StructuredEpilogue) {
+    let try_match = |profile: &ud_arch_x86::ProfileInputs| -> (
+        bool,
+        bool,
+        ud_arch_x86::StructuredPrologue,
+        ud_arch_x86::StructuredEpilogue,
+    ) {
         let dp = ud_arch_x86::default_prologue(profile);
         let de = ud_arch_x86::default_epilogue(profile);
         let pm = matches!(body.first(), Some(Stmt::Prologue { params: Some(p), .. })
@@ -252,7 +255,10 @@ pub fn build_function(
     if pro_matches {
         body.remove(0);
         dropped_any = true;
-    } else if let Some(Stmt::Prologue { params: Some(p), .. }) = body.first() {
+    } else if let Some(Stmt::Prologue {
+        params: Some(p), ..
+    }) = body.first()
+    {
         // Non-matching prologue: prepend a brief comment showing
         // what the auto-derived default would have been, so a
         // reader can see at a glance why the explicit form is
@@ -276,7 +282,10 @@ pub fn build_function(
     if epi_matches {
         body.pop();
         dropped_any = true;
-    } else if let Some(Stmt::Epilogue { params: Some(e), .. }) = body.last() {
+    } else if let Some(Stmt::Epilogue {
+        params: Some(e), ..
+    }) = body.last()
+    {
         let saves_is_subset = is_subset(&e.saves, &default_epi.saves)
             && e.leave == default_epi.leave
             && e.pop_frame == default_epi.pop_frame
@@ -407,11 +416,7 @@ fn detect_calling_convention_attrs(
 /// Walk the entry block and report whether `reg` is read before
 /// it gets written. Treats SSA's per-IP read/write info as
 /// authoritative.
-fn reg_read_before_write(
-    f: &Function<DecodedInsn>,
-    ssa: &crate::ssa::SsaInfo,
-    reg: &str,
-) -> bool {
+fn reg_read_before_write(f: &Function<DecodedInsn>, ssa: &crate::ssa::SsaInfo, reg: &str) -> bool {
     let Some(entry) = f.blocks.first() else {
         return false;
     };
@@ -490,9 +495,7 @@ fn compute_sp_delta_cfg(f: &Function<DecodedInsn>) -> HashMap<u64, i64> {
                     successors.push(t);
                 }
             }
-            Terminator::Return
-            | Terminator::IndirectBranch
-            | Terminator::InvalidOrUnreachable => {}
+            Terminator::Return | Terminator::IndirectBranch | Terminator::InvalidOrUnreachable => {}
         }
         for succ in successors {
             if let std::collections::hash_map::Entry::Vacant(e) = block_entry.entry(succ) {
@@ -607,14 +610,13 @@ fn replace_register_word(text: &str, reg: &str, value: &str) -> String {
                 depth -= 1;
             }
         }
-        let head_matches = i + reg_chars.len() <= chars.len()
-            && chars[i..i + reg_chars.len()] == reg_chars[..];
+        let head_matches =
+            i + reg_chars.len() <= chars.len() && chars[i..i + reg_chars.len()] == reg_chars[..];
         let prefix_ok = i == 0 || !is_ident_char(chars[i - 1]);
         let suffix_ok = !head_matches
             || i + reg_chars.len() == chars.len()
             || !is_ident_char(chars[i + reg_chars.len()]);
-        let matches_here =
-            depth == 0 && !in_quote && head_matches && prefix_ok && suffix_ok;
+        let matches_here = depth == 0 && !in_quote && head_matches && prefix_ok && suffix_ok;
         if matches_here {
             let needs_parens = value.contains(' ');
             if needs_parens {
@@ -1028,9 +1030,10 @@ fn profile_inputs_from_fn(f: &ud_ast::FnDecl) -> ud_arch_x86::ProfileInputs {
             _ => None,
         })
         .unwrap_or_default();
-    let noframe = f.attrs.iter().any(|a| {
-        a.key == "noframe" && matches!(a.value, ud_ast::AttrValue::Flag)
-    });
+    let noframe = f
+        .attrs
+        .iter()
+        .any(|a| a.key == "noframe" && matches!(a.value, ud_ast::AttrValue::Flag));
     let mut uses_ebx = false;
     let mut uses_esi = false;
     let mut uses_edi = false;
@@ -1411,7 +1414,9 @@ fn resolve_absolute_indirect(text: &str, name_at: &HashMap<u64, String>) -> Opti
     let hex = if let Some(s) = inner.strip_suffix('h') {
         s
     } else {
-        inner.strip_prefix("0x").or_else(|| inner.strip_prefix("0X"))?
+        inner
+            .strip_prefix("0x")
+            .or_else(|| inner.strip_prefix("0X"))?
     };
     let va = u64::from_str_radix(hex, 16).ok()?;
     name_at.get(&va).cloned()
@@ -1430,11 +1435,7 @@ fn resolve_absolute_indirect(text: &str, name_at: &HashMap<u64, String>) -> Opti
 /// `// returns <expr>` comment the annotator already inserted
 /// before the epilogue, falling back to the constant the init
 /// stmts produced.
-fn fold_early_returns(
-    stmts: &mut [Stmt],
-    base_ip: u64,
-    bitness: ud_arch_x86::Bitness,
-) {
+fn fold_early_returns(stmts: &mut [Stmt], base_ip: u64, bitness: ud_arch_x86::Bitness) {
     let returns_at = collect_return_targets(stmts, base_ip);
     let mut cursor = base_ip;
     fold_early_returns_in_seq(stmts, &mut cursor, &returns_at, bitness);
@@ -1452,13 +1453,9 @@ fn fold_early_returns_in_seq(
         let advance = stmt_total_bytes(&stmts[i]);
         let mut replaced = false;
         if let Stmt::Asm { text, bytes } = &stmts[i] {
-            if let Some(rewrite) = try_fold_to_if_return(
-                text,
-                bytes,
-                stmt_start,
-                returns_at,
-                bitness,
-            ) {
+            if let Some(rewrite) =
+                try_fold_to_if_return(text, bytes, stmt_start, returns_at, bitness)
+            {
                 stmts[i] = rewrite;
                 replaced = true;
             }
@@ -1571,11 +1568,7 @@ fn collect_return_targets(stmts: &[Stmt], base_ip: u64) -> HashMap<u64, String> 
     out
 }
 
-fn collect_return_targets_in_seq(
-    stmts: &[Stmt],
-    cursor: &mut u64,
-    out: &mut HashMap<u64, String>,
-) {
+fn collect_return_targets_in_seq(stmts: &[Stmt], cursor: &mut u64, out: &mut HashMap<u64, String>) {
     let mut i = 0;
     while i < stmts.len() {
         let chunk_start = *cursor;
@@ -1736,11 +1729,7 @@ fn stmts_total_bytes(stmts: &[Stmt]) -> usize {
 /// Only fires when the dst is a tracked GPR (registers
 /// participating in liveness analysis). Memory destinations,
 /// register-pair forms, and non-GPR fields are left alone.
-fn fold_dead_register_moves(
-    stmts: &mut Vec<Stmt>,
-    liveness: &crate::ssa::Liveness,
-    base_ip: u64,
-) {
+fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::ssa::Liveness, base_ip: u64) {
     let mut cursor = base_ip;
     let mut i = 0;
     while i < stmts.len() {
@@ -1751,10 +1740,10 @@ fn fold_dead_register_moves(
             if is_gpr_name(dst) && !bytes.is_empty() {
                 let last_insn_ip = stmt_start;
                 let var = crate::ssa::Var::Reg(dst.clone());
-                let dead_after =
-                    liveness.live_after_insn.get(&last_insn_ip).is_some_and(|live| {
-                        !live.contains(&var)
-                    });
+                let dead_after = liveness
+                    .live_after_insn
+                    .get(&last_insn_ip)
+                    .is_some_and(|live| !live.contains(&var));
                 // Even if the register stays live for one more
                 // instruction, fold when the next stmt's render
                 // text doesn't reference it at top level — that
@@ -1770,12 +1759,8 @@ fn fold_dead_register_moves(
                         Stmt::Move { bytes, .. } => bytes.clone(),
                         _ => unreachable!(),
                     };
-                    if let Some(next_bytes) = stmts
-                        .get_mut(i + 1)
-                        .and_then(stmt_bytes_field_mut)
-                    {
-                        let mut merged =
-                            Vec::with_capacity(prefix.len() + next_bytes.len());
+                    if let Some(next_bytes) = stmts.get_mut(i + 1).and_then(stmt_bytes_field_mut) {
+                        let mut merged = Vec::with_capacity(prefix.len() + next_bytes.len());
                         merged.extend_from_slice(&prefix);
                         merged.extend_from_slice(next_bytes);
                         *next_bytes = merged;
@@ -1876,8 +1861,8 @@ fn text_has_top_level_reg(text: &str, needle: &[u8]) -> bool {
                 && &bytes[i..i + needle.len()] == needle =>
             {
                 let prev_alnum = i > 0 && is_ident_byte(bytes[i - 1]);
-                let next_alnum = i + needle.len() < bytes.len()
-                    && is_ident_byte(bytes[i + needle.len()]);
+                let next_alnum =
+                    i + needle.len() < bytes.len() && is_ident_byte(bytes[i + needle.len()]);
                 if !prev_alnum && !next_alnum {
                     return true;
                 }
@@ -1913,10 +1898,7 @@ fn stmt_bytes_field_ro(stmt: &Stmt) -> Option<&Vec<u8>> {
         | Stmt::Inc16 { bytes, .. }
         | Stmt::SehInstall { bytes }
         | Stmt::SehRestore { bytes } => Some(bytes),
-        Stmt::IfBranch { .. }
-        | Stmt::Loop { .. }
-        | Stmt::Label { .. }
-        | Stmt::Comment(_) => None,
+        Stmt::IfBranch { .. } | Stmt::Loop { .. } | Stmt::Label { .. } | Stmt::Comment(_) => None,
     }
 }
 
@@ -1946,10 +1928,7 @@ fn stmt_bytes_field_mut(stmt: &mut Stmt) -> Option<&mut Vec<u8>> {
         | Stmt::Inc16 { bytes, .. }
         | Stmt::SehInstall { bytes }
         | Stmt::SehRestore { bytes } => Some(bytes),
-        Stmt::IfBranch { .. }
-        | Stmt::Loop { .. }
-        | Stmt::Label { .. }
-        | Stmt::Comment(_) => None,
+        Stmt::IfBranch { .. } | Stmt::Loop { .. } | Stmt::Label { .. } | Stmt::Comment(_) => None,
     }
 }
 
@@ -2288,9 +2267,7 @@ fn try_switch_pair(
     if jmp.iced.memory_index_scale() != 4 {
         return None;
     }
-    if jmp.iced.op_count() != 1
-        || jmp.iced.op_kind(0) != ud_arch_x86::OpKind::Memory
-    {
+    if jmp.iced.op_count() != 1 || jmp.iced.op_kind(0) != ud_arch_x86::OpKind::Memory {
         return None;
     }
     let table_va = jmp.iced.memory_displacement64();
@@ -2491,11 +2468,7 @@ fn fold_local_if_skip(stmts: &mut Vec<Stmt>, _bitness: ud_arch_x86::Bitness) {
 /// This is the unconditional fallback for the structural lifters:
 /// anything they couldn't fold into an `IfBranch`, `Loop`,
 /// `IfReturn`, etc. ends up here as named goto + label.
-fn fold_gotos_and_labels(
-    stmts: &mut Vec<Stmt>,
-    base_ip: u64,
-    bitness: ud_arch_x86::Bitness,
-) {
+fn fold_gotos_and_labels(stmts: &mut Vec<Stmt>, base_ip: u64, bitness: ud_arch_x86::Bitness) {
     let func_end = base_ip + stmts_total_bytes(stmts) as u64;
     // Pass 1: walk the body, decode each `@asm` candidate, collect
     // (path, target_addr, kind, cond_text) tuples for the ones we
@@ -2605,11 +2578,7 @@ fn collect_goto_targets(
 /// decode to a single direct branch (`jmp rel`, `jcc rel`, or a
 /// `cmp/test + jcc` pair where the jcc is the second instruction).
 /// Returns `None` for indirect jumps, calls, or anything else.
-fn jump_target_of(
-    bytes: &[u8],
-    ip: u64,
-    bitness: ud_arch_x86::Bitness,
-) -> Option<u64> {
+fn jump_target_of(bytes: &[u8], ip: u64, bitness: ud_arch_x86::Bitness) -> Option<u64> {
     use ud_arch_x86::FlowControl;
     let insns = ud_arch_x86::decode(bitness, bytes, ip).ok()?;
     if insns.is_empty() {
@@ -2782,19 +2751,11 @@ fn jcc_mnemonic_to_text(m: ud_arch_x86::Mnemonic) -> Option<String> {
 /// whose IP equals one of the recorded target addresses. Idempotent
 /// for the entry IP (we don't add a label at function start since
 /// nothing can jump to it from within).
-fn insert_labels_at_targets(
-    stmts: &mut Vec<Stmt>,
-    base_ip: u64,
-    targets: &HashSet<u64>,
-) {
+fn insert_labels_at_targets(stmts: &mut Vec<Stmt>, base_ip: u64, targets: &HashSet<u64>) {
     insert_labels_in_seq(stmts, base_ip, targets);
 }
 
-fn insert_labels_in_seq(
-    stmts: &mut Vec<Stmt>,
-    base_ip: u64,
-    targets: &HashSet<u64>,
-) -> u64 {
+fn insert_labels_in_seq(stmts: &mut Vec<Stmt>, base_ip: u64, targets: &HashSet<u64>) -> u64 {
     let mut cursor = base_ip;
     let mut i = 0;
     let mut labeled_at: HashSet<u64> = HashSet::new();
@@ -3018,9 +2979,18 @@ fn parse_callee_save_pop(text: &str) -> Option<String> {
 fn is_callee_saved_reg(reg: &str) -> bool {
     matches!(
         reg,
-        "ebx" | "esi" | "edi" | "ebp"
-            | "rbx" | "rsi" | "rdi" | "rbp"
-            | "r12" | "r13" | "r14" | "r15"
+        "ebx"
+            | "esi"
+            | "edi"
+            | "ebp"
+            | "rbx"
+            | "rsi"
+            | "rdi"
+            | "rbp"
+            | "r12"
+            | "r13"
+            | "r14"
+            | "r15"
     )
 }
 
@@ -3041,11 +3011,29 @@ fn asm_state_effect(text: &str, state: &mut RegState) {
     // tracked values don't hold — reset state to be safe.
     let is_branch = matches!(
         head,
-        "jmp" | "ret"
-            | "je" | "jne" | "jl" | "jle" | "jg" | "jge"
-            | "jb" | "jbe" | "ja" | "jae" | "js" | "jns"
-            | "jo" | "jno" | "jp" | "jnp" | "jc" | "jnc"
-            | "jecxz" | "jcxz" | "jrcxz"
+        "jmp"
+            | "ret"
+            | "je"
+            | "jne"
+            | "jl"
+            | "jle"
+            | "jg"
+            | "jge"
+            | "jb"
+            | "jbe"
+            | "ja"
+            | "jae"
+            | "js"
+            | "jns"
+            | "jo"
+            | "jno"
+            | "jp"
+            | "jnp"
+            | "jc"
+            | "jnc"
+            | "jecxz"
+            | "jcxz"
+            | "jrcxz"
     ) || text.contains("; j")
         || text.contains("; ret");
     if is_branch {
@@ -3068,8 +3056,7 @@ fn asm_state_effect(text: &str, state: &mut RegState) {
     // Pure flag-setters and no-effect-on-GPRs.
     let is_pure_read = matches!(
         head,
-        "push" | "cmp" | "test" | "nop" | "cdq" | "cwd"
-            | "rep" | "repe" | "repne" | "leave"
+        "push" | "cmp" | "test" | "nop" | "cdq" | "cwd" | "rep" | "repe" | "repne" | "leave"
     );
     if is_pure_read {
         return;
@@ -3079,9 +3066,19 @@ fn asm_state_effect(text: &str, state: &mut RegState) {
     // taking the first operand after the mnemonic.
     let modifies_single_dst = matches!(
         head,
-        "pop" | "inc" | "dec" | "neg" | "not"
-            | "shl" | "shr" | "sar" | "rol" | "ror"
-            | "sal" | "rcl" | "rcr"
+        "pop"
+            | "inc"
+            | "dec"
+            | "neg"
+            | "not"
+            | "shl"
+            | "shr"
+            | "sar"
+            | "rol"
+            | "ror"
+            | "sal"
+            | "rcl"
+            | "rcr"
     );
     if modifies_single_dst {
         if let Some(rest) = text.split_once(' ').map(|(_, r)| r) {
@@ -3111,10 +3108,7 @@ fn asm_state_effect(text: &str, state: &mut RegState) {
 /// `mov al, [ebp-4]` then `mov dword ptr [ebp-4], …` makes
 /// `var_4: u32` (the dword form wins).
 #[allow(clippy::too_many_lines)]
-fn discover_locals(
-    f: &Function<DecodedInsn>,
-    sp_table: &HashMap<u64, i64>,
-) -> Vec<LocalDecl> {
+fn discover_locals(f: &Function<DecodedInsn>, sp_table: &HashMap<u64, i64>) -> Vec<LocalDecl> {
     use std::collections::BTreeMap;
 
     // Stack slots keyed by *conventional* offset (the EBP-relative
@@ -3295,10 +3289,8 @@ fn uses_register_as_signed(insn: &ud_arch_x86::Instruction, reg: Register) -> bo
     }
     // For `idiv`/`imul`, the implicit edx:eax pair is signed.
     // For `sar`/`movsx*`, the named operand is signed.
-    let touched = (0..insn.op_count()).any(|i| {
-        insn.op_kind(i) == ud_arch_x86::OpKind::Register
-            && insn.op_register(i) == reg
-    });
+    let touched = (0..insn.op_count())
+        .any(|i| insn.op_kind(i) == ud_arch_x86::OpKind::Register && insn.op_register(i) == reg);
     if !touched && matches!(insn.mnemonic(), Mnemonic::Idiv | Mnemonic::Imul) {
         // Treat eax/edx as touched for implicit-operand forms.
         return matches!(
@@ -3348,8 +3340,8 @@ fn memory_size_bytes(size: ud_arch_x86::MemorySize) -> u32 {
 /// participate in the high-level variable naming.
 fn canonical_register_name(reg: Register) -> Option<String> {
     use Register::{
-        EAX, EBP, EBX, ECX, EDI, EDX, ESI, ESP, R8D, R9D, R10D, R11D, R12D, R13D, R14D, R15D, RAX,
-        RBP, RBX, RCX, RDI, RDX, RSI, RSP, R8, R9, R10, R11, R12, R13, R14, R15,
+        EAX, EBP, EBX, ECX, EDI, EDX, ESI, ESP, R10, R10D, R11, R11D, R12, R12D, R13, R13D, R14,
+        R14D, R15, R15D, R8, R8D, R9, R9D, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
     };
     let full = match reg {
         // 8-bit / 16-bit / 32-bit halves of the eight legacy GPRs
@@ -3540,7 +3532,8 @@ fn emit_blocks_in_range(
                     let intervening_start = block_len - group.head_consumed - group.pre_body_count;
                     let intervening_end = block_len - group.head_consumed;
                     let mut intervening_view = block.clone();
-                    intervening_view.insns = block.insns[intervening_start..intervening_end].to_vec();
+                    intervening_view.insns =
+                        block.insns[intervening_start..intervening_end].to_vec();
                     intervening_view.terminator = ud_ir::Terminator::Fallthrough;
                     emit_block_stmts(
                         &mut pre_body_stmts,
@@ -4330,8 +4323,7 @@ fn try_detect_if_else_at(
         }
         Terminator::UnconditionalBranch { target } => Some(target.0),
         Terminator::ConditionalBranch {
-            taken: inner_taken,
-            ..
+            taken: inner_taken, ..
         } => {
             // Compound OR / AND: the then-arm is a single pure
             // cmp/test+jcc block whose jcc-taken target is the
@@ -4556,10 +4548,7 @@ fn build_if_head_extras(
     for i in (0..jcc_idx).rev() {
         let ins = &block.insns[i];
         let m = ins.iced.mnemonic();
-        if matches!(
-            m,
-            ud_arch_x86::Mnemonic::Cmp | ud_arch_x86::Mnemonic::Test
-        ) {
+        if matches!(m, ud_arch_x86::Mnemonic::Cmp | ud_arch_x86::Mnemonic::Test) {
             cmp_idx = Some(i);
             break;
         }

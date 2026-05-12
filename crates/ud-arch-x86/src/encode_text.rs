@@ -94,9 +94,7 @@ fn encode_relational(text: &str) -> Option<Vec<u8>> {
 /// doesn't get partially-eaten as `<`.
 fn split_relational(text: &str) -> Option<(&str, &str, &str)> {
     // Order matters: longer operators first.
-    const OPS: &[&str] = &[
-        "<=u", ">=u", "<u", ">u", "==", "!=", "<=", ">=", "<", ">",
-    ];
+    const OPS: &[&str] = &["<=u", ">=u", "<u", ">u", "==", "!=", "<=", ">=", "<", ">"];
     let mut depth = 0i32;
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -380,7 +378,10 @@ fn parse_mem_dword(s: &str) -> Option<MemOperand> {
     }
     let s = s.strip_prefix("dword ptr ").unwrap_or(s).trim();
     let s = s.strip_prefix("qword ptr ").unwrap_or(s).trim();
-    let inner = s.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?.trim();
+    let inner = s
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))?
+        .trim();
 
     // Base + (optional) displacement.
     if let Some((base, disp_part)) = split_after_reg(inner) {
@@ -425,7 +426,9 @@ fn split_after_reg(s: &str) -> Option<(&str, &str)> {
     let s = s.trim();
     // The register name is the leading run of letters. Anything
     // after (whitespace, sign, digits, …) is the displacement.
-    let end = s.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let end = s
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(s.len());
     if end == 0 {
         return None;
     }
@@ -480,9 +483,18 @@ mod tests {
     #[test]
     fn cmp_reg_imm8() {
         // 0x83 /7 imm8
-        assert_eq!(encode_cmp_or_test("cmp esi,1"), Some(vec![0x83, 0xfe, 0x01]));
-        assert_eq!(encode_cmp_or_test("cmp esi,2"), Some(vec![0x83, 0xfe, 0x02]));
-        assert_eq!(encode_cmp_or_test("cmp eax,0"), Some(vec![0x83, 0xf8, 0x00]));
+        assert_eq!(
+            encode_cmp_or_test("cmp esi,1"),
+            Some(vec![0x83, 0xfe, 0x01])
+        );
+        assert_eq!(
+            encode_cmp_or_test("cmp esi,2"),
+            Some(vec![0x83, 0xfe, 0x02])
+        );
+        assert_eq!(
+            encode_cmp_or_test("cmp eax,0"),
+            Some(vec![0x83, 0xf8, 0x00])
+        );
     }
 
     #[test]

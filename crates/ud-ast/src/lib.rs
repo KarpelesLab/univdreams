@@ -23,6 +23,6 @@ mod types;
 
 pub use emit::emit;
 pub use types::{
-    AttrValue, Attribute, EpilogueParams, Field, FnDecl, Item, LocalDecl, LocalKind, Module,
-    Param, PrologueParams, Signature, Stmt, Type, UdFile, Value,
+    AttrValue, Attribute, EpilogueParams, Field, FnDecl, Item, LocalDecl, LocalKind, Module, Param,
+    PrologueParams, Signature, Stmt, Type, UdFile, Value,
 };

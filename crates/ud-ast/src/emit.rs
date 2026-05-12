@@ -12,8 +12,7 @@
 use std::fmt::Write as _;
 
 use crate::types::{
-    AttrValue, Attribute, Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile,
-    Value,
+    AttrValue, Attribute, Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value,
 };
 
 /// Format an entire AST as canonical `.ud` text. Trailing newline is
@@ -162,10 +161,18 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
         }
-        Stmt::Prologue { kind, params, bytes } => {
+        Stmt::Prologue {
+            kind,
+            params,
+            bytes,
+        } => {
             emit_prologue(out, indent, kind, params.as_ref(), bytes);
         }
-        Stmt::Epilogue { kind, params, bytes } => {
+        Stmt::Epilogue {
+            kind,
+            params,
+            bytes,
+        } => {
             emit_epilogue(out, indent, kind, params.as_ref(), bytes);
         }
         Stmt::Save { reg, bytes } => {
@@ -249,8 +256,7 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             for (i, target) in cases.iter().enumerate() {
                 writeln!(out, "{body_indent}case {i}: goto label_{target:x};").unwrap();
             }
-            writeln!(out, "{body_indent}default: goto label_{default_addr:x};")
-                .unwrap();
+            writeln!(out, "{body_indent}default: goto label_{default_addr:x};").unwrap();
             writeln!(out, "{indent}}}").unwrap();
         }
         Stmt::ReturnExpr { text, bytes } => {

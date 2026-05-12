@@ -97,9 +97,10 @@ pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
     // when it dropped a matched-default prologue/epilogue. Without
     // this marker, lower emits the body verbatim — no MSVC-style
     // bytes get injected into GCC or hand-written functions.
-    let autogen = f.attrs.iter().any(|a| {
-        a.key == "autogen" && matches!(a.value, ud_ast::AttrValue::Flag)
-    });
+    let autogen = f
+        .attrs
+        .iter()
+        .any(|a| a.key == "autogen" && matches!(a.value, ud_ast::AttrValue::Flag));
     if !has_prologue && autogen {
         let prefix = auto_prologue_bytes(f);
         out.extend_from_slice(&prefix);
@@ -144,9 +145,10 @@ fn profile_inputs_from_fn(f: &FnDecl) -> ud_arch_x86::ProfileInputs {
     // `#[noframe]` opts the function out of MSVC /Oy- default
     // (frame pointer always). The decompiler emits this when the
     // no-frame variant of the default prologue/epilogue matches.
-    let noframe = f.attrs.iter().any(|a| {
-        a.key == "noframe" && matches!(a.value, ud_ast::AttrValue::Flag)
-    });
+    let noframe = f
+        .attrs
+        .iter()
+        .any(|a| a.key == "noframe" && matches!(a.value, ud_ast::AttrValue::Flag));
     let mut uses_ebx = false;
     let mut uses_esi = false;
     let mut uses_edi = false;

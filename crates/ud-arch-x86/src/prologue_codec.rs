@@ -26,7 +26,6 @@
 //! back to the same bytes, we can drop the byte list entirely
 //! and round-trip via the structured form alone.
 
-
 /// Bit-width assumed by the codec. 32-bit and 64-bit have
 /// slightly different encodings for the frame setup (REX
 /// prefix) and the endbr instruction (`endbr32` vs `endbr64`).
@@ -112,7 +111,9 @@ pub fn decode_prologue(bytes: &[u8], bits: CodecBits) -> Option<StructuredProlog
             p.saves.push(push_reg_name(b, false)?);
             i += 1;
         } else if matches!(bits, CodecBits::Bits64)
-            && bytes.get(i..i + 2).is_some_and(|s| s[0] == 0x41 && (0x50..=0x57).contains(&s[1]))
+            && bytes
+                .get(i..i + 2)
+                .is_some_and(|s| s[0] == 0x41 && (0x50..=0x57).contains(&s[1]))
         {
             p.saves.push(push_reg_name(bytes[i + 1], true)?);
             i += 2;
@@ -146,7 +147,9 @@ pub fn decode_prologue(bytes: &[u8], bits: CodecBits) -> Option<StructuredProlog
             p.saves_after.push(push_reg_name(b, false)?);
             i += 1;
         } else if matches!(bits, CodecBits::Bits64)
-            && bytes.get(i..i + 2).is_some_and(|s| s[0] == 0x41 && (0x50..=0x57).contains(&s[1]))
+            && bytes
+                .get(i..i + 2)
+                .is_some_and(|s| s[0] == 0x41 && (0x50..=0x57).contains(&s[1]))
         {
             p.saves_after.push(push_reg_name(bytes[i + 1], true)?);
             i += 2;
@@ -214,7 +217,9 @@ pub fn decode_epilogue(bytes: &[u8], bits: CodecBits) -> Option<StructuredEpilog
             e.saves.push(pop_reg_name(b, false)?);
             i += 1;
         } else if matches!(bits, CodecBits::Bits64)
-            && bytes.get(i..i + 2).is_some_and(|s| s[0] == 0x41 && (0x58..=0x5f).contains(&s[1]))
+            && bytes
+                .get(i..i + 2)
+                .is_some_and(|s| s[0] == 0x41 && (0x58..=0x5f).contains(&s[1]))
         {
             e.saves.push(pop_reg_name(bytes[i + 1], true)?);
             i += 2;

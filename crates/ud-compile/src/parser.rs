@@ -7,7 +7,6 @@ use ud_ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, 
 
 use crate::lexer::{tokenize, LexError, Token, TokenKind};
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error(transparent)]
@@ -286,10 +285,7 @@ impl Parser {
             // Bare-flag attrs (`#[naked]`) skip the `=value` part;
             // the next token is either a separator or the
             // closing bracket.
-            let value = if matches!(
-                self.peek().kind,
-                TokenKind::Comma | TokenKind::RBracket
-            ) {
+            let value = if matches!(self.peek().kind, TokenKind::Comma | TokenKind::RBracket) {
                 ud_ast::AttrValue::Flag
             } else {
                 self.expect(&TokenKind::Eq, "`=` after attribute key")?;
@@ -585,10 +581,7 @@ impl Parser {
                     // `label_HEX = …` (a stmt whose lhs happens to
                     // start with `label_`). Only consume as a label
                     // when the next token is `:`.
-                    let next_kind = self
-                        .tokens
-                        .get(self.pos + 1)
-                        .map(|t| t.kind.clone());
+                    let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
                     if matches!(next_kind, Some(TokenKind::Colon)) {
                         let stmt = self.parse_label_stmt()?;
                         body.push(stmt);
@@ -641,7 +634,10 @@ impl Parser {
                 break;
             }
             i += 1;
-            if !matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+            if !matches!(
+                self.tokens.get(i).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            ) {
                 return false;
             }
             i += 1;
@@ -771,14 +767,15 @@ impl Parser {
             }
             probe += 1;
         }
-        let last_eq_tok = last_eq_idx
-            .map(|i| self.tokens[i].clone())
-            .ok_or_else(|| ParseError::Expected {
-                expected: "`=` in assignment statement".into(),
-                got: describe(&self.peek().kind),
-                line: self.peek().line,
-                col: self.peek().col,
-            })?;
+        let last_eq_tok =
+            last_eq_idx
+                .map(|i| self.tokens[i].clone())
+                .ok_or_else(|| ParseError::Expected {
+                    expected: "`=` in assignment statement".into(),
+                    got: describe(&self.peek().kind),
+                    line: self.peek().line,
+                    col: self.peek().col,
+                })?;
         let bytes_tok = byte_list_idx
             .map(|i| self.tokens[i].clone())
             .ok_or_else(|| ParseError::Expected {
@@ -796,7 +793,9 @@ impl Parser {
             });
         }
         let dst = self.src[stmt_start..last_eq_tok.start].trim().to_string();
-        let src = self.src[last_eq_tok.end..bytes_tok.start].trim().to_string();
+        let src = self.src[last_eq_tok.end..bytes_tok.start]
+            .trim()
+            .to_string();
         // Advance to the byte list and parse it.
         while self.pos < self.tokens.len() && self.peek().start < bytes_tok.start {
             self.bump();
@@ -1009,8 +1008,7 @@ impl Parser {
         let attrs = self.parse_attrs()?;
         let cond_bytes = self.parse_byte_list()?;
         self.expect(&TokenKind::LBrace, "`{` to open `if` body")?;
-        let (pre_body, then_body, else_body_in_braces) =
-            self.parse_if_body_with_optional_arms()?;
+        let (pre_body, then_body, else_body_in_braces) = self.parse_if_body_with_optional_arms()?;
         self.expect(&TokenKind::RBrace, "`}` to close `if` body")?;
         let else_body = if else_body_in_braces.is_some() {
             else_body_in_braces
@@ -1199,7 +1197,7 @@ impl Parser {
     /// `return` keyword.
     fn parse_if_return_tail(&mut self, cond_text: String) -> Result<Stmt, ParseError> {
         self.bump(); // consume `return`
-        // Optional value expression — anything up to the `;`.
+                     // Optional value expression — anything up to the `;`.
         let value_text = if self.peek().kind == TokenKind::Semicolon {
             String::new()
         } else {
@@ -1264,10 +1262,7 @@ impl Parser {
                         if name == "then" || name == "else" {
                             self.bump(); // `@`
                             let arm_name = self.expect_ident("`then` or `else`")?;
-                            self.expect(
-                                &TokenKind::LBrace,
-                                "`{` to open `@then` / `@else` arm",
-                            )?;
+                            self.expect(&TokenKind::LBrace, "`{` to open `@then` / `@else` arm")?;
                             let arm = self.parse_stmt_list_until_rbrace()?;
                             self.expect(&TokenKind::RBrace, "`}` to close arm")?;
                             match arm_name.as_str() {
@@ -1796,7 +1791,10 @@ impl Parser {
 /// the trailing byte list from operand-side memory expressions
 /// like `[ebp+8]` or `[1C201030h]`.
 fn is_byte_list_block(tokens: &[Token], lbracket_idx: usize) -> bool {
-    if !matches!(tokens.get(lbracket_idx).map(|t| &t.kind), Some(TokenKind::LBracket)) {
+    if !matches!(
+        tokens.get(lbracket_idx).map(|t| &t.kind),
+        Some(TokenKind::LBracket)
+    ) {
         return false;
     }
     let mut i = lbracket_idx + 1;

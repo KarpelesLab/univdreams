@@ -91,10 +91,17 @@ mod tests {
         let insns = decode(Bitness::Bits32, &bytes, 0x1000).unwrap();
         let cand = CmpJcc.tentative(&ctx(), &insns, 0).expect("match");
         assert_eq!(cand.consumed, 2);
-        let Some(Stmt::Asm { text, bytes: out_bytes }) = cand.stmts.first() else {
+        let Some(Stmt::Asm {
+            text,
+            bytes: out_bytes,
+        }) = cand.stmts.first()
+        else {
             panic!("expected Stmt::Asm");
         };
-        assert!(text.contains("cmp eax,1") && text.contains("je"), "got {text}");
+        assert!(
+            text.contains("cmp eax,1") && text.contains("je"),
+            "got {text}"
+        );
         assert_eq!(out_bytes, &bytes);
     }
 

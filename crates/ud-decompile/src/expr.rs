@@ -234,8 +234,8 @@ fn tokenize(text: &str) -> Vec<Tok> {
                 out.push(Tok::Str(s));
                 continue;
             }
-            b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'~' | b'!'
-            | b'<' | b'>' | b'=' => {
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'~' | b'!' | b'<' | b'>'
+            | b'=' => {
                 let ch = c as char;
                 let s: &'static str = match ch {
                     '+' => "+",
@@ -264,8 +264,7 @@ fn tokenize(text: &str) -> Vec<Tok> {
             let start = i;
             // Optional 0x prefix.
             let prefixed_hex = bytes[i] == b'0'
-                && (i + 1 < bytes.len()
-                    && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X'));
+                && (i + 1 < bytes.len() && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X'));
             if prefixed_hex {
                 i += 2;
                 let digits_start = i;
@@ -315,7 +314,9 @@ fn tokenize(text: &str) -> Vec<Tok> {
                     break;
                 }
             }
-            let raw = std::str::from_utf8(&bytes[start..i]).unwrap_or("").to_string();
+            let raw = std::str::from_utf8(&bytes[start..i])
+                .unwrap_or("")
+                .to_string();
             out.push(Tok::Ident(raw));
             continue;
         }
@@ -424,10 +425,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_compare(&mut self) -> Option<Expr> {
-        self.binop_left(
-            Self::parse_bitwise_or,
-            &["==", "!=", "<", "<=", ">", ">="],
-        )
+        self.binop_left(Self::parse_bitwise_or, &["==", "!=", "<", "<=", ">", ">="])
     }
 
     fn parse_bitwise_or(&mut self) -> Option<Expr> {
@@ -637,9 +635,7 @@ fn expr_contains_ident(expr: &Expr) -> bool {
         Expr::Lit(_) | Expr::StringRef(_) | Expr::Raw(_) => false,
         Expr::Deref(inner) | Expr::Unary(_, inner) => expr_contains_ident(inner),
         Expr::Binary(_, l, r) => expr_contains_ident(l) || expr_contains_ident(r),
-        Expr::Call(_, args) | Expr::CommaList(args) => {
-            args.iter().any(expr_contains_ident)
-        }
+        Expr::Call(_, args) | Expr::CommaList(args) => args.iter().any(expr_contains_ident),
     }
 }
 
@@ -648,10 +644,7 @@ fn expr_contains_ident(expr: &Expr) -> bool {
 /// where `lookup(va)` succeeds, renders back. Falls back to the
 /// original text if parsing fails (round-trip-safe by construction).
 #[must_use]
-pub fn resolve_strings_in_text(
-    text: &str,
-    lookup: &dyn Fn(u64) -> Option<String>,
-) -> String {
+pub fn resolve_strings_in_text(text: &str, lookup: &dyn Fn(u64) -> Option<String>) -> String {
     let tokens = tokenize(text);
     let mut parser = Parser::new(&tokens);
     let Some(expr) = parser.parse_expr_or_comma_list() else {
@@ -711,12 +704,9 @@ fn simplify_step(expr: Expr, width: BitWidth) -> Expr {
             name,
             args.into_iter().map(|a| simplify_step(a, width)).collect(),
         ),
-        Expr::CommaList(items) => Expr::CommaList(
-            items
-                .into_iter()
-                .map(|a| simplify_step(a, width))
-                .collect(),
-        ),
+        Expr::CommaList(items) => {
+            Expr::CommaList(items.into_iter().map(|a| simplify_step(a, width)).collect())
+        }
     }
 }
 
@@ -744,11 +734,7 @@ fn simplify_binary(op: &'static str, l: Expr, r: Expr, width: BitWidth) -> Expr 
                     if sum == 0 {
                         return (**ll).clone();
                     }
-                    return Expr::Binary(
-                        "+",
-                        ll.clone(),
-                        Box::new(Expr::Lit(sum)),
-                    );
+                    return Expr::Binary("+", ll.clone(), Box::new(Expr::Lit(sum)));
                 }
             }
             // (x - a) + b → x + (b - a) or x - (a - b)
@@ -761,23 +747,16 @@ fn simplify_binary(op: &'static str, l: Expr, r: Expr, width: BitWidth) -> Expr 
                     // Render as `x - LIT` when net is "small negative",
                     // else `x + LIT`. We approximate by treating high
                     // bits as negative.
-                    let half = 1u64 << (match width {
-                        BitWidth::Bits32 => 31,
-                        BitWidth::Bits64 => 63,
-                    });
+                    let half = 1u64
+                        << (match width {
+                            BitWidth::Bits32 => 31,
+                            BitWidth::Bits64 => 63,
+                        });
                     if (net & mask) >= half {
                         let abs = net.wrapping_neg() & mask;
-                        return Expr::Binary(
-                            "-",
-                            ll.clone(),
-                            Box::new(Expr::Lit(abs)),
-                        );
+                        return Expr::Binary("-", ll.clone(), Box::new(Expr::Lit(abs)));
                     }
-                    return Expr::Binary(
-                        "+",
-                        ll.clone(),
-                        Box::new(Expr::Lit(net & mask)),
-                    );
+                    return Expr::Binary("+", ll.clone(), Box::new(Expr::Lit(net & mask)));
                 }
             }
         }
@@ -793,11 +772,7 @@ fn simplify_binary(op: &'static str, l: Expr, r: Expr, width: BitWidth) -> Expr 
             if let (Expr::Binary("-", ll, lr), Expr::Lit(b)) = (&l, &r) {
                 if let Expr::Lit(a) = **lr {
                     let sum = a.wrapping_add(*b) & mask;
-                    return Expr::Binary(
-                        "-",
-                        ll.clone(),
-                        Box::new(Expr::Lit(sum)),
-                    );
+                    return Expr::Binary("-", ll.clone(), Box::new(Expr::Lit(sum)));
                 }
             }
             // (x + a) - b → x + (a - b) or x - (b - a)
@@ -808,18 +783,10 @@ fn simplify_binary(op: &'static str, l: Expr, r: Expr, width: BitWidth) -> Expr 
                         if net == 0 {
                             return (**ll).clone();
                         }
-                        return Expr::Binary(
-                            "+",
-                            ll.clone(),
-                            Box::new(Expr::Lit(net)),
-                        );
+                        return Expr::Binary("+", ll.clone(), Box::new(Expr::Lit(net)));
                     }
                     let net = b.wrapping_sub(a) & mask;
-                    return Expr::Binary(
-                        "-",
-                        ll.clone(),
-                        Box::new(Expr::Lit(net)),
-                    );
+                    return Expr::Binary("-", ll.clone(), Box::new(Expr::Lit(net)));
                 }
             }
         }

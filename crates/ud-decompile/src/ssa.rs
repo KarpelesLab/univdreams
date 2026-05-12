@@ -39,9 +39,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ud_arch_x86::{
-    DecodedInsn, Instruction, InstructionInfoFactory, OpAccess, OpKind, Register,
-};
+use ud_arch_x86::{DecodedInsn, Instruction, InstructionInfoFactory, OpAccess, OpKind, Register};
 use ud_core::VAddr;
 use ud_ir::{BasicBlock, Function, Terminator};
 
@@ -117,9 +115,7 @@ impl SsaInfo {
     /// duplicating computation.
     #[must_use]
     pub fn use_count(&self, def: DefId) -> usize {
-        self.defs
-            .get(def.0 as usize)
-            .map_or(0, |r| r.uses.len())
+        self.defs.get(def.0 as usize).map_or(0, |r| r.uses.len())
     }
 
     /// Iterate over use IPs for a def.
@@ -182,10 +178,7 @@ pub struct Liveness {
 /// use), and proper scope decisions for variable lifetimes in the
 /// rendered source.
 #[must_use]
-pub fn compute_liveness(
-    f: &Function<DecodedInsn>,
-    sp_delta_at: &HashMap<u64, i64>,
-) -> Liveness {
+pub fn compute_liveness(f: &Function<DecodedInsn>, sp_delta_at: &HashMap<u64, i64>) -> Liveness {
     if f.blocks.is_empty() {
         return Liveness::default();
     }
@@ -288,10 +281,7 @@ pub fn compute_liveness(
 /// to the same EBP-form slots `[ebp+disp]` uses, so both shapes
 /// resolve to the same `Var::Stack` and version chain.
 #[must_use]
-pub fn build_ssa(
-    f: &Function<DecodedInsn>,
-    sp_delta_at: &HashMap<u64, i64>,
-) -> SsaInfo {
+pub fn build_ssa(f: &Function<DecodedInsn>, sp_delta_at: &HashMap<u64, i64>) -> SsaInfo {
     if f.blocks.is_empty() {
         return SsaInfo::default();
     }
@@ -414,11 +404,8 @@ fn compute_dominators(
     let mut dom: Vec<Option<usize>> = vec![None; n];
     dom[0] = Some(0);
     let rpo = reverse_postorder(f, block_idx);
-    let rpo_index: HashMap<usize, usize> = rpo
-        .iter()
-        .enumerate()
-        .map(|(rank, &b)| (b, rank))
-        .collect();
+    let rpo_index: HashMap<usize, usize> =
+        rpo.iter().enumerate().map(|(rank, &b)| (b, rank)).collect();
     let mut changed = true;
     while changed {
         changed = false;
@@ -517,10 +504,7 @@ fn rpo_dfs(
 }
 
 /// Reverse postorder over the CFG starting from the entry block (0).
-fn reverse_postorder(
-    f: &Function<DecodedInsn>,
-    block_idx: &HashMap<VAddr, usize>,
-) -> Vec<usize> {
+fn reverse_postorder(f: &Function<DecodedInsn>, block_idx: &HashMap<VAddr, usize>) -> Vec<usize> {
     let mut visited = vec![false; f.blocks.len()];
     let mut post = Vec::with_capacity(f.blocks.len());
     rpo_dfs(0, f, block_idx, &mut visited, &mut post);
@@ -557,9 +541,7 @@ fn block_successors(
             // Self-references / out-of-function targets just go unrecorded.
             let _ = f; // suppress unused
         }
-        Terminator::Return
-        | Terminator::IndirectBranch
-        | Terminator::InvalidOrUnreachable => {}
+        Terminator::Return | Terminator::IndirectBranch | Terminator::InvalidOrUnreachable => {}
     }
     out
 }
@@ -569,10 +551,7 @@ fn block_successors(
 /// instruction order.
 type BlockRw = Vec<Vec<(u64, Vec<Var>, Vec<Var>)>>;
 
-fn collect_reads_writes(
-    f: &Function<DecodedInsn>,
-    sp_delta_at: &HashMap<u64, i64>,
-) -> BlockRw {
+fn collect_reads_writes(f: &Function<DecodedInsn>, sp_delta_at: &HashMap<u64, i64>) -> BlockRw {
     f.blocks
         .iter()
         .map(|b| {
@@ -596,10 +575,7 @@ fn collect_reads_writes(
 /// forming registers are reads, the memory target itself is
 /// `Var::Stack(disp)` when the access is EBP/ESP-relative or
 /// `Var::Memory` otherwise.
-fn insn_reads_writes(
-    insn: &DecodedInsn,
-    sp_delta_at: &HashMap<u64, i64>,
-) -> (Vec<Var>, Vec<Var>) {
+fn insn_reads_writes(insn: &DecodedInsn, sp_delta_at: &HashMap<u64, i64>) -> (Vec<Var>, Vec<Var>) {
     let mut reads: Vec<Var> = Vec::new();
     let mut writes: Vec<Var> = Vec::new();
     let i = &insn.iced;
@@ -663,7 +639,12 @@ fn is_write_to_op0(m: ud_arch_x86::Mnemonic) -> bool {
     !matches!(
         m,
         // op0 is a read, not a write, for these.
-        Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Push | Mnemonic::Jmp | Mnemonic::Call | Mnemonic::Bt
+        Mnemonic::Cmp
+            | Mnemonic::Test
+            | Mnemonic::Push
+            | Mnemonic::Jmp
+            | Mnemonic::Call
+            | Mnemonic::Bt
     )
 }
 
@@ -766,10 +747,7 @@ fn memory_var(i: &Instruction, sp: Option<i64>) -> Var {
     Var::Memory
 }
 
-fn collect_all_vars(
-    rw: &BlockRw,
-    phi_blocks: &HashMap<Var, HashSet<usize>>,
-) -> HashSet<Var> {
+fn collect_all_vars(rw: &BlockRw, phi_blocks: &HashMap<Var, HashSet<usize>>) -> HashSet<Var> {
     let mut out = HashSet::new();
     for block_rw in rw {
         for (_ip, reads, writes) in block_rw {
@@ -805,10 +783,7 @@ fn rename_dfs(
     stacks: &mut HashMap<Var, Vec<DefId>>,
 ) {
     // Snapshot stack lengths so we can pop on the way out.
-    let snapshot: HashMap<Var, usize> = stacks
-        .iter()
-        .map(|(v, s)| (v.clone(), s.len()))
-        .collect();
+    let snapshot: HashMap<Var, usize> = stacks.iter().map(|(v, s)| (v.clone(), s.len())).collect();
 
     // 1. Phi defs at this block's entry get pushed before any insn.
     let mut phi_vars_pushed: Vec<Var> = Vec::new();
@@ -930,7 +905,11 @@ fn fill_phi_incoming(
                 .unwrap_or(DefId(0));
             incoming.push(resolved);
         }
-        if let DefSite::Phi { incoming: ref mut inc, .. } = ssa.defs[phi_id.0 as usize].site {
+        if let DefSite::Phi {
+            incoming: ref mut inc,
+            ..
+        } = ssa.defs[phi_id.0 as usize].site
+        {
             *inc = incoming;
         }
     }
@@ -939,8 +918,8 @@ fn fill_phi_incoming(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ud_arch_x86::{decode, Bitness};
     use ud_arch_x86::lift_function;
+    use ud_arch_x86::{decode, Bitness};
 
     fn lift(bytes: &[u8]) -> Function<DecodedInsn> {
         let insns = decode(Bitness::Bits32, bytes, 0x1000).unwrap();
@@ -993,8 +972,8 @@ mod tests {
         let bytes = [
             0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1   — dead
             0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2
-            0x89, 0xc3,                   // mov ebx, eax — reads eax
-            0xc3,                          // ret
+            0x89, 0xc3, // mov ebx, eax — reads eax
+            0xc3, // ret
         ];
         let f = lift(&bytes);
         let sp: HashMap<u64, i64> = HashMap::new();
@@ -1029,22 +1008,27 @@ mod tests {
     fn diamond_cfg_places_phi_at_merge() {
         let bytes = [
             0x83, 0xf9, 0x00, // cmp ecx, 0
-            0x74, 0x06,       // je +6 → 0x100b
+            0x74, 0x06, // je +6 → 0x100b
             0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
-            0xeb, 0x05,       // jmp +5 → 0x1011 (off by 1 — let's compute)
+            0xeb, 0x05, // jmp +5 → 0x1011 (off by 1 — let's compute)
             0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2
             0xc3, // ret
         ];
         let f = lift(&bytes);
         // Verify we have ≥ 3 blocks (entry, two arms, merge).
-        assert!(f.blocks.len() >= 3, "expected diamond CFG, got {} blocks", f.blocks.len());
+        assert!(
+            f.blocks.len() >= 3,
+            "expected diamond CFG, got {} blocks",
+            f.blocks.len()
+        );
         let sp: HashMap<u64, i64> = HashMap::new();
         let ssa = build_ssa(&f, &sp);
         // Look for a phi for eax.
         let eax = Var::Reg("eax".into());
-        let has_phi = ssa.defs.iter().any(|r| {
-            r.var == eax && matches!(r.site, DefSite::Phi { .. })
-        });
+        let has_phi = ssa
+            .defs
+            .iter()
+            .any(|r| r.var == eax && matches!(r.site, DefSite::Phi { .. }));
         assert!(has_phi, "expected a phi for eax at the diamond merge");
     }
 }

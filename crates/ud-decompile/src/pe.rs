@@ -177,8 +177,8 @@ fn scan_vtables(pe: &PeFile) -> Vec<Value> {
     // Scan data sections (writable OR initialized-data) for
     // function-pointer runs.
     for (idx, sh) in pe.sections.iter().enumerate() {
-        let is_data = sh.characteristics & 0x4000_0000 != 0
-            && sh.characteristics & 0x2000_0000 == 0;
+        let is_data =
+            sh.characteristics & 0x4000_0000 != 0 && sh.characteristics & 0x2000_0000 == 0;
         if !is_data {
             continue;
         }
@@ -654,9 +654,7 @@ fn pe_name_at(pe: &PeFile) -> HashMap<u64, String> {
     for imp in pe.imports() {
         let label = match (&imp.name, imp.ordinal) {
             (Some(name), _) => {
-                if name_count.get(name).copied().unwrap_or(0) > 1
-                    && !imp.dll_name.is_empty()
-                {
+                if name_count.get(name).copied().unwrap_or(0) > 1 && !imp.dll_name.is_empty() {
                     // Strip the `.dll` suffix for the qualifier so
                     // `KERNEL32.dll!HeapAlloc` reads as
                     // `KERNEL32!HeapAlloc`.

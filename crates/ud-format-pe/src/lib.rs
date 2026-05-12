@@ -595,10 +595,9 @@ impl PeFile {
             };
             for idx in 0..1u32 << 20 {
                 let off = (idx as usize).saturating_mul(thunk_size);
-                let Some(thunk_bytes) = self.slice_at_rva(
-                    int_rva.wrapping_add(off as u32),
-                    thunk_size,
-                ) else {
+                let Some(thunk_bytes) =
+                    self.slice_at_rva(int_rva.wrapping_add(off as u32), thunk_size)
+                else {
                     break;
                 };
                 let thunk_val: u64 = match self.kind {
@@ -608,8 +607,7 @@ impl PeFile {
                 if thunk_val == 0 {
                     break;
                 }
-                let iat_va = self.image_base
-                    + u64::from(first_thunk.wrapping_add(off as u32));
+                let iat_va = self.image_base + u64::from(first_thunk.wrapping_add(off as u32));
                 let ordinal_flag: u64 = match self.kind {
                     PeKind::Pe32 => 0x8000_0000,
                     PeKind::Pe32Plus => 0x8000_0000_0000_0000,
@@ -621,8 +619,7 @@ impl PeFile {
                     // 2-byte hint then the NUL-terminated name.
                     #[allow(clippy::cast_possible_truncation)]
                     let by_name_rva = (thunk_val & 0xFFFF_FFFF) as u32;
-                    let name = self
-                        .read_cstring_at_rva(by_name_rva.wrapping_add(2));
+                    let name = self.read_cstring_at_rva(by_name_rva.wrapping_add(2));
                     (None, name)
                 };
                 out.push(PeImport {

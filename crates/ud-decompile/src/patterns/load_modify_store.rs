@@ -67,9 +67,7 @@ impl Pattern for LoadModifyStore {
             return None;
         }
         // Modify: reg ← reg op X  (binary) or reg++/reg--/-reg/~reg (unary).
-        if modify.iced.op0_kind() != OpKind::Register
-            || modify.iced.op0_register() != scratch
-        {
+        if modify.iced.op0_kind() != OpKind::Register || modify.iced.op0_register() != scratch {
             return None;
         }
         let modify_text = format_intel(&modify.iced);
@@ -95,8 +93,7 @@ impl Pattern for LoadModifyStore {
         // what we're starting with; the store's destination is where
         // the result lands. Both go through the SP-aware renamer so
         // stack slots show up by their named-slot form.
-        let (_, load_src_raw) =
-            super::mov::split_two_operands(&format_intel(&load.iced), "mov ")?;
+        let (_, load_src_raw) = super::mov::split_two_operands(&format_intel(&load.iced), "mov ")?;
         let (store_dst_raw, _) =
             super::mov::split_two_operands(&format_intel(&store.iced), "mov ")?;
         let load_src = ud_arch_x86::rename_operand_in_ctx(&load_src_raw, sp);
@@ -179,7 +176,12 @@ mod tests {
         let insns = decode(Bitness::Bits32, &bytes, 0).unwrap();
         let c = LoadModifyStore.tentative(&ctx(), &insns, 0).expect("match");
         assert_eq!(c.consumed, 3);
-        let Some(Stmt::Move { dst, src, bytes: out }) = c.stmts.first() else {
+        let Some(Stmt::Move {
+            dst,
+            src,
+            bytes: out,
+        }) = c.stmts.first()
+        else {
             panic!("expected Stmt::Move");
         };
         assert_eq!(dst, "var_4");
@@ -193,7 +195,7 @@ mod tests {
     fn folds_load_inc_store() {
         let bytes = [
             0x8b, 0x45, 0x08, // mov eax, [ebp+8]
-            0x40,             // inc eax
+            0x40, // inc eax
             0x89, 0x45, 0xfc, // mov [ebp-4], eax
         ];
         let insns = decode(Bitness::Bits32, &bytes, 0).unwrap();
@@ -212,7 +214,7 @@ mod tests {
         let bytes = [
             0x8b, 0x45, 0x08, // mov eax, [ebp+8]
             0x83, 0xc0, 0x05, // add eax, 5
-            0x89, 0xc3,       // mov ebx, eax
+            0x89, 0xc3, // mov ebx, eax
         ];
         let insns = decode(Bitness::Bits32, &bytes, 0).unwrap();
         assert!(LoadModifyStore.tentative(&ctx(), &insns, 0).is_none());

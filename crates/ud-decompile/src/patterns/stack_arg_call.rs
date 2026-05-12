@@ -92,9 +92,8 @@ impl Pattern for StackArgCall {
                 let tail_prefix: Option<String> = if is_tail_jmp {
                     let target = ins.iced.near_branch_target();
                     let in_known_fn = target != 0 && ctx.name_at.contains_key(&target);
-                    let in_local_range = target != 0
-                        && target >= ctx.fn_addr_start
-                        && target < ctx.fn_addr_end;
+                    let in_local_range =
+                        target != 0 && target >= ctx.fn_addr_start && target < ctx.fn_addr_end;
                     if in_known_fn {
                         Some("tail_".to_string())
                     } else if in_local_range {
@@ -245,7 +244,9 @@ fn lookup_indirect_absolute(operand: &str, ctx: &PatternCtx) -> Option<String> {
     let hex = if let Some(s) = inner.strip_suffix('h') {
         s
     } else {
-        inner.strip_prefix("0x").or_else(|| inner.strip_prefix("0X"))?
+        inner
+            .strip_prefix("0x")
+            .or_else(|| inner.strip_prefix("0X"))?
     };
     let va = u64::from_str_radix(hex, 16).ok()?;
     ctx.name_at.get(&va).cloned()

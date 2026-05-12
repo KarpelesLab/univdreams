@@ -42,9 +42,9 @@ pub use encode_text::{encode_cmp_or_test, encode_head_from_cond_text};
 pub use expr::{try_lift_value_block, ExprRenderCtx, LiftedValueBlock, ValueExpr};
 pub use lift::{lift_function, LiftError};
 pub use prologue_codec::{
-    decode_epilogue, decode_prologue, default_epilogue, default_prologue,
-    encode_epilogue, encode_prologue, epilogue_roundtrips, prologue_roundtrips,
-    CodecBits, ProfileInputs, StructuredEpilogue, StructuredPrologue,
+    decode_epilogue, decode_prologue, default_epilogue, default_prologue, encode_epilogue,
+    encode_prologue, epilogue_roundtrips, prologue_roundtrips, CodecBits, ProfileInputs,
+    StructuredEpilogue, StructuredPrologue,
 };
 
 /// If `insn` is a direct (relative) `call` whose target is statically
@@ -770,11 +770,7 @@ pub fn rename_operand_in_ctx(text: &str, sp_delta: Option<i64>) -> String {
 fn parse_unsigned_disp(s: &str) -> Option<u64> {
     // Reject anything that's not a plain integer literal — we don't
     // want to rename `[ebp+esi*4]` or other indexed forms.
-    if s.is_empty()
-        || !s
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
