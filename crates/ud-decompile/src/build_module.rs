@@ -62,9 +62,24 @@ pub fn build_module(elf: &Elf64File) -> Module {
             ),
         ),
         // Inter-region padding: `(file_offset, bytes)` per gap.
+        //
+        // All-zero entries are filtered out: `Elf64File::write_to_vec`
+        // initialises its output buffer to zeros before overlaying
+        // structured regions, so an omitted zero-padding region
+        // produces the same bytes as a listed one. Keeping these
+        // entries explicit just bloats the source (a single padding
+        // region can be hundreds of bytes long in stripped binaries).
+        // Non-zero padding (0xCC fills, debug guards, etc.) still
+        // round-trips through its explicit byte list.
         field(
             "padding",
-            Value::List(elf.padding().iter().map(padding_block).collect()),
+            Value::List(
+                elf.padding()
+                    .iter()
+                    .filter(|(_, bytes)| bytes.iter().any(|&b| b != 0))
+                    .map(padding_block)
+                    .collect(),
+            ),
         ),
     ]);
 
