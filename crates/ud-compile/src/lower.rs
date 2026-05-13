@@ -654,16 +654,21 @@ pub fn lower_section_bytes(
     let mut cursor = section_addr;
 
     for item in items {
-        let (item_addr, item_bytes) = match item {
+        // Lower each item to its bytes; for `Function` items we
+        // also want the function's true `addr` in IP space (its
+        // `f.addr`) so we can detect edit-induced shifts. Items
+        // that declare an explicit `addr` get checked against
+        // the cumulative cursor; items without an explicit addr
+        // (today: `Item::Comment` only — every byte-bearing
+        // variant carries an addr) just append.
+        let (explicit_addr, item_bytes) = match item {
             Item::Comment(_) => continue,
-            Item::Raw { addr, bytes } => (*addr, bytes.clone()),
-            Item::Strings { addr, strings } => (*addr, lower_strings_bytes(strings)),
-            Item::Notes { addr, entries } => (*addr, lower_notes_bytes(entries)),
+            Item::Raw { addr, bytes } => (Some(*addr), bytes.clone()),
+            Item::Strings { addr, strings } => (Some(*addr), lower_strings_bytes(strings)),
+            Item::Notes { addr, entries } => (Some(*addr), lower_notes_bytes(entries)),
             Item::Function(f) => {
-                let addr = f.addr.ok_or_else(|| LowerError::FunctionWithoutAddr {
-                    fn_name: f.name.clone(),
-                })?;
-                (addr, lower_function_bytes(f)?)
+                let bytes = lower_function_bytes_at(f, Some(cursor))?;
+                (f.addr, bytes)
             }
             Item::Section { name: nested, .. } => {
                 return Err(LowerError::NestedSection {
@@ -672,19 +677,24 @@ pub fn lower_section_bytes(
             }
         };
 
-        if item_addr < cursor {
-            return Err(LowerError::SectionOverlap {
-                section: name.to_string(),
-                cursor,
-                item_addr,
-            });
-        }
-        if item_addr > cursor {
-            return Err(LowerError::SectionGap {
-                section: name.to_string(),
-                cursor,
-                item_addr,
-            });
+        if let Some(item_addr) = explicit_addr {
+            if item_addr < cursor {
+                return Err(LowerError::SectionOverlap {
+                    section: name.to_string(),
+                    cursor,
+                    item_addr,
+                });
+            }
+            if item_addr > cursor {
+                // A gap declared by the source: zero-pad so the
+                // declared `addr` lands at the right offset. This
+                // handles `.text` alignment padding between
+                // functions without forcing the source to spell
+                // out an `@raw(addr, [0x00; N])` block.
+                let gap = (item_addr - cursor) as usize;
+                out.resize(out.len() + gap, 0);
+                cursor = item_addr;
+            }
         }
         out.extend_from_slice(&item_bytes);
         cursor = cursor.saturating_add(item_bytes.len() as u64);
@@ -841,7 +851,11 @@ mod tests {
     }
 
     #[test]
-    fn lower_section_detects_gap() {
+    fn lower_section_zero_fills_gap() {
+        // Items separated by a gap of declared addresses get
+        // zero-padded so the second item lands at its declared
+        // addr — supports section alignment without forcing the
+        // source to spell out an `@raw` zero-fill block.
         let items = vec![
             Item::Function(FnDecl {
                 addr: Some(0x1000),
@@ -852,12 +866,15 @@ mod tests {
                 body: vec![Stmt::asm("ret", vec![0xc3])],
             }),
             Item::Raw {
-                addr: 0x1010, // gap from 0x1001 to 0x1010
+                addr: 0x1010, // 15-byte zero gap from 0x1001 to 0x1010
                 bytes: vec![0x90],
             },
         ];
-        let err = lower_section_bytes(".text", 0x1000, &items).unwrap_err();
-        assert!(matches!(err, LowerError::SectionGap { .. }));
+        let bytes = lower_section_bytes(".text", 0x1000, &items).unwrap();
+        let mut expected = vec![0xc3];
+        expected.extend(std::iter::repeat(0u8).take(15));
+        expected.push(0x90);
+        assert_eq!(bytes, expected);
     }
 
     #[test]
