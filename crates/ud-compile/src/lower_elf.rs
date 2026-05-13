@@ -71,11 +71,11 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
     let build = build_block(&file.module)?;
 
     let class = read_elf_class(&file.module)?;
-    let ehdr = read_ehdr(&file.module, build)?;
-    let phdrs = read_phdrs(build)?;
-    let shdrs = read_shdrs(build)?;
-    let padding = read_padding(build)?;
-    let file_size = read_int(build, "file_size")?;
+    let mut ehdr = read_ehdr(&file.module, build)?;
+    let mut phdrs = read_phdrs(build)?;
+    let mut shdrs = read_shdrs(build)?;
+    let mut padding = read_padding(build)?;
+    let mut file_size = read_int(build, "file_size")?;
 
     // Lower every @section block; index by name.
     let mut by_name: HashMap<String, (u64, Vec<u8>)> = HashMap::new();
@@ -103,13 +103,6 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
         let Some((_, bytes)) = by_name.remove(&name) else {
             return Err(ElfLowerError::UnknownSection { section: name });
         };
-        if bytes.len() as u64 != sh.sh_size {
-            return Err(ElfLowerError::SectionSizeMismatch {
-                idx,
-                expected: sh.sh_size,
-                got: bytes.len() as u64,
-            });
-        }
         section_data.push(bytes);
     }
 
@@ -117,6 +110,21 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
     if let Some(stray) = by_name.into_keys().next() {
         return Err(ElfLowerError::UnknownSection { section: stray });
     }
+
+    // Cascade-shift the ELF layout to match any per-section
+    // content-size changes. Unedited input → all deltas are 0 →
+    // no shifts → byte-identical round-trip. Edits → sh_size
+    // gets updated, later regions slide by the cumulative
+    // delta, segment sizes containing changed sections grow
+    // accordingly. See [`apply_size_changes`] for the details.
+    apply_size_changes(
+        &mut ehdr,
+        &mut phdrs,
+        &mut shdrs,
+        &mut padding,
+        &mut file_size,
+        &section_data,
+    );
 
     Ok(Elf64File::from_parts(
         class,
@@ -127,6 +135,118 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
         padding,
         file_size,
     ))
+}
+
+/// Walk the section table in file-offset order; for each section
+/// whose lowered content size differs from its recorded
+/// `sh_size`, update `sh_size` and queue a "shift everything
+/// past my old end" event. After all sections are visited,
+/// apply the cumulative shift to subsequent regions (sections
+/// at higher offsets, padding, the section-header table, the
+/// file size). For each program header whose loadable range
+/// covers a grown/shrunk section, bump its `p_filesz` and
+/// `p_memsz` by the section's delta and shift its `p_offset` /
+/// `p_vaddr` / `p_paddr` if the segment starts past a shifted
+/// region.
+///
+/// This is the "lenient" path: unedited input has zero deltas
+/// everywhere, so the shifts are no-ops and the writer
+/// reproduces the original bytes exactly. Edited input lays out
+/// a new ELF that loads and runs at the cost of file/VA
+/// offsets that no longer match the pristine binary.
+fn apply_size_changes(
+    ehdr: &mut Ehdr64,
+    phdrs: &mut [Phdr64],
+    shdrs: &mut [Shdr64],
+    padding: &mut [(u64, Vec<u8>)],
+    file_size: &mut u64,
+    section_data: &[Vec<u8>],
+) {
+    // Snapshot every section's pre-update (offset, end) so the
+    // "is this region past section S's old end?" test stays
+    // consistent across multiple shifts.
+    let snapshot: Vec<(u64, u64, i64)> = shdrs
+        .iter()
+        .enumerate()
+        .map(|(idx, sh)| {
+            if !shdr_occupies_file(sh) {
+                return (sh.sh_offset, sh.sh_offset, 0);
+            }
+            let actual = section_data[idx].len() as u64;
+            let delta = actual as i64 - sh.sh_size as i64;
+            (sh.sh_offset, sh.sh_offset + sh.sh_size, delta)
+        })
+        .collect();
+
+    // 1. Update each section's sh_size (in place) and shift its
+    //    sh_offset by the cumulative delta from earlier
+    //    (lower-offset) sections.
+    let mut events: Vec<(u64, i64)> = snapshot
+        .iter()
+        .filter_map(|(_, end, d)| (*d != 0).then_some((*end, *d)))
+        .collect();
+    events.sort_by_key(|(off, _)| *off);
+    let shift_for = |off: u64| -> i64 {
+        events
+            .iter()
+            .filter(|(boundary, _)| *boundary <= off)
+            .map(|(_, d)| *d)
+            .sum()
+    };
+
+    // 2. Apply to sections.
+    for (idx, sh) in shdrs.iter_mut().enumerate() {
+        if shdr_occupies_file(sh) {
+            sh.sh_size = section_data[idx].len() as u64;
+        }
+        let original_off = snapshot[idx].0;
+        let shift = shift_for(original_off);
+        sh.sh_offset = sh.sh_offset.saturating_add_signed(shift);
+    }
+
+    // 3. Apply to program headers. A segment's p_filesz grows by
+    //    the total delta of sections living inside its OLD
+    //    range; its p_offset shifts by the cumulative delta at
+    //    its original position.
+    for ph in phdrs.iter_mut() {
+        let seg_start = ph.p_offset;
+        let seg_end = ph.p_offset + ph.p_filesz;
+        let mut growth: i64 = 0;
+        for (idx, sh) in shdrs.iter().enumerate() {
+            let (old_off, old_end, d) = snapshot[idx];
+            if d == 0 {
+                continue;
+            }
+            let _ = sh;
+            if seg_start <= old_off && old_end <= seg_end {
+                growth += d;
+            }
+        }
+        let off_shift = shift_for(seg_start);
+        ph.p_offset = ph.p_offset.saturating_add_signed(off_shift);
+        ph.p_vaddr = ph.p_vaddr.saturating_add_signed(off_shift);
+        ph.p_paddr = ph.p_paddr.saturating_add_signed(off_shift);
+        if growth != 0 {
+            ph.p_filesz = ph.p_filesz.saturating_add_signed(growth);
+            ph.p_memsz = ph.p_memsz.saturating_add_signed(growth);
+        }
+    }
+
+    // 4. Padding chunks shift by the cumulative delta at their
+    //    original offset.
+    for (off, _bytes) in padding.iter_mut() {
+        let shift = shift_for(*off);
+        *off = off.saturating_add_signed(shift);
+    }
+
+    // 5. The section-header table moves if it lives past a
+    //    changed section.
+    let sh_shift = shift_for(ehdr.e_shoff);
+    ehdr.e_shoff = ehdr.e_shoff.saturating_add_signed(sh_shift);
+
+    // 6. file_size grows by the sum of all deltas.
+    let total: i64 = snapshot.iter().map(|(_, _, d)| *d).sum();
+    *file_size = file_size.saturating_add_signed(total);
 }
 
 /// Map the `bits` field of `@module` (32 or 64) to the corresponding
