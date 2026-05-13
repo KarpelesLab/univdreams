@@ -17,15 +17,21 @@
 
 <main class="wide">
 <p class="playground-intro">
-Upload an ELF, PE, Mach-O, or 6502 raw image — it decompiles to <code>.ud</code> source in the editor.
+Upload an ELF, PE, Mach-O, or 6502 raw image — or paste a URL — and it decompiles to <code>.ud</code> source in the editor.
 Edit the source, click <strong>Compile</strong>, and the rebuilt binary downloads.
 The whole pipeline runs in this tab via WebAssembly; nothing leaves your browser.
+</p>
+<p class="playground-intro">
+Try it on the Windows msmpeg4 codec DLL (420 KB):
+<a href="#" id="example-msmpeg4">load wmpcdcs8-mpg4c32.dll</a>
+&mdash; structural decompilation of a real-world video codec, including i386 stdcall calls, switch tables, and Win32 imports.
 </p>
 
 <div class="playground">
   <div class="toolbar">
     <label class="file-btn" for="upload">Upload binary…</label>
     <input id="upload" type="file">
+    <button id="btn-load-url" class="file-btn">Load from URL…</button>
     <span id="filename" class="filename"></span>
     <span class="spacer"></span>
     <button id="btn-verify">Verify</button>

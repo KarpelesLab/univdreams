@@ -15,11 +15,16 @@ import { oneDark } from "https://esm.sh/@codemirror/theme-one-dark@6";
 
 import init, { decompile, compile, verify } from "../wasm/ud_wasm.js";
 
-const $status   = document.getElementById("status");
-const $filename = document.getElementById("filename");
-const $upload   = document.getElementById("upload");
-const $compile  = document.getElementById("btn-compile");
-const $verify   = document.getElementById("btn-verify");
+const $status        = document.getElementById("status");
+const $filename      = document.getElementById("filename");
+const $upload        = document.getElementById("upload");
+const $compile       = document.getElementById("btn-compile");
+const $verify        = document.getElementById("btn-verify");
+const $loadUrl       = document.getElementById("btn-load-url");
+const $exampleMsmpeg = document.getElementById("example-msmpeg4");
+
+const MSMPEG4_URL =
+  "https://samples.oxideav.org/codecs/windows/msmpeg4/wmpcdcs8-mpg4c32.dll";
 
 let editor;
 let uploadName = "input.bin";
@@ -75,8 +80,71 @@ async function start() {
   $upload.addEventListener("change", onUpload);
   $compile.addEventListener("click", onCompile);
   $verify.addEventListener("click", onVerify);
+  $loadUrl.addEventListener("click", onLoadUrlPrompt);
+  if ($exampleMsmpeg) {
+    $exampleMsmpeg.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      void loadFromUrl(MSMPEG4_URL);
+    });
+  }
 
-  setStatus("Ready. Upload a binary, or edit the sample and click Compile.", "ok");
+  setStatus("Ready. Upload a binary, paste a URL, or edit the sample and click Compile.", "ok");
+}
+
+function onLoadUrlPrompt() {
+  const url = prompt(
+    "Fetch a binary from a URL (CORS must allow GET; e.g. samples.oxideav.org):",
+    MSMPEG4_URL,
+  );
+  if (!url) return;
+  void loadFromUrl(url);
+}
+
+async function loadFromUrl(url) {
+  setStatus(`Fetching ${url}…`, "");
+  try {
+    const resp = await fetch(url, { mode: "cors" });
+    if (!resp.ok) {
+      setStatus(
+        `Fetch failed: HTTP ${resp.status} ${resp.statusText} from ${url}`,
+        "error",
+      );
+      return;
+    }
+    const buf = new Uint8Array(await resp.arrayBuffer());
+    // Derive a display name from the URL path so guessOutputName
+    // can synthesize a sensible download name later.
+    const parsed = new URL(url, window.location.href);
+    const tail = parsed.pathname.split("/").filter(Boolean).pop() || "input.bin";
+    uploadName = tail;
+    $filename.textContent = `${tail} (${buf.length} bytes, from ${parsed.host})`;
+    await decompileBytes(buf, tail);
+  } catch (e) {
+    setStatus(
+      `Fetch / decode failed for ${url}: ${e.message || e}` +
+        " — the server must send `Access-Control-Allow-Origin` for cross-origin fetches.",
+      "error",
+    );
+  }
+}
+
+async function decompileBytes(buf, name) {
+  setStatus(`Decompiling ${name} (${buf.length} bytes)…`, "");
+  // Yield to the event loop so the status message paints before
+  // the synchronous decompile call ties up the main thread.
+  await new Promise((r) => setTimeout(r, 0));
+  try {
+    const t0 = performance.now();
+    const text = decompile(buf);
+    const dt = (performance.now() - t0).toFixed(0);
+    replaceEditor(text);
+    setStatus(
+      `Decompiled ${name} in ${dt} ms (${text.length.toLocaleString()} chars of source).`,
+      "ok",
+    );
+  } catch (e) {
+    setStatus("Decompile failed: " + (e.message || e), "error");
+  }
 }
 
 async function onUpload(ev) {
@@ -84,17 +152,8 @@ async function onUpload(ev) {
   if (!file) return;
   uploadName = file.name;
   $filename.textContent = file.name + " (" + file.size + " bytes)";
-  setStatus("Decompiling " + file.name + "…", "");
-  try {
-    const buf = new Uint8Array(await file.arrayBuffer());
-    const t0 = performance.now();
-    const text = decompile(buf);
-    const dt = (performance.now() - t0).toFixed(0);
-    replaceEditor(text);
-    setStatus(`Decompiled ${file.name} in ${dt} ms (${text.length} chars of source).`, "ok");
-  } catch (e) {
-    setStatus("Decompile failed: " + (e.message || e), "error");
-  }
+  const buf = new Uint8Array(await file.arrayBuffer());
+  await decompileBytes(buf, file.name);
 }
 
 function replaceEditor(text) {
