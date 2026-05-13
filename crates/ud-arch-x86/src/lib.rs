@@ -1462,9 +1462,129 @@ pub fn roundtrip_bytes(bitness: Bitness, bytes: &[u8], rip: u64) -> Result<Vec<D
     Ok(insns)
 }
 
+/// Errors emitted by [`encode_msvc_jmp_table_dispatch`].
+#[derive(Debug, thiserror::Error)]
+pub enum SwitchEncodeError {
+    #[error("unsupported selector register {0:?} (expected eax/ecx/edx/ebx/esi/edi/ebp)")]
+    UnsupportedSelector(String),
+    #[error("case count {0} doesn't fit in u32")]
+    TooManyCases(usize),
+    #[error("ja rel32 target out of i32 range: cmp_ip={cmp_ip:#x} default={default:#x}")]
+    JaOutOfRange { cmp_ip: u64, default: u64 },
+}
+
+/// Encode an MSVC-style switch dispatch sequence:
+///
+/// ```text
+/// cmp <reg>, <max>           ; 3 bytes (imm8 if max≤127) or 6 (imm32)
+/// ja <default>               ; 6 bytes (rel32)
+/// jmp dword ptr [<reg>*4 + <table_va>]  ; 7 bytes
+/// ```
+///
+/// `cmp_ip` is the absolute address where the cmp instruction
+/// will live — used to compute the `ja` rel32. `cases` is the
+/// number of jump-table entries; the bounds-check uses
+/// `MAX = cases - 1`. Returns the encoded bytes.
+///
+/// This is the inverse of the dispatch-recogniser in
+/// `ud-decompile`'s `try_switch_pair`. Together they form the
+/// round-trip: structural Switch → bytes → structural Switch.
+pub fn encode_msvc_jmp_table_dispatch(
+    selector: &str,
+    cases: usize,
+    default_addr: u64,
+    table_va: u64,
+    cmp_ip: u64,
+) -> std::result::Result<Vec<u8>, SwitchEncodeError> {
+    let reg_code = gpr32_code(selector)
+        .ok_or_else(|| SwitchEncodeError::UnsupportedSelector(selector.into()))?;
+    let max_value = u32::try_from(cases.saturating_sub(1))
+        .map_err(|_| SwitchEncodeError::TooManyCases(cases))?;
+
+    let mut out = Vec::with_capacity(16);
+
+    // cmp REG, imm
+    let cmp_modrm = 0xc0 | (7 << 3) | reg_code; // mod=11, reg=/7, r/m=reg_code
+    if max_value <= 0x7f {
+        out.push(0x83);
+        out.push(cmp_modrm);
+        out.push(max_value as u8);
+    } else {
+        out.push(0x81);
+        out.push(cmp_modrm);
+        out.extend_from_slice(&max_value.to_le_bytes());
+    }
+
+    // ja rel32 — target = default; rel = default - (cmp_ip + cmp_len + 6)
+    let cmp_len = out.len() as u64;
+    let ja_end = cmp_ip
+        .checked_add(cmp_len)
+        .and_then(|x| x.checked_add(6))
+        .ok_or(SwitchEncodeError::JaOutOfRange {
+            cmp_ip,
+            default: default_addr,
+        })?;
+    let rel = i128::from(default_addr) - i128::from(ja_end);
+    let rel32 = i32::try_from(rel).map_err(|_| SwitchEncodeError::JaOutOfRange {
+        cmp_ip,
+        default: default_addr,
+    })?;
+    out.push(0x0f);
+    out.push(0x87);
+    out.extend_from_slice(&rel32.to_le_bytes());
+
+    // jmp dword ptr [REG*4 + TABLE_VA]
+    //   opcode = ff
+    //   ModR/M = 00_100_100 (mod=00 SIB-follows, reg=/4, r/m=100 SIB)
+    //   SIB    = 10_<reg_code>_101  (scale=2 bits = *4, index=reg, base=101 no-base+disp32)
+    //   DISP32 = table_va (LE)
+    out.push(0xff);
+    out.push(0x24);
+    out.push(0x80 | (reg_code << 3) | 0x05);
+    out.extend_from_slice(&(table_va as u32).to_le_bytes());
+
+    Ok(out)
+}
+
+/// 32-bit GPR register-code lookup by name. Returns `None` for
+/// names that don't map to a usable index/r-m register in the
+/// switch-dispatch encoding above.
+fn gpr32_code(name: &str) -> Option<u8> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "eax" => Some(0),
+        "ecx" => Some(1),
+        "edx" => Some(2),
+        "ebx" => Some(3),
+        // esp (4) can't be an index register in SIB; rejected.
+        "ebp" => Some(5),
+        "esi" => Some(6),
+        "edi" => Some(7),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encoding regression: the dispatch we lift from the msmpeg4
+    /// codec's `DriverProc` switch round-trips. Verifies the
+    /// `cmp ecx, 9; ja 0x23e8; jmp [ecx*4+0x1c20246a]` form
+    /// re-emits to the exact bytes the compiler put down.
+    #[test]
+    fn encode_msmpeg4_driverproc_switch() {
+        // cmp_ip = 0x208d (where the cmp lives in the original
+        // .text). default = 0x23e8. table_va = 0x1c20246a.
+        let bytes = encode_msvc_jmp_table_dispatch("ecx", 10, 0x23e8, 0x1c20_246a, 0x208d).unwrap();
+        assert_eq!(
+            bytes,
+            vec![
+                0x83, 0xf9, 0x09, // cmp ecx, 9
+                0x0f, 0x87, 0x52, 0x03, 0x00, 0x00, // ja 0x23e8 (rel32 = 0x352)
+                0xff, 0x24, 0x8d, 0x6a, 0x24, 0x20, 0x1c, // jmp [ecx*4 + 0x1c20246a]
+            ]
+        );
+    }
 
     /// `endbr64`: 0xf3 0x0f 0x1e 0xfa — gcc with -fcf-protection emits
     /// this at every function entry, so the fixtures all start with it.

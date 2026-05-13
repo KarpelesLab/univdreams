@@ -405,18 +405,29 @@ pub enum Stmt {
         bytes: Vec<u8>,
     },
 
-    /// `switch (selector) { case N: goto label_X; … default: goto label_D; }`
-    /// — recognized MSVC switch dispatch (bound-check `cmp reg, MAX; ja
-    /// default` followed by indirect `jmp [TABLE + reg*4]`). The
-    /// `cases` vec is parallel to the jump table; `default_addr`
-    /// is the `ja`-taken target. Bytes pin the full cmp + ja + jmp
-    /// encoding (the jump table data itself stays in the data
-    /// section, untouched).
+    /// `switch (selector) #[dispatch="…", table_va=…] { case N: goto … }`
+    /// — a structured switch whose dispatch bytes are *not* pinned
+    /// to the source. The lower path regenerates `cmp REG,MAX; ja
+    /// DEFAULT; jmp dword ptr [REG*4+TABLE_VA]` from the structured
+    /// fields, validating that the case/default/selector data
+    /// re-encodes to a correct dispatch sequence.
+    ///
+    /// `dispatch` names the encoding shape (currently only
+    /// `"msvc-jmp-table"` is recognised). `table_va` is the
+    /// absolute address of the jump-table data the indirect jmp
+    /// reads — the table contents themselves still ride in a
+    /// `@raw` block under the appropriate data section.
+    ///
+    /// Editing the source is the whole point: adding a case here,
+    /// changing `default_addr`, or renaming the selector all flow
+    /// through to the rebuilt binary via the lower-side encoder,
+    /// without any pinned bytes to silently invalidate.
     Switch {
         selector: String,
         cases: Vec<u64>,
         default_addr: u64,
-        bytes: Vec<u8>,
+        dispatch: String,
+        table_va: u64,
     },
 
     /// `@seh_install([bytes])` — MSVC's Structured Exception

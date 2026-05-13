@@ -86,6 +86,7 @@ fn verify_fn_body(f: &ud_ast::FnDecl, section: Option<&str>, out: &mut Vec<AsmWa
     verify_stmts(f, section, &f.body, &mut cursor, out);
 }
 
+#[allow(clippy::too_many_lines)]
 fn verify_stmts(
     f: &ud_ast::FnDecl,
     section: Option<&str>,
@@ -141,7 +142,6 @@ fn verify_stmts(
             | Stmt::IfReturn { bytes, .. }
             | Stmt::Goto { bytes, .. }
             | Stmt::IfGoto { bytes, .. }
-            | Stmt::Switch { bytes, .. }
             | Stmt::SehInstall { bytes }
             | Stmt::SehRestore { bytes }
             | Stmt::ReturnExpr { bytes, .. }
@@ -153,6 +153,19 @@ fn verify_stmts(
             | Stmt::Move { bytes, .. }
             | Stmt::Inc16 { bytes, .. } => {
                 *cursor = cursor.saturating_add(bytes.len() as u64);
+            }
+            Stmt::Switch {
+                cases, dispatch, ..
+            } => {
+                // Match the `switch_encoded_size` formula used on
+                // the decompile side: cmp(3|6) + ja(6) + jmp(7).
+                let max_value = u32::try_from(cases.len().saturating_sub(1)).unwrap_or(u32::MAX);
+                let cmp: u64 = if dispatch == "msvc-jmp-table" && max_value <= 0x7f {
+                    3
+                } else {
+                    6
+                };
+                *cursor = cursor.saturating_add(cmp + 6 + 7);
             }
             #[allow(clippy::match_same_arms)]
             Stmt::Label { .. } => {}

@@ -953,12 +953,12 @@ fn propagate_one_stmt(
             }
             *cursor += bytes.len() as u64;
         }
-        Stmt::IfReturn { bytes, .. }
-        | Stmt::Goto { bytes, .. }
-        | Stmt::IfGoto { bytes, .. }
-        | Stmt::Switch { bytes, .. } => {
+        Stmt::IfReturn { bytes, .. } | Stmt::Goto { bytes, .. } | Stmt::IfGoto { bytes, .. } => {
             // cmp/test/jcc/jmp don't touch GPRs — state preserved.
             *cursor += bytes.len() as u64;
+        }
+        Stmt::Switch { .. } => {
+            *cursor += switch_encoded_size(stmt) as u64;
         }
         Stmt::SehInstall { bytes } | Stmt::SehRestore { bytes } => {
             // FS:[0] writes don't affect GPR tracking, but the
@@ -1876,7 +1876,30 @@ fn collect_return_targets_in_seq(stmts: &[Stmt], cursor: &mut u64, out: &mut Has
 /// stream. Matches `lower_stmts_into`'s walk order, including
 /// nested `IfBranch` head/cond/arm bytes and `Loop`
 /// entry/body/tail.
+/// Encoded byte size of a `Stmt::Switch` body — `cmp REG,MAX; ja
+/// DEFAULT; jmp [REG*4+TABLE]` for the `msvc-jmp-table` dispatch.
+/// The cmp shrinks from 6 to 3 bytes when MAX fits in `imm8`; the
+/// rest is always 6 (`ja rel32`) + 7 (`jmp dword ptr [SIB+disp32]`).
+fn switch_encoded_size(stmt: &Stmt) -> usize {
+    let Stmt::Switch {
+        cases, dispatch, ..
+    } = stmt
+    else {
+        return 0;
+    };
+    if dispatch != "msvc-jmp-table" {
+        return 0;
+    }
+    let max_value = u32::try_from(cases.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    let cmp = if max_value <= 0x7f { 3 } else { 6 };
+    cmp + 6 + 7
+}
+
 fn stmt_total_bytes(stmt: &Stmt) -> usize {
+    if matches!(stmt, Stmt::Switch { .. }) {
+        return switch_encoded_size(stmt);
+    }
+    #[allow(clippy::match_same_arms)]
     match stmt {
         Stmt::Asm { bytes, .. }
         | Stmt::Return { bytes, .. }
@@ -1887,7 +1910,6 @@ fn stmt_total_bytes(stmt: &Stmt) -> usize {
         | Stmt::IfReturn { bytes, .. }
         | Stmt::Goto { bytes, .. }
         | Stmt::IfGoto { bytes, .. }
-        | Stmt::Switch { bytes, .. }
         | Stmt::ReturnExpr { bytes, .. }
         | Stmt::ArgSpill { bytes, .. }
         | Stmt::Call { bytes, .. }
@@ -1932,6 +1954,7 @@ fn stmt_total_bytes(stmt: &Stmt) -> usize {
             n
         }
         Stmt::Label { .. } | Stmt::Comment(_) => 0,
+        Stmt::Switch { .. } => switch_encoded_size(stmt),
     }
 }
 
@@ -2063,7 +2086,6 @@ fn stmt_bytes_field_mut(stmt: &mut Stmt) -> Option<&mut Vec<u8>> {
         | Stmt::IfReturn { bytes, .. }
         | Stmt::Goto { bytes, .. }
         | Stmt::IfGoto { bytes, .. }
-        | Stmt::Switch { bytes, .. }
         | Stmt::ReturnExpr { bytes, .. }
         | Stmt::ArgSpill { bytes, .. }
         | Stmt::Call { bytes, .. }
@@ -2074,7 +2096,11 @@ fn stmt_bytes_field_mut(stmt: &mut Stmt) -> Option<&mut Vec<u8>> {
         | Stmt::Inc16 { bytes, .. }
         | Stmt::SehInstall { bytes }
         | Stmt::SehRestore { bytes } => Some(bytes),
-        Stmt::IfBranch { .. } | Stmt::Loop { .. } | Stmt::Label { .. } | Stmt::Comment(_) => None,
+        Stmt::IfBranch { .. }
+        | Stmt::Loop { .. }
+        | Stmt::Label { .. }
+        | Stmt::Comment(_)
+        | Stmt::Switch { .. } => None,
     }
 }
 
@@ -3171,25 +3197,28 @@ fn truncate_for_preview(s: &str, max: usize) -> String {
 /// * A final line for the default target.
 fn describe_switch_dispatch(
     switch_stmt: &Stmt,
-    cmp_ip: u64,
-    jmp_ip: u64,
-    bitness: ud_arch_x86::Bitness,
+    _cmp_ip: u64,
+    _jmp_ip: u64,
+    _bitness: ud_arch_x86::Bitness,
     label_previews: &HashMap<u64, String>,
 ) -> Vec<String> {
-    let (cases, default_addr, bytes) = match switch_stmt {
+    let (selector, cases, default_addr, table_va) = match switch_stmt {
         Stmt::Switch {
+            selector,
             cases,
             default_addr,
-            bytes,
+            table_va,
             ..
-        } => (cases, *default_addr, bytes),
+        } => (selector, cases, *default_addr, *table_va),
         _ => return Vec::new(),
     };
 
     let mut out = Vec::new();
-    if let Some(line) = describe_dispatch_insns(bytes, cmp_ip, jmp_ip, bitness) {
-        out.push(line);
-    }
+    let size = switch_encoded_size(switch_stmt);
+    let max_value = cases.len().saturating_sub(1);
+    out.push(format!(
+        "switch dispatch ({size} bytes): cmp {selector},{max_value}; ja 0x{default_addr:x}; jmp dword ptr [{selector}*4+0x{table_va:x}]",
+    ));
 
     // Group cases by destination so a switch where N cases all
     // goto the same label renders as one comment line instead of
@@ -3225,37 +3254,6 @@ fn describe_switch_dispatch(
     ));
 
     out
-}
-
-/// Decode the cmp+ja+jmp prefix bytes of a `Stmt::Switch` and
-/// render them as a `cmp REG,MAX; ja DEFAULT; jmp [REG*4+TABLE]`
-/// single-line string suitable for a leading comment.
-fn describe_dispatch_insns(
-    bytes: &[u8],
-    cmp_ip: u64,
-    jmp_ip: u64,
-    bitness: ud_arch_x86::Bitness,
-) -> Option<String> {
-    let cmp_len = (jmp_ip.checked_sub(cmp_ip)?) as usize;
-    if cmp_len > bytes.len() {
-        return None;
-    }
-    let cmp_block = &bytes[..cmp_len];
-    let jmp_block = &bytes[cmp_len..];
-    let cmp_insns = ud_arch_x86::decode(bitness, cmp_block, cmp_ip).ok()?;
-    let jmp_insns = ud_arch_x86::decode(bitness, jmp_block, jmp_ip).ok()?;
-    let mut parts: Vec<String> = Vec::with_capacity(cmp_insns.len() + jmp_insns.len());
-    for ins in &cmp_insns {
-        parts.push(ud_arch_x86::format_intel(&ins.iced));
-    }
-    for ins in &jmp_insns {
-        parts.push(ud_arch_x86::format_intel(&ins.iced));
-    }
-    Some(format!(
-        "switch dispatch ({} bytes): {}",
-        bytes.len(),
-        parts.join("; ")
-    ))
 }
 
 /// Try to recognise an adjacent (cmp+ja, jmp[table+reg*4]) pair
@@ -3348,15 +3346,12 @@ fn try_switch_pair(
         let rva = absolute.saturating_sub(image_base);
         cases.push(rva);
     }
-    let mut bytes = Vec::with_capacity(a_bytes.len() + b_bytes.len());
-    bytes.extend_from_slice(a_bytes);
-    bytes.extend_from_slice(b_bytes);
-    let _ = selector_reg.clone();
     Some(Stmt::Switch {
         selector: selector_reg,
         cases,
         default_addr,
-        bytes,
+        dispatch: "msvc-jmp-table".into(),
+        table_va,
     })
 }
 
@@ -3568,7 +3563,6 @@ fn collect_goto_targets(
             Stmt::Switch {
                 cases,
                 default_addr,
-                bytes,
                 ..
             } => {
                 for &c in cases {
@@ -3579,7 +3573,7 @@ fn collect_goto_targets(
                 if *default_addr >= fn_start && *default_addr < fn_end {
                     out.insert(*default_addr);
                 }
-                cursor += bytes.len() as u64;
+                cursor += switch_encoded_size(stmt) as u64;
             }
             Stmt::Goto { target_addr, bytes }
             | Stmt::IfGoto {

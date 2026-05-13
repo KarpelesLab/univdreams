@@ -312,13 +312,24 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             selector,
             cases,
             default_addr,
-            bytes,
+            dispatch,
+            table_va,
         } => {
-            // C-shape: `switch (sel) [bytes] { case N: goto …; default: goto …; }`.
+            // Source-language shape:
+            // `switch (sel) #[dispatch="…", table_va=…] { case N: goto …; default: goto …; }`
+            //
+            // The dispatch bytes are NOT pinned to the source. The
+            // lower path re-encodes them from `selector`, `cases`,
+            // `default_addr`, and `table_va` — so editing any of
+            // those fields (or the case targets) flows into the
+            // rebuilt binary instead of being silently overridden
+            // by a stale byte literal.
             let body_indent = format!("{indent}    ");
-            write!(out, "{indent}switch ({selector}) [").unwrap();
-            emit_byte_list(out, bytes);
-            writeln!(out, "] {{").unwrap();
+            writeln!(
+                out,
+                "{indent}switch ({selector}) #[dispatch={dispatch:?}, table_va=0x{table_va:x}] {{",
+            )
+            .unwrap();
             for (i, target) in cases.iter().enumerate() {
                 writeln!(out, "{body_indent}case {i}: goto label_{target:x};").unwrap();
             }

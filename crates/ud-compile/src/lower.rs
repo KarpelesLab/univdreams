@@ -76,6 +76,33 @@ pub enum LowerError {
     #[error("section `{section}` contains a nested section, which is not supported")]
     NestedSection { section: String },
 
+    #[error(
+        "function `{fn_name}` body index {stmt_index}: switch dispatch \
+         {dispatch:?} is not a supported encoding (expected \"msvc-jmp-table\")"
+    )]
+    UnsupportedSwitchDispatch {
+        fn_name: String,
+        stmt_index: usize,
+        dispatch: String,
+    },
+
+    #[error(
+        "function `{fn_name}` body index {stmt_index}: switch dispatch \
+         needs the enclosing function's `@addr` set so the `ja rel32` \
+         can be computed against the case targets"
+    )]
+    SwitchNeedsAddress { fn_name: String, stmt_index: usize },
+
+    #[error(
+        "function `{fn_name}` body index {stmt_index}: switch dispatch \
+         encode failed: {source}"
+    )]
+    SwitchEncode {
+        fn_name: String,
+        stmt_index: usize,
+        source: ud_arch_x86::SwitchEncodeError,
+    },
+
     #[error("function `{fn_name}` has no @addr; cannot place it inside a section")]
     FunctionWithoutAddr { fn_name: String },
 }
@@ -90,6 +117,16 @@ pub enum LowerError {
 /// @epilogue when their structured params equal the auto-default
 /// for the function's profile.
 pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
+    lower_function_bytes_at(f, f.addr)
+}
+
+/// Same as [`lower_function_bytes`] but with an explicit
+/// "IP-space" address override. Callers that store something
+/// other than the function's IP in `FnDecl.addr` (notably the PE
+/// pipeline, which uses file offsets) pass the function's true
+/// virtual address here so `Stmt::Switch` (and any other
+/// PC-relative encoders) compute correctly.
+pub fn lower_function_bytes_at(f: &FnDecl, ip_base: Option<u64>) -> Result<Vec<u8>, LowerError> {
     let mut out = Vec::new();
     let has_prologue = matches!(f.body.first(), Some(Stmt::Prologue { .. }));
     let has_epilogue = matches!(f.body.last(), Some(Stmt::Epilogue { .. }));
@@ -119,7 +156,13 @@ pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
         let prefix = auto_prologue_bytes(f);
         out.extend_from_slice(&prefix);
     }
-    lower_stmts_into(&f.name, &f.body, &mut out)?;
+    // `func_ip` is the function's IP-space address (RVA on PE,
+    // VA on ELF/Mach-O). Statements that re-encode rel32 jumps —
+    // currently `Stmt::Switch`'s dispatch — compute their `ja`
+    // offsets as `func_ip + out.len()`, so the auto-emitted
+    // prologue's bytes (already in `out`) naturally shift the
+    // body cursor.
+    lower_stmts_into(&f.name, ip_base, &f.body, &mut out)?;
     if !has_epilogue && regen_epi {
         let suffix = auto_epilogue_bytes(f);
         out.extend_from_slice(&suffix);
@@ -277,7 +320,13 @@ fn reg_views_intersect(touched: &std::collections::HashSet<&str>, reg64: &str) -
 /// don't track stmt-index paths through nested arms — the body indices
 /// in errors refer to the outermost iteration order, which is enough
 /// to find the bad statement in practice.
-fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<(), LowerError> {
+#[allow(clippy::too_many_lines)]
+fn lower_stmts_into(
+    fn_name: &str,
+    base_addr: Option<u64>,
+    stmts: &[Stmt],
+    out: &mut Vec<u8>,
+) -> Result<(), LowerError> {
     for (i, stmt) in stmts.iter().enumerate() {
         match stmt {
             Stmt::Asm { text, bytes } => {
@@ -290,6 +339,44 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
                 }
                 out.extend_from_slice(bytes);
             }
+            Stmt::Switch {
+                selector,
+                cases,
+                default_addr,
+                dispatch,
+                table_va,
+            } => {
+                if dispatch != "msvc-jmp-table" {
+                    return Err(LowerError::UnsupportedSwitchDispatch {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                        dispatch: dispatch.clone(),
+                    });
+                }
+                let func_addr = base_addr.ok_or_else(|| LowerError::SwitchNeedsAddress {
+                    fn_name: fn_name.to_string(),
+                    stmt_index: i,
+                })?;
+                let cmp_ip = func_addr.checked_add(out.len() as u64).ok_or_else(|| {
+                    LowerError::SwitchNeedsAddress {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                    }
+                })?;
+                let bytes = ud_arch_x86::encode_msvc_jmp_table_dispatch(
+                    selector,
+                    cases.len(),
+                    *default_addr,
+                    *table_va,
+                    cmp_ip,
+                )
+                .map_err(|e| LowerError::SwitchEncode {
+                    fn_name: fn_name.to_string(),
+                    stmt_index: i,
+                    source: e,
+                })?;
+                out.extend_from_slice(&bytes);
+            }
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. }
@@ -298,7 +385,6 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
             | Stmt::IfReturn { bytes, .. }
             | Stmt::Goto { bytes, .. }
             | Stmt::IfGoto { bytes, .. }
-            | Stmt::Switch { bytes, .. }
             | Stmt::SehInstall { bytes }
             | Stmt::SehRestore { bytes }
             | Stmt::ReturnExpr { bytes, .. }
@@ -334,11 +420,11 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
                 if let Some(head_bytes) = head_bytes_attr(attrs) {
                     out.extend_from_slice(head_bytes);
                 }
-                lower_stmts_into(fn_name, pre_body, out)?;
+                lower_stmts_into(fn_name, base_addr, pre_body, out)?;
                 out.extend_from_slice(cond_bytes);
-                lower_stmts_into(fn_name, then_body, out)?;
+                lower_stmts_into(fn_name, base_addr, then_body, out)?;
                 if let Some(else_body) = else_body {
-                    lower_stmts_into(fn_name, else_body, out)?;
+                    lower_stmts_into(fn_name, base_addr, else_body, out)?;
                 }
             }
             Stmt::Loop {
@@ -350,7 +436,7 @@ fn lower_stmts_into(fn_name: &str, stmts: &[Stmt], out: &mut Vec<u8>) -> Result<
                 if let Some(jmp_bytes) = entry_jmp_bytes {
                     out.extend_from_slice(jmp_bytes);
                 }
-                lower_stmts_into(fn_name, body, out)?;
+                lower_stmts_into(fn_name, base_addr, body, out)?;
                 out.extend_from_slice(tail_bytes);
             }
             Stmt::Comment(_) => {}

@@ -20,8 +20,6 @@
 
 use ud_ast::{Field, Item, Module, UdFile, Value};
 
-use crate::lower::lower_function_bytes;
-
 /// Errors specific to the PE lower path.
 #[derive(Debug, thiserror::Error)]
 pub enum PeLowerError {
@@ -85,6 +83,10 @@ pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
 
     let build = build_block(&file.module)?;
     let file_size = read_int(build, "file_size")?;
+    // Read each section's (fileoff, vaddr) so we can translate
+    // function file offsets into IP-space (RVA) addresses for
+    // PC-relative encoders inside `lower_function_bytes`.
+    let section_vaddrs = collect_section_ip_offsets(build);
 
     let mut out = vec![0u8; file_size as usize];
 
@@ -102,7 +104,12 @@ pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
                 let addr = f.addr.ok_or_else(|| PeLowerError::FunctionWithoutAddr {
                     name: f.name.clone(),
                 })?;
-                let bytes = lower_function_bytes(f)?;
+                // `f.addr` is a file offset in PE; the encoder
+                // wants an IP-space address. Walk the section
+                // table to find the section containing `addr`
+                // and translate via `(vaddr - fileoff)`.
+                let ip_base = file_offset_to_rva(addr, &section_vaddrs);
+                let bytes = crate::lower::lower_function_bytes_at(f, ip_base)?;
                 owned_function_bytes.push(bytes);
                 let last = owned_function_bytes.last().unwrap();
                 raws.push((addr, last.clone()));
@@ -188,6 +195,56 @@ fn read_int(fields: &[Field], name: &str) -> Result<u64, PeLowerError> {
         }
     }
     Err(PeLowerError::MissingField { field: name.into() })
+}
+
+/// Parse the `@module.build.sections` list and return each
+/// section's `(pointer_to_raw_data, virtual_address,
+/// size_of_raw_data)` triple. Used to translate a function's
+/// file-offset `addr` to a virtual-address-space IP for
+/// PC-relative encoders inside the function body.
+fn collect_section_ip_offsets(build: &[Field]) -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::new();
+    for f in build {
+        if f.name != "sections" {
+            continue;
+        }
+        let Value::List(secs) = &f.value else {
+            return out;
+        };
+        for s in secs {
+            let Value::Block(sf) = s else { continue };
+            let mut fileoff: Option<u64> = None;
+            let mut vaddr: Option<u64> = None;
+            let mut raw_size: Option<u64> = None;
+            for x in sf {
+                match (x.name.as_str(), &x.value) {
+                    ("pointer_to_raw_data", Value::Int(n)) => fileoff = Some(*n),
+                    ("virtual_address", Value::Int(n)) => vaddr = Some(*n),
+                    ("size_of_raw_data", Value::Int(n)) => raw_size = Some(*n),
+                    _ => {}
+                }
+            }
+            if let (Some(off), Some(va), Some(sz)) = (fileoff, vaddr, raw_size) {
+                out.push((off, va, sz));
+            }
+        }
+        break;
+    }
+    out
+}
+
+/// Given a function's file-offset `addr` and the section table,
+/// return the corresponding RVA (virtual-address-space IP). `None`
+/// when the file offset doesn't fall inside any section we know
+/// about — encoders that require an IP base then fail clearly
+/// instead of silently using a wrong value.
+fn file_offset_to_rva(addr: u64, sections: &[(u64, u64, u64)]) -> Option<u64> {
+    for &(fileoff, vaddr, raw_size) in sections {
+        if addr >= fileoff && addr < fileoff + raw_size {
+            return Some(vaddr + (addr - fileoff));
+        }
+    }
+    None
 }
 
 fn read_string(module: &Module, name: &str) -> Option<String> {

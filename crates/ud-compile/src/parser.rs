@@ -1209,13 +1209,36 @@ impl Parser {
         })
     }
 
-    /// Parse `switch (sel) [bytes] { case N: goto label_HEX; … default: goto label_HEX; }`.
+    /// Parse `switch (sel) #[dispatch="...", table_va=…] { case N: goto label_HEX; … default: goto label_HEX; }`.
+    #[allow(clippy::too_many_lines)]
     fn parse_switch_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let switch_tok = self.peek().clone();
         self.bump(); // `switch`
         self.expect(&TokenKind::LParen, "`(` after `switch`")?;
         let selector = self.parse_paren_inner()?;
         self.expect(&TokenKind::RParen, "`)` to close `switch` selector")?;
-        let bytes = self.parse_byte_list()?;
+        let attrs = self.parse_attrs()?;
+        let mut dispatch: Option<String> = None;
+        let mut table_va: Option<u64> = None;
+        for attr in &attrs {
+            match (attr.key.as_str(), &attr.value) {
+                ("dispatch", ud_ast::AttrValue::String(s)) => dispatch = Some(s.clone()),
+                ("table_va", ud_ast::AttrValue::Int(n)) => table_va = Some(*n),
+                _ => {}
+            }
+        }
+        let dispatch = dispatch.ok_or_else(|| ParseError::Expected {
+            expected: "`#[dispatch=\"...\", table_va=…]` on switch".into(),
+            got: "no dispatch attribute".into(),
+            line: switch_tok.line,
+            col: switch_tok.col,
+        })?;
+        let table_va = table_va.ok_or_else(|| ParseError::Expected {
+            expected: "`table_va=<addr>` on switch".into(),
+            got: "no table_va attribute".into(),
+            line: switch_tok.line,
+            col: switch_tok.col,
+        })?;
         self.expect(&TokenKind::LBrace, "`{` to open `switch` body")?;
         let mut case_table: Vec<(u64, u64)> = Vec::new();
         let mut default_addr: Option<u64> = None;
@@ -1298,7 +1321,8 @@ impl Parser {
             selector,
             cases,
             default_addr,
-            bytes,
+            dispatch,
+            table_va,
         })
     }
 
