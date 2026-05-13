@@ -204,6 +204,11 @@ fn count_function_bytes_as_insns(items: &[Item]) -> usize {
                         *c = (*addr).saturating_add(est);
                     }
                 }
+                Item::JumpTable { addr, entries, .. } => {
+                    if let Some(c) = cursor.as_mut() {
+                        *c = (*addr).saturating_add((entries.len() as u64) * 4);
+                    }
+                }
                 Item::Comment(_) => {}
             }
         }

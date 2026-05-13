@@ -122,6 +122,9 @@ pub enum LowerError {
 
     #[error("function `{fn_name}` has no @addr; cannot place it inside a section")]
     FunctionWithoutAddr { fn_name: String },
+
+    #[error("unknown jump_table dispatch `{dispatch}` (expected `gcc_pie_rel32` or `msvc_va32`)")]
+    UnknownJumpTableDispatch { dispatch: String },
 }
 
 /// Lower one [`FnDecl`] to its byte sequence.
@@ -623,6 +626,16 @@ fn walk_functions(
                     *c = (*addr).saturating_add(lower_notes_bytes(entries).len() as u64);
                 }
             }
+            Item::JumpTable {
+                addr,
+                dispatch,
+                entries,
+            } => {
+                if let Some(c) = cursor.as_mut() {
+                    let bytes = lower_jump_table_bytes(*addr, dispatch, entries)?;
+                    *c = (*addr).saturating_add(bytes.len() as u64);
+                }
+            }
             Item::Comment(_) => {}
         }
     }
@@ -670,6 +683,47 @@ fn lower_notes_bytes(entries: &[ud_ast::NoteEntry]) -> Vec<u8> {
     out
 }
 
+/// Encode an [`Item::JumpTable`] to its on-disk bytes. The
+/// dispatch tag selects the entry encoding:
+///
+/// * `"gcc_pie_rel32"` — 4-byte signed little-endian
+///   `target - table_base`, written in case-index order. Matches
+///   GCC's PIE switch dispatch.
+/// * `"msvc_va32"` — 4-byte little-endian absolute VA of the
+///   target. Matches MSVC's `jmp [base + idx*4]` dispatch.
+///
+/// The case index range is taken as `0..entries.len()`; sparse
+/// tables (cases that aren't 0..N) are not supported at lower
+/// time — the source must spell out gaps with `default:` arms
+/// or an `@raw` fallback.
+fn lower_jump_table_bytes(
+    addr: u64,
+    dispatch: &str,
+    entries: &[ud_ast::JumpTableEntry],
+) -> Result<Vec<u8>, LowerError> {
+    let mut out = Vec::with_capacity(entries.len() * 4);
+    match dispatch {
+        "gcc_pie_rel32" => {
+            for e in entries {
+                let off = e.target.wrapping_sub(addr) as i64 as i32;
+                out.extend_from_slice(&off.to_le_bytes());
+            }
+        }
+        "msvc_va32" => {
+            for e in entries {
+                let va = u32::try_from(e.target & 0xffff_ffff).unwrap_or(0);
+                out.extend_from_slice(&va.to_le_bytes());
+            }
+        }
+        other => {
+            return Err(LowerError::UnknownJumpTableDispatch {
+                dispatch: other.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// One section lowered to its on-disk bytes.
 #[derive(Debug, Clone)]
 pub struct LoweredSection {
@@ -708,6 +762,14 @@ pub fn lower_section_bytes(
             Item::Raw { addr, bytes } => (Some(*addr), bytes.clone()),
             Item::Strings { addr, strings } => (Some(*addr), lower_strings_bytes(strings)),
             Item::Notes { addr, entries } => (Some(*addr), lower_notes_bytes(entries)),
+            Item::JumpTable {
+                addr,
+                dispatch,
+                entries,
+            } => (
+                Some(*addr),
+                lower_jump_table_bytes(*addr, dispatch, entries)?,
+            ),
             Item::Function(f) => {
                 let bytes = lower_function_bytes_at(f, Some(cursor))?;
                 (f.addr, bytes)
@@ -946,6 +1008,61 @@ mod tests {
         ];
         let bytes = lower_section_bytes(".x", 0x1000, &items).unwrap();
         assert_eq!(bytes, vec![0xaa]);
+    }
+
+    #[test]
+    fn lower_jump_table_gcc_pie_rel32_encodes_signed_offsets() {
+        // Table at 0x2020 dispatches to:
+        //   case 0 → 0x117a   (offset -0xea6, low bytes 5a f1 ff ff)
+        //   case 1 → 0x1183   (offset -0xe9d, low bytes 63 f1 ff ff)
+        let bytes = lower_jump_table_bytes(
+            0x2020,
+            "gcc_pie_rel32",
+            &[
+                ud_ast::JumpTableEntry {
+                    case: 0,
+                    target: 0x117a,
+                },
+                ud_ast::JumpTableEntry {
+                    case: 1,
+                    target: 0x1183,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            bytes,
+            vec![0x5a, 0xf1, 0xff, 0xff, 0x63, 0xf1, 0xff, 0xff]
+        );
+    }
+
+    #[test]
+    fn lower_jump_table_msvc_va32_encodes_absolute_va() {
+        let bytes = lower_jump_table_bytes(
+            0x40_2000,
+            "msvc_va32",
+            &[
+                ud_ast::JumpTableEntry {
+                    case: 0,
+                    target: 0x40_117a,
+                },
+                ud_ast::JumpTableEntry {
+                    case: 1,
+                    target: 0x40_1183,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            bytes,
+            vec![0x7a, 0x11, 0x40, 0x00, 0x83, 0x11, 0x40, 0x00]
+        );
+    }
+
+    #[test]
+    fn lower_jump_table_unknown_dispatch_errors() {
+        let err = lower_jump_table_bytes(0x2020, "bogus", &[]).unwrap_err();
+        assert!(matches!(err, LowerError::UnknownJumpTableDispatch { .. }));
     }
 
     #[test]

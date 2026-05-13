@@ -75,8 +75,11 @@ pub fn lower_to_raw(file: &UdFile) -> Result<Vec<u8>, RawLowerError> {
                 let last = owned_function_bytes.last().unwrap();
                 blocks.push((addr, last.clone()));
             }
-            Item::Comment(_) | Item::Section { .. } | Item::Strings { .. } | Item::Notes { .. } => {
-            }
+            Item::Comment(_)
+            | Item::Section { .. }
+            | Item::Strings { .. }
+            | Item::Notes { .. }
+            | Item::JumpTable { .. } => {}
         }
     }
     blocks.sort_by_key(|(addr, _)| *addr);

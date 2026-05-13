@@ -49,6 +49,11 @@ fn emit_item_indented(out: &mut String, item: &Item, depth: usize) {
         Item::Strings { addr, strings } => emit_strings(out, *addr, strings, depth),
         Item::Notes { addr, entries } => emit_notes(out, *addr, entries, depth),
         Item::Section { name, addr, items } => emit_section(out, name, *addr, items, depth),
+        Item::JumpTable {
+            addr,
+            dispatch,
+            entries,
+        } => emit_jump_table(out, *addr, dispatch, entries, depth),
     }
 }
 
@@ -74,6 +79,27 @@ fn emit_strings(out: &mut String, addr: u64, strings: &[String], depth: usize) {
         out.push_str(",\n");
     }
     writeln!(out, "{indent}])").unwrap();
+}
+
+fn emit_jump_table(
+    out: &mut String,
+    addr: u64,
+    dispatch: &str,
+    entries: &[crate::JumpTableEntry],
+    depth: usize,
+) {
+    let indent = " ".repeat(depth * 4);
+    let inner = " ".repeat((depth + 1) * 4);
+    writeln!(
+        out,
+        "{indent}@jump_table(0x{addr:x}, dispatch={}) {{",
+        quote_string(dispatch)
+    )
+    .unwrap();
+    for e in entries {
+        writeln!(out, "{inner}case_{}: label_{:x},", e.case, e.target).unwrap();
+    }
+    writeln!(out, "{indent}}}").unwrap();
 }
 
 fn emit_notes(out: &mut String, addr: u64, entries: &[crate::NoteEntry], depth: usize) {
@@ -1275,5 +1301,33 @@ mod tests {
         assert_eq!(quote_string("a"), r#""a""#);
         assert_eq!(quote_string(r#"say "hi""#), r#""say \"hi\"""#);
         assert_eq!(quote_string(r"\n"), r#""\\n""#);
+    }
+
+    #[test]
+    fn jump_table_emits_addr_dispatch_and_cases() {
+        let f = UdFile {
+            module: empty_module(),
+            items: vec![Item::JumpTable {
+                addr: 0x2020,
+                dispatch: "gcc_pie_rel32".into(),
+                entries: vec![
+                    crate::JumpTableEntry {
+                        case: 0,
+                        target: 0x117a,
+                    },
+                    crate::JumpTableEntry {
+                        case: 1,
+                        target: 0x1183,
+                    },
+                ],
+            }],
+        };
+        let out = emit(&f);
+        assert!(
+            out.contains("@jump_table(0x2020, dispatch=\"gcc_pie_rel32\") {"),
+            "actual:\n{out}"
+        );
+        assert!(out.contains("case_0: label_117a,"), "actual:\n{out}");
+        assert!(out.contains("case_1: label_1183,"), "actual:\n{out}");
     }
 }

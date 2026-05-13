@@ -518,6 +518,61 @@ impl Parser {
                 self.expect(&TokenKind::RParen, "`)` to close `@notes`")?;
                 Ok(Item::Notes { addr, entries })
             }
+            "jump_table" => {
+                self.expect(&TokenKind::LParen, "`(` after `@jump_table`")?;
+                let addr = self.expect_int("an integer address")?;
+                self.expect(&TokenKind::Comma, "`,` after `@jump_table` address")?;
+                let dispatch_key = self.expect_ident("`dispatch`")?;
+                if dispatch_key != "dispatch" {
+                    return Err(ParseError::Expected {
+                        expected: "`dispatch`".into(),
+                        got: format!("`{dispatch_key}`"),
+                        line: dir_tok.line,
+                        col: dir_tok.col,
+                    });
+                }
+                self.expect(&TokenKind::Eq, "`=` after `dispatch`")?;
+                let dispatch = self.expect_string("dispatch kind string")?;
+                self.expect(&TokenKind::RParen, "`)` to close `@jump_table` header")?;
+                self.expect(&TokenKind::LBrace, "`{` to open jump_table entries")?;
+                let mut entries: Vec<ud_ast::JumpTableEntry> = Vec::new();
+                while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+                    let case_ident = self.expect_ident("`case_<N>` identifier")?;
+                    let case_num = case_ident
+                        .strip_prefix("case_")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .ok_or_else(|| ParseError::Expected {
+                            expected: "`case_<N>` (decimal index)".into(),
+                            got: format!("`{case_ident}`"),
+                            line: self.peek().line,
+                            col: self.peek().col,
+                        })?;
+                    self.expect(&TokenKind::Colon, "`:` after case label")?;
+                    let target_ident = self.expect_ident("`label_<hex>` target")?;
+                    let target = target_ident
+                        .strip_prefix("label_")
+                        .and_then(|s| u64::from_str_radix(s, 16).ok())
+                        .ok_or_else(|| ParseError::Expected {
+                            expected: "`label_<hex>` target".into(),
+                            got: format!("`{target_ident}`"),
+                            line: self.peek().line,
+                            col: self.peek().col,
+                        })?;
+                    entries.push(ud_ast::JumpTableEntry {
+                        case: case_num,
+                        target,
+                    });
+                    if !self.eat_kind(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBrace, "`}` to close `@jump_table` body")?;
+                Ok(Item::JumpTable {
+                    addr,
+                    dispatch,
+                    entries,
+                })
+            }
             "section" => {
                 self.expect(&TokenKind::LParen, "`(` after `@section`")?;
                 let section_name = self.expect_string("section name")?;
@@ -2664,6 +2719,34 @@ fn f() {
             msg.contains("@then"),
             "expected `@then` mention in error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn jump_table_round_trips_through_parse() {
+        let src = r#"@module {}
+
+@jump_table(0x2020, dispatch="gcc_pie_rel32") {
+    case_0: label_117a,
+    case_1: label_1183,
+    case_2: label_118c,
+}
+"#;
+        let f = parse(src).unwrap();
+        let Item::JumpTable {
+            addr,
+            dispatch,
+            entries,
+        } = &f.items[0]
+        else {
+            panic!("expected JumpTable, got {:?}", f.items[0]);
+        };
+        assert_eq!(*addr, 0x2020);
+        assert_eq!(dispatch, "gcc_pie_rel32");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].case, 0);
+        assert_eq!(entries[0].target, 0x117a);
+        assert_eq!(entries[2].case, 2);
+        assert_eq!(entries[2].target, 0x118c);
     }
 
     #[test]

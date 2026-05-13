@@ -119,6 +119,38 @@ pub enum Item {
         addr: u64,
         items: Vec<Item>,
     },
+
+    /// `@jump_table(0x…, dispatch="…") { case_0: label_<addr>; … }` —
+    /// a structured switch jump table. Each entry names a case index
+    /// and the address it dispatches to; the `dispatch` string tags
+    /// the encoding kind (e.g. `"gcc_pie_rel32"`, `"msvc_va32"`) so
+    /// lower knows whether to emit 4-byte signed offsets relative to
+    /// the table base, absolute 32-bit VAs, or some other layout.
+    /// Replaces the `@raw` byte run a jump table would otherwise
+    /// occupy in `.rodata`, recovering the symbolic intent of the
+    /// dispatch.
+    JumpTable {
+        addr: u64,
+        dispatch: String,
+        entries: Vec<JumpTableEntry>,
+    },
+}
+
+/// One entry inside an [`Item::JumpTable`] block: a case index and
+/// the address it dispatches to. The case ordering is the encoded
+/// table order — entries lower in source-text order render at
+/// `(addr + i * entry_size)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JumpTableEntry {
+    /// Case index — `0`, `1`, … for dense tables; sparse tables
+    /// preserve gaps via case numbers that aren't strictly
+    /// contiguous (rare in practice — most compilers normalise to
+    /// a dense table with a `default` arm).
+    pub case: u64,
+    /// Target address the case dispatches to. Renders as
+    /// `label_<addr:x>` in source text — the same label name a
+    /// `Stmt::Goto` would produce.
+    pub target: u64,
 }
 
 /// One entry inside an [`Item::Notes`] block. Mirrors the structure

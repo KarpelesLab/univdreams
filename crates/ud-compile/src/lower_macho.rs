@@ -95,8 +95,11 @@ pub fn lower_to_macho(file: &UdFile) -> Result<Vec<u8>, MachoLowerError> {
                 let bytes = crate::lower::lower_function_bytes(f)?;
                 raws.push((addr, bytes));
             }
-            Item::Comment(_) | Item::Section { .. } | Item::Strings { .. } | Item::Notes { .. } => {
-            }
+            Item::Comment(_)
+            | Item::Section { .. }
+            | Item::Strings { .. }
+            | Item::Notes { .. }
+            | Item::JumpTable { .. } => {}
         }
     }
     for (addr, bytes) in &raws {

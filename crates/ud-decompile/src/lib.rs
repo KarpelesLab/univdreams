@@ -179,6 +179,11 @@ fn drop_redundant_function_addrs(section_addr: u64, items: &mut [Item]) {
             Item::Notes { addr, entries } => {
                 cursor = (*addr).saturating_add(notes_byte_size(entries));
             }
+            Item::JumpTable { addr, entries, .. } => {
+                // Every supported dispatch encoding uses 4-byte
+                // entries; case_count * 4 is the on-disk size.
+                cursor = (*addr).saturating_add((entries.len() as u64) * 4);
+            }
             Item::Comment(_) | Item::Section { .. } => {}
         }
     }
