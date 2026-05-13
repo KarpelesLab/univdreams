@@ -38,6 +38,12 @@ struct Parser {
     src: String,
     tokens: Vec<Token>,
     pos: usize,
+    /// Bit width captured from `@module.bits` once the module
+    /// header is parsed. Drives the prologue/epilogue codec choice
+    /// for byte encoding at parse time. Defaults to 32 so legacy
+    /// fixtures without an explicit `bits` field still encode
+    /// correctly.
+    bits: u32,
 }
 
 impl Parser {
@@ -46,6 +52,7 @@ impl Parser {
             src,
             tokens,
             pos: 0,
+            bits: 32,
         }
     }
 
@@ -135,6 +142,19 @@ impl Parser {
 
     fn parse_file(&mut self) -> Result<UdFile, ParseError> {
         let module = self.parse_module()?;
+        // Cache `bits` so prologue/epilogue encoders downstream
+        // pick the matching codec width without re-walking the
+        // module fields per stmt.
+        for f in &module.fields {
+            if f.name == "bits" {
+                if let ud_ast::Value::Int(n) = &f.value {
+                    if let Ok(n) = u32::try_from(*n) {
+                        self.bits = n;
+                    }
+                }
+                break;
+            }
+        }
         let mut items = Vec::new();
         while self.peek().kind != TokenKind::Eof {
             items.push(self.parse_item()?);
@@ -1570,7 +1590,7 @@ impl Parser {
                 if self.peek().kind == TokenKind::RParen {
                     self.bump();
                     let params = ud_ast::PrologueParams::default();
-                    let bytes = encode_prologue_bytes(&kind, &params);
+                    let bytes = encode_prologue_bytes(&kind, &params, self.bits);
                     return Ok(Stmt::Prologue {
                         kind,
                         params: Some(params),
@@ -1589,7 +1609,7 @@ impl Parser {
                 } else {
                     let params = self.parse_prologue_params()?;
                     self.expect(&TokenKind::RParen, "`)` to close `@prologue`")?;
-                    let bytes = encode_prologue_bytes(&kind, &params);
+                    let bytes = encode_prologue_bytes(&kind, &params, self.bits);
                     Ok(Stmt::Prologue {
                         kind,
                         params: Some(params),
@@ -1603,7 +1623,7 @@ impl Parser {
                 if self.peek().kind == TokenKind::RParen {
                     self.bump();
                     let params = ud_ast::EpilogueParams::default();
-                    let bytes = encode_epilogue_bytes(&params);
+                    let bytes = encode_epilogue_bytes(&params, self.bits);
                     return Ok(Stmt::Epilogue {
                         kind,
                         params: Some(params),
@@ -1622,7 +1642,7 @@ impl Parser {
                 } else {
                     let params = self.parse_epilogue_params()?;
                     self.expect(&TokenKind::RParen, "`)` to close `@epilogue`")?;
-                    let bytes = encode_epilogue_bytes(&params);
+                    let bytes = encode_epilogue_bytes(&params, self.bits);
                     Ok(Stmt::Epilogue {
                         kind,
                         params: Some(params),
@@ -1971,13 +1991,21 @@ fn ensure_head_bytes(
 /// 64-bit kinds use the `64-` prefix (e.g. `64-std`). For now,
 /// callers always use 32-bit since the structured-form codec is
 /// wired in only for x86-32 inputs.
-fn encode_prologue_bytes(_kind: &str, params: &ud_ast::PrologueParams) -> Vec<u8> {
-    let cb = ud_arch_x86::CodecBits::Bits32;
+fn encode_prologue_bytes(_kind: &str, params: &ud_ast::PrologueParams, bits: u32) -> Vec<u8> {
+    let cb = if bits == 64 {
+        ud_arch_x86::CodecBits::Bits64
+    } else {
+        ud_arch_x86::CodecBits::Bits32
+    };
     ud_arch_x86::encode_prologue(&prologue_to_codec(params), cb)
 }
 
-fn encode_epilogue_bytes(params: &ud_ast::EpilogueParams) -> Vec<u8> {
-    let cb = ud_arch_x86::CodecBits::Bits32;
+fn encode_epilogue_bytes(params: &ud_ast::EpilogueParams, bits: u32) -> Vec<u8> {
+    let cb = if bits == 64 {
+        ud_arch_x86::CodecBits::Bits64
+    } else {
+        ud_arch_x86::CodecBits::Bits32
+    };
     ud_arch_x86::encode_epilogue(&epilogue_to_codec(params), cb)
 }
 

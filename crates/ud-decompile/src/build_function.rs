@@ -56,6 +56,10 @@ pub fn build_function(
 
     let mut body = Vec::new();
     let func_end = f.addr.0.saturating_add(f.size() as u64);
+    let codec_bits = match bitness {
+        ud_arch_x86::Bitness::Bits64 => ud_arch_x86::CodecBits::Bits64,
+        _ => ud_arch_x86::CodecBits::Bits32,
+    };
     let ctx = EmitCtx {
         fn_addr_start: f.addr.0,
         fn_addr_end: func_end,
@@ -63,6 +67,7 @@ pub fn build_function(
         sp_delta_at: &sp_delta_at,
         signature: signature.as_ref(),
         data,
+        codec_bits,
     };
 
     // Loops can fold the unconditional `jmp` from the block right
@@ -252,12 +257,22 @@ pub fn build_function(
         (pm_fp, em_fp, dp_fp, de_fp)
     };
     let mut dropped_any = false;
-    if pro_matches {
+    // The default heuristic targets MSVC x86-32 prologue shapes
+    // (callee-saved ebx/esi/edi, `push ebp; mov ebp, esp` frame
+    // setup). For 64-bit functions the comparison is structurally
+    // impossible — the registers don't match — so the comments it
+    // would emit are misleading and the autogen marker would
+    // round-trip wrong. Gate the whole block.
+    let defaults_apply = !matches!(bitness, ud_arch_x86::Bitness::Bits64);
+    if defaults_apply && pro_matches {
         body.remove(0);
         dropped_any = true;
-    } else if let Some(Stmt::Prologue {
-        params: Some(p), ..
-    }) = body.first()
+    } else if let (
+        true,
+        Some(Stmt::Prologue {
+            params: Some(p), ..
+        }),
+    ) = (defaults_apply, body.first())
     {
         // Non-matching prologue: prepend a brief comment showing
         // what the auto-derived default would have been, so a
@@ -279,12 +294,15 @@ pub fn build_function(
             }
         }
     }
-    if epi_matches {
+    if defaults_apply && epi_matches {
         body.pop();
         dropped_any = true;
-    } else if let Some(Stmt::Epilogue {
-        params: Some(e), ..
-    }) = body.last()
+    } else if let (
+        true,
+        Some(Stmt::Epilogue {
+            params: Some(e), ..
+        }),
+    ) = (defaults_apply, body.last())
     {
         let saves_is_subset = is_subset(&e.saves, &default_epi.saves)
             && e.leave == default_epi.leave
@@ -1167,8 +1185,11 @@ fn describe_default_epilogue(e: &ud_arch_x86::StructuredEpilogue) -> Option<Stri
 /// back to the opaque byte list. The bit-width is currently
 /// fixed to 32-bit; expand the call site when the structured
 /// form is wired in for x86-64.
-fn decode_prologue_params(bytes: &[u8]) -> Option<ud_ast::PrologueParams> {
-    let p = ud_arch_x86::prologue_roundtrips(bytes, ud_arch_x86::CodecBits::Bits32)?;
+fn decode_prologue_params(
+    bytes: &[u8],
+    bits: ud_arch_x86::CodecBits,
+) -> Option<ud_ast::PrologueParams> {
+    let p = ud_arch_x86::prologue_roundtrips(bytes, bits)?;
     Some(ud_ast::PrologueParams {
         saves: p.saves,
         saves_after: p.saves_after,
@@ -1179,8 +1200,11 @@ fn decode_prologue_params(bytes: &[u8]) -> Option<ud_ast::PrologueParams> {
 }
 
 /// Mirror of [`decode_prologue_params`] for epilogues.
-fn decode_epilogue_params(bytes: &[u8]) -> Option<ud_ast::EpilogueParams> {
-    let e = ud_arch_x86::epilogue_roundtrips(bytes, ud_arch_x86::CodecBits::Bits32)?;
+fn decode_epilogue_params(
+    bytes: &[u8],
+    bits: ud_arch_x86::CodecBits,
+) -> Option<ud_ast::EpilogueParams> {
+    let e = ud_arch_x86::epilogue_roundtrips(bytes, bits)?;
     Some(ud_ast::EpilogueParams {
         saves: e.saves,
         leave: e.leave,
@@ -3893,6 +3917,10 @@ struct EmitCtx<'a> {
     sp_delta_at: &'a HashMap<u64, i64>,
     signature: Option<&'a Signature>,
     data: &'a dyn DataLookup,
+    /// Bit width for the prologue/epilogue codec — derived from the
+    /// function's first instruction. Drives the 32-bit vs 64-bit
+    /// encoding choice in `decode_prologue_params` and friends.
+    codec_bits: ud_arch_x86::CodecBits,
 }
 
 /// Emit one block's worth of statements into `out`.
@@ -3919,7 +3947,7 @@ fn emit_block_stmts(
                 .iter()
                 .flat_map(|insn| insn.original_bytes.iter().copied())
                 .collect();
-            let params = decode_prologue_params(&bytes);
+            let params = decode_prologue_params(&bytes, ctx.codec_bits);
             out.push(Stmt::Prologue {
                 kind: lifted.kind.to_string(),
                 params,
@@ -4130,7 +4158,7 @@ fn emit_block_stmts(
                 });
             }
             BlockTailLift::Epilogue { kind, .. } => {
-                let params = decode_epilogue_params(&lifted_bytes);
+                let params = decode_epilogue_params(&lifted_bytes, ctx.codec_bits);
                 out.push(Stmt::Epilogue {
                     kind: (*kind).to_string(),
                     params,
