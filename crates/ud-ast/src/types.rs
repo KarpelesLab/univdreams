@@ -375,10 +375,19 @@ pub enum Stmt {
     /// `value` is the literal/expression the target block returns,
     /// when statically known; empty when the target's return value
     /// can't be folded.
+    ///
+    /// Same shape as `IfGoto`: the jcc tail re-encodes from
+    /// the target's *implicit* address (the return-block's
+    /// position, captured at decompile time via the cmp-bytes
+    /// length + jcc rel resolution). `cmp_bytes` stays pinned
+    /// until the text assembler.
     IfReturn {
         cond_text: String,
         value_text: String,
-        bytes: Vec<u8>,
+        target_addr: u64,
+        cmp_bytes: Vec<u8>,
+        cond_code: u8,
+        wide: bool,
     },
 
     /// `label_XXXX:` — a zero-byte marker for a jump target. The
@@ -407,14 +416,25 @@ pub enum Stmt {
     /// when the displacement no longer fits in `i8`.
     Goto { target_addr: u64, wide: bool },
 
-    /// `if (cond) goto label_XXXX; [bytes]` — a conditional jump
-    /// folded from `@asm("cmp/test …; jcc …")` whose target is a
-    /// labeled block elsewhere in the function. Bytes are the
-    /// original cmp/test + jcc encoding.
+    /// `if (cond) goto label_XXXX;` — a conditional jump folded
+    /// from `cmp/test …; jcc …`. The jcc tail is no longer
+    /// pinned in source: the lower path re-encodes
+    /// `jcc rel8/rel32` from `target_addr`, `cond_code`, and
+    /// `wide`. `cmp_bytes` carries the cmp/test prefix (empty
+    /// when the source is a bare flag check); it stays pinned
+    /// until the text-assembler can re-encode it from
+    /// `cond_text`.
+    ///
+    /// Editing a label so its position changes flows through to
+    /// the rebuilt binary. Editing `cmp_bytes` and `cond_text`
+    /// without keeping them consistent is the user's job until
+    /// the assembler lands.
     IfGoto {
         cond_text: String,
         target_addr: u64,
-        bytes: Vec<u8>,
+        cmp_bytes: Vec<u8>,
+        cond_code: u8,
+        wide: bool,
     },
 
     /// `switch (selector) #[dispatch="…", table_va=…] { case N: goto … }`

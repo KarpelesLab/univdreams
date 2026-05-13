@@ -254,20 +254,17 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
         Stmt::IfReturn {
             cond_text,
             value_text,
-            bytes,
+            target_addr,
+            cmp_bytes,
+            cond_code,
+            wide,
         } => {
-            // C-shaped rendering: `if (cond) return value; [bytes]`.
-            // The bytes are the original cmp/test + jcc encoding;
-            // the `return value;` form is purely informational —
-            // at runtime the jcc transfers control to a shared
-            // return tail elsewhere in the function.
             write!(out, "{indent}if ({cond_text}) return").unwrap();
             if !value_text.is_empty() {
                 write!(out, " {value_text}").unwrap();
             }
-            write!(out, "; [").unwrap();
-            emit_byte_list(out, bytes);
-            writeln!(out, "]").unwrap();
+            emit_jcc_attrs(out, *cond_code, *wide, cmp_bytes, *target_addr, true);
+            writeln!(out, ";").unwrap();
         }
         Stmt::Label { addr } => {
             // No bytes — labels are pure markers. Render dedented
@@ -290,15 +287,13 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
         Stmt::IfGoto {
             cond_text,
             target_addr,
-            bytes,
+            cmp_bytes,
+            cond_code,
+            wide,
         } => {
-            write!(
-                out,
-                "{indent}if ({cond_text}) goto label_{target_addr:x}; ["
-            )
-            .unwrap();
-            emit_byte_list(out, bytes);
-            writeln!(out, "]").unwrap();
+            write!(out, "{indent}if ({cond_text}) goto label_{target_addr:x}").unwrap();
+            emit_jcc_attrs(out, *cond_code, *wide, cmp_bytes, *target_addr, false);
+            writeln!(out, ";").unwrap();
         }
         Stmt::SehInstall { bytes } => {
             write!(out, "{indent}@seh_install([").unwrap();
@@ -647,6 +642,64 @@ fn emit_signed_hex(out: &mut String, n: i64) {
         write!(out, "-0x{:x}", n.unsigned_abs()).unwrap();
     } else {
         write!(out, "0x{n:x}").unwrap();
+    }
+}
+
+/// Render the trailing attribute list for an `if (...) goto/return …`
+/// statement: any combination of `#[cond="je"]`, `#[cmp=[bytes]]`,
+/// `#[wide]`, and (for `return` forms only) `#[target=0x…]`.
+fn emit_jcc_attrs(
+    out: &mut String,
+    cond_code: u8,
+    wide: bool,
+    cmp_bytes: &[u8],
+    target_addr: u64,
+    include_target: bool,
+) {
+    let mut parts: Vec<String> = Vec::new();
+    let cond_name = jcc_cond_name_for_emit(cond_code);
+    parts.push(format!("cond={cond_name:?}"));
+    if !cmp_bytes.is_empty() {
+        let mut s = String::from("cmp=[");
+        for (i, b) in cmp_bytes.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            write!(s, "0x{b:02x}").unwrap();
+        }
+        s.push(']');
+        parts.push(s);
+    }
+    if wide {
+        parts.push("wide".into());
+    }
+    if include_target {
+        parts.push(format!("target=0x{target_addr:x}"));
+    }
+    out.push_str(" #[");
+    out.push_str(&parts.join(", "));
+    out.push(']');
+}
+
+fn jcc_cond_name_for_emit(cond_code: u8) -> &'static str {
+    // Canonical lowercase names; lower / parse uses the same mapping.
+    match cond_code & 0x0f {
+        0x0 => "jo",
+        0x1 => "jno",
+        0x2 => "jb",
+        0x3 => "jae",
+        0x4 => "je",
+        0x5 => "jne",
+        0x6 => "jbe",
+        0x7 => "ja",
+        0x8 => "js",
+        0x9 => "jns",
+        0xa => "jp",
+        0xb => "jnp",
+        0xc => "jl",
+        0xd => "jge",
+        0xe => "jle",
+        _ => "jg",
     }
 }
 

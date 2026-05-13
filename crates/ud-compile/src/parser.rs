@@ -1187,7 +1187,7 @@ impl Parser {
         }
     }
 
-    /// Parse the tail of an `if (cond) goto label_HEX; [bytes]`.
+    /// Parse the tail of an `if (cond) goto label_HEX [#[…]] ;`.
     fn parse_if_goto_tail(&mut self, cond_text: String) -> Result<Stmt, ParseError> {
         self.bump(); // consume `goto`
         let label_tok = self.peek().clone();
@@ -1200,13 +1200,58 @@ impl Parser {
                 col: label_tok.col,
             });
         };
+        let (cmp_bytes, cond_code, wide, _target_attr) = self.parse_jcc_attrs(&label_tok)?;
         self.expect(&TokenKind::Semicolon, "`;` after `goto` target")?;
-        let bytes = self.parse_byte_list()?;
         Ok(Stmt::IfGoto {
             cond_text,
             target_addr,
-            bytes,
+            cmp_bytes,
+            cond_code,
+            wide,
         })
+    }
+
+    /// Parse the trailing `#[cond="…", cmp=[bytes], wide, target=0x…]`
+    /// block shared by `IfGoto` and `IfReturn`. Returns
+    /// `(cmp_bytes, cond_code, wide, target)` with the cond
+    /// resolved from the attribute's name. `target` is `None` for
+    /// goto forms (the target is in the `goto label_X` syntax)
+    /// and `Some(addr)` for return forms.
+    fn parse_jcc_attrs(
+        &mut self,
+        anchor_tok: &super::lexer::Token,
+    ) -> Result<(Vec<u8>, u8, bool, Option<u64>), ParseError> {
+        let attrs = self.parse_attrs()?;
+        let mut cmp_bytes: Vec<u8> = Vec::new();
+        let mut cond_code: Option<u8> = None;
+        let mut wide = false;
+        let mut target: Option<u64> = None;
+        for a in &attrs {
+            match (a.key.as_str(), &a.value) {
+                ("cond", ud_ast::AttrValue::String(s)) => {
+                    cond_code = ud_arch_x86::jcc_cond_code_from_name(s);
+                    if cond_code.is_none() {
+                        return Err(ParseError::Expected {
+                            expected: "known jcc mnemonic in `cond=\"…\"`".into(),
+                            got: format!("`{s}`"),
+                            line: anchor_tok.line,
+                            col: anchor_tok.col,
+                        });
+                    }
+                }
+                ("cmp", ud_ast::AttrValue::ByteList(b)) => cmp_bytes.clone_from(b),
+                ("wide", ud_ast::AttrValue::Flag) => wide = true,
+                ("target", ud_ast::AttrValue::Int(n)) => target = Some(*n),
+                _ => {}
+            }
+        }
+        let cond_code = cond_code.ok_or_else(|| ParseError::Expected {
+            expected: "`#[cond=\"…\"]` attribute on the `if (...) goto/return`".into(),
+            got: "no `cond` attribute".into(),
+            line: anchor_tok.line,
+            col: anchor_tok.col,
+        })?;
+        Ok((cmp_bytes, cond_code, wide, target))
     }
 
     /// Parse `switch (sel) #[dispatch="...", table_va=…] { case N: goto label_HEX; … default: goto label_HEX; }`.
@@ -1370,24 +1415,49 @@ impl Parser {
     }
 
     /// Parse the tail of an early-return `if`:
-    /// `return [value]; [bytes]`. Called by [`parse_if_stmt`] when
+    /// `return [value] [#[…]] ;`. Called by [`parse_if_stmt`] when
     /// the token immediately after the condition's `)` is the
     /// `return` keyword.
     fn parse_if_return_tail(&mut self, cond_text: String) -> Result<Stmt, ParseError> {
+        let anchor_tok = self.peek().clone();
         self.bump(); // consume `return`
-                     // Optional value expression — anything up to the `;`.
-        let value_text = if self.peek().kind == TokenKind::Semicolon {
+                     // Optional value expression — anything up to the `;` or `#[…]` attrs.
+        let value_text = if matches!(self.peek().kind, TokenKind::Semicolon | TokenKind::Hash) {
             String::new()
         } else {
-            self.parse_until_semicolon()?
+            self.parse_until_semicolon_or_attr()?
         };
+        let (cmp_bytes, cond_code, wide, target) = self.parse_jcc_attrs(&anchor_tok)?;
         self.expect(&TokenKind::Semicolon, "`;` after `return` value")?;
-        let bytes = self.parse_byte_list()?;
+        let target_addr = target.ok_or_else(|| ParseError::Expected {
+            expected: "`target=0x…` attribute on `if (...) return …`".into(),
+            got: "no `target` attribute".into(),
+            line: anchor_tok.line,
+            col: anchor_tok.col,
+        })?;
         Ok(Stmt::IfReturn {
             cond_text,
             value_text,
-            bytes,
+            target_addr,
+            cmp_bytes,
+            cond_code,
+            wide,
         })
+    }
+
+    fn parse_until_semicolon_or_attr(&mut self) -> Result<String, ParseError> {
+        let start_pos = self.peek().start;
+        loop {
+            match self.peek().kind {
+                TokenKind::Semicolon | TokenKind::Hash => break,
+                TokenKind::Eof => return Err(ParseError::UnexpectedEof),
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        let end_pos = self.peek().start;
+        Ok(self.src[start_pos..end_pos].trim().to_string())
     }
 
     /// Snip the source text between the current position and the
@@ -1719,20 +1789,12 @@ impl Parser {
                 self.expect(&TokenKind::RParen, "`)` to close `@seh_restore`")?;
                 Ok(Stmt::SehRestore { bytes })
             }
-            "if_return" => {
-                self.expect(&TokenKind::LParen, "`(` after `@if_return`")?;
-                let cond_text = self.expect_string("if_return condition text")?;
-                self.expect(&TokenKind::Comma, "`,` after `@if_return` condition")?;
-                let value_text = self.expect_string("if_return return-value text")?;
-                self.expect(&TokenKind::Comma, "`,` after `@if_return` value")?;
-                let bytes = self.parse_byte_list()?;
-                self.expect(&TokenKind::RParen, "`)` to close `@if_return`")?;
-                Ok(Stmt::IfReturn {
-                    cond_text,
-                    value_text,
-                    bytes,
-                })
-            }
+            "if_return" => Err(ParseError::Expected {
+                expected: "C-style `if (cond) return value;` syntax — the legacy `@if_return(...)` directive is retired".into(),
+                got: "`@if_return`".into(),
+                line: 0,
+                col: 0,
+            }),
             "return_expr" => {
                 self.expect(&TokenKind::LParen, "`(` after `@return_expr`")?;
                 let text = self.expect_string("return-expr text")?;

@@ -1522,6 +1522,120 @@ pub fn encoded_jmp_size(source_ip: u64, target: u64, wide: bool) -> usize {
     5
 }
 
+/// Encode a conditional `jcc` from `source_ip` (the address of
+/// the jcc instruction itself) to `target`.
+///
+/// `cond_code` is the low nibble of the jcc opcode (0..=15):
+///
+/// * 0x0 = jo,  0x1 = jno,  0x2 = jb/jnae,  0x3 = jae/jnb
+/// * 0x4 = je,  0x5 = jne,  0x6 = jbe,      0x7 = ja
+/// * 0x8 = js,  0x9 = jns,  0xA = jp,       0xB = jnp
+/// * 0xC = jl,  0xD = jge,  0xE = jle,      0xF = jg
+///
+/// * `wide=false` and the displacement fits in `i8`: `jcc rel8`
+///   (2 bytes, opcode `0x70 | cond`).
+/// * otherwise: `jcc rel32` (6 bytes, opcodes `0x0F 0x80 | cond`).
+pub fn encode_jcc(
+    source_ip: u64,
+    target: u64,
+    cond_code: u8,
+    wide: bool,
+) -> std::result::Result<Vec<u8>, JumpEncodeError> {
+    let cc = cond_code & 0x0f;
+    if !wide {
+        let after_rel8 = source_ip.wrapping_add(2);
+        let rel8 = i128::from(target).wrapping_sub(i128::from(after_rel8));
+        if (-128..=127).contains(&rel8) {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let imm = rel8 as i8 as u8;
+            return Ok(vec![0x70 | cc, imm]);
+        }
+    }
+    let after_rel32 = source_ip.wrapping_add(6);
+    let rel = i128::from(target).wrapping_sub(i128::from(after_rel32));
+    let rel32 = i32::try_from(rel).map_err(|_| JumpEncodeError::OutOfRange {
+        from: source_ip,
+        to: target,
+    })?;
+    let mut out = Vec::with_capacity(6);
+    out.push(0x0f);
+    out.push(0x80 | cc);
+    out.extend_from_slice(&rel32.to_le_bytes());
+    Ok(out)
+}
+
+/// Pre-computed byte size of [`encode_jcc`]'s output.
+#[must_use]
+pub fn encoded_jcc_size(source_ip: u64, target: u64, wide: bool) -> usize {
+    if !wide {
+        let after_rel8 = source_ip.wrapping_add(2);
+        let rel8 = i128::from(target).wrapping_sub(i128::from(after_rel8));
+        if (-128..=127).contains(&rel8) {
+            return 2;
+        }
+    }
+    6
+}
+
+/// Extract the jcc condition code (0..=15) from an already-
+/// decoded jcc's opcode bytes. Returns `None` when `bytes` isn't
+/// a recognised jcc encoding.
+#[must_use]
+pub fn jcc_cond_code_from_bytes(bytes: &[u8]) -> Option<u8> {
+    match bytes {
+        [op, ..] if (0x70..=0x7f).contains(op) => Some(op - 0x70),
+        [0x0f, op, ..] if (0x80..=0x8f).contains(op) => Some(op - 0x80),
+        _ => None,
+    }
+}
+
+/// Symbolic name for a jcc condition code, lowercase.
+#[must_use]
+pub fn jcc_cond_name(cond_code: u8) -> &'static str {
+    match cond_code & 0x0f {
+        0x0 => "jo",
+        0x1 => "jno",
+        0x2 => "jb",
+        0x3 => "jae",
+        0x4 => "je",
+        0x5 => "jne",
+        0x6 => "jbe",
+        0x7 => "ja",
+        0x8 => "js",
+        0x9 => "jns",
+        0xa => "jp",
+        0xb => "jnp",
+        0xc => "jl",
+        0xd => "jge",
+        0xe => "jle",
+        _ => "jg",
+    }
+}
+
+/// Inverse of [`jcc_cond_name`].
+#[must_use]
+pub fn jcc_cond_code_from_name(name: &str) -> Option<u8> {
+    Some(match name {
+        "jo" => 0x0,
+        "jno" => 0x1,
+        "jb" | "jc" | "jnae" => 0x2,
+        "jae" | "jnb" | "jnc" => 0x3,
+        "je" | "jz" => 0x4,
+        "jne" | "jnz" => 0x5,
+        "jbe" | "jna" => 0x6,
+        "ja" | "jnbe" => 0x7,
+        "js" => 0x8,
+        "jns" => 0x9,
+        "jp" | "jpe" => 0xa,
+        "jnp" | "jpo" => 0xb,
+        "jl" | "jnge" => 0xc,
+        "jge" | "jnl" => 0xd,
+        "jle" | "jng" => 0xe,
+        "jg" | "jnle" => 0xf,
+        _ => return None,
+    })
+}
+
 /// Errors emitted by [`encode_msvc_jmp_table_dispatch`].
 #[derive(Debug, thiserror::Error)]
 pub enum SwitchEncodeError {

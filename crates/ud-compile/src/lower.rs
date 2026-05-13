@@ -415,13 +415,63 @@ fn lower_stmts_into(
                     })?;
                 out.extend_from_slice(&bytes);
             }
+            Stmt::IfGoto {
+                target_addr,
+                cmp_bytes,
+                cond_code,
+                wide,
+                ..
+            } => {
+                let func_addr = base_addr.ok_or_else(|| LowerError::GotoNeedsAddress {
+                    fn_name: fn_name.to_string(),
+                    stmt_index: i,
+                })?;
+                out.extend_from_slice(cmp_bytes);
+                let jcc_ip = func_addr.checked_add(out.len() as u64).ok_or_else(|| {
+                    LowerError::GotoNeedsAddress {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                    }
+                })?;
+                let jcc = ud_arch_x86::encode_jcc(jcc_ip, *target_addr, *cond_code, *wide)
+                    .map_err(|e| LowerError::GotoEncode {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                        source: e,
+                    })?;
+                out.extend_from_slice(&jcc);
+            }
+            Stmt::IfReturn {
+                target_addr,
+                cmp_bytes,
+                cond_code,
+                wide,
+                ..
+            } => {
+                let func_addr = base_addr.ok_or_else(|| LowerError::GotoNeedsAddress {
+                    fn_name: fn_name.to_string(),
+                    stmt_index: i,
+                })?;
+                out.extend_from_slice(cmp_bytes);
+                let jcc_ip = func_addr.checked_add(out.len() as u64).ok_or_else(|| {
+                    LowerError::GotoNeedsAddress {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                    }
+                })?;
+                let jcc = ud_arch_x86::encode_jcc(jcc_ip, *target_addr, *cond_code, *wide)
+                    .map_err(|e| LowerError::GotoEncode {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                        source: e,
+                    })?;
+                out.extend_from_slice(&jcc);
+            }
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. }
             | Stmt::Save { bytes, .. }
             | Stmt::Restore { bytes, .. }
-            | Stmt::IfReturn { bytes, .. }
-            | Stmt::IfGoto { bytes, .. }
             | Stmt::SehInstall { bytes }
             | Stmt::SehRestore { bytes }
             | Stmt::ReturnExpr { bytes, .. }

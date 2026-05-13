@@ -953,9 +953,22 @@ fn propagate_one_stmt(
             }
             *cursor += bytes.len() as u64;
         }
-        Stmt::IfReturn { bytes, .. } | Stmt::IfGoto { bytes, .. } => {
+        Stmt::IfReturn {
+            cmp_bytes,
+            target_addr,
+            wide,
+            ..
+        }
+        | Stmt::IfGoto {
+            cmp_bytes,
+            target_addr,
+            wide,
+            ..
+        } => {
             // cmp/test/jcc don't touch GPRs — state preserved.
-            *cursor += bytes.len() as u64;
+            let jcc_ip = cursor.saturating_add(cmp_bytes.len() as u64);
+            *cursor += cmp_bytes.len() as u64
+                + ud_arch_x86::encoded_jcc_size(jcc_ip, *target_addr, *wide) as u64;
         }
         Stmt::Goto { target_addr, wide } => {
             *cursor += ud_arch_x86::encoded_jmp_size(*cursor, *target_addr, *wide) as u64;
@@ -1769,10 +1782,17 @@ fn try_fold_to_if_return(
     // (inverted) form, so we invert it back here.
     let body_form = ud_arch_x86::render_cond_source(&cmp.iced, &jcc.iced);
     let cond_text = invert_relational_cond(&body_form);
+    let jcc_bytes_len = jcc.original_bytes.len();
+    let cmp_bytes = bytes[..bytes.len() - jcc_bytes_len].to_vec();
+    let cond_code = ud_arch_x86::jcc_cond_code_from_bytes(&jcc.original_bytes)?;
+    let wide = jcc_bytes_len > 2;
     Some(Stmt::IfReturn {
         cond_text,
         value_text,
-        bytes: bytes.to_vec(),
+        target_addr: target,
+        cmp_bytes,
+        cond_code,
+        wide,
     })
 }
 
@@ -1912,8 +1932,6 @@ fn stmt_total_bytes_at(stmt: &Stmt, cursor: u64) -> usize {
         | Stmt::Epilogue { bytes, .. }
         | Stmt::Save { bytes, .. }
         | Stmt::Restore { bytes, .. }
-        | Stmt::IfReturn { bytes, .. }
-        | Stmt::IfGoto { bytes, .. }
         | Stmt::ReturnExpr { bytes, .. }
         | Stmt::ArgSpill { bytes, .. }
         | Stmt::Call { bytes, .. }
@@ -1926,6 +1944,21 @@ fn stmt_total_bytes_at(stmt: &Stmt, cursor: u64) -> usize {
         | Stmt::SehRestore { bytes } => bytes.len(),
         Stmt::Goto { target_addr, wide } => {
             ud_arch_x86::encoded_jmp_size(cursor, *target_addr, *wide)
+        }
+        Stmt::IfGoto {
+            cmp_bytes,
+            target_addr,
+            wide,
+            ..
+        }
+        | Stmt::IfReturn {
+            cmp_bytes,
+            target_addr,
+            wide,
+            ..
+        } => {
+            let jcc_ip = cursor.saturating_add(cmp_bytes.len() as u64);
+            cmp_bytes.len() + ud_arch_x86::encoded_jcc_size(jcc_ip, *target_addr, *wide)
         }
         Stmt::IfBranch {
             attrs,
@@ -1995,6 +2028,7 @@ fn stmts_total_bytes_at(stmts: &[Stmt], mut cursor: u64) -> usize {
     n
 }
 
+#[allow(dead_code)]
 fn stmts_total_bytes(stmts: &[Stmt]) -> usize {
     stmts_total_bytes_at(stmts, 0)
 }
@@ -2120,8 +2154,6 @@ fn stmt_bytes_field_mut(stmt: &mut Stmt) -> Option<&mut Vec<u8>> {
         | Stmt::Epilogue { bytes, .. }
         | Stmt::Save { bytes, .. }
         | Stmt::Restore { bytes, .. }
-        | Stmt::IfReturn { bytes, .. }
-        | Stmt::IfGoto { bytes, .. }
         | Stmt::ReturnExpr { bytes, .. }
         | Stmt::ArgSpill { bytes, .. }
         | Stmt::Call { bytes, .. }
@@ -2132,7 +2164,9 @@ fn stmt_bytes_field_mut(stmt: &mut Stmt) -> Option<&mut Vec<u8>> {
         | Stmt::Inc16 { bytes, .. }
         | Stmt::SehInstall { bytes }
         | Stmt::SehRestore { bytes } => Some(bytes),
-        Stmt::IfBranch { .. }
+        Stmt::IfGoto { .. }
+        | Stmt::IfReturn { .. }
+        | Stmt::IfBranch { .. }
         | Stmt::Loop { .. }
         | Stmt::Label { .. }
         | Stmt::Comment(_)
@@ -3167,7 +3201,7 @@ fn collect_label_previews(stmts: &[Stmt], base_ip: u64) -> HashMap<u64, String> 
     let mut out: HashMap<u64, String> = HashMap::new();
     let mut cursor = base_ip;
     for stmt in stmts {
-        let size = stmt_total_bytes(stmt) as u64;
+        let size = stmt_total_bytes_at(stmt, cursor) as u64;
         if size > 0 {
             let summary = summarise_stmt_for_preview(stmt);
             out.entry(cursor).or_insert(summary);
@@ -3522,10 +3556,29 @@ fn fold_local_if_skip(stmts: &mut Vec<Stmt>, _bitness: ud_arch_x86::Bitness) {
             continue;
         }
         // Pull the IfGoto out, gather the body, build the IfBranch.
+        // The IfBranch's pinned `cond_bytes` is the encoded jcc;
+        // we synthesize it from the IfGoto's structural fields
+        // here. Note: this codepath is currently unreachable in
+        // the build pipeline because IfGoto isn't constructed
+        // until `fold_gotos_and_labels` which runs after this
+        // pass. When that ordering changes, the jcc encode below
+        // needs the function's IP plumbed in to compute the
+        // correct rel32 — today we emit with cursor=0 as a
+        // placeholder.
         let (cond_text_inverted, cond_bytes) = match stmts.remove(i) {
             Stmt::IfGoto {
-                cond_text, bytes, ..
-            } => (invert_relational_cond(&cond_text), bytes),
+                cond_text,
+                target_addr,
+                cmp_bytes,
+                cond_code,
+                wide,
+            } => {
+                let jcc =
+                    ud_arch_x86::encode_jcc(0, target_addr, cond_code, wide).unwrap_or_default();
+                let mut bytes = cmp_bytes;
+                bytes.extend_from_slice(&jcc);
+                (invert_relational_cond(&cond_text), bytes)
+            }
             _ => unreachable!(),
         };
         // After removing the IfGoto, body indices i..end_idx-1
@@ -3557,7 +3610,7 @@ fn fold_local_if_skip(stmts: &mut Vec<Stmt>, _bitness: ud_arch_x86::Bitness) {
 /// anything they couldn't fold into an `IfBranch`, `Loop`,
 /// `IfReturn`, etc. ends up here as named goto + label.
 fn fold_gotos_and_labels(stmts: &mut Vec<Stmt>, base_ip: u64, bitness: ud_arch_x86::Bitness) {
-    let func_end = base_ip + stmts_total_bytes(stmts) as u64;
+    let func_end = base_ip + stmts_total_bytes_at(stmts, base_ip) as u64;
     // Pass 1: walk the body, decode each `@asm` candidate, collect
     // (path, target_addr, kind, cond_text) tuples for the ones we
     // can fold.
@@ -3619,12 +3672,17 @@ fn collect_goto_targets(
                 cursor += ud_arch_x86::encoded_jmp_size(cursor, *target_addr, *wide) as u64;
             }
             Stmt::IfGoto {
-                target_addr, bytes, ..
+                target_addr,
+                cmp_bytes,
+                wide,
+                ..
             } => {
                 if *target_addr >= fn_start && *target_addr < fn_end {
                     out.insert(*target_addr);
                 }
-                cursor += bytes.len() as u64;
+                let jcc_ip = cursor + cmp_bytes.len() as u64;
+                cursor += cmp_bytes.len() as u64
+                    + ud_arch_x86::encoded_jcc_size(jcc_ip, *target_addr, *wide) as u64;
             }
             Stmt::Call { name, bytes, .. } => {
                 // Synthetic call names like `goto_<hex>(args)` (from
@@ -3654,13 +3712,13 @@ fn collect_goto_targets(
                     sub += hb.len() as u64;
                 }
                 collect_goto_targets(pre_body, sub, bitness, fn_start, fn_end, out);
-                sub += stmts_total_bytes(pre_body) as u64 + cond_bytes.len() as u64;
+                sub += stmts_total_bytes_at(pre_body, sub) as u64 + cond_bytes.len() as u64;
                 collect_goto_targets(then_body, sub, bitness, fn_start, fn_end, out);
                 if let Some(eb) = else_body {
-                    sub += stmts_total_bytes(then_body) as u64;
+                    sub += stmts_total_bytes_at(then_body, sub) as u64;
                     collect_goto_targets(eb, sub, bitness, fn_start, fn_end, out);
                 }
-                cursor += stmt_total_bytes(stmt) as u64;
+                cursor += stmt_total_bytes_at(stmt, cursor) as u64;
             }
             Stmt::Loop {
                 entry_jmp_bytes,
@@ -3672,10 +3730,10 @@ fn collect_goto_targets(
                     sub += jmp.len() as u64;
                 }
                 collect_goto_targets(body, sub, bitness, fn_start, fn_end, out);
-                cursor += stmt_total_bytes(stmt) as u64;
+                cursor += stmt_total_bytes_at(stmt, cursor) as u64;
             }
             _ => {
-                cursor += stmt_total_bytes(stmt) as u64;
+                cursor += stmt_total_bytes_at(stmt, cursor) as u64;
             }
         }
     }
@@ -3738,7 +3796,7 @@ fn rewrite_gotos_in_seq(
 ) {
     for stmt in stmts.iter_mut() {
         let stmt_start = *cursor;
-        let advance = stmt_total_bytes(stmt) as u64;
+        let advance = stmt_total_bytes_at(stmt, stmt_start) as u64;
         let mut replaced = false;
         if let Stmt::Asm { text: _, bytes } = stmt {
             if let Some(target) = jump_target_of(bytes, stmt_start, bitness) {
@@ -3835,10 +3893,16 @@ fn make_goto_stmt(
             } else {
                 return None;
             };
+            let jcc_bytes_len = last.original_bytes.len();
+            let cmp_bytes = bytes[..bytes.len() - jcc_bytes_len].to_vec();
+            let cond_code = ud_arch_x86::jcc_cond_code_from_bytes(&last.original_bytes)?;
+            let wide = jcc_bytes_len > 2;
             Some(Stmt::IfGoto {
                 cond_text,
                 target_addr,
-                bytes: bytes.to_vec(),
+                cmp_bytes,
+                cond_code,
+                wide,
             })
         }
         _ => None,

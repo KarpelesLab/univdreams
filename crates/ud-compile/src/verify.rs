@@ -139,8 +139,6 @@ fn verify_stmts(
             | Stmt::Epilogue { bytes, .. }
             | Stmt::Save { bytes, .. }
             | Stmt::Restore { bytes, .. }
-            | Stmt::IfReturn { bytes, .. }
-            | Stmt::IfGoto { bytes, .. }
             | Stmt::SehInstall { bytes }
             | Stmt::SehRestore { bytes }
             | Stmt::ReturnExpr { bytes, .. }
@@ -155,6 +153,23 @@ fn verify_stmts(
             }
             Stmt::Goto { target_addr, wide } => {
                 let size = ud_arch_x86::encoded_jmp_size(*cursor, *target_addr, *wide) as u64;
+                *cursor = cursor.saturating_add(size);
+            }
+            Stmt::IfGoto {
+                target_addr,
+                cmp_bytes,
+                wide,
+                ..
+            }
+            | Stmt::IfReturn {
+                target_addr,
+                cmp_bytes,
+                wide,
+                ..
+            } => {
+                let jcc_ip = cursor.saturating_add(cmp_bytes.len() as u64);
+                let size = (cmp_bytes.len() as u64)
+                    + ud_arch_x86::encoded_jcc_size(jcc_ip, *target_addr, *wide) as u64;
                 *cursor = cursor.saturating_add(size);
             }
             Stmt::Switch {
