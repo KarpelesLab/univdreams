@@ -356,6 +356,18 @@ pub fn build_function(
         rewrite_stack_refs(&mut body, &stack_map);
     }
 
+    // Parameter-register rename: in SysV-x64 (the default for ELF
+    // x86-64) the first six integer parameters are passed in
+    // rdi/rsi/rdx/rcx/r8/r9 (plus xmm0-7 for floats). When the
+    // signature names them, substitute each register read in the
+    // body with the parameter name — but only while the register
+    // is still believed to hold the entry value (Move-to-self,
+    // Call clobbers, etc.). Round-trip safe: pure text rewrite.
+    let param_regs = build_param_register_map(signature.as_ref(), &attrs, bitness);
+    if !param_regs.is_empty() {
+        rewrite_param_register_reads(&mut body, &param_regs);
+    }
+
     FnDecl {
         addr: Some(f.addr.0),
         name: f.name.clone(),
@@ -2055,6 +2067,246 @@ fn rewrite_ecx_in_stmt(stmt: &mut Stmt) {
         Stmt::IfGoto { cond_text, .. } => apply(cond_text),
         _ => {}
     }
+}
+
+/// Map each parameter to the canonical entry register it occupies
+/// under the function's ABI, when the param is integer-typed and
+/// the ABI passes the first few integer args in registers.
+///
+/// Returns `(reg_name → param_name)` pairs covering every form of
+/// the register the body might mention (e.g. `edi`/`rdi`/`di`).
+/// Empty for non-register ABIs (cdecl/stdcall) or for functions
+/// with no typed signature.
+fn build_param_register_map(
+    sig: Option<&Signature>,
+    attrs: &[ud_ast::Attribute],
+    bitness: ud_arch_x86::Bitness,
+) -> Vec<(String, String)> {
+    let Some(sig) = sig else {
+        return Vec::new();
+    };
+    let abi = attrs.iter().find_map(|a| match (&a.key, &a.value) {
+        (k, ud_ast::AttrValue::String(s)) if k == "abi" => Some(s.as_str()),
+        _ => None,
+    });
+    // x86-64: SysV (rdi/rsi/rdx/rcx/r8/r9) vs Windows (rcx/rdx/r8/r9).
+    // x86-32 cdecl/stdcall: stack-only, no register params.
+    let regs64_sysv = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+    let regs64_win = ["rcx", "rdx", "r8", "r9"];
+    let is_ms = matches!(abi, Some("ms" | "win" | "microsoft"));
+    let convention: &[&str] = match (bitness, is_ms) {
+        (ud_arch_x86::Bitness::Bits64, true) => &regs64_win,
+        (ud_arch_x86::Bitness::Bits64, false) => &regs64_sysv,
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut int_idx = 0usize;
+    for p in &sig.params {
+        if p.name.is_empty() {
+            int_idx += 1;
+            continue;
+        }
+        if int_idx >= convention.len() {
+            break;
+        }
+        if !param_is_integer_like(&p.ty) {
+            continue;
+        }
+        let reg64 = convention[int_idx];
+        // Register the param under every common name the body
+        // might use for that register.
+        for view in register_views(reg64) {
+            out.push(((*view).to_string(), p.name.clone()));
+        }
+        int_idx += 1;
+    }
+    out
+}
+
+fn param_is_integer_like(ty: &ud_ast::Type) -> bool {
+    matches!(
+        ty,
+        ud_ast::Type::I8
+            | ud_ast::Type::I16
+            | ud_ast::Type::I32
+            | ud_ast::Type::I64
+            | ud_ast::Type::U8
+            | ud_ast::Type::U16
+            | ud_ast::Type::U32
+            | ud_ast::Type::U64
+            | ud_ast::Type::Bool
+            | ud_ast::Type::Char
+            | ud_ast::Type::Pointer(_)
+            | ud_ast::Type::Unknown
+    )
+}
+
+/// Return every register name the body might reference for a given
+/// 64-bit register. e.g. `rdi` → `["rdi", "edi", "di", "dil"]`.
+fn register_views(reg64: &str) -> &'static [&'static str] {
+    match reg64 {
+        "rdi" => &["rdi", "edi", "di", "dil"],
+        "rsi" => &["rsi", "esi", "si", "sil"],
+        "rdx" => &["rdx", "edx", "dx", "dl"],
+        "rcx" => &["rcx", "ecx", "cx", "cl"],
+        "r8" => &["r8", "r8d", "r8w", "r8b"],
+        "r9" => &["r9", "r9d", "r9w", "r9b"],
+        _ => &[],
+    }
+}
+
+/// Walk the body and substitute reads of param-holding registers
+/// with the parameter name. Maintains a set of registers still
+/// believed to hold their entry value; removes a register when the
+/// body writes to it, and clears all caller-saved on a Call.
+fn rewrite_param_register_reads(stmts: &mut [Stmt], param_regs: &[(String, String)]) {
+    let mut live: std::collections::HashMap<String, String> = param_regs.iter().cloned().collect();
+    rewrite_param_in_seq(stmts, &mut live);
+}
+
+fn rewrite_param_in_seq(stmts: &mut [Stmt], live: &mut std::collections::HashMap<String, String>) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::Move { dst, src, .. } => {
+                *src = substitute_word_tokens(src, live);
+                // Writing to a register kills its entry-value
+                // tracking. Cover all width-views so a write to
+                // `edi` also invalidates `rdi`/`di`/`dil`.
+                let invalidated = views_invalidated_by(dst);
+                for v in invalidated {
+                    live.remove(*v);
+                }
+            }
+            Stmt::Call { name, args, .. } => {
+                *name = substitute_word_tokens(name, live);
+                for a in args.iter_mut() {
+                    *a = substitute_word_tokens(a, live);
+                }
+                // Caller-saved registers get clobbered: in
+                // SysV-x64 that's rdi/rsi/rdx/rcx/r8/r9/r10/r11
+                // (and xmm0-15). Keep it simple: invalidate any
+                // live register since we can't tell the callee's
+                // calling convention here.
+                live.clear();
+            }
+            Stmt::Asm { text, .. } | Stmt::ReturnExpr { text, .. } => {
+                *text = substitute_word_tokens(text, live);
+            }
+            Stmt::IfBranch {
+                cond_text,
+                pre_body,
+                then_body,
+                else_body,
+                ..
+            } => {
+                *cond_text = substitute_word_tokens(cond_text, live);
+                rewrite_param_in_seq(pre_body, live);
+                let mut then_live = live.clone();
+                rewrite_param_in_seq(then_body, &mut then_live);
+                if let Some(eb) = else_body {
+                    let mut else_live = live.clone();
+                    rewrite_param_in_seq(eb, &mut else_live);
+                }
+                // Conservative: assume both arms could have
+                // clobbered everything.
+                live.clear();
+            }
+            Stmt::Loop {
+                cond_text, body, ..
+            } => {
+                *cond_text = substitute_word_tokens(cond_text, live);
+                rewrite_param_in_seq(body, live);
+                live.clear();
+            }
+            Stmt::IfReturn {
+                cond_text,
+                value_text,
+                ..
+            } => {
+                *cond_text = substitute_word_tokens(cond_text, live);
+                *value_text = substitute_word_tokens(value_text, live);
+            }
+            Stmt::IfGoto { cond_text, .. } => {
+                *cond_text = substitute_word_tokens(cond_text, live);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Conservative set of register-view names invalidated by writing
+/// `dst`. Treats `edi` as a write to the full rdi family.
+fn views_invalidated_by(dst: &str) -> &'static [&'static str] {
+    match dst {
+        "rdi" | "edi" | "di" | "dil" => &["rdi", "edi", "di", "dil"],
+        "rsi" | "esi" | "si" | "sil" => &["rsi", "esi", "si", "sil"],
+        "rdx" | "edx" | "dx" | "dl" => &["rdx", "edx", "dx", "dl"],
+        "rcx" | "ecx" | "cx" | "cl" => &["rcx", "ecx", "cx", "cl"],
+        "r8" | "r8d" | "r8w" | "r8b" => &["r8", "r8d", "r8w", "r8b"],
+        "r9" | "r9d" | "r9w" | "r9b" => &["r9", "r9d", "r9w", "r9b"],
+        _ => &[],
+    }
+}
+
+/// Replace whole-word occurrences of any key in `subs` with its
+/// associated value. Skips matches inside quoted strings and
+/// matches that aren't on word boundaries (so `rdi` doesn't
+/// substitute inside `rdival`). Char-based iteration so embedded
+/// UTF-8 in string payloads passes through unchanged.
+fn substitute_word_tokens(text: &str, subs: &std::collections::HashMap<String, String>) -> String {
+    if subs.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut iter = text.char_indices().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+    while let Some((i, c)) = iter.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push('"');
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            // Find the end of this identifier.
+            let start = i;
+            let mut end = i + c.len_utf8();
+            while let Some(&(j, nc)) = iter.peek() {
+                if nc.is_ascii_alphanumeric() || nc == '_' {
+                    end = j + nc.len_utf8();
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+            let word = &text[start..end];
+            // Reject matches preceded by `.` or `'` (member access
+            // / quote-bracketed ids).
+            let prev = text[..start].chars().last();
+            let word_boundary_ok = prev.map_or(true, |p| !p.is_ascii_alphanumeric() && p != '_');
+            if word_boundary_ok {
+                if let Some(replacement) = subs.get(word) {
+                    out.push_str(replacement);
+                    continue;
+                }
+            }
+            out.push_str(word);
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Build a `(offset → name)` map of the function's stack locals
