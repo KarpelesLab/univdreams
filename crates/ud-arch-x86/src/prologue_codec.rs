@@ -304,6 +304,7 @@ pub fn encode_epilogue(e: &StructuredEpilogue, bits: CodecBits) -> Vec<u8> {
 /// it reserves, args it expects) and from the function's `abi`
 /// attribute at parse time.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProfileInputs {
     /// Callee-saved registers the function overwrites and must
     /// therefore preserve. Listed in push order (typically MSVC
@@ -336,6 +337,40 @@ pub struct ProfileInputs {
     /// (`0x89 0xe5`). x86-64 SysV (GCC) defaults to `true`,
     /// x86-32 MSVC to `false`.
     pub frame_alt: bool,
+    /// True when the function body issues at least one
+    /// (non-tail) call. Drives the x86-64 stack-alignment
+    /// heuristic — leaf functions that don't issue further
+    /// calls can skip `sub rsp, 8`.
+    pub body_has_call: bool,
+}
+
+/// Apply the bit-width-specific stack-alignment formula to
+/// `inputs.sub_esp` (the raw max-negative-offset slot) and
+/// return the bytes the prologue should reserve.
+///
+/// x86-64 SysV: at function entry `rsp` is `16k - 8` (call
+/// pushed the return address). The prologue must bring `rsp` to
+/// 16-aligned for any outgoing call. With a frame the
+/// `push rbp` already realigns; without a frame the `sub rsp`
+/// has to land on `16n + 8`.
+///
+/// x86-32: just pass through the raw value — MSVC reserves the
+/// declared frame size verbatim.
+fn compute_aligned_sub_esp(inputs: &ProfileInputs) -> u32 {
+    let max_var_off = inputs.sub_esp;
+    if inputs.bits == 64 {
+        if inputs.frame_required {
+            (max_var_off + 15) & !15u32
+        } else if max_var_off == 0 && !inputs.body_has_call {
+            0
+        } else if max_var_off <= 8 {
+            8
+        } else {
+            (((max_var_off - 8) + 15) & !15u32) + 8
+        }
+    } else {
+        max_var_off
+    }
 }
 
 /// Compute the canonical-default prologue for a function with
@@ -359,10 +394,7 @@ pub fn default_prologue(inputs: &ProfileInputs) -> StructuredPrologue {
     } else {
         (inputs.saves_used.clone(), Vec::new())
     };
-    // x86-64 alignment is handled in `profile_inputs_from_fn`
-    // (decompile- and lower-side mirrors); pass `sub_esp`
-    // through unchanged here.
-    let sub_esp = inputs.sub_esp;
+    let sub_esp = compute_aligned_sub_esp(inputs);
     StructuredPrologue {
         saves,
         saves_after,
@@ -390,20 +422,17 @@ pub fn default_epilogue(inputs: &ProfileInputs) -> StructuredEpilogue {
         }
         _ => 0,
     };
+    let sub_esp = compute_aligned_sub_esp(inputs);
     // Use `leave` when there's both a frame and a non-trivial
     // sub_esp — same byte budget as `add esp, N; pop ebp` but
     // a single instruction. Otherwise plain `pop ebp` (when
     // frame, no sub) or nothing.
-    let leave = inputs.frame_required && inputs.sub_esp > 0;
+    let leave = inputs.frame_required && sub_esp > 0;
     let pop_frame = inputs.frame_required && !leave;
     // No frame + non-zero sub_esp (`thin` x86-64 prologue) needs
     // an explicit `add rsp, N` to tear the allocation back down
     // before `ret`. With a frame, `leave` already covers this.
-    let add_esp = if inputs.frame_required {
-        0
-    } else {
-        inputs.sub_esp
-    };
+    let add_esp = if inputs.frame_required { 0 } else { sub_esp };
     StructuredEpilogue {
         saves,
         leave,

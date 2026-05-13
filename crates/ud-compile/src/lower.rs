@@ -221,27 +221,18 @@ fn profile_inputs_from_fn(f: &FnDecl) -> ud_arch_x86::ProfileInputs {
             saves_used.push((*r).to_string());
         }
     }
-    // x86-64 SysV stack-alignment minimum — mirror of the
-    // decompile-side heuristic.
-    let sub_esp = if bits == 64 {
-        if max_neg_off == 0 && !body_has_call {
-            0
-        } else {
-            let rounded = (max_neg_off + 15) & !15u32;
-            rounded.max(8)
-        }
-    } else {
-        max_neg_off
-    };
+    // `sub_esp` stays as the raw max-negative-offset; the
+    // bit-width formula lives in `default_prologue`.
     ud_arch_x86::ProfileInputs {
         saves_used,
         frame_required,
-        sub_esp,
+        sub_esp: max_neg_off,
         cf_protect: cf,
         stack_arg_count,
         abi,
         bits,
         frame_alt: bits == 64,
+        body_has_call,
     }
 }
 

@@ -251,6 +251,10 @@ pub fn build_function(
     // variant matches, mark the fn with `#[noframe]` so the
     // parser regenerates the same prologue/epilogue.
     let base = profile_inputs_from_fn(&temp_decl);
+    // `default_prologue` reads `inputs.sub_esp` as the raw
+    // max-negative-offset and applies the bit-width-specific
+    // alignment formula itself, so cloning + flipping
+    // `frame_required` is enough to try both variants.
     let mut profile_fp = base.clone();
     profile_fp.frame_required = true;
     let mut profile_nofp = base.clone();
@@ -1204,26 +1208,15 @@ fn profile_inputs_from_fn(f: &ud_ast::FnDecl) -> ud_arch_x86::ProfileInputs {
             saves_used.push((*r).to_string());
         }
     }
-    // x86-64 SysV stack alignment. The callee's `rsp` is
-    // 8-aligned at entry (return address pushed by `call`); the
-    // prologue brings it to 16-aligned for any outgoing call.
-    //   sub_esp = max(8, round_up_16(max_var_off))
-    // when the function either has locals or calls another fn.
-    // Leaf functions with no locals and no calls keep sub_esp=0.
-    let sub_esp = if bits == 64 {
-        if max_neg_off == 0 && !body_has_call {
-            0
-        } else {
-            let rounded = (max_neg_off + 15) & !15u32;
-            rounded.max(8)
-        }
-    } else {
-        max_neg_off
-    };
+    // `sub_esp` stays as the raw max-negative-offset. The
+    // bit-width-specific alignment formula lives in
+    // `default_prologue` so the two candidate-profile variants
+    // (frame on / off) can be derived by cloning and flipping
+    // `frame_required` without recomputing sub_esp here.
     ud_arch_x86::ProfileInputs {
         saves_used,
         frame_required,
-        sub_esp,
+        sub_esp: max_neg_off,
         cf_protect: cf,
         stack_arg_count,
         abi,
@@ -1231,6 +1224,7 @@ fn profile_inputs_from_fn(f: &ud_ast::FnDecl) -> ud_arch_x86::ProfileInputs {
         // GCC's `mov rbp, rsp` MR encoding is the convention for
         // SysV x86-64; MSVC and x86-32 use the RM form.
         frame_alt: bits == 64,
+        body_has_call,
     }
 }
 
