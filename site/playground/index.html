@@ -32,6 +32,14 @@ Try it on the Windows msmpeg4 codec DLL (420 KB):
     <label class="file-btn" for="upload">Upload binary…</label>
     <input id="upload" type="file">
     <button id="btn-load-url" class="file-btn">Load from URL…</button>
+    <label for="format-select" class="format-label">Format:</label>
+    <select id="format-select">
+      <option value="auto" selected>auto (ELF / PE / Mach-O header)</option>
+      <option value="elf">ELF (force)</option>
+      <option value="pe">PE / COFF (force)</option>
+      <option value="macho">Mach-O (force)</option>
+      <option value="raw-6502">raw 6502 image</option>
+    </select>
     <span id="filename" class="filename"></span>
     <span class="spacer"></span>
     <button id="btn-verify">Verify</button>

@@ -2,9 +2,9 @@
 //!
 //! Exposes two functions to the JS playground at `site/playground/`:
 //!
-//! * [`decompile`] takes binary bytes (uploaded file contents),
-//!   detects ELF / PE / 6502-raw via the same byte-signature checks
-//!   the CLI uses, and returns `.ud` source text.
+//! * [`decompile`] takes binary bytes and a format hint, dispatches
+//!   to the appropriate format-specific decompiler, and returns
+//!   `.ud` source text.
 //! * [`compile`] takes `.ud` source text, parses it, reads
 //!   `@module.format` to pick a backend, and returns the rebuilt
 //!   binary bytes.
@@ -17,36 +17,77 @@ use wasm_bindgen::prelude::*;
 use ud_ast::{Module, Value};
 use ud_compile::AsmWarning;
 
-/// Decompile a binary blob to `.ud` source. Routes on byte
-/// signature: ELF64-LE → PE → 6502-raw (16K-and-under image whose
-/// reset vector points inside itself). Unrecognised formats fail.
+/// Decompile a binary blob to `.ud` source.
+///
+/// `format` picks the decompile path:
+///
+/// * `"auto"` — header-detect ELF64-LE, PE, or thin Mach-O. Refuses
+///   inputs without a recognisable header so that arbitrary bytes
+///   (which 6502 raw images, by definition, are) can't be silently
+///   misinterpreted as code.
+/// * `"elf"` — force ELF64-LE.
+/// * `"pe"` — force PE/COFF.
+/// * `"macho"` — force thin 64-bit Mach-O.
+/// * `"raw-6502"` — interpret as a raw 6502 image whose load address
+///   is derived from the file length (top of the 16-bit address
+///   space).
 #[wasm_bindgen]
-pub fn decompile(bytes: &[u8]) -> Result<String, JsError> {
+pub fn decompile(bytes: &[u8], format: &str) -> Result<String, JsError> {
     set_panic_hook();
+    match format {
+        "auto" => decompile_auto(bytes),
+        "elf" => decompile_as_elf(bytes),
+        "pe" => decompile_as_pe(bytes),
+        "macho" => decompile_as_macho(bytes),
+        "raw-6502" => decompile_as_raw_6502(bytes),
+        other => Err(JsError::new(&format!(
+            "unsupported format hint {other:?} (expected \"auto\", \"elf\", \"pe\", \"macho\", or \"raw-6502\")"
+        ))),
+    }
+}
+
+fn decompile_auto(bytes: &[u8]) -> Result<String, JsError> {
     if ud_format_elf::is_elf64_le(bytes) {
-        let elf = ud_format_elf::Elf64File::parse(bytes)
-            .map_err(|e| JsError::new(&format!("parse ELF: {e}")))?;
-        return ud_decompile::decompile_to_text(&elf)
-            .map_err(|e| JsError::new(&format!("decompile ELF: {e}")));
+        return decompile_as_elf(bytes);
     }
     if ud_format_pe::is_pe(bytes) {
-        let pe = ud_format_pe::PeFile::parse(bytes)
-            .map_err(|e| JsError::new(&format!("parse PE: {e}")))?;
-        return Ok(ud_decompile::decompile_pe_to_text(&pe));
+        return decompile_as_pe(bytes);
     }
     if ud_format_macho::is_macho64(bytes) {
-        let macho = ud_format_macho::MachoFile::parse(bytes)
-            .map_err(|e| JsError::new(&format!("parse Mach-O: {e}")))?;
-        return Ok(ud_decompile::decompile_macho_to_text(&macho));
-    }
-    if let Some(load_addr) = raw_6502_load_addr(bytes) {
-        let image = ud_format_raw::RawImage::new(bytes.to_vec(), load_addr);
-        return ud_decompile::decompile_raw_6502_to_text(&image)
-            .map_err(|e| JsError::new(&format!("decompile 6502 raw: {e}")));
+        return decompile_as_macho(bytes);
     }
     Err(JsError::new(
-        "unrecognised binary format (expected ELF64-LE, PE, Mach-O, or a 6502 raw image)",
+        "auto-detect found no ELF / PE / Mach-O header. Pick an explicit format if this is a raw image (e.g. 6502).",
     ))
+}
+
+fn decompile_as_elf(bytes: &[u8]) -> Result<String, JsError> {
+    let elf = ud_format_elf::Elf64File::parse(bytes)
+        .map_err(|e| JsError::new(&format!("parse ELF: {e}")))?;
+    ud_decompile::decompile_to_text(&elf).map_err(|e| JsError::new(&format!("decompile ELF: {e}")))
+}
+
+fn decompile_as_pe(bytes: &[u8]) -> Result<String, JsError> {
+    let pe =
+        ud_format_pe::PeFile::parse(bytes).map_err(|e| JsError::new(&format!("parse PE: {e}")))?;
+    Ok(ud_decompile::decompile_pe_to_text(&pe))
+}
+
+fn decompile_as_macho(bytes: &[u8]) -> Result<String, JsError> {
+    let macho = ud_format_macho::MachoFile::parse(bytes)
+        .map_err(|e| JsError::new(&format!("parse Mach-O: {e}")))?;
+    Ok(ud_decompile::decompile_macho_to_text(&macho))
+}
+
+fn decompile_as_raw_6502(bytes: &[u8]) -> Result<String, JsError> {
+    let load_addr = raw_6502_load_addr(bytes).ok_or_else(|| {
+        JsError::new(
+            "6502 raw image: file must be 6..=65536 bytes and the reset vector at $FFFC must point inside the image",
+        )
+    })?;
+    let image = ud_format_raw::RawImage::new(bytes.to_vec(), load_addr);
+    ud_decompile::decompile_raw_6502_to_text(&image)
+        .map_err(|e| JsError::new(&format!("decompile 6502 raw: {e}")))
 }
 
 /// Compile `.ud` source to binary bytes. Dispatches on the parsed
@@ -127,9 +168,16 @@ fn read_string(module: &Module, name: &str) -> Option<String> {
     })
 }
 
-/// 6502 raw-image detection — identical to `ud_cli::raw_6502_load_addr`.
-/// Duplicated here to avoid pulling clap into the WASM build via the
-/// CLI crate's dependency graph.
+/// 6502 raw-image load-address heuristic. Mirrors
+/// `ud_cli::raw_6502_load_addr` but duplicated here so the WASM
+/// build doesn't pull `clap` (and the rest of the CLI deps) in.
+///
+/// Convention: a 6502 image of length L "wants" to live so that it
+/// ends at `$FFFF`, putting the canonical NMI/RESET/IRQ vectors at
+/// `$FFFA..$FFFF`. We then sanity-check that the reset vector at
+/// `$FFFC` points back inside the image — a cheap "is this even
+/// 6502 code" filter that pseudoinputs like `0`-filled regions
+/// fail.
 fn raw_6502_load_addr(bytes: &[u8]) -> Option<u64> {
     let len = bytes.len();
     if !(6..=0x10000).contains(&len) {
@@ -170,7 +218,7 @@ mod tests {
         let Ok(bytes) = std::fs::read(path) else {
             return; // fixture missing; skip
         };
-        let text = decompile(&bytes).expect("decompile");
+        let text = decompile(&bytes, "auto").expect("decompile");
         let rebuilt = compile(&text).expect("compile");
         assert_eq!(
             rebuilt,
@@ -185,5 +233,6 @@ mod tests {
     // wasm-bindgen import that panics on non-wasm targets. The
     // success-path round-trip above exercises both functions
     // through the full pipeline, which is what we actually care
-    // about. Error formatting is tested manually in the playground.
+    // about. The auto-refuses-6502 behaviour is tested manually
+    // in the playground.
 }

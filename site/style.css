@@ -184,6 +184,22 @@ footer {
   font-family: var(--mono);
   font-size: 0.85rem;
 }
+.toolbar .format-label {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin-left: 0.5rem;
+}
+.toolbar select {
+  padding: 0.35rem 0.5rem;
+  background: #2a313c;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.toolbar select:hover { background: #3a414c; }
 
 #editor {
   border: 1px solid var(--border);

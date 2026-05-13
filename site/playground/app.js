@@ -22,6 +22,7 @@ const $compile       = document.getElementById("btn-compile");
 const $verify        = document.getElementById("btn-verify");
 const $loadUrl       = document.getElementById("btn-load-url");
 const $exampleMsmpeg = document.getElementById("example-msmpeg4");
+const $format        = document.getElementById("format-select");
 
 const MSMPEG4_URL =
   "https://samples.oxideav.org/codecs/windows/msmpeg4/wmpcdcs8-mpg4c32.dll";
@@ -129,17 +130,18 @@ async function loadFromUrl(url) {
 }
 
 async function decompileBytes(buf, name) {
-  setStatus(`Decompiling ${name} (${buf.length} bytes)…`, "");
+  const format = $format.value;
+  setStatus(`Decompiling ${name} (${buf.length} bytes, format: ${format})…`, "");
   // Yield to the event loop so the status message paints before
   // the synchronous decompile call ties up the main thread.
   await new Promise((r) => setTimeout(r, 0));
   try {
     const t0 = performance.now();
-    const text = decompile(buf);
+    const text = decompile(buf, format);
     const dt = (performance.now() - t0).toFixed(0);
     replaceEditor(text);
     setStatus(
-      `Decompiled ${name} in ${dt} ms (${text.length.toLocaleString()} chars of source).`,
+      `Decompiled ${name} in ${dt} ms (${text.length.toLocaleString()} chars of source, format: ${format}).`,
       "ok",
     );
   } catch (e) {
