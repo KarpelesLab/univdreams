@@ -998,8 +998,20 @@ impl Parser {
             self.collect_call_args(&mut args)?;
         }
         self.expect(&TokenKind::RParen, "`)` to close call argument list")?;
+        // Optional `#[target=0x…]` attribute marks a direct call
+        // whose trailing `call rel32` re-encodes at lower time.
+        let attrs = self.parse_attrs()?;
+        let direct_target = attrs.iter().find_map(|a| match (a.key.as_str(), &a.value) {
+            ("target", ud_ast::AttrValue::Int(n)) => Some(*n),
+            _ => None,
+        });
         let bytes = self.parse_byte_list()?;
-        Ok(Stmt::Call { name, args, bytes })
+        Ok(Stmt::Call {
+            name,
+            args,
+            bytes,
+            direct_target,
+        })
     }
 
     /// Walk tokens until the matching `)` of the current call

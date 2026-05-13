@@ -1564,6 +1564,25 @@ pub fn encode_jcc(
     Ok(out)
 }
 
+/// Encode `call rel32` from `source_ip` to `target` — 5 bytes
+/// (`0xe8` + i32). Direct near calls on x86 are always rel32 in
+/// 32- and 64-bit modes, so there's no narrow/wide choice here.
+pub fn encode_call_rel32(
+    source_ip: u64,
+    target: u64,
+) -> std::result::Result<Vec<u8>, JumpEncodeError> {
+    let after = source_ip.wrapping_add(5);
+    let rel = i128::from(target).wrapping_sub(i128::from(after));
+    let rel32 = i32::try_from(rel).map_err(|_| JumpEncodeError::OutOfRange {
+        from: source_ip,
+        to: target,
+    })?;
+    let mut out = Vec::with_capacity(5);
+    out.push(0xe8);
+    out.extend_from_slice(&rel32.to_le_bytes());
+    Ok(out)
+}
+
 /// Pre-computed byte size of [`encode_jcc`]'s output.
 #[must_use]
 pub fn encoded_jcc_size(source_ip: u64, target: u64, wide: bool) -> usize {

@@ -105,7 +105,20 @@ impl Pattern for StackArgCall {
                 } else {
                     None
                 };
-                bytes.extend_from_slice(&ins.original_bytes);
+                // Determine direct-call target (only direct `call
+                // rel32` qualifies; indirect calls and tail-jmps
+                // keep their bytes pinned). A target of 0 means
+                // iced couldn't resolve the destination — usually
+                // because the bytes are data interpreted as code;
+                // we don't regenerate those.
+                let direct_call_target = if is_call && !is_tail_jmp {
+                    ud_arch_x86::direct_call_target(&ins.iced).filter(|t| *t != 0)
+                } else {
+                    None
+                };
+                if direct_call_target.is_none() {
+                    bytes.extend_from_slice(&ins.original_bytes);
+                }
                 // The post-call result spill (`mov [ebp+N], eax`)
                 // is normally folded into the inline `call_at`'s
                 // bytes. When we preempt that path we have to
@@ -115,8 +128,19 @@ impl Pattern for StackArgCall {
                 // don't get spilled.
                 let mut consumed_extra = 0usize;
                 let mut spill_comment: Option<String> = None;
+                // Only fold the call when there's no post-call
+                // spill — see the matching cautious branch in
+                // `call_at`. If a spill rides along we must keep
+                // the call inline so the spill follows.
+                let mut direct_target = direct_call_target;
                 if is_call {
                     if let Some(spill) = detect_post_call_spill(insns, i + 1) {
+                        // Restore the call bytes since we're not
+                        // going to regenerate them.
+                        if direct_target.is_some() {
+                            bytes.extend_from_slice(&ins.original_bytes);
+                            direct_target = None;
+                        }
                         for j in 0..spill.insns_consumed {
                             if let Some(s) = insns.get(i + 1 + j) {
                                 bytes.extend_from_slice(&s.original_bytes);
@@ -151,7 +175,12 @@ impl Pattern for StackArgCall {
                     _ => raw_name,
                 };
                 let consumed = (i + 1 - start) + consumed_extra;
-                let mut stmts: Vec<Stmt> = vec![Stmt::Call { name, args, bytes }];
+                let mut stmts: Vec<Stmt> = vec![Stmt::Call {
+                    name,
+                    args,
+                    bytes,
+                    direct_target,
+                }];
                 if let Some(c) = spill_comment {
                     stmts.push(Stmt::Comment(c));
                 }
@@ -194,7 +223,12 @@ impl Pattern for StackArgCall {
                 start,
                 consumed: i - start,
                 priority: 200,
-                stmts: vec![Stmt::Call { name, args, bytes }],
+                stmts: vec![Stmt::Call {
+                    name,
+                    args,
+                    bytes,
+                    direct_target: None,
+                }],
             });
         }
         None

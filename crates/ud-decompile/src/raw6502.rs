@@ -536,6 +536,7 @@ fn try_lift_imm_call(
         name: function_name(target, u64::MAX),
         args: vec![arg],
         bytes,
+        direct_target: None,
     })
 }
 
@@ -772,6 +773,7 @@ fn try_lift_bare_call(local: &[&DecodedInsn], i: usize, entries: &HashSet<u64>) 
         name: function_name(target, u64::MAX),
         args: Vec::new(),
         bytes: jsr.original_bytes.clone(),
+        direct_target: None,
     })
 }
 

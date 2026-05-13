@@ -842,7 +842,12 @@ fn propagate_one_stmt(
             }
             *cursor += bytes.len() as u64;
         }
-        Stmt::Call { name, args, bytes } => {
+        Stmt::Call {
+            name,
+            args,
+            bytes,
+            direct_target,
+        } => {
             for a in args.iter_mut() {
                 *a = state.substitute(a);
             }
@@ -850,7 +855,14 @@ fn propagate_one_stmt(
             for reg in CALLER_SAVED {
                 state.invalidate(reg);
             }
-            *cursor += bytes.len() as u64;
+            // Direct calls have their 5-byte `call rel32` stripped
+            // from `bytes`; account for it here so cursor tracking
+            // matches the lower path's regenerated encoding.
+            let mut size = bytes.len() as u64;
+            if direct_target.is_some() {
+                size += 5;
+            }
+            *cursor += size;
         }
         Stmt::IfBranch {
             cond_text,
@@ -1934,7 +1946,6 @@ fn stmt_total_bytes_at(stmt: &Stmt, cursor: u64) -> usize {
         | Stmt::Restore { bytes, .. }
         | Stmt::ReturnExpr { bytes, .. }
         | Stmt::ArgSpill { bytes, .. }
-        | Stmt::Call { bytes, .. }
         | Stmt::LocalSet { bytes, .. }
         | Stmt::LocalArith { bytes, .. }
         | Stmt::LocalCompound { bytes, .. }
@@ -1942,6 +1953,11 @@ fn stmt_total_bytes_at(stmt: &Stmt, cursor: u64) -> usize {
         | Stmt::Inc16 { bytes, .. }
         | Stmt::SehInstall { bytes }
         | Stmt::SehRestore { bytes } => bytes.len(),
+        Stmt::Call {
+            bytes,
+            direct_target,
+            ..
+        } => bytes.len() + if direct_target.is_some() { 5 } else { 0 },
         Stmt::Goto { target_addr, wide } => {
             ud_arch_x86::encoded_jmp_size(cursor, *target_addr, *wide)
         }
@@ -3451,6 +3467,7 @@ fn recognise_string_idioms(stmts: &mut [Stmt]) {
                         name: name.into(),
                         args: args.into_iter().map(str::to_string).collect(),
                         bytes: std::mem::take(bytes),
+                        direct_target: None,
                     };
                 }
             }
@@ -4986,9 +5003,36 @@ fn emit_block_stmts(
             let setup_start = site.setup_start.max(prologue_consumed);
             let end_idx = *call_end_idx.get(&site.call_idx).unwrap_or(&site.call_idx);
             let spill_disp = post_call_spill.get(&site.call_idx).copied();
+            // `direct_target` lets the lower path regenerate the
+            // 5-byte `call rel32` so a moved callee's offset
+            // re-resolves automatically. We can only do that when
+            // the call instruction is the last thing in this
+            // Stmt::Call's byte range (no post-call spill); when a
+            // spill rides along, the call's bytes sit in the
+            // middle of the range, and the regenerator's append-
+            // at-end strategy doesn't apply.
+            let direct_target = if end_idx == site.call_idx && site.call_target != 0 {
+                Some(site.call_target)
+            } else {
+                None
+            };
             let mut bytes = Vec::new();
-            for j in setup_start..=end_idx {
-                bytes.extend_from_slice(&block.insns[j].original_bytes);
+            // Range of insns whose bytes go into `Stmt::Call.bytes`.
+            // When `direct_target` is set, we strip the call insn
+            // (5 bytes) since the lower path regenerates it.
+            let bytes_end_inclusive = if direct_target.is_some() {
+                if site.call_idx == 0 {
+                    None
+                } else {
+                    Some(site.call_idx - 1)
+                }
+            } else {
+                Some(end_idx)
+            };
+            if let Some(end) = bytes_end_inclusive {
+                for j in setup_start..=end {
+                    bytes.extend_from_slice(&block.insns[j].original_bytes);
+                }
             }
             let name = ctx
                 .name_at
@@ -5000,7 +5044,12 @@ fn emit_block_stmts(
                 .iter()
                 .map(|a| render_arg_value(a, ctx))
                 .collect::<Vec<_>>();
-            out.push(Stmt::Call { name, args, bytes });
+            out.push(Stmt::Call {
+                name,
+                args,
+                bytes,
+                direct_target,
+            });
             if let Some(disp) = spill_disp {
                 let dest = if disp < 0 {
                     format!("[rbp-0x{:x}]", disp.unsigned_abs())

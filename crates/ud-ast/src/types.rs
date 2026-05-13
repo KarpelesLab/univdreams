@@ -496,12 +496,24 @@ pub enum Stmt {
     /// human-readable rendering (string literal, integer constant,
     /// global address, `&function` reference, or `result` for a
     /// previous call's return value); the pinned bytes cover both
-    /// the arg-setup instructions and the call itself, so the lower
-    /// path emits the original instruction sequence verbatim.
+    /// `name(args)` — a function call (direct or indirect).
+    ///
+    /// `bytes` pins the arg-setup prefix (pushes, movs, etc.).
+    /// For **indirect** calls (`call dword ptr [imm]` etc.) the
+    /// call instruction itself rides at the end of `bytes`
+    /// because we don't yet re-encode arbitrary memory operands.
+    ///
+    /// For **direct** calls (`call rel32`) the trailing 5 bytes
+    /// are stripped from `bytes` and `direct_target` carries the
+    /// callee's IP. The lower path encodes `call rel32` against
+    /// the current cursor + `direct_target`, so editing a
+    /// function's position automatically re-resolves every
+    /// caller's relative offset.
     Call {
         name: String,
         args: Vec<String>,
         bytes: Vec<u8>,
+        direct_target: Option<u64>,
     },
 
     /// A structured `cmp/test + jcc` head plus its branches:

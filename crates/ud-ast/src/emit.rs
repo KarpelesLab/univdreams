@@ -346,7 +346,12 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
         }
-        Stmt::Call { name, args, bytes } => {
+        Stmt::Call {
+            name,
+            args,
+            bytes,
+            direct_target,
+        } => {
             write!(out, "{indent}{name}(").unwrap();
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
@@ -358,7 +363,11 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
                     out.push_str(&quote_string(a));
                 }
             }
-            out.push_str(") [");
+            out.push(')');
+            if let Some(target) = direct_target {
+                write!(out, " #[target=0x{target:x}]").unwrap();
+            }
+            out.push_str(" [");
             emit_byte_list(out, bytes);
             writeln!(out, "]").unwrap();
         }

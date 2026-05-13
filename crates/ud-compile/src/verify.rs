@@ -143,13 +143,23 @@ fn verify_stmts(
             | Stmt::SehRestore { bytes }
             | Stmt::ReturnExpr { bytes, .. }
             | Stmt::ArgSpill { bytes, .. }
-            | Stmt::Call { bytes, .. }
             | Stmt::LocalSet { bytes, .. }
             | Stmt::LocalArith { bytes, .. }
             | Stmt::LocalCompound { bytes, .. }
             | Stmt::Move { bytes, .. }
             | Stmt::Inc16 { bytes, .. } => {
                 *cursor = cursor.saturating_add(bytes.len() as u64);
+            }
+            Stmt::Call {
+                bytes,
+                direct_target,
+                ..
+            } => {
+                let mut size = bytes.len() as u64;
+                if direct_target.is_some() {
+                    size += 5;
+                }
+                *cursor = cursor.saturating_add(size);
             }
             Stmt::Goto { target_addr, wide } => {
                 let size = ud_arch_x86::encoded_jmp_size(*cursor, *target_addr, *wide) as u64;

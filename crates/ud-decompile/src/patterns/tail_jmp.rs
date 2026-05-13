@@ -66,6 +66,7 @@ impl Pattern for TailJmp {
                         name: "tail_call".into(),
                         args: vec![target],
                         bytes: ins.original_bytes.clone(),
+                        direct_target: None,
                     }],
                 })
             }
@@ -95,6 +96,7 @@ impl Pattern for TailJmp {
                         name,
                         args,
                         bytes: ins.original_bytes.clone(),
+                        direct_target: None,
                     }],
                 })
             }

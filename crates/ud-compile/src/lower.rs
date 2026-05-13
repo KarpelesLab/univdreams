@@ -467,6 +467,34 @@ fn lower_stmts_into(
                     })?;
                 out.extend_from_slice(&jcc);
             }
+            Stmt::Call {
+                bytes,
+                direct_target,
+                ..
+            } => {
+                out.extend_from_slice(bytes);
+                if let Some(target) = direct_target {
+                    let func_addr = base_addr.ok_or_else(|| LowerError::GotoNeedsAddress {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                    })?;
+                    let call_ip = func_addr.checked_add(out.len() as u64).ok_or_else(|| {
+                        LowerError::GotoNeedsAddress {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                        }
+                    })?;
+                    let call_bytes =
+                        ud_arch_x86::encode_call_rel32(call_ip, *target).map_err(|e| {
+                            LowerError::GotoEncode {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                                source: e,
+                            }
+                        })?;
+                    out.extend_from_slice(&call_bytes);
+                }
+            }
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. }
@@ -476,7 +504,6 @@ fn lower_stmts_into(
             | Stmt::SehRestore { bytes }
             | Stmt::ReturnExpr { bytes, .. }
             | Stmt::ArgSpill { bytes, .. }
-            | Stmt::Call { bytes, .. }
             | Stmt::LocalSet { bytes, .. }
             | Stmt::LocalArith { bytes, .. }
             | Stmt::LocalCompound { bytes, .. }
