@@ -204,10 +204,44 @@ pub fn build_function(
     // at emit time. When a function has neither prologue nor
     // epilogue and the default WOULD add one, mark it `naked` so
     // the parser/lower knows to skip auto-generation.
+    // Pre-seed the attrs the autogen heuristic needs to predict
+    // the prologue's bytes from the function's profile alone:
+    //
+    //   * `#[bits=64]` so the codec picks the 64-bit encoding for
+    //     `mov rbp, rsp` and `sub rsp, N`.
+    //   * `#[cf]` so the predicted prologue includes the `endbr64`
+    //     (or `endbr32`) landing pad when the actual one does.
+    //
+    // These attrs are kept on the function only when the heuristic
+    // actually ends up dropping the @prologue/@epilogue (and thus
+    // the parser needs them at lower time to regenerate the bytes).
+    // If no drop happens, they're stripped at the end.
+    let observed_bits: u32 = if matches!(bitness, ud_arch_x86::Bitness::Bits64) {
+        64
+    } else {
+        32
+    };
+    let observed_cf = matches!(
+        body.first(),
+        Some(Stmt::Prologue { params: Some(p), .. }) if p.cf_protect
+    );
+    let mut attrs_with_profile = attrs.clone();
+    if observed_bits == 64 {
+        attrs_with_profile.push(ud_ast::Attribute {
+            key: "bits".into(),
+            value: ud_ast::AttrValue::Int(64),
+        });
+    }
+    if observed_cf {
+        attrs_with_profile.push(ud_ast::Attribute {
+            key: "cf".into(),
+            value: ud_ast::AttrValue::Flag,
+        });
+    }
     let temp_decl = ud_ast::FnDecl {
         addr: Some(f.addr.0),
         name: f.name.clone(),
-        attrs: attrs.clone(),
+        attrs: attrs_with_profile.clone(),
         signature: signature.clone(),
         locals: locals.clone(),
         body: body.clone(),
@@ -256,17 +290,18 @@ pub fn build_function(
     } else {
         (pm_fp, em_fp, dp_fp, de_fp)
     };
-    let mut dropped_any = false;
-    // The default heuristic targets MSVC x86-32 prologue shapes
-    // (callee-saved ebx/esi/edi, `push ebp; mov ebp, esp` frame
-    // setup). For 64-bit functions the comparison is structurally
-    // impossible — the registers don't match — so the comments it
-    // would emit are misleading and the autogen marker would
-    // round-trip wrong. Gate the whole block.
-    let defaults_apply = !matches!(bitness, ud_arch_x86::Bitness::Bits64);
+    let mut pro_dropped = false;
+    let mut epi_dropped = false;
+    // The heuristic now handles both x86-32 (MSVC callee-saved
+    // ebx/esi/edi, RM `mov ebp, esp`) and x86-64 (SysV
+    // callee-saved rbx/r12-r15, GCC MR `mov rbp, rsp`). The
+    // `#[bits=64]` and `#[cf]` attrs we seeded above carry the
+    // compiler-profile choices the parser needs to predict the
+    // same bytes at lower time.
+    let defaults_apply = true;
     if defaults_apply && pro_matches {
         body.remove(0);
-        dropped_any = true;
+        pro_dropped = true;
     } else if let (
         true,
         Some(Stmt::Prologue {
@@ -296,7 +331,7 @@ pub fn build_function(
     }
     if defaults_apply && epi_matches {
         body.pop();
-        dropped_any = true;
+        epi_dropped = true;
     } else if let (
         true,
         Some(Stmt::Epilogue {
@@ -316,16 +351,39 @@ pub fn build_function(
             }
         }
     }
-    if dropped_any {
-        // `#[autogen]` opts the function INTO lower-time defaults
-        // regeneration. We add it only when we actually dropped a
-        // matched prologue or epilogue, so functions that don't
-        // round-trip through the codec (GCC, hand-written) stay
-        // bare and lower emits their bytes verbatim.
+    if pro_dropped {
+        // `#[autogen_pro]` opts the function's prologue INTO
+        // lower-time regeneration. Per-side so that we can drop
+        // the prologue independently of the epilogue (e.g. PLT
+        // entries have a prologue and no epilogue).
         attrs.push(ud_ast::Attribute {
-            key: "autogen".into(),
+            key: "autogen_pro".into(),
             value: ud_ast::AttrValue::Flag,
         });
+    }
+    if epi_dropped {
+        attrs.push(ud_ast::Attribute {
+            key: "autogen_epi".into(),
+            value: ud_ast::AttrValue::Flag,
+        });
+    }
+    let dropped_any = pro_dropped || epi_dropped;
+    if dropped_any {
+        // Carry the compiler-profile choices the heuristic used
+        // (`#[bits=64]`, `#[cf]`) onto the final attrs so the
+        // parser regenerates the same bytes at lower time.
+        if observed_bits == 64 {
+            attrs.push(ud_ast::Attribute {
+                key: "bits".into(),
+                value: ud_ast::AttrValue::Int(64),
+            });
+        }
+        if observed_cf {
+            attrs.push(ud_ast::Attribute {
+                key: "cf".into(),
+                value: ud_ast::AttrValue::Flag,
+            });
+        }
     }
     if use_nofp && dropped_any {
         attrs.push(ud_ast::Attribute {
@@ -1087,19 +1145,30 @@ fn profile_inputs_from_fn(f: &ud_ast::FnDecl) -> ud_arch_x86::ProfileInputs {
         .attrs
         .iter()
         .any(|a| a.key == "noframe" && matches!(a.value, ud_ast::AttrValue::Flag));
-    let mut uses_ebx = false;
-    let mut uses_esi = false;
-    let mut uses_edi = false;
+    let cf = f
+        .attrs
+        .iter()
+        .any(|a| a.key == "cf" && matches!(a.value, ud_ast::AttrValue::Flag));
+    // 64-bit functions are flagged with `#[bits=64]` by the
+    // decompiler; absent → 32-bit. Drives codec width, the
+    // callee-saved register set, and the `mov bp, sp` encoding
+    // choice (MSVC RM vs GCC MR).
+    let bits = f
+        .attrs
+        .iter()
+        .find_map(|a| match (&a.key, &a.value) {
+            (k, ud_ast::AttrValue::Int(n)) if k == "bits" => Some(*n as u32),
+            _ => None,
+        })
+        .unwrap_or(32);
     let mut max_neg_off: u32 = 0;
     let mut stack_arg_count: u32 = 0;
+    let mut touched_regs: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for local in &f.locals {
         match local.kind {
-            ud_ast::LocalKind::Register => match local.name.as_str() {
-                "ebx" => uses_ebx = true,
-                "esi" => uses_esi = true,
-                "edi" => uses_edi = true,
-                _ => {}
-            },
+            ud_ast::LocalKind::Register => {
+                touched_regs.insert(local.name.as_str());
+            }
             ud_ast::LocalKind::Stack => {
                 if let Some(rest) = local.name.strip_prefix("var_") {
                     if let Ok(n) = u32::from_str_radix(rest, 16) {
@@ -1115,30 +1184,94 @@ fn profile_inputs_from_fn(f: &ud_ast::FnDecl) -> ud_arch_x86::ProfileInputs {
             }
         }
     }
+    let body_has_call = body_contains_call(&f.body);
     // MSVC /Oy- default keeps a frame pointer in nearly every
     // function. `#[noframe]` is the per-fn opt-out marker that the
     // decompiler sets when the no-frame variant of the default
     // matches the observed bytes.
     let frame_required = !noframe;
-    // Canonical MSVC x86 save order: ebx → esi → edi.
+    // Callee-saved set differs by ABI:
+    //   x86-32 (MSVC):     push order ebx → esi → edi
+    //   x86-64 (SysV/GCC): push order rbx → r12 → r13 → r14 → r15
+    let saves_order: &[&str] = if bits == 64 {
+        &["rbx", "r12", "r13", "r14", "r15"]
+    } else {
+        &["ebx", "esi", "edi"]
+    };
     let mut saves_used: Vec<String> = Vec::new();
-    if uses_ebx {
-        saves_used.push("ebx".into());
+    for r in saves_order {
+        if reg_views_intersect(&touched_regs, r) {
+            saves_used.push((*r).to_string());
+        }
     }
-    if uses_esi {
-        saves_used.push("esi".into());
-    }
-    if uses_edi {
-        saves_used.push("edi".into());
-    }
+    // x86-64 SysV stack alignment. The callee's `rsp` is
+    // 8-aligned at entry (return address pushed by `call`); the
+    // prologue brings it to 16-aligned for any outgoing call.
+    //   sub_esp = max(8, round_up_16(max_var_off))
+    // when the function either has locals or calls another fn.
+    // Leaf functions with no locals and no calls keep sub_esp=0.
+    let sub_esp = if bits == 64 {
+        if max_neg_off == 0 && !body_has_call {
+            0
+        } else {
+            let rounded = (max_neg_off + 15) & !15u32;
+            rounded.max(8)
+        }
+    } else {
+        max_neg_off
+    };
     ud_arch_x86::ProfileInputs {
         saves_used,
         frame_required,
-        sub_esp: max_neg_off,
-        cf_protect: false,
+        sub_esp,
+        cf_protect: cf,
         stack_arg_count,
         abi,
+        bits,
+        // GCC's `mov rbp, rsp` MR encoding is the convention for
+        // SysV x86-64; MSVC and x86-32 use the RM form.
+        frame_alt: bits == 64,
     }
+}
+
+/// True when the function's body contains a `Stmt::Call` (at any
+/// nesting depth). Used by the x86-64 stack-alignment heuristic
+/// to detect leaf-with-call vs leaf-without-call.
+fn body_contains_call(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Call { .. } => true,
+        Stmt::IfBranch {
+            pre_body,
+            then_body,
+            else_body,
+            ..
+        } => {
+            body_contains_call(pre_body)
+                || body_contains_call(then_body)
+                || else_body.as_deref().is_some_and(body_contains_call)
+        }
+        Stmt::Loop { body, .. } => body_contains_call(body),
+        Stmt::Asm { text, .. } => text.contains("call "),
+        _ => false,
+    })
+}
+
+/// True when any width-view of `reg64` (e.g. `rdi`/`edi`/`di`/`dil`)
+/// is touched by the function. Used to decide whether the function
+/// preserves a callee-saved register.
+fn reg_views_intersect(touched: &std::collections::HashSet<&str>, reg64: &str) -> bool {
+    let views: &[&str] = match reg64 {
+        "rbx" => &["rbx", "ebx", "bx", "bl", "bh"],
+        "r12" => &["r12", "r12d", "r12w", "r12b"],
+        "r13" => &["r13", "r13d", "r13w", "r13b"],
+        "r14" => &["r14", "r14d", "r14w", "r14b"],
+        "r15" => &["r15", "r15d", "r15w", "r15b"],
+        "ebx" => &["ebx", "bx", "bl", "bh"],
+        "esi" => &["esi", "si", "sil"],
+        "edi" => &["edi", "di", "dil"],
+        _ => return false,
+    };
+    views.iter().any(|v| touched.contains(*v))
 }
 
 /// Is every element of `small` also in `large` (order-preserving

@@ -328,6 +328,14 @@ pub struct ProfileInputs {
     /// `"fastcall"` recognised; everything else falls through
     /// to cdecl-style (no ret immediate).
     pub abi: String,
+    /// Bit width — 32 or 64. Drives codec selection (`Bits32` /
+    /// `Bits64`) and the callee-saved-register set.
+    pub bits: u32,
+    /// `mov ebp, esp` encoding selector. `false` for MSVC's RM
+    /// form (`0x8b 0xec`), `true` for GCC's MR form
+    /// (`0x89 0xe5`). x86-64 SysV (GCC) defaults to `true`,
+    /// x86-32 MSVC to `false`.
+    pub frame_alt: bool,
 }
 
 /// Compute the canonical-default prologue for a function with
@@ -351,15 +359,17 @@ pub fn default_prologue(inputs: &ProfileInputs) -> StructuredPrologue {
     } else {
         (inputs.saves_used.clone(), Vec::new())
     };
+    // x86-64 alignment is handled in `profile_inputs_from_fn`
+    // (decompile- and lower-side mirrors); pass `sub_esp`
+    // through unchanged here.
+    let sub_esp = inputs.sub_esp;
     StructuredPrologue {
         saves,
         saves_after,
         frame: inputs.frame_required,
-        sub_esp: inputs.sub_esp,
+        sub_esp,
         cf_protect: inputs.cf_protect,
-        // Defaults match MSVC's RM `mov ebp, esp` encoding —
-        // autogen is targeted at MSVC anyway.
-        frame_alt_encoding: false,
+        frame_alt_encoding: inputs.frame_alt,
     }
 }
 
@@ -386,11 +396,19 @@ pub fn default_epilogue(inputs: &ProfileInputs) -> StructuredEpilogue {
     // frame, no sub) or nothing.
     let leave = inputs.frame_required && inputs.sub_esp > 0;
     let pop_frame = inputs.frame_required && !leave;
+    // No frame + non-zero sub_esp (`thin` x86-64 prologue) needs
+    // an explicit `add rsp, N` to tear the allocation back down
+    // before `ret`. With a frame, `leave` already covers this.
+    let add_esp = if inputs.frame_required {
+        0
+    } else {
+        inputs.sub_esp
+    };
     StructuredEpilogue {
         saves,
         leave,
         pop_frame,
-        add_esp: 0,
+        add_esp,
         ret_imm,
     }
 }

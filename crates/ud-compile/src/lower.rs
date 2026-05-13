@@ -93,20 +93,34 @@ pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
     let mut out = Vec::new();
     let has_prologue = matches!(f.body.first(), Some(Stmt::Prologue { .. }));
     let has_epilogue = matches!(f.body.last(), Some(Stmt::Epilogue { .. }));
-    // `#[autogen]` is the explicit opt-IN: the decompiler set it
-    // when it dropped a matched-default prologue/epilogue. Without
-    // this marker, lower emits the body verbatim — no MSVC-style
-    // bytes get injected into GCC or hand-written functions.
-    let autogen = f
+    // Per-side opt-in: the decompiler sets `#[autogen_pro]` /
+    // `#[autogen_epi]` for each side it dropped (a function may
+    // drop just the prologue, just the epilogue, or both — PLT
+    // entries are prologue-only, tail-call wrappers are
+    // epilogue-only).  Without the relevant marker, lower emits
+    // the body verbatim — no bytes get injected into GCC or
+    // hand-written functions that lack the codec round-trip.
+    let autogen_pro = f
+        .attrs
+        .iter()
+        .any(|a| a.key == "autogen_pro" && matches!(a.value, ud_ast::AttrValue::Flag));
+    let autogen_epi = f
+        .attrs
+        .iter()
+        .any(|a| a.key == "autogen_epi" && matches!(a.value, ud_ast::AttrValue::Flag));
+    // Backward-compat: an older `#[autogen]` flag means BOTH.
+    let autogen_legacy = f
         .attrs
         .iter()
         .any(|a| a.key == "autogen" && matches!(a.value, ud_ast::AttrValue::Flag));
-    if !has_prologue && autogen {
+    let regen_pro = autogen_pro || autogen_legacy;
+    let regen_epi = autogen_epi || autogen_legacy;
+    if !has_prologue && regen_pro {
         let prefix = auto_prologue_bytes(f);
         out.extend_from_slice(&prefix);
     }
     lower_stmts_into(&f.name, &f.body, &mut out)?;
-    if !has_epilogue && autogen {
+    if !has_epilogue && regen_epi {
         let suffix = auto_epilogue_bytes(f);
         out.extend_from_slice(&suffix);
     }
@@ -118,15 +132,25 @@ pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
 /// from the body — same inputs, same algorithm, same bytes.
 fn auto_prologue_bytes(f: &FnDecl) -> Vec<u8> {
     let profile = profile_inputs_from_fn(f);
+    let cb = codec_bits(profile.bits);
     let prologue = ud_arch_x86::default_prologue(&profile);
-    ud_arch_x86::encode_prologue(&prologue, ud_arch_x86::CodecBits::Bits32)
+    ud_arch_x86::encode_prologue(&prologue, cb)
 }
 
 /// Pair to [`auto_prologue_bytes`].
 fn auto_epilogue_bytes(f: &FnDecl) -> Vec<u8> {
     let profile = profile_inputs_from_fn(f);
+    let cb = codec_bits(profile.bits);
     let epilogue = ud_arch_x86::default_epilogue(&profile);
-    ud_arch_x86::encode_epilogue(&epilogue, ud_arch_x86::CodecBits::Bits32)
+    ud_arch_x86::encode_epilogue(&epilogue, cb)
+}
+
+fn codec_bits(bits: u32) -> ud_arch_x86::CodecBits {
+    if bits == 64 {
+        ud_arch_x86::CodecBits::Bits64
+    } else {
+        ud_arch_x86::CodecBits::Bits32
+    }
 }
 
 /// Distill a `FnDecl` into the inputs the prologue/epilogue
@@ -142,26 +166,31 @@ fn profile_inputs_from_fn(f: &FnDecl) -> ud_arch_x86::ProfileInputs {
             _ => None,
         })
         .unwrap_or_default();
-    // `#[noframe]` opts the function out of MSVC /Oy- default
-    // (frame pointer always). The decompiler emits this when the
-    // no-frame variant of the default prologue/epilogue matches.
     let noframe = f
         .attrs
         .iter()
         .any(|a| a.key == "noframe" && matches!(a.value, ud_ast::AttrValue::Flag));
-    let mut uses_ebx = false;
-    let mut uses_esi = false;
-    let mut uses_edi = false;
+    let cf = f
+        .attrs
+        .iter()
+        .any(|a| a.key == "cf" && matches!(a.value, ud_ast::AttrValue::Flag));
+    // 64-bit functions carry `#[bits=64]`; absent → 32-bit.
+    let bits = f
+        .attrs
+        .iter()
+        .find_map(|a| match (&a.key, &a.value) {
+            (k, ud_ast::AttrValue::Int(n)) if k == "bits" => Some(*n as u32),
+            _ => None,
+        })
+        .unwrap_or(32);
+    let mut touched_regs: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut max_neg_off: u32 = 0;
     let mut stack_arg_count: u32 = 0;
     for local in &f.locals {
         match local.kind {
-            ud_ast::LocalKind::Register => match local.name.as_str() {
-                "ebx" => uses_ebx = true,
-                "esi" => uses_esi = true,
-                "edi" => uses_edi = true,
-                _ => {}
-            },
+            ud_ast::LocalKind::Register => {
+                touched_regs.insert(local.name.as_str());
+            }
             ud_ast::LocalKind::Stack => {
                 if let Some(rest) = local.name.strip_prefix("var_") {
                     if let Ok(n) = u32::from_str_radix(rest, 16) {
@@ -177,31 +206,77 @@ fn profile_inputs_from_fn(f: &FnDecl) -> ud_arch_x86::ProfileInputs {
             }
         }
     }
-    // MSVC /Oy- default keeps a frame pointer in nearly every
-    // function. The opt-out is the `#[noframe]` flag, which the
-    // decompiler emits when the no-frame default variant matched
-    // the observed prologue/epilogue. (Whether to auto-inject at
-    // all is gated by `#[autogen]` upstream in `lower_function_bytes`.)
+    let body_has_call = body_contains_call(&f.body);
     let frame_required = !noframe;
-    // Canonical MSVC x86 save order: ebx → esi → edi.
+    // Callee-saved register set varies by ABI/bitness — see the
+    // mirror in `ud_decompile::build_function::profile_inputs_from_fn`.
+    let saves_order: &[&str] = if bits == 64 {
+        &["rbx", "r12", "r13", "r14", "r15"]
+    } else {
+        &["ebx", "esi", "edi"]
+    };
     let mut saves_used: Vec<String> = Vec::new();
-    if uses_ebx {
-        saves_used.push("ebx".into());
+    for r in saves_order {
+        if reg_views_intersect(&touched_regs, r) {
+            saves_used.push((*r).to_string());
+        }
     }
-    if uses_esi {
-        saves_used.push("esi".into());
-    }
-    if uses_edi {
-        saves_used.push("edi".into());
-    }
+    // x86-64 SysV stack-alignment minimum — mirror of the
+    // decompile-side heuristic.
+    let sub_esp = if bits == 64 {
+        if max_neg_off == 0 && !body_has_call {
+            0
+        } else {
+            let rounded = (max_neg_off + 15) & !15u32;
+            rounded.max(8)
+        }
+    } else {
+        max_neg_off
+    };
     ud_arch_x86::ProfileInputs {
         saves_used,
         frame_required,
-        sub_esp: max_neg_off,
-        cf_protect: false,
+        sub_esp,
+        cf_protect: cf,
         stack_arg_count,
         abi,
+        bits,
+        frame_alt: bits == 64,
     }
+}
+
+fn body_contains_call(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Call { .. } => true,
+        Stmt::IfBranch {
+            pre_body,
+            then_body,
+            else_body,
+            ..
+        } => {
+            body_contains_call(pre_body)
+                || body_contains_call(then_body)
+                || else_body.as_deref().is_some_and(body_contains_call)
+        }
+        Stmt::Loop { body, .. } => body_contains_call(body),
+        Stmt::Asm { text, .. } => text.contains("call "),
+        _ => false,
+    })
+}
+
+fn reg_views_intersect(touched: &std::collections::HashSet<&str>, reg64: &str) -> bool {
+    let views: &[&str] = match reg64 {
+        "rbx" => &["rbx", "ebx", "bx", "bl", "bh"],
+        "r12" => &["r12", "r12d", "r12w", "r12b"],
+        "r13" => &["r13", "r13d", "r13w", "r13b"],
+        "r14" => &["r14", "r14d", "r14w", "r14b"],
+        "r15" => &["r15", "r15d", "r15w", "r15b"],
+        "ebx" => &["ebx", "bx", "bl", "bh"],
+        "esi" => &["esi", "si", "sil"],
+        "edi" => &["edi", "di", "dil"],
+        _ => return false,
+    };
+    views.iter().any(|v| touched.contains(*v))
 }
 
 /// Recursive worker: lower a flat statement list into `out`,
