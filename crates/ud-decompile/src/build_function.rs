@@ -365,6 +365,11 @@ pub fn build_function(
         rewrite_label_refs(&mut body, &labels);
     }
 
+    // Hex-literal style normalisation: iced renders constants in
+    // Intel `0Nh` / `Nh` syntax; rewrite to C-style `0xN` so the
+    // body uses one consistent notation throughout.
+    rewrite_intel_hex_in_body(&mut body);
+
     // Parameter-register rename: in SysV-x64 (the default for ELF
     // x86-64) the first six integer parameters are passed in
     // rdi/rsi/rdx/rcx/r8/r9 (plus xmm0-7 for floats). When the
@@ -2387,6 +2392,129 @@ fn rewrite_label_refs_in_stmt(stmt: &mut Stmt, labels: &std::collections::HashSe
         Stmt::Loop { body, .. } => rewrite_label_refs(body, labels),
         _ => {}
     }
+}
+
+/// Walk the body rewriting Intel `Nh` / `0Nh` hex literals in
+/// every text field to C-style `0xN`. Operates outside quoted
+/// strings; word-boundary checks prevent matches inside
+/// identifiers (`mov ahxh` would never reach this since it's not
+/// a real instruction, but the boundary check keeps the pass safe).
+fn rewrite_intel_hex_in_body(stmts: &mut [Stmt]) {
+    for stmt in stmts.iter_mut() {
+        rewrite_intel_hex_in_stmt(stmt);
+    }
+}
+
+fn rewrite_intel_hex_in_stmt(stmt: &mut Stmt) {
+    fn apply(text: &mut String) {
+        let new_text = rewrite_intel_hex_in_text(text);
+        if new_text != *text {
+            *text = new_text;
+        }
+    }
+    match stmt {
+        Stmt::Move { dst, src, .. } => {
+            apply(dst);
+            apply(src);
+        }
+        Stmt::Call { name, args, .. } => {
+            apply(name);
+            for a in args.iter_mut() {
+                apply(a);
+            }
+        }
+        Stmt::Asm { text, .. } | Stmt::ReturnExpr { text, .. } => apply(text),
+        Stmt::IfBranch {
+            cond_text,
+            pre_body,
+            then_body,
+            else_body,
+            ..
+        } => {
+            apply(cond_text);
+            rewrite_intel_hex_in_body(pre_body);
+            rewrite_intel_hex_in_body(then_body);
+            if let Some(eb) = else_body {
+                rewrite_intel_hex_in_body(eb);
+            }
+        }
+        Stmt::Loop {
+            cond_text, body, ..
+        } => {
+            apply(cond_text);
+            rewrite_intel_hex_in_body(body);
+        }
+        Stmt::IfReturn {
+            cond_text,
+            value_text,
+            ..
+        } => {
+            apply(cond_text);
+            apply(value_text);
+        }
+        Stmt::IfGoto { cond_text, .. } => apply(cond_text),
+        _ => {}
+    }
+}
+
+fn rewrite_intel_hex_in_text(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    let mut iter = text.char_indices().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+    while let Some((i, c)) = iter.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push('"');
+            continue;
+        }
+        // Intel hex literals start with a digit (or a leading `0`
+        // for sub-16 letter-leading values, e.g. `0Ah`).
+        if c.is_ascii_digit() {
+            let prev = text[..i].chars().last();
+            let boundary_ok = prev.map_or(true, |p| !p.is_ascii_alphanumeric() && p != '_');
+            if boundary_ok {
+                let start = i;
+                let mut end = i + c.len_utf8();
+                while let Some(&(j, nc)) = iter.peek() {
+                    if nc.is_ascii_hexdigit() {
+                        end = j + nc.len_utf8();
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(&(_, 'h')) = iter.peek() {
+                    let hex = &text[start..end];
+                    if let Ok(n) = u64::from_str_radix(hex, 16) {
+                        iter.next(); // consume the `h`
+                                     // Drop the iced "leading zero for letter-
+                                     // leading hex" convention by formatting `n`
+                                     // fresh.
+                        let _ = write!(out, "0x{n:x}");
+                        continue;
+                    }
+                }
+                // Not a hex-suffix literal: emit verbatim.
+                out.push_str(&text[start..end]);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn rewrite_label_refs_in_text(text: &str, labels: &std::collections::HashSet<u64>) -> String {
