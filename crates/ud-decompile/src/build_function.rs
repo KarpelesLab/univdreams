@@ -3396,6 +3396,21 @@ fn collect_goto_targets(
                 }
                 cursor += bytes.len() as u64;
             }
+            Stmt::Call { name, bytes, .. } => {
+                // Synthetic call names like `goto_<hex>(args)` (from
+                // the tail-jmp lift) and `to_<hex>(args)` (from the
+                // end-of-block push-chain lift) reference an
+                // intra-function address. Surface it as a label so
+                // the destination block gets a visible `label_<hex>:`
+                // anchor — otherwise the reader sees `to_22b1(…)`
+                // pointing at nothing.
+                if let Some(addr) = parse_addr_prefix_call_name(name) {
+                    if addr >= fn_start && addr < fn_end {
+                        out.insert(addr);
+                    }
+                }
+                cursor += bytes.len() as u64;
+            }
             Stmt::IfBranch {
                 attrs,
                 cond_bytes,
@@ -3434,6 +3449,23 @@ fn collect_goto_targets(
             }
         }
     }
+}
+
+/// If `name` is one of the synthetic `goto_<hex>` / `to_<hex>` /
+/// `tail_<hex>` call names the pattern engine emits for
+/// intra-function targets, return the parsed address. The lifters
+/// only synthesise these for direct, in-range targets (indirect
+/// jumps fall through `tail_<expr>` with non-hex operand text),
+/// so anything that parses as hex *is* an intra-function address.
+fn parse_addr_prefix_call_name(name: &str) -> Option<u64> {
+    for prefix in ["goto_", "to_", "tail_"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                return u64::from_str_radix(rest, 16).ok();
+            }
+        }
+    }
+    None
 }
 
 /// Decode `bytes` at `ip` and report the jump target if the bytes

@@ -33,6 +33,7 @@ impl Pattern for StackArgCall {
         "stack_arg_call"
     }
 
+    #[allow(clippy::too_many_lines)]
     fn tentative(
         &self,
         ctx: &PatternCtx,
@@ -172,22 +173,28 @@ impl Pattern for StackArgCall {
         // pushed the same args). Both paths push the same number
         // of args; the call lives in the next block.
         //
-        // Emit a synthetic `pushed_args(arg, …)` call so the args
-        // surface structurally in the source instead of leaving
-        // the pushes on `@asm`. The bytes round-trip exactly —
-        // it's only a rendering tweak.
+        // Emit a synthetic `to_<next_ip>(arg, …)` call so the
+        // args surface structurally and the reader can follow
+        // the destination by label name (`label_22b1:` for
+        // `to_22b1(...)`). The bytes round-trip exactly — it's
+        // only a rendering tweak.
         if !args.is_empty() && args.len() >= 2 {
             args.reverse();
+            let last_ip = insns
+                .last()
+                .map(|ins| ins.iced.next_ip())
+                .unwrap_or_default();
+            let name = if last_ip != 0 {
+                format!("to_{last_ip:x}")
+            } else {
+                "pushed_args".into()
+            };
             return Some(Candidate {
                 pattern: self.name(),
                 start,
                 consumed: i - start,
                 priority: 200,
-                stmts: vec![Stmt::Call {
-                    name: "pushed_args".into(),
-                    args,
-                    bytes,
-                }],
+                stmts: vec![Stmt::Call { name, args, bytes }],
             });
         }
         None
