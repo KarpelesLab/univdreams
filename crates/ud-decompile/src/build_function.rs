@@ -1969,31 +1969,24 @@ fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::ssa::Livene
                     .live_after_insn
                     .get(&last_insn_ip)
                     .is_some_and(|live| !live.contains(&var));
-                // Even if the register stays live for one more
-                // instruction, fold when the next stmt's render
-                // text doesn't reference it ANYWHERE — that
-                // means forward-propagation fully inlined the
-                // value at the use site, so the intermediate
-                // line is purely redundant in the visible source.
+                // The "forwarded" heuristic ("next stmt's text
+                // doesn't mention the register, so forward-prop
+                // inlined the value already") turns out to be
+                // unsound: it conflates "register isn't read by
+                // the immediate next stmt" with "register is
+                // dead". The former can be true while the
+                // register stays live to a later stmt — silently
+                // absorbing the Move's bytes then hides a
+                // semantic write that downstream code depends on.
                 //
-                // "Anywhere" includes bracketed reads (`[eax+0x20]`)
-                // because those are still semantic reads of the
-                // register, even though the forward-prop pass
-                // didn't substitute them at the top level.
-                //
-                // Control-transfer stmts (goto / if-goto / jmp / call)
-                // hide their semantic reads behind the target's code,
-                // so the "text doesn't mention it" check is unsound
-                // for them — we'd silently absorb the Move's bytes
-                // into a `jmp label_X` whose text only shows the jmp,
-                // breaking the byte/text correspondence the reader
-                // depends on. Restrict the forward-propagation fold
-                // to non-transfer stmts.
-                let forwarded = stmts.get(i + 1).is_some_and(|next| {
-                    !stmt_has_register_read_anywhere(next, dst)
-                        && stmt_bytes_field_ro(next).is_some()
-                        && !stmt_is_control_transfer(next)
-                });
+                // Rely on the real liveness signal (`dead_after`)
+                // exclusively. Cases the forwarded path used to
+                // catch — Move-into-Call where the call's args
+                // already render the inlined value — are still
+                // covered because the Move's dst is actually
+                // dead at the call site (its only use was the
+                // inline, and that was forwarded).
+                let forwarded = false;
                 if dead_after || forwarded {
                     let prefix = match &stmts[i] {
                         Stmt::Move { bytes, .. } => bytes.clone(),
@@ -2058,111 +2051,6 @@ fn stmt_is_control_transfer(stmt: &Stmt) -> bool {
                     && text.as_bytes()[1].is_ascii_alphabetic())
         }
         _ => false,
-    }
-}
-
-/// Does `stmt`'s rendered text reference `reg` as a read
-/// anywhere — including bracketed memory operands. Used by the
-/// dead-move fold so a Move-then-bracket-read sequence isn't
-/// absorbed even when forward-propagation skipped the
-/// substitution.
-fn stmt_has_register_read_anywhere(stmt: &Stmt, reg: &str) -> bool {
-    let needle = reg.as_bytes();
-    let mut found = false;
-    let mut visit = |text: &str| {
-        if found {
-            return;
-        }
-        if text_has_reg_anywhere(text, needle) {
-            found = true;
-        }
-    };
-    match stmt {
-        Stmt::Move { dst, src, .. } => {
-            visit(dst);
-            visit(src);
-        }
-        Stmt::Call { name, args, .. } => {
-            visit(name);
-            for a in args {
-                visit(a);
-            }
-        }
-        Stmt::IfBranch { cond_text, .. }
-        | Stmt::Loop { cond_text, .. }
-        | Stmt::IfGoto { cond_text, .. } => visit(cond_text),
-        Stmt::IfReturn {
-            cond_text,
-            value_text,
-            ..
-        } => {
-            visit(cond_text);
-            visit(value_text);
-        }
-        Stmt::ReturnExpr { text, .. } | Stmt::Asm { text, .. } => visit(text),
-        _ => {}
-    }
-    found
-}
-
-/// Scan `text` for a bare-word occurrence of `needle` — including
-/// inside `[…]` brackets. Skips matches inside double-quoted
-/// strings.
-fn text_has_reg_anywhere(text: &str, needle: &[u8]) -> bool {
-    let bytes = text.as_bytes();
-    let mut in_string = false;
-    let mut prev_escape = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_string {
-            if !prev_escape && c == b'"' {
-                in_string = false;
-            }
-            prev_escape = !prev_escape && c == b'\\';
-            i += 1;
-            continue;
-        }
-        if c == b'"' {
-            in_string = true;
-        } else if i + needle.len() <= bytes.len() && &bytes[i..i + needle.len()] == needle {
-            let prev_alnum = i > 0 && is_ident_byte(bytes[i - 1]);
-            let next_alnum =
-                i + needle.len() < bytes.len() && is_ident_byte(bytes[i + needle.len()]);
-            if !prev_alnum && !next_alnum {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Read-only access to the bytes field — mirror of
-/// [`stmt_bytes_field_mut`] for the dead-store fold's predicate.
-fn stmt_bytes_field_ro(stmt: &Stmt) -> Option<&Vec<u8>> {
-    match stmt {
-        Stmt::Asm { bytes, .. }
-        | Stmt::Return { bytes, .. }
-        | Stmt::Prologue { bytes, .. }
-        | Stmt::Epilogue { bytes, .. }
-        | Stmt::Save { bytes, .. }
-        | Stmt::Restore { bytes, .. }
-        | Stmt::IfReturn { bytes, .. }
-        | Stmt::Goto { bytes, .. }
-        | Stmt::IfGoto { bytes, .. }
-        | Stmt::Switch { bytes, .. }
-        | Stmt::ReturnExpr { bytes, .. }
-        | Stmt::ArgSpill { bytes, .. }
-        | Stmt::Call { bytes, .. }
-        | Stmt::LocalSet { bytes, .. }
-        | Stmt::LocalArith { bytes, .. }
-        | Stmt::LocalCompound { bytes, .. }
-        | Stmt::Move { bytes, .. }
-        | Stmt::Inc16 { bytes, .. }
-        | Stmt::SehInstall { bytes }
-        | Stmt::SehRestore { bytes } => Some(bytes),
-        Stmt::IfBranch { .. } | Stmt::Loop { .. } | Stmt::Label { .. } | Stmt::Comment(_) => None,
     }
 }
 
