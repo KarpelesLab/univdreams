@@ -180,7 +180,15 @@ fn render_push_arg(insn: &DecodedInsn, sp_delta: Option<i64>) -> String {
     let raw = full
         .strip_prefix("push ")
         .map_or_else(|| full.clone(), str::to_string);
-    ud_arch_x86::rename_operand_in_ctx(&raw, sp_delta)
+    // Trim iced's verbose `dword ptr ` / `qword ptr ` size hint
+    // off memory-operand pushes. On x86, `push` always pushes one
+    // operand-size word, so the hint is redundant for the reader.
+    let trimmed = raw
+        .trim_start_matches("dword ptr ")
+        .trim_start_matches("qword ptr ")
+        .trim_start_matches("word ptr ")
+        .to_string();
+    ud_arch_x86::rename_operand_in_ctx(&trimmed, sp_delta)
 }
 
 /// Pick a name for a call target. Handles four cases:
