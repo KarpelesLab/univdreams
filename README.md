@@ -10,34 +10,32 @@ Most decompilers paraphrase. They lose the choices a compiler made — register 
 
 ## Status
 
-**The headline property is working and defended on every push:**
+**The headline property is working and defended on every push, for every format:**
 
 ```
-lower_to_elf(parse(decompile_to_text(elf)))   ==   elf-bytes
+lower_to_{elf,pe,macho,raw}(parse(decompile_to_text(bin)))   ==   bin-bytes
 ```
 
-For ELF64 x86-64 binaries (gcc-built, with debug info), the entire file — header, program-header table, section-header table, every section's content, and every interstitial padding gap — round-trips through the `.ud` source language byte-identically. The current corpus of two real fixtures totals **33,680 bytes byte-identical** through source.
+For every committed fixture, the entire file — headers, segment / section tables, every section's content, every interstitial padding gap, and code-signature blobs — round-trips through the `.ud` source language byte-identically. The corpus covers 15 binaries totalling roughly **490 KB**, plus the 420 KB `wmpcdcs8-mpg4c32.dll` (Windows msmpeg4 codec) as an opt-in external fixture.
 
 What's working today:
 
-- ELF64 reader/writer with byte-identical round-trip.
-- x86-64 instruction decode + dual-path emit (preserved bytes for round-trip; `iced` reencode for analysis).
-- Function discovery layered across `.symtab`, `.dynsym`, `.eh_frame`, byte-pattern signatures (CRT helpers), and a size-filling pass for size-less sources.
-- IR (Function/BasicBlock/Terminator) generic over an arch instruction type; CFG construction via iced flow control.
-- `.ud` AST and canonical pretty-printer.
-- `.ud` parser (text → AST) with diagnostics.
-- Decompile pipeline: ELF → discover → lift → AST → text.
-- Lower pipeline: text → AST → bytes per function and per section; `lower_to_elf` builds a complete `Elf64File` and emits.
-- DWARF reader for typed function signatures (parameters and return type from `.debug_info`).
-- 104 tests across 11 crates, fmt + clippy + tests defended on every push.
+- **Byte-identical round-trip** across ELF64, PE/COFF, and thin Mach-O (x86-64 + arm64), plus 6502 raw images.
+- **Architectures**: x86-64 + i386 via `iced-x86`, AArch64 (decode + lift), 6502 (full assembler + disassembler).
+- **Structured statement lifting**, not just `@asm()` dumps: `if`/`switch`/`goto`, register-named locals, `dword ptr [global] = expr` stores, `lea`-as-`&` address-of, `sub_foo(arg_8, arg_c)` calls with stdcall/cdecl push-chain folding, `tail_F(args)` for tail-jmps, prologue/epilogue auto-generation, SSA expression composition.
+- **PE / Mach-O readability** comparable to Ghidra's Headers + Memory Map + Symbol Table + Listing panes: structural decode of load commands (`LC_SEGMENT_64`, `LC_SYMTAB`, `LC_MAIN`, `LC_BUILD_VERSION`, `LC_LOAD_DYLIB`, etc.), inline disassembly comments, IAT-resolved imports (`GetDriverModuleHandle(arg_c)`).
+- **DWARF reader** for typed function signatures (parameters and return type from `.debug_info`).
+- **Function discovery** layered across `.symtab`, `.dynsym`, `.eh_frame`, PE export table, byte-pattern signatures (CRT helpers), and size-filling for unsymbolised binaries.
+- **WASM playground** at <https://karpeleslab.github.io/univdreams/> running the full pipeline in-browser.
+- **250 tests across 17 crates**, fmt + clippy + tests defended on every push.
 
 What's not done yet:
 
-- 16- and 32-bit x86, ARM, and Mach-O / PE backends — only ELF64-LE x86-64 is on the structured source path; other formats round-trip via byte-copy.
-- Structured statement lifting — function bodies are still sequences of `@asm("text", [bytes])` lines; expressions like `let x = a + b` aren't yet recovered.
-- Edit semantics — editing an `@asm` line in a way that would change re-encoded length doesn't yet warn.
-- libc / runtime signature DBs for static binaries.
-- Type recovery from access patterns when DWARF is absent.
+- Higher-level decompilation: loops as `for`/`while` rather than `goto`, struct-field naming from offset patterns, type recovery from access patterns when DWARF is absent.
+- libc / Win32 / Foundation runtime signature DBs beyond the current CRT-helper set.
+- Fat (universal) Mach-O wrappers; 32-bit Mach-O.
+- Mach-O code-signature regeneration after edits (currently the signature blob rides as opaque bytes — editing the source breaks the signature, same as any binary edit).
+- Edit semantics: `@asm` edits whose re-encoded length changes don't yet warn.
 
 See [docs/roadmap.md](docs/roadmap.md) for what's done in detail and what's next.
 
@@ -46,75 +44,119 @@ See [docs/roadmap.md](docs/roadmap.md) for what's done in detail and what's next
 Decompile a binary to canonical `.ud` source:
 
 ```bash
-$ ud decompile testdata/sqrt-gcc13-O0
+$ ud decompile testdata/external/wmpcdcs8-mpg4c32.dll
 @module {
-    arch: "x86_64",
-    abi: "sysv",
-    format: "elf",
-    bits: 0x40,
+    arch: "x86",
+    format: "pe",
+    bits: 0x20,
     endian: "little",
-    type: 0x3,
-    entry: 0x10a0,
-    build: { … e_ident, phdrs, shdrs, padding, file_size … },
+    build: { … coff, sections, optional_header, padding, file_size … },
 }
 
-@section(".text", 0x10a0) {
-    @addr(0x10a0)
-    fn _start() {
-        @asm("endbr64", [0xf3, 0x0f, 0x1e, 0xfa])
-        @asm("xor ebp,ebp", [0x31, 0xed])
+fn DriverProc() #[abi="stdcall", autogen_pro] {
+    let arg_8: u32;
+    let arg_c: u32;
+    let arg_10: u32;
+    let arg_14: u32;
+    let arg_18: u32;
+    let eax: u32, edx: u32, ecx: u32 @reg;
+
+    eax = arg_10 [0x8b, 0x45, 0x10]
+    edx = arg_14 [0x8b, 0x55, 0x14]
+    ecx = 0x4004 [0xb9, 0x04, 0x40, 0x00, 0x00]
+    if (eax >u ecx) goto label_2116;
+    if (eax == ecx) goto label_2103;
+    ecx = &[eax - 1]
+    switch (ecx) {
+        case 0: goto label_209d;
+        case 1: goto label_20fb;
         …
     }
 
-    @addr(0x10b0)
-    fn deregister_tm_clones() { … }    // recovered via signature
-
-    @addr(0x10e0)
-    fn register_tm_clones() { … }      // recovered via signature
-
-    @addr(0x1189)
-    fn test_sqrt(v: f64) {              // signature from DWARF
-        @asm("endbr64", [0xf3, 0x0f, 0x1e, 0xfa])
-        …
+label_209d:
+    if (dword ptr [0x1c262194] == 0) {
+        GetDriverModuleHandle(arg_c)
+        [0x1c262194] = eax
     }
+    dword ptr [0x1c26219c] = dword ptr [0x1c26219c] + 1
+    goto label_20fb;
 
-    @addr(0x11da)
-    fn do_fac(v: i32) -> i32 {          // signature from DWARF
-        …
-    }
+label_2288:
+    eax = arg_14
+    pushed_args([eax], [eax + 4], [eax + 8], [eax + 0x24], [eax + 0x28], …, [eax + 0x20])
+    sub_3469(arg_8)
+    goto label_2466;
 
-    @addr(0x1209)
-    fn main() -> i32 {                  // signature from DWARF
-        …
-    }
+    …
 }
-
-@section(".rodata", 0x2000) {
-    @raw(0x2000, [ … bytes … ])
-}
-
-…
 ```
 
-Recompile the same `.ud` source back to a byte-identical binary (round-trip is enforced by the test suite; a CLI flag for routing through source is on the near-term list).
+Compare the same idea for Mach-O:
+
+```bash
+$ ud decompile testdata/hello-clang-macho-x86_64
+@module {
+    arch: "x86_64", abi: "macho", format: "macho", …
+    build: {
+        commands: [
+            { cmd: 0x19, segment: { name: "__TEXT", sections: [
+                { name: "__text",   addr: 0x100000470, size: 0x23, … },
+                { name: "__stubs",  addr: 0x100000494, … },
+                { name: "__cstring", … },
+            ] } },
+            { cmd: 0xe, dylinker: { name: "/usr/lib/dyld", … } },
+            { cmd: 0x1b, uuid: "E567B4F0-B55D-3028-B141-EA1067085478" },
+            { cmd: 0x80000028, main: { entryoff: 0x470, stacksize: 0 } },
+            { cmd: 0xc, dylib: { name: "/usr/lib/libSystem.B.dylib", … } },
+            …
+        ],
+    },
+}
+
+// ── symbols ── (decoded from LC_SYMTAB; informational, not round-trip source)
+// 0x0000000100000470  SECT EXT        sect=1  _main
+// 0x0000000000000000  UNDF EXT        sect=0  _puts
+
+// ── disassembly of __text @ 0x100000470 (35 bytes) ──
+// 0x0000000100000470  55                        push rbp
+// 0x0000000100000471  48 89 e5                  mov rbp,rsp
+// 0x0000000100000474  48 83 ec 10               sub rsp,10h
+// 0x0000000100000478  c7 45 fc 00 00 00 00      mov dword ptr [rbp-4],0
+// 0x000000010000047f  48 8d 3d 14 00 00 00      lea rdi,[10000049Ah]
+// 0x0000000100000486  e8 09 00 00 00            call 0000000100000494h
+// 0x000000010000048b  31 c0                     xor eax,eax
+// 0x000000010000048d  48 83 c4 10               add rsp,10h
+// 0x0000000100000491  5d                        pop rbp
+// 0x0000000100000492  c3                        ret
+```
+
+Recompile the same `.ud` source back to a byte-identical binary:
+
+```bash
+$ ud roundtrip --through-source testdata/external/wmpcdcs8-mpg4c32.dll \
+    --out /tmp/mpg4c32.rebuilt
+source round-trip ok: testdata/external/wmpcdcs8-mpg4c32.dll == /tmp/mpg4c32.rebuilt (420240 bytes)
+```
 
 ## Targets
 
-| Tier | Format | Architecture | Status |
-|------|--------|--------------|--------|
-| **v1 (working)** | ELF64 | x86-64 (SysV) | ✅ whole-binary source round-trip; signatures + DWARF |
-| 2 | ELF | x86 (32-bit), arm32, arm64 | byte-copy round-trip only |
-| 3 | PE/COFF | x86-64, x86 (Windows MSVC + MinGW) | byte-copy round-trip only |
-| 3 | Mach-O | x86-64, arm64 (macOS/iOS) | not yet |
-| Future | raw / flat | x86-16, embedded ARM, others | not yet |
+| Tier | Format | Architectures | Status |
+|------|--------|---------------|--------|
+| **v1 (working)** | ELF64 | x86-64 (SysV), x86 (32-bit), aarch64 | ✅ whole-binary source round-trip; DWARF; structured lifts |
+| **v1 (working)** | PE/COFF | x86-64, x86 (Windows MSVC + MinGW) | ✅ whole-binary source round-trip; imports + signatures |
+| **v1 (working)** | Mach-O (thin) | x86-64, arm64 (macOS) | ✅ whole-binary source round-trip; Ghidra-style listing |
+| **v1 (working)** | raw / flat | 6502 (Apple I / WozMon) | ✅ round-trip + lift |
+| 2 | Mach-O fat | universal binaries | demux to thin first |
+| 2 | ARM / Thumb | 32-bit ARM | not yet |
+| 3 | High-level lifting | loops, types, struct fields | partial — see roadmap |
 
-The v1 complexity bar reached: **scalar code from gcc with debug info and `-fcf-protection`**. Auto-vectorization, LTO/PGO, hand-tuned asm, and packed binaries are explicit non-goals for v1.
+The v1 complexity bar reached: **scalar code from gcc / clang / MSVC / MinGW with or without debug info**. Auto-vectorization, LTO/PGO, hand-tuned asm, and packed binaries are explicit non-goals for v1.
 
 ## Use cases driving the design
 
-- Reverse engineering and patching: edit a function, recompile, ship a binary indistinguishable from the original except for your edit.
-- Education / research / CTF: see what the compiler actually did, in a language that explains itself.
-- Reproducible-build verification (later): independently compile a vendor's source and verify it matches their shipped binary.
+- **Reverse engineering and patching**: edit a function, recompile, ship a binary indistinguishable from the original except for your edit.
+- **Education / research / CTF**: see what the compiler actually did, in a language that explains itself.
+- **Reproducible-build verification** (later): independently compile a vendor's source and verify it matches their shipped binary.
 
 Binary porting between architectures is *not* in v1. A faithful round-trip on one arch is the precondition for cross-arch porting later.
 
@@ -122,7 +164,7 @@ Binary porting between architectures is *not* in v1. A faithful round-trip on on
 
 Rust. Reasoning, briefly:
 - Strong type system catches IR-transformation bugs that are otherwise silent.
-- The ecosystem is the best fit: [`iced-x86`](https://crates.io/crates/iced-x86) for x86 enc/dec, [`gimli`](https://crates.io/crates/gimli) for DWARF / `.eh_frame`, hand-rolled ELF for round-trip control.
+- The ecosystem is the best fit: [`iced-x86`](https://crates.io/crates/iced-x86) for x86 enc/dec, [`gimli`](https://crates.io/crates/gimli) for DWARF / `.eh_frame`, hand-rolled ELF / PE / Mach-O readers / writers for round-trip control.
 - Memory safety matters when parsing untrusted binaries.
 
 ## Repository layout
@@ -139,15 +181,21 @@ Rust. Reasoning, briefly:
 └── crates/
     ├── ud-core/                # shared types: VAddr, Result, byte helpers
     ├── ud-format-elf/          # ELF64 reader + writer (byte-identical)
-    ├── ud-arch-x86/            # x86 decode + lift + Intel formatter
+    ├── ud-format-pe/           # PE/COFF reader + writer (byte-identical)
+    ├── ud-format-macho/        # thin 64-bit Mach-O reader + writer
+    ├── ud-format-raw/          # raw / flat-image fixtures (6502)
+    ├── ud-arch-x86/            # x86 decode + lift + Intel formatter + call-site analyzer
+    ├── ud-arch-aarch64/        # AArch64 decode + lift
+    ├── ud-arch-6502/           # 6502 decode + lift + assembler
     ├── ud-ir/                  # Function, BasicBlock, Terminator (generic over arch)
     ├── ud-analysis/            # function discovery (symtab / eh_frame / signatures)
     ├── ud-signatures/          # byte-pattern DB (CRT helpers)
     ├── ud-debug/               # DWARF reader → typed signatures
     ├── ud-ast/                 # .ud AST + canonical pretty-printer
-    ├── ud-compile/             # .ud parser + lower_to_elf
-    ├── ud-decompile/           # ELF → AST pipeline
-    └── ud-cli/                 # the `ud` binary
+    ├── ud-compile/             # .ud parser + lower_to_{elf,pe,macho,raw}
+    ├── ud-decompile/           # binary → AST pipeline (all formats)
+    ├── ud-cli/                 # the `ud` binary
+    └── ud-wasm/                # wasm-bindgen bindings for the browser playground
 ```
 
 ## Quick start
@@ -159,11 +207,14 @@ cargo build --workspace
 # Run end-to-end byte-identical round-trip on the test corpus
 cargo test --workspace
 
-# Decompile an ELF64-LE x86-64 binary to .ud
+# Decompile any supported binary to .ud (auto-detects ELF / PE / Mach-O / 6502)
 cargo run --bin ud -- decompile path/to/binary
 
-# Verify that bytes can be read and rewritten via the byte-level path
-cargo run --bin ud -- roundtrip path/to/binary
+# Source round-trip: decompile → emit → parse → lower → check byte-equality
+cargo run --bin ud -- roundtrip --through-source path/to/binary
+
+# Verify an .ud file's @asm lines decode to canonical Intel-syntax form
+cargo run --bin ud -- verify path/to/file.ud
 ```
 
 ## How to read this repo
