@@ -65,6 +65,24 @@ enum Command {
         /// `.ud` source file.
         input: PathBuf,
     },
+
+    /// Compile a `.ud` source file back to a binary. Dispatches on
+    /// the `@module.format` field — `"elf"` → ELF, `"pe"` → PE,
+    /// `"macho"` → Mach-O, `"raw"` → raw image.
+    ///
+    /// Editing the source between decompile and compile is the
+    /// supported workflow: PC-relative encoders (jmp, jcc, call,
+    /// switch) re-resolve at lower time so moving a function or
+    /// growing its body produces a working binary.
+    Compile {
+        /// `.ud` source file.
+        input: PathBuf,
+
+        /// Where to write the rebuilt binary. Defaults to
+        /// `<input>.bin`.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -205,6 +223,52 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 eprintln!("{}", format_warning(w));
             }
             eprintln!("{} warning(s) in {}", warnings.len(), input.display());
+            Ok(())
+        }
+        Command::Compile { input, out } => {
+            let output = out.unwrap_or_else(|| {
+                let mut p = input.clone().into_os_string();
+                p.push(".bin");
+                PathBuf::from(p)
+            });
+            let text = std::fs::read_to_string(&input)
+                .with_context(|| format!("read {}", input.display()))?;
+            let ast =
+                ud_compile::parse(&text).with_context(|| format!("parse {}", input.display()))?;
+            let format = ast
+                .module
+                .fields
+                .iter()
+                .find(|f| f.name == "format")
+                .and_then(|f| match &f.value {
+                    ud_ast::Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("`@module.format` is missing — expected \"elf\", \"pe\", \"macho\", or \"raw\"")
+                })?;
+            let bytes = match format.as_str() {
+                "elf" => ud_compile::lower_to_elf(&ast)
+                    .with_context(|| format!("lower {} to ELF", input.display()))?,
+                "pe" => ud_compile::lower_to_pe(&ast)
+                    .with_context(|| format!("lower {} to PE", input.display()))?,
+                "macho" => ud_compile::lower_to_macho(&ast)
+                    .with_context(|| format!("lower {} to Mach-O", input.display()))?,
+                "raw" => ud_compile::lower_to_raw(&ast)
+                    .with_context(|| format!("lower {} to raw", input.display()))?,
+                other => anyhow::bail!(
+                    "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", or \"raw\")"
+                ),
+            };
+            std::fs::write(&output, &bytes)
+                .with_context(|| format!("write {}", output.display()))?;
+            println!(
+                "compiled: {} → {} ({} bytes, format: {})",
+                input.display(),
+                output.display(),
+                bytes.len(),
+                format,
+            );
             Ok(())
         }
     }
