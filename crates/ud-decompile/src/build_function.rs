@@ -1971,10 +1971,15 @@ fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::ssa::Livene
                     .is_some_and(|live| !live.contains(&var));
                 // Even if the register stays live for one more
                 // instruction, fold when the next stmt's render
-                // text doesn't reference it at top level — that
-                // means forward-propagation already inlined the
+                // text doesn't reference it ANYWHERE — that
+                // means forward-propagation fully inlined the
                 // value at the use site, so the intermediate
                 // line is purely redundant in the visible source.
+                //
+                // "Anywhere" includes bracketed reads (`[eax+0x20]`)
+                // because those are still semantic reads of the
+                // register, even though the forward-prop pass
+                // didn't substitute them at the top level.
                 //
                 // Control-transfer stmts (goto / if-goto / jmp / call)
                 // hide their semantic reads behind the target's code,
@@ -1985,7 +1990,7 @@ fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::ssa::Livene
                 // depends on. Restrict the forward-propagation fold
                 // to non-transfer stmts.
                 let forwarded = stmts.get(i + 1).is_some_and(|next| {
-                    !stmt_has_top_level_register_read(next, dst)
+                    !stmt_has_register_read_anywhere(next, dst)
                         && stmt_bytes_field_ro(next).is_some()
                         && !stmt_is_control_transfer(next)
                 });
@@ -2056,21 +2061,19 @@ fn stmt_is_control_transfer(stmt: &Stmt) -> bool {
     }
 }
 
-/// Does `stmt`'s rendered text reference `reg` as a top-level
-/// (i.e., not inside a `[…]` address calculation) word-boundary
-/// use? Used by dead-store folding to ask "would the reader still
-/// see the register name in this stmt's output?". A `false`
-/// answer means forward-propagation has already substituted the
-/// value at the use site, so the producing move is redundant
-/// for display purposes.
-fn stmt_has_top_level_register_read(stmt: &Stmt, reg: &str) -> bool {
+/// Does `stmt`'s rendered text reference `reg` as a read
+/// anywhere — including bracketed memory operands. Used by the
+/// dead-move fold so a Move-then-bracket-read sequence isn't
+/// absorbed even when forward-propagation skipped the
+/// substitution.
+fn stmt_has_register_read_anywhere(stmt: &Stmt, reg: &str) -> bool {
     let needle = reg.as_bytes();
     let mut found = false;
     let mut visit = |text: &str| {
         if found {
             return;
         }
-        if text_has_top_level_reg(text, needle) {
+        if text_has_reg_anywhere(text, needle) {
             found = true;
         }
     };
@@ -2102,13 +2105,11 @@ fn stmt_has_top_level_register_read(stmt: &Stmt, reg: &str) -> bool {
     found
 }
 
-/// Scan `text` for a bare-word occurrence of `needle` outside
-/// any `[…]` bracketed subexpression and outside quoted strings.
-/// Mirrors the register-substitution scanner the forward-prop
-/// pass uses so the two stay consistent.
-fn text_has_top_level_reg(text: &str, needle: &[u8]) -> bool {
+/// Scan `text` for a bare-word occurrence of `needle` — including
+/// inside `[…]` brackets. Skips matches inside double-quoted
+/// strings.
+fn text_has_reg_anywhere(text: &str, needle: &[u8]) -> bool {
     let bytes = text.as_bytes();
-    let mut depth = 0i32;
     let mut in_string = false;
     let mut prev_escape = false;
     let mut i = 0;
@@ -2122,24 +2123,15 @@ fn text_has_top_level_reg(text: &str, needle: &[u8]) -> bool {
             i += 1;
             continue;
         }
-        match c {
-            b'"' => {
-                in_string = true;
+        if c == b'"' {
+            in_string = true;
+        } else if i + needle.len() <= bytes.len() && &bytes[i..i + needle.len()] == needle {
+            let prev_alnum = i > 0 && is_ident_byte(bytes[i - 1]);
+            let next_alnum =
+                i + needle.len() < bytes.len() && is_ident_byte(bytes[i + needle.len()]);
+            if !prev_alnum && !next_alnum {
+                return true;
             }
-            b'[' | b'(' => depth += 1,
-            b']' | b')' => depth = depth.saturating_sub(1),
-            _ if depth == 0
-                && i + needle.len() <= bytes.len()
-                && &bytes[i..i + needle.len()] == needle =>
-            {
-                let prev_alnum = i > 0 && is_ident_byte(bytes[i - 1]);
-                let next_alnum =
-                    i + needle.len() < bytes.len() && is_ident_byte(bytes[i + needle.len()]);
-                if !prev_alnum && !next_alnum {
-                    return true;
-                }
-            }
-            _ => {}
         }
         i += 1;
     }
