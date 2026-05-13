@@ -1994,12 +1994,11 @@ fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::ssa::Livene
                         Stmt::Move { bytes, .. } => bytes.clone(),
                         _ => unreachable!(),
                     };
-                    // Even when the static analysis says the value is
-                    // dead, never absorb a Move's bytes into a
-                    // control-transfer stmt (jmp / call / ret /
-                    // jcc): the target's code may read the register,
-                    // so silently merging hides a semantic write
-                    // behind misleading text.
+                    // Never absorb a Move's bytes into a control-
+                    // transfer stmt (jmp / call / ret / jcc /
+                    // goto / if-goto): the target's code may read
+                    // the register, so silently merging hides a
+                    // semantic write behind misleading text.
                     let next_is_transfer = stmts.get(i + 1).is_some_and(stmt_is_control_transfer);
                     if !next_is_transfer {
                         if let Some(next_bytes) =
@@ -2097,7 +2096,7 @@ fn stmt_has_top_level_register_read(stmt: &Stmt, reg: &str) -> bool {
             visit(cond_text);
             visit(value_text);
         }
-        Stmt::ReturnExpr { text, .. } => visit(text),
+        Stmt::ReturnExpr { text, .. } | Stmt::Asm { text, .. } => visit(text),
         _ => {}
     }
     found
