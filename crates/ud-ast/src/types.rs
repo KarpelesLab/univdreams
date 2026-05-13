@@ -265,6 +265,12 @@ pub struct PrologueParams {
     /// True when the prologue starts with `endbr32` / `endbr64`
     /// (Intel CET indirect-branch landing pad).
     pub cf_protect: bool,
+    /// Frame-setup encoding selector: `false` for the MSVC RM
+    /// form (`mov ebp, esp` as `0x8b 0xec`), `true` for the GCC
+    /// MR form (`0x89 0xe5`). Only meaningful when `frame` is
+    /// true; the codec uses it to re-emit byte-identical
+    /// instructions for either compiler.
+    pub frame_alt: bool,
 }
 
 /// Structured breakdown of a function epilogue. Mirrors

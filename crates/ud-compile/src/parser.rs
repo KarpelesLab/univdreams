@@ -2027,6 +2027,7 @@ fn prologue_to_codec(p: &ud_ast::PrologueParams) -> ud_arch_x86::StructuredProlo
         frame: p.frame,
         sub_esp: p.sub_esp,
         cf_protect: p.cf_protect,
+        frame_alt_encoding: p.frame_alt,
     }
 }
 
@@ -2064,6 +2065,23 @@ impl Parser {
                 }
                 "frame" => {
                     p.frame = true;
+                    // Optional `=alt` selector picks the GCC MR
+                    // encoding (`mov ebp, esp` as `0x89 0xe5`)
+                    // instead of the default MSVC RM form
+                    // (`0x8b 0xec`).
+                    if self.eat_kind(&TokenKind::Eq) {
+                        let marker_tok = self.peek().clone();
+                        let marker = self.expect_ident("`alt` after `frame=`")?;
+                        if marker != "alt" {
+                            return Err(ParseError::Expected {
+                                expected: "`alt` after `frame=`".into(),
+                                got: format!("`{marker}`"),
+                                line: marker_tok.line,
+                                col: marker_tok.col,
+                            });
+                        }
+                        p.frame_alt = true;
+                    }
                 }
                 "sub" => {
                     self.expect(&TokenKind::Colon, "`:` after `sub`")?;

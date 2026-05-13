@@ -895,7 +895,11 @@ fn emit_prologue_params(out: &mut String, p: &crate::types::PrologueParams) {
         out.push(']');
     }
     if p.frame {
-        out.push_str(", frame");
+        if p.frame_alt {
+            out.push_str(", frame=alt");
+        } else {
+            out.push_str(", frame");
+        }
     }
     if p.sub_esp > 0 {
         write!(out, ", sub: 0x{:x}", p.sub_esp).unwrap();

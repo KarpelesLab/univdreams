@@ -61,6 +61,13 @@ pub struct StructuredPrologue {
     /// True when the prologue starts with `endbr32` / `endbr64`
     /// (Intel CET indirect-branch landing pad).
     pub cf_protect: bool,
+    /// Frame-setup encoding selector for the `mov ebp, esp` move:
+    /// MSVC emits `0x8b 0xec` (RM form) while GCC emits
+    /// `0x89 0xe5` (MR form). Functionally identical but
+    /// byte-different, so we observe at decode time and re-emit
+    /// the same form at encode time to keep round-trip lossless.
+    /// Only meaningful when `frame` is true.
+    pub frame_alt_encoding: bool,
 }
 
 /// Structured epilogue, the mirror of [`StructuredPrologue`].
@@ -127,8 +134,9 @@ pub fn decode_prologue(bytes: &[u8], bits: CodecBits) -> Option<StructuredProlog
     // been counted as a save above — detect and re-attribute.
     if matches!(p.saves.last().map(String::as_str), Some("ebp" | "rbp")) {
         if let Some(mov_b) = bytes.get(i..i + mov_bp_sp_len(bits)) {
-            if is_mov_bp_sp(mov_b, bits) {
+            if let Some(alt) = mov_bp_sp_form(mov_b, bits) {
                 p.frame = true;
+                p.frame_alt_encoding = alt;
                 p.saves.pop(); // re-attribute the last push
                 i += mov_bp_sp_len(bits);
             }
@@ -185,12 +193,17 @@ pub fn encode_prologue(p: &StructuredPrologue, bits: CodecBits) -> Vec<u8> {
         push_reg_encoded(r, bits, &mut out);
     }
     if p.frame {
-        // push ebp; mov ebp, esp.
+        // push ebp; mov ebp, esp. Two equivalent encodings: MSVC
+        // emits the RM form (`0x8b 0xec`), GCC the MR form
+        // (`0x89 0xe5`). Pick the one the decode pass observed.
         out.push(0x55);
-        match bits {
-            CodecBits::Bits32 => out.extend_from_slice(&[0x8b, 0xec]),
-            CodecBits::Bits64 => out.extend_from_slice(&[0x48, 0x8b, 0xec]),
-        }
+        let mov_bytes: &[u8] = match (bits, p.frame_alt_encoding) {
+            (CodecBits::Bits32, false) => &[0x8b, 0xec],
+            (CodecBits::Bits32, true) => &[0x89, 0xe5],
+            (CodecBits::Bits64, false) => &[0x48, 0x8b, 0xec],
+            (CodecBits::Bits64, true) => &[0x48, 0x89, 0xe5],
+        };
+        out.extend_from_slice(mov_bytes);
     }
     if p.sub_esp > 0 {
         encode_sub_esp(p.sub_esp, bits, &mut out);
@@ -344,6 +357,9 @@ pub fn default_prologue(inputs: &ProfileInputs) -> StructuredPrologue {
         frame: inputs.frame_required,
         sub_esp: inputs.sub_esp,
         cf_protect: inputs.cf_protect,
+        // Defaults match MSVC's RM `mov ebp, esp` encoding —
+        // autogen is targeted at MSVC anyway.
+        frame_alt_encoding: false,
     }
 }
 
@@ -488,13 +504,23 @@ fn mov_bp_sp_len(bits: CodecBits) -> usize {
     }
 }
 
-fn is_mov_bp_sp(b: &[u8], bits: CodecBits) -> bool {
+/// `Some(false)` for the MSVC RM form (`0x8b 0xec`), `Some(true)`
+/// for the GCC MR form (`0x89 0xe5`), `None` if `b` isn't a
+/// recognised `mov ebp, esp` (or 64-bit variant). Used by the
+/// decoder to remember which form was observed so the encoder can
+/// re-emit the same bytes.
+fn mov_bp_sp_form(b: &[u8], bits: CodecBits) -> Option<bool> {
     match bits {
-        // Accept both `0x8b 0xec` (mov r32, r/m32) and the
-        // alternative `0x89 0xe5` (mov r/m32, r32) — different
-        // compilers emit different encodings.
-        CodecBits::Bits32 => b == [0x8b, 0xec] || b == [0x89, 0xe5],
-        CodecBits::Bits64 => b == [0x48, 0x8b, 0xec] || b == [0x48, 0x89, 0xe5],
+        CodecBits::Bits32 => match b {
+            [0x8b, 0xec] => Some(false),
+            [0x89, 0xe5] => Some(true),
+            _ => None,
+        },
+        CodecBits::Bits64 => match b {
+            [0x48, 0x8b, 0xec] => Some(false),
+            [0x48, 0x89, 0xe5] => Some(true),
+            _ => None,
+        },
     }
 }
 

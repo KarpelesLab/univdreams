@@ -1208,6 +1208,7 @@ fn decode_prologue_params(
         frame: p.frame,
         sub_esp: p.sub_esp,
         cf_protect: p.cf_protect,
+        frame_alt: p.frame_alt_encoding,
     })
 }
 
