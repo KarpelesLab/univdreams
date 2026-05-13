@@ -566,22 +566,64 @@ fn lower_stmts_into(
 /// source order. Non-function items are skipped silently.
 pub fn lower_functions(file: &UdFile) -> Result<Vec<LoweredFunction>, LowerError> {
     let mut out = Vec::new();
-    walk_functions(&file.items, &mut out)?;
+    walk_functions(&file.items, None, &mut out)?;
     Ok(out)
 }
 
-fn walk_functions(items: &[Item], out: &mut Vec<LoweredFunction>) -> Result<(), LowerError> {
+/// Walk every `Function` in `items`, lowering each to bytes. The
+/// `section_cursor` tracks the cumulative byte position within
+/// the enclosing `@section` block (in IP space), so functions
+/// without an explicit `@addr` can still resolve PC-relative
+/// references — their effective IP is the cumulative cursor.
+/// Top-level functions (no enclosing section) keep the original
+/// behavior: the cursor is `None` and PC-relative regen falls
+/// back to `f.addr`.
+fn walk_functions(
+    items: &[Item],
+    section_cursor: Option<u64>,
+    out: &mut Vec<LoweredFunction>,
+) -> Result<(), LowerError> {
+    let mut cursor = section_cursor;
     for item in items {
         match item {
             Item::Function(f) => {
+                let ip = match (f.addr, cursor) {
+                    (Some(a), _) => Some(a),
+                    (None, Some(c)) => Some(c),
+                    (None, None) => None,
+                };
+                let bytes = lower_function_bytes_at(f, ip)?;
+                if let Some(c) = cursor.as_mut() {
+                    let placement = f.addr.unwrap_or(*c);
+                    *c = placement.saturating_add(bytes.len() as u64);
+                }
                 out.push(LoweredFunction {
                     name: f.name.clone(),
-                    addr: f.addr,
-                    bytes: lower_function_bytes(f)?,
+                    addr: f.addr.or(ip),
+                    bytes,
                 });
             }
-            Item::Section { items: nested, .. } => walk_functions(nested, out)?,
-            Item::Comment(_) | Item::Raw { .. } | Item::Strings { .. } | Item::Notes { .. } => {}
+            Item::Section {
+                addr,
+                items: nested,
+                ..
+            } => walk_functions(nested, Some(*addr), out)?,
+            Item::Raw { addr, bytes } => {
+                if let Some(c) = cursor.as_mut() {
+                    *c = (*addr).saturating_add(bytes.len() as u64);
+                }
+            }
+            Item::Strings { addr, strings } => {
+                if let Some(c) = cursor.as_mut() {
+                    *c = (*addr).saturating_add(lower_strings_bytes(strings).len() as u64);
+                }
+            }
+            Item::Notes { addr, entries } => {
+                if let Some(c) = cursor.as_mut() {
+                    *c = (*addr).saturating_add(lower_notes_bytes(entries).len() as u64);
+                }
+            }
+            Item::Comment(_) => {}
         }
     }
     Ok(())

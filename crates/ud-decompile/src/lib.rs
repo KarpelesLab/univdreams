@@ -130,8 +130,9 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
         let name = elf
             .section_name(idx)
             .map_or_else(|| format!("section{idx}"), str::to_string);
-        let section_items =
+        let mut section_items =
             build_section_items(elf, sh, data, &map, &debug_by_addr, &name_at, arch)?;
+        drop_redundant_function_addrs(sh.sh_addr, &mut section_items);
         items.push(Item::Section {
             name,
             addr: sh.sh_addr,
@@ -140,6 +141,63 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
     }
 
     Ok(UdFile { module, items })
+}
+
+/// Walk a section's items in declaration order and drop
+/// `@addr(…)` from every `Function` whose address is exactly the
+/// cumulative cursor — i.e., the function would fall in at the
+/// expected position anyway. This removes noise from the
+/// decompiled source: the addr-pinned shape is reserved for
+/// items that diverge from the running cursor (functions
+/// preceded by a deliberate alignment gap, or hand-edited
+/// placements). On lower, items without an explicit addr take
+/// the cumulative cursor automatically.
+///
+/// `Raw`, `Strings`, and `Notes` items keep their `addr` — those
+/// are required by the AST today, and they're typically pinned
+/// at section-relative offsets that matter for the binary's
+/// data layout. We advance the cursor past them by recomputing
+/// the on-disk byte size locally so subsequent function-addr
+/// comparisons land at the right position.
+fn drop_redundant_function_addrs(section_addr: u64, items: &mut [Item]) {
+    let mut cursor = section_addr;
+    for item in items.iter_mut() {
+        match item {
+            Item::Function(f) => {
+                let body_size = build_function::lowered_body_size_at(&f.body, cursor);
+                if f.addr == Some(cursor) {
+                    f.addr = None;
+                }
+                cursor = cursor.saturating_add(body_size);
+            }
+            Item::Raw { addr, bytes } => {
+                cursor = (*addr).saturating_add(bytes.len() as u64);
+            }
+            Item::Strings { addr, strings } => {
+                cursor = (*addr).saturating_add(strings_byte_size(strings));
+            }
+            Item::Notes { addr, entries } => {
+                cursor = (*addr).saturating_add(notes_byte_size(entries));
+            }
+            Item::Comment(_) | Item::Section { .. } => {}
+        }
+    }
+}
+
+fn strings_byte_size(strings: &[String]) -> u64 {
+    strings.iter().map(|s| (s.len() + 1) as u64).sum()
+}
+
+fn notes_byte_size(entries: &[ud_ast::NoteEntry]) -> u64 {
+    let mut size: u64 = 0;
+    for e in entries {
+        size += 12; // Nhdr: name_size + desc_size + type
+        let name_padded = ((e.name.len() + 1) + 3) & !3; // null-terminated, 4-aligned
+        size += name_padded as u64;
+        let desc_padded = (e.desc.len() + 3) & !3;
+        size += desc_padded as u64;
+    }
+    size
 }
 
 /// Convenience: build the AST and pretty-print it to canonical text.

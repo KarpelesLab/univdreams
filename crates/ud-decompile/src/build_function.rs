@@ -2044,6 +2044,14 @@ fn stmts_total_bytes_at(stmts: &[Stmt], mut cursor: u64) -> usize {
     n
 }
 
+/// Total lowered byte size of a function body starting at the
+/// given IP. Public so the top-level decompiler can compute the
+/// cumulative section cursor when deciding whether a function's
+/// `@addr(0x…)` is redundant.
+pub fn lowered_body_size_at(body: &[Stmt], ip: u64) -> u64 {
+    stmts_total_bytes_at(body, ip) as u64
+}
+
 #[allow(dead_code)]
 fn stmts_total_bytes(stmts: &[Stmt]) -> usize {
     stmts_total_bytes_at(stmts, 0)

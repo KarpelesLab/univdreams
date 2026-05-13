@@ -154,24 +154,62 @@ fn asm_count_matches_lifted_instruction_count() {
     );
 }
 
-/// Walk the items and decode each function's `lower_function_bytes`
-/// output, summing instruction counts. Equivalent to the old
+/// Walk the items and decode each function's lowered output,
+/// summing instruction counts. Equivalent to the old
 /// `count_asm_stmts` but covers autogen-regenerated prologue and
 /// epilogue bytes that aren't in the body anymore.
+///
+/// Threads a section-relative cursor so functions without an
+/// explicit `@addr` (dropped by the redundancy pass when they
+/// fall in at the cumulative position) still lower against a
+/// concrete IP.
 fn count_function_bytes_as_insns(items: &[Item]) -> usize {
-    let mut n = 0;
-    for item in items {
-        match item {
-            Item::Function(f) => {
-                let bytes = ud_compile::lower_function_bytes(f).expect("lower");
-                let insns =
-                    ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, &bytes, 0).expect("decode");
-                n += insns.len();
+    fn walk(items: &[Item], section_cursor: Option<u64>, n: &mut usize) {
+        let mut cursor = section_cursor;
+        for item in items {
+            match item {
+                Item::Function(f) => {
+                    let ip = f.addr.or(cursor);
+                    let bytes = ud_compile::lower_function_bytes_at(f, ip).expect("lower");
+                    let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, &bytes, 0)
+                        .expect("decode");
+                    *n += insns.len();
+                    if let Some(c) = cursor.as_mut() {
+                        *c = f.addr.unwrap_or(*c).saturating_add(bytes.len() as u64);
+                    }
+                }
+                Item::Section { addr, items, .. } => {
+                    walk(items, Some(*addr), n);
+                }
+                Item::Raw { addr, bytes } => {
+                    if let Some(c) = cursor.as_mut() {
+                        *c = (*addr).saturating_add(bytes.len() as u64);
+                    }
+                }
+                Item::Strings { addr, strings } => {
+                    if let Some(c) = cursor.as_mut() {
+                        *c = (*addr)
+                            .saturating_add(strings.iter().map(|s| (s.len() + 1) as u64).sum());
+                    }
+                }
+                Item::Notes { addr, entries } => {
+                    if let Some(c) = cursor.as_mut() {
+                        // Conservative bump — exact note byte size
+                        // isn't exposed; this estimate is only used
+                        // to gate addr-comparisons we don't make.
+                        let est: u64 = entries
+                            .iter()
+                            .map(|e| 12 + e.name.len() as u64 + 1 + e.desc.len() as u64 + 7)
+                            .sum();
+                        *c = (*addr).saturating_add(est);
+                    }
+                }
+                Item::Comment(_) => {}
             }
-            Item::Section { items, .. } => n += count_function_bytes_as_insns(items),
-            _ => {}
         }
     }
+    let mut n = 0;
+    walk(items, None, &mut n);
     n
 }
 

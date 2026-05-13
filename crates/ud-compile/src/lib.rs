@@ -22,8 +22,8 @@ mod parser;
 mod verify;
 
 pub use lower::{
-    lower_function_bytes, lower_functions, lower_section_bytes, lower_sections, LowerError,
-    LoweredFunction, LoweredSection,
+    lower_function_bytes, lower_function_bytes_at, lower_functions, lower_section_bytes,
+    lower_sections, LowerError, LoweredFunction, LoweredSection,
 };
 pub use lower_elf::{build_elf64, lower_to_elf, ElfLowerError};
 pub use lower_macho::{lower_to_macho, MachoLowerError};
