@@ -280,10 +280,12 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             };
             writeln!(out, "{outdent}label_{addr:x}:").unwrap();
         }
-        Stmt::Goto { target_addr, bytes } => {
-            write!(out, "{indent}goto label_{target_addr:x}; [").unwrap();
-            emit_byte_list(out, bytes);
-            writeln!(out, "]").unwrap();
+        Stmt::Goto { target_addr, wide } => {
+            if *wide {
+                writeln!(out, "{indent}goto label_{target_addr:x} #[wide];").unwrap();
+            } else {
+                writeln!(out, "{indent}goto label_{target_addr:x};").unwrap();
+            }
         }
         Stmt::IfGoto {
             cond_text,

@@ -1462,6 +1462,66 @@ pub fn roundtrip_bytes(bitness: Bitness, bytes: &[u8], rip: u64) -> Result<Vec<D
     Ok(insns)
 }
 
+/// Errors emitted by [`encode_jmp`].
+#[derive(Debug, thiserror::Error)]
+pub enum JumpEncodeError {
+    #[error("jmp rel32 target out of i32 range: from=0x{from:x} to=0x{to:x}")]
+    OutOfRange { from: u64, to: u64 },
+}
+
+/// Encode an unconditional `jmp` from `source_ip` (the address of
+/// the jmp instruction itself) to `target`.
+///
+/// * `wide=false` and the displacement fits in `i8`: `jmp rel8`
+///   (2 bytes, opcode `0xeb`).
+/// * otherwise (`wide=true`, or `i8` displacement doesn't fit):
+///   `jmp rel32` (5 bytes, opcode `0xe9`).
+///
+/// The `wide` flag exists because compilers don't always pick
+/// the shortest encoding — most do, but MSVC in particular
+/// occasionally emits `jmp rel32` when `jmp rel8` would fit.
+/// Setting `wide=true` reproduces that choice for round-trip
+/// fidelity on unedited inputs. Edits that push a target beyond
+/// `i8` reach auto-promote to `rel32` regardless of the flag.
+pub fn encode_jmp(
+    source_ip: u64,
+    target: u64,
+    wide: bool,
+) -> std::result::Result<Vec<u8>, JumpEncodeError> {
+    if !wide {
+        let after_rel8 = source_ip.wrapping_add(2);
+        let rel8 = i128::from(target).wrapping_sub(i128::from(after_rel8));
+        if (-128..=127).contains(&rel8) {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let imm = rel8 as i8 as u8;
+            return Ok(vec![0xeb, imm]);
+        }
+    }
+    let after_rel32 = source_ip.wrapping_add(5);
+    let rel = i128::from(target).wrapping_sub(i128::from(after_rel32));
+    let rel32 = i32::try_from(rel).map_err(|_| JumpEncodeError::OutOfRange {
+        from: source_ip,
+        to: target,
+    })?;
+    let mut out = Vec::with_capacity(5);
+    out.push(0xe9);
+    out.extend_from_slice(&rel32.to_le_bytes());
+    Ok(out)
+}
+
+/// Pre-computed byte size of [`encode_jmp`]'s output.
+#[must_use]
+pub fn encoded_jmp_size(source_ip: u64, target: u64, wide: bool) -> usize {
+    if !wide {
+        let after_rel8 = source_ip.wrapping_add(2);
+        let rel8 = i128::from(target).wrapping_sub(i128::from(after_rel8));
+        if (-128..=127).contains(&rel8) {
+            return 2;
+        }
+    }
+    5
+}
+
 /// Errors emitted by [`encode_msvc_jmp_table_dispatch`].
 #[derive(Debug, thiserror::Error)]
 pub enum SwitchEncodeError {

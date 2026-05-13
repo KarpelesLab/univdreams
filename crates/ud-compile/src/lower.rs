@@ -94,6 +94,23 @@ pub enum LowerError {
     SwitchNeedsAddress { fn_name: String, stmt_index: usize },
 
     #[error(
+        "function `{fn_name}` body index {stmt_index}: goto needs the \
+         enclosing function's `@addr` set so the `jmp rel32` can be \
+         computed against the target label"
+    )]
+    GotoNeedsAddress { fn_name: String, stmt_index: usize },
+
+    #[error(
+        "function `{fn_name}` body index {stmt_index}: goto encode \
+         failed: {source}"
+    )]
+    GotoEncode {
+        fn_name: String,
+        stmt_index: usize,
+        source: ud_arch_x86::JumpEncodeError,
+    },
+
+    #[error(
         "function `{fn_name}` body index {stmt_index}: switch dispatch \
          encode failed: {source}"
     )]
@@ -377,13 +394,33 @@ fn lower_stmts_into(
                 })?;
                 out.extend_from_slice(&bytes);
             }
+            Stmt::Goto { target_addr, wide } => {
+                let func_addr = base_addr.ok_or_else(|| LowerError::GotoNeedsAddress {
+                    fn_name: fn_name.to_string(),
+                    stmt_index: i,
+                })?;
+                let source_ip = func_addr.checked_add(out.len() as u64).ok_or_else(|| {
+                    LowerError::GotoNeedsAddress {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                    }
+                })?;
+                let bytes =
+                    ud_arch_x86::encode_jmp(source_ip, *target_addr, *wide).map_err(|e| {
+                        LowerError::GotoEncode {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                            source: e,
+                        }
+                    })?;
+                out.extend_from_slice(&bytes);
+            }
             Stmt::Return { bytes, .. }
             | Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. }
             | Stmt::Save { bytes, .. }
             | Stmt::Restore { bytes, .. }
             | Stmt::IfReturn { bytes, .. }
-            | Stmt::Goto { bytes, .. }
             | Stmt::IfGoto { bytes, .. }
             | Stmt::SehInstall { bytes }
             | Stmt::SehRestore { bytes }

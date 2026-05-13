@@ -953,9 +953,12 @@ fn propagate_one_stmt(
             }
             *cursor += bytes.len() as u64;
         }
-        Stmt::IfReturn { bytes, .. } | Stmt::Goto { bytes, .. } | Stmt::IfGoto { bytes, .. } => {
-            // cmp/test/jcc/jmp don't touch GPRs — state preserved.
+        Stmt::IfReturn { bytes, .. } | Stmt::IfGoto { bytes, .. } => {
+            // cmp/test/jcc don't touch GPRs — state preserved.
             *cursor += bytes.len() as u64;
+        }
+        Stmt::Goto { target_addr, wide } => {
+            *cursor += ud_arch_x86::encoded_jmp_size(*cursor, *target_addr, *wide) as u64;
         }
         Stmt::Switch { .. } => {
             *cursor += switch_encoded_size(stmt) as u64;
@@ -1895,10 +1898,12 @@ fn switch_encoded_size(stmt: &Stmt) -> usize {
     cmp + 6 + 7
 }
 
-fn stmt_total_bytes(stmt: &Stmt) -> usize {
-    if matches!(stmt, Stmt::Switch { .. }) {
-        return switch_encoded_size(stmt);
-    }
+/// Encoded byte size of a statement at the given cursor. Most
+/// statements have a fixed size (their pinned `bytes` field).
+/// `Stmt::Goto` and `Stmt::Switch` regenerate their bytes at
+/// lower time from the cursor + target address — for them the
+/// size depends on the cursor position.
+fn stmt_total_bytes_at(stmt: &Stmt, cursor: u64) -> usize {
     #[allow(clippy::match_same_arms)]
     match stmt {
         Stmt::Asm { bytes, .. }
@@ -1908,7 +1913,6 @@ fn stmt_total_bytes(stmt: &Stmt) -> usize {
         | Stmt::Save { bytes, .. }
         | Stmt::Restore { bytes, .. }
         | Stmt::IfReturn { bytes, .. }
-        | Stmt::Goto { bytes, .. }
         | Stmt::IfGoto { bytes, .. }
         | Stmt::ReturnExpr { bytes, .. }
         | Stmt::ArgSpill { bytes, .. }
@@ -1920,6 +1924,9 @@ fn stmt_total_bytes(stmt: &Stmt) -> usize {
         | Stmt::Inc16 { bytes, .. }
         | Stmt::SehInstall { bytes }
         | Stmt::SehRestore { bytes } => bytes.len(),
+        Stmt::Goto { target_addr, wide } => {
+            ud_arch_x86::encoded_jmp_size(cursor, *target_addr, *wide)
+        }
         Stmt::IfBranch {
             attrs,
             cond_bytes,
@@ -1928,14 +1935,21 @@ fn stmt_total_bytes(stmt: &Stmt) -> usize {
             else_body,
             ..
         } => {
-            let mut n = cond_bytes.len();
+            let mut sub = cursor;
             if let Some(hb) = ud_ast_head_bytes_attr(attrs) {
-                n += hb.len();
+                sub += hb.len() as u64;
             }
-            n += stmts_total_bytes(pre_body);
-            n += stmts_total_bytes(then_body);
+            let mut n = (sub - cursor) as usize;
+            let pre_n = stmts_total_bytes_at(pre_body, sub);
+            n += pre_n;
+            sub += pre_n as u64;
+            n += cond_bytes.len();
+            sub += cond_bytes.len() as u64;
+            let then_n = stmts_total_bytes_at(then_body, sub);
+            n += then_n;
+            sub += then_n as u64;
             if let Some(eb) = else_body {
-                n += stmts_total_bytes(eb);
+                n += stmts_total_bytes_at(eb, sub);
             }
             n
         }
@@ -1945,11 +1959,14 @@ fn stmt_total_bytes(stmt: &Stmt) -> usize {
             tail_bytes,
             ..
         } => {
+            let mut sub = cursor;
             let mut n = 0;
             if let Some(jmp) = entry_jmp_bytes {
                 n += jmp.len();
+                sub += jmp.len() as u64;
             }
-            n += stmts_total_bytes(body);
+            let body_n = stmts_total_bytes_at(body, sub);
+            n += body_n;
             n += tail_bytes.len();
             n
         }
@@ -1958,8 +1975,28 @@ fn stmt_total_bytes(stmt: &Stmt) -> usize {
     }
 }
 
+/// Cursor-less size: assumes a fresh cursor at 0. Accurate for
+/// every statement except `Stmt::Goto`, whose encoded size
+/// depends on the displacement; the worst-case (5-byte rel32)
+/// is returned in that case via the encoder. Callers that
+/// already track a cursor should call [`stmt_total_bytes_at`]
+/// directly.
+fn stmt_total_bytes(stmt: &Stmt) -> usize {
+    stmt_total_bytes_at(stmt, 0)
+}
+
+fn stmts_total_bytes_at(stmts: &[Stmt], mut cursor: u64) -> usize {
+    let mut n = 0;
+    for s in stmts {
+        let sz = stmt_total_bytes_at(s, cursor);
+        n += sz;
+        cursor += sz as u64;
+    }
+    n
+}
+
 fn stmts_total_bytes(stmts: &[Stmt]) -> usize {
-    stmts.iter().map(stmt_total_bytes).sum()
+    stmts_total_bytes_at(stmts, 0)
 }
 
 /// Drop `Move { dst: REG, … }` stmts whose dst register is dead
@@ -2084,7 +2121,6 @@ fn stmt_bytes_field_mut(stmt: &mut Stmt) -> Option<&mut Vec<u8>> {
         | Stmt::Save { bytes, .. }
         | Stmt::Restore { bytes, .. }
         | Stmt::IfReturn { bytes, .. }
-        | Stmt::Goto { bytes, .. }
         | Stmt::IfGoto { bytes, .. }
         | Stmt::ReturnExpr { bytes, .. }
         | Stmt::ArgSpill { bytes, .. }
@@ -2100,6 +2136,7 @@ fn stmt_bytes_field_mut(stmt: &mut Stmt) -> Option<&mut Vec<u8>> {
         | Stmt::Loop { .. }
         | Stmt::Label { .. }
         | Stmt::Comment(_)
+        | Stmt::Goto { .. }
         | Stmt::Switch { .. } => None,
     }
 }
@@ -3575,8 +3612,13 @@ fn collect_goto_targets(
                 }
                 cursor += switch_encoded_size(stmt) as u64;
             }
-            Stmt::Goto { target_addr, bytes }
-            | Stmt::IfGoto {
+            Stmt::Goto { target_addr, wide } => {
+                if *target_addr >= fn_start && *target_addr < fn_end {
+                    out.insert(*target_addr);
+                }
+                cursor += ud_arch_x86::encoded_jmp_size(cursor, *target_addr, *wide) as u64;
+            }
+            Stmt::IfGoto {
                 target_addr, bytes, ..
             } => {
                 if *target_addr >= fn_start && *target_addr < fn_end {
@@ -3768,10 +3810,14 @@ fn make_goto_stmt(
             if insns.len() != 1 {
                 return None;
             }
-            Some(Stmt::Goto {
-                target_addr,
-                bytes: bytes.to_vec(),
-            })
+            // Record the original encoding width so the lower
+            // path can reproduce the compiler's choice: rel8
+            // takes 2 bytes (`0xeb` + i8), rel32 takes 5 bytes
+            // (`0xe9` + i32). Most rel32 emissions could fit
+            // rel8 but the compiler picked the wider form; we
+            // preserve that to keep the round-trip byte-equal.
+            let wide = bytes.len() > 2;
+            Some(Stmt::Goto { target_addr, wide })
         }
         FlowControl::ConditionalBranch => {
             let cond_text = if insns.len() == 1 {

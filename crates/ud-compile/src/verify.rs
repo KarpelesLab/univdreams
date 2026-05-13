@@ -140,7 +140,6 @@ fn verify_stmts(
             | Stmt::Save { bytes, .. }
             | Stmt::Restore { bytes, .. }
             | Stmt::IfReturn { bytes, .. }
-            | Stmt::Goto { bytes, .. }
             | Stmt::IfGoto { bytes, .. }
             | Stmt::SehInstall { bytes }
             | Stmt::SehRestore { bytes }
@@ -153,6 +152,10 @@ fn verify_stmts(
             | Stmt::Move { bytes, .. }
             | Stmt::Inc16 { bytes, .. } => {
                 *cursor = cursor.saturating_add(bytes.len() as u64);
+            }
+            Stmt::Goto { target_addr, wide } => {
+                let size = ud_arch_x86::encoded_jmp_size(*cursor, *target_addr, *wide) as u64;
+                *cursor = cursor.saturating_add(size);
             }
             Stmt::Switch {
                 cases, dispatch, ..

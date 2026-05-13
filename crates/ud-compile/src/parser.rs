@@ -1339,9 +1339,15 @@ impl Parser {
                 col: label_tok.col,
             });
         };
+        // Optional `#[wide]` attribute forces a 5-byte rel32 even
+        // when a 2-byte rel8 would fit — used to preserve the
+        // encoding choice the original compiler made.
+        let attrs = self.parse_attrs()?;
+        let wide = attrs
+            .iter()
+            .any(|a| a.key == "wide" && matches!(a.value, ud_ast::AttrValue::Flag));
         self.expect(&TokenKind::Semicolon, "`;` after `goto` target")?;
-        let bytes = self.parse_byte_list()?;
-        Ok(Stmt::Goto { target_addr, bytes })
+        Ok(Stmt::Goto { target_addr, wide })
     }
 
     /// Parse a `label_HEX:` marker — no bytes, just a position

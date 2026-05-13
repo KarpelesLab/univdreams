@@ -389,11 +389,23 @@ pub enum Stmt {
     /// them by name. Round-trip neutral.
     Label { addr: u64 },
 
-    /// `goto label_XXXX; [bytes]` — an unconditional jump folded
-    /// from `@asm("jmp …")`. Bytes are the original `jmp` encoding
-    /// (short or near); `target_addr` is what `label_<hex>` refers
-    /// to elsewhere in the function body.
-    Goto { target_addr: u64, bytes: Vec<u8> },
+    /// `goto label_XXXX;` (or `goto label_XXXX #[wide];`) — an
+    /// unconditional `jmp` to a label somewhere in the function
+    /// body. No pinned bytes: the lower path picks the encoding
+    /// from `target_addr`, the cursor position, and the `wide`
+    /// flag:
+    ///
+    /// * `wide=false` and the displacement fits in `i8`:
+    ///   `jmp rel8` (2 bytes).
+    /// * otherwise: `jmp rel32` (5 bytes).
+    ///
+    /// The `wide` flag captures encoding choices the compiler
+    /// made that don't follow the "always shortest" rule —
+    /// occasional, but real (some MSVC paths emit `jmp rel32`
+    /// even when `jmp rel8` would fit). Editing the function so
+    /// a label moves auto-promotes `wide=false` → `wide=true`
+    /// when the displacement no longer fits in `i8`.
+    Goto { target_addr: u64, wide: bool },
 
     /// `if (cond) goto label_XXXX; [bytes]` — a conditional jump
     /// folded from `@asm("cmp/test …; jcc …")` whose target is a
