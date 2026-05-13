@@ -4630,7 +4630,13 @@ fn emit_block_stmts(
         name_at: ctx.name_at,
         sp_delta_at: ctx.sp_delta_at,
     };
-    let pattern_matches = crate::patterns::apply_patterns(&pattern_ctx, &block.insns);
+    // Restrict pattern matching to the `[0, asm_count)` instruction
+    // range. Anything past `asm_count` belongs to the block tail
+    // lift (return / epilogue / return-expr) which owns those
+    // bytes; letting a pattern scan into that range can produce
+    // overlapping byte claims (e.g. `push imm; pop reg` whose
+    // `pop` is actually the epilogue's `pop reg` restore).
+    let pattern_matches = crate::patterns::apply_patterns(&pattern_ctx, &block.insns[..asm_count]);
 
     let mut global_idx = prologue_consumed;
     while global_idx < asm_count {

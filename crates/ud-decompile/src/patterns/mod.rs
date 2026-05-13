@@ -49,6 +49,7 @@ mod load_modify_store;
 mod mem_via_reg;
 mod mov;
 mod mov_extend;
+mod push_imm_pop_reg;
 mod simd_expr;
 mod stack_arg_call;
 mod tail_jmp;
@@ -130,6 +131,7 @@ fn registry() -> Vec<&'static dyn Pattern> {
     vec![
         &stack_arg_call::StackArgCall,
         &tail_jmp::TailJmp,
+        &push_imm_pop_reg::PushImmPopReg,
         &xor_zero::XorZero,
         &load_modify_store::LoadModifyStore,
         &mem_via_reg::MemViaReg,
