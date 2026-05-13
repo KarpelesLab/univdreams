@@ -329,6 +329,15 @@ pub fn build_function(
         rewrite_ecx_as_this(&mut body);
     }
 
+    // Stack-slot rename: `[rbp-4]`, `dword ptr [rbp-4]`, `[ebp+8]`,
+    // etc. in operand text → matching `var_N` / `arg_N` local name.
+    // The local list already carries the names, so the body
+    // matches; pure text rewrite, bytes untouched.
+    let stack_map = build_stack_local_map(&locals);
+    if !stack_map.is_empty() {
+        rewrite_stack_refs(&mut body, &stack_map);
+    }
+
     FnDecl {
         addr: Some(f.addr.0),
         name: f.name.clone(),
@@ -1250,6 +1259,40 @@ const CALLER_SAVED: &[&str] = &[
     "eax", "ecx", "edx", "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
 ];
 
+/// At an Epilogue/Return position `i` with a known returned
+/// expression `expr`, rewrite the most recent `eax/rax = <expr>`
+/// Move into a `Stmt::ReturnExpr` (renders as `return <expr>;`).
+/// Falls back to inserting a `// returns <expr>` comment when the
+/// preceding Move can't be cleanly identified (side-effecting
+/// stmt in between, or value flowed in through a Call's return).
+///
+/// Returns the number of statements inserted before `i` so the
+/// caller can advance its cursor accordingly.
+fn fold_or_annotate_return(stmts: &mut Vec<Stmt>, i: usize, expr: &str) -> usize {
+    for k in (0..i).rev() {
+        match &stmts[k] {
+            Stmt::Move { dst, src, bytes } if (dst == "eax" || dst == "rax") && src == expr => {
+                let new_stmt = Stmt::ReturnExpr {
+                    text: src.clone(),
+                    bytes: bytes.clone(),
+                };
+                stmts[k] = new_stmt;
+                return 0;
+            }
+            Stmt::Call { .. }
+            | Stmt::Asm { .. }
+            | Stmt::Move { .. }
+            | Stmt::IfBranch { .. }
+            | Stmt::Loop { .. }
+            | Stmt::Switch { .. } => break,
+            _ => {}
+        }
+    }
+    let comment = Stmt::Comment(format!("returns {expr}"));
+    stmts.insert(i, comment);
+    1
+}
+
 /// Walk the function body and insert a `// returns <expr>` comment
 /// before every `@epilogue` / `@return` that has a tracked EAX/RAX
 /// expression at exit. Same `RegState` machinery as forward
@@ -1275,13 +1318,9 @@ fn annotate_in_seq(stmts: &mut Vec<Stmt>, state: &mut RegState) {
                     .cloned();
                 state.invalidate_all();
                 if let Some(expr) = ret {
-                    // Avoid the trivial `// returns eax = eax`
-                    // cases by skipping when the tracked expr is
-                    // the register itself.
                     if expr != "eax" && expr != "rax" {
-                        let comment = Stmt::Comment(format!("returns {expr}"));
-                        stmts.insert(i, comment);
-                        i += 1;
+                        let added = fold_or_annotate_return(stmts, i, &expr);
+                        i += added;
                     }
                 }
                 i += 1;
@@ -1992,6 +2031,212 @@ fn rewrite_ecx_in_stmt(stmt: &mut Stmt) {
         Stmt::IfGoto { cond_text, .. } => apply(cond_text),
         _ => {}
     }
+}
+
+/// Build a `(offset → name)` map of the function's stack locals
+/// for the stack-slot rewrite pass. Negative offsets (the
+/// `var_<hex>` decls) and positive offsets (the `arg_<hex>`
+/// decls) are pulled in; non-stack locals are ignored.
+fn build_stack_local_map(locals: &[ud_ast::LocalDecl]) -> Vec<(i64, String)> {
+    let mut out: Vec<(i64, String)> = Vec::new();
+    for l in locals {
+        if !matches!(l.kind, ud_ast::LocalKind::Stack) {
+            continue;
+        }
+        if let Some(rest) = l.name.strip_prefix("var_") {
+            if let Ok(n) = i64::from_str_radix(rest, 16) {
+                out.push((-n, l.name.clone()));
+            }
+        } else if let Some(rest) = l.name.strip_prefix("arg_") {
+            if let Ok(n) = i64::from_str_radix(rest, 16) {
+                out.push((n, l.name.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Walk every text field in `stmts` and substitute `[rbp±N]` /
+/// `[ebp±N]` / size-prefixed forms with the matching local name.
+/// Pure text rewrite — bytes are untouched, round-trip is safe.
+fn rewrite_stack_refs(stmts: &mut [Stmt], map: &[(i64, String)]) {
+    for stmt in stmts.iter_mut() {
+        rewrite_stack_refs_in_stmt(stmt, map);
+    }
+}
+
+fn rewrite_stack_refs_in_stmt(stmt: &mut Stmt, map: &[(i64, String)]) {
+    fn apply(text: &mut String, map: &[(i64, String)]) {
+        let new_text = rewrite_stack_refs_in_text(text, map);
+        if new_text != *text {
+            *text = new_text;
+        }
+    }
+    match stmt {
+        Stmt::Move { dst, src, .. } => {
+            apply(dst, map);
+            apply(src, map);
+        }
+        Stmt::Call { name, args, .. } => {
+            apply(name, map);
+            for a in args.iter_mut() {
+                apply(a, map);
+            }
+        }
+        Stmt::Asm { text, .. } | Stmt::ReturnExpr { text, .. } => apply(text, map),
+        Stmt::IfBranch {
+            cond_text,
+            pre_body,
+            then_body,
+            else_body,
+            ..
+        } => {
+            apply(cond_text, map);
+            rewrite_stack_refs(pre_body, map);
+            rewrite_stack_refs(then_body, map);
+            if let Some(eb) = else_body {
+                rewrite_stack_refs(eb, map);
+            }
+        }
+        Stmt::Loop {
+            cond_text, body, ..
+        } => {
+            apply(cond_text, map);
+            rewrite_stack_refs(body, map);
+        }
+        Stmt::IfReturn {
+            cond_text,
+            value_text,
+            ..
+        } => {
+            apply(cond_text, map);
+            apply(value_text, map);
+        }
+        Stmt::IfGoto { cond_text, .. } => apply(cond_text, map),
+        _ => {}
+    }
+}
+
+/// One pass over `text` replacing `[rbp±N]` (with optional size
+/// prefix and `0x`/decimal offsets) with the matching local
+/// name. Operates outside quoted strings to avoid corrupting
+/// `@asm("…")` payloads that happen to mention `[rbp-4]` in
+/// some embedded context.
+fn rewrite_stack_refs_in_text(text: &str, map: &[(i64, String)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut iter = text.char_indices().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+    while let Some((i, c)) = iter.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push('"');
+            continue;
+        }
+        // Only attempt the substitution when the char could start
+        // one of the patterns (`[`, or a size prefix's leading
+        // letter). Char-based iteration avoids UTF-8 slicing
+        // panics on `@asm("…")` string-literal payloads that can
+        // contain multibyte chars like `…`.
+        if matches!(c, '[' | 'd' | 'q' | 'w' | 'b' | 'x' | 't') {
+            if let Some((name, consumed)) = try_match_stack_ref(&text[i..], map) {
+                out.push_str(name);
+                // Advance `iter` past the consumed range so the
+                // outer loop continues from the new position.
+                let target = i + consumed;
+                while iter.peek().is_some_and(|&(j, _)| j < target) {
+                    iter.next();
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// At `text`'s start, try to match `[<size> ptr ]?[(r|e)bp(\s*[+-]\s*(0x[0-9a-f]+|[0-9]+))?]`.
+/// Returns the matching local name + bytes consumed.
+fn try_match_stack_ref<'a>(text: &str, map: &'a [(i64, String)]) -> Option<(&'a String, usize)> {
+    let lc_full = text.to_ascii_lowercase();
+    let bytes = lc_full.as_bytes();
+    let mut i = 0;
+    // Optional size prefix.
+    for prefix in &[
+        "xmmword ptr ",
+        "qword ptr ",
+        "dword ptr ",
+        "word ptr ",
+        "byte ptr ",
+        "tbyte ptr ",
+    ] {
+        if lc_full[i..].starts_with(prefix) {
+            i += prefix.len();
+            break;
+        }
+    }
+    if !lc_full[i..].starts_with("[rbp") && !lc_full[i..].starts_with("[ebp") {
+        return None;
+    }
+    i += 4; // past `[rbp` / `[ebp`
+            // Skip whitespace.
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    // Bare `[rbp]` → offset 0.
+    if i < bytes.len() && bytes[i] == b']' {
+        let name = map.iter().find(|(off, _)| *off == 0).map(|(_, n)| n)?;
+        return Some((name, i + 1));
+    }
+    let sign: i64 = match bytes.get(i) {
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => return None,
+    };
+    i += 1;
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    let num_start = i;
+    let value: i64 = if lc_full[i..].starts_with("0x") {
+        i += 2;
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        if i == num_start + 2 {
+            return None;
+        }
+        i64::from_str_radix(&lc_full[num_start + 2..i], 16).ok()?
+    } else {
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == num_start {
+            return None;
+        }
+        lc_full[num_start..i].parse::<i64>().ok()?
+    };
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b']') {
+        return None;
+    }
+    i += 1;
+    let offset = sign * value;
+    let name = map.iter().find(|(off, _)| *off == offset).map(|(_, n)| n)?;
+    Some((name, i))
 }
 
 /// Substitute occurrences of `ecx` (at word boundaries, outside
@@ -4685,7 +4930,13 @@ fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
             if let Some((section_name, data, off)) = ctx.data.section_at(addr) {
                 if is_string_data_section(section_name) {
                     if let Some(s) = read_cstring_at(data, off) {
-                        return format!("{:?}", shorten_for_display(s));
+                        // Return the raw string content — the emitter
+                        // owns the quoting policy (auto-wraps any arg
+                        // whose unquoted form would be ambiguous). Using
+                        // `{:?}` here pre-wraps with quotes and the
+                        // emitter then re-quotes, producing the
+                        // `"\"Hello\""` double-quoting bug.
+                        return shorten_for_display(s);
                     }
                 }
             }
@@ -4699,23 +4950,20 @@ fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
             if let Some((section_name, data, off)) = ctx.data.section_at(*addr) {
                 if is_string_data_section(section_name) {
                     if let Some(s) = read_cstring_at(data, off) {
-                        return format!("{:?}", shorten_for_display(s));
+                        return shorten_for_display(s);
                     }
                 }
-                if !section_name.is_empty() {
-                    return format!("{section_name} @ 0x{addr:x}");
-                }
             }
+            // Drop the `{section_name} @ 0x{addr:x}` form: it contains
+            // a space and `@`, which the emit layer would auto-quote
+            // and the reader would mistake for a string literal. The
+            // bare `&0x{addr:x}` round-trips cleanly and the per-line
+            // annotation comment carries the section context.
             format!("&0x{addr:x}")
         }
         ArgValue::GlobalLoad { addr } => {
             if let Some(name) = ctx.name_at.get(addr) {
                 return format!("*{name}");
-            }
-            if let Some((section_name, _, _)) = ctx.data.section_at(*addr) {
-                if !section_name.is_empty() {
-                    return format!("*{section_name} @ 0x{addr:x}");
-                }
             }
             format!("*0x{addr:x}")
         }

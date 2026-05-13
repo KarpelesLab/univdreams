@@ -195,9 +195,17 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             writeln!(out, "{indent}// {text}").unwrap();
         }
         Stmt::Return { value, bytes } => {
-            write!(out, "{indent}@return(0x{value:x}, [").unwrap();
+            // Render in C-style `return EXPR; [bytes]` keyword form
+            // rather than the legacy `@return(EXPR, [bytes])` directive
+            // form — closer to ghidra's output and faster to scan.
+            if *value < 10 {
+                write!(out, "{indent}return {value};").unwrap();
+            } else {
+                write!(out, "{indent}return 0x{value:x};").unwrap();
+            }
+            out.push_str(" [");
             emit_byte_list(out, bytes);
-            writeln!(out, "])").unwrap();
+            writeln!(out, "]").unwrap();
         }
         Stmt::Prologue {
             kind,
@@ -298,9 +306,12 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             writeln!(out, "{indent}}}").unwrap();
         }
         Stmt::ReturnExpr { text, bytes } => {
-            write!(out, "{indent}@return_expr({}, [", quote_string(text)).unwrap();
+            // C-style `return EXPR; [bytes]` form — same shape the
+            // `if (cond) return EXPR; [bytes]` early-return uses.
+            write!(out, "{indent}return {text};").unwrap();
+            out.push_str(" [");
             emit_byte_list(out, bytes);
-            writeln!(out, "])").unwrap();
+            writeln!(out, "]").unwrap();
         }
         Stmt::ArgSpill { arg_index, bytes } => {
             write!(out, "{indent}@arg_spill({arg_index}, [").unwrap();

@@ -658,6 +658,10 @@ impl Parser {
                     let stmt = self.parse_goto_stmt()?;
                     body.push(stmt);
                 }
+                TokenKind::Ident(name) if name == "return" => {
+                    let stmt = self.parse_return_stmt()?;
+                    body.push(stmt);
+                }
                 TokenKind::Ident(name) if name == "switch" => {
                     let stmt = self.parse_switch_stmt()?;
                     body.push(stmt);
@@ -1125,6 +1129,33 @@ impl Parser {
         })
     }
 
+    /// Parse a top-level `return EXPR; [bytes]` statement.
+    ///
+    /// When `EXPR` parses as a single integer literal, the result is
+    /// a [`Stmt::Return`] (numeric form); otherwise it's a
+    /// [`Stmt::ReturnExpr`] carrying the literal source text so the
+    /// expression survives the round-trip verbatim.
+    fn parse_return_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // consume `return`
+        let value_text = if self.peek().kind == TokenKind::Semicolon {
+            String::new()
+        } else {
+            self.parse_until_semicolon()?
+        };
+        self.expect(&TokenKind::Semicolon, "`;` after `return` value")?;
+        let bytes = self.parse_byte_list()?;
+        // Numeric tail → Stmt::Return; otherwise keep the text as
+        // a ReturnExpr.
+        if let Some(value) = parse_int_literal(&value_text) {
+            Ok(Stmt::Return { value, bytes })
+        } else {
+            Ok(Stmt::ReturnExpr {
+                text: value_text,
+                bytes,
+            })
+        }
+    }
+
     /// Parse the tail of an `if (cond) goto label_HEX; [bytes]`.
     fn parse_if_goto_tail(&mut self, cond_text: String) -> Result<Stmt, ParseError> {
         self.bump(); // consume `goto`
@@ -1393,6 +1424,7 @@ impl Parser {
             TokenKind::Ident(name) if name == "if" => self.parse_if_stmt(),
             TokenKind::Ident(name) if name == "do" => self.parse_do_while_stmt(),
             TokenKind::Ident(name) if name == "goto" => self.parse_goto_stmt(),
+            TokenKind::Ident(name) if name == "return" => self.parse_return_stmt(),
             TokenKind::Ident(name) if is_label_name(name.as_str()) => {
                 let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
                 if matches!(next_kind, Some(TokenKind::Colon)) {
@@ -2087,6 +2119,19 @@ impl Parser {
 fn parse_label_addr(name: &str) -> Option<u64> {
     let rest = name.strip_prefix("label_")?;
     u64::from_str_radix(rest, 16).ok()
+}
+
+/// Recognise `123`, `0x1f`, or `0X1F` as an integer literal.
+/// Used by `parse_return_stmt` to decide whether a tail like
+/// `return 0;` carries a numeric value (lift to `Stmt::Return`)
+/// or an expression (`Stmt::ReturnExpr`).
+fn parse_int_literal(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(rest, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
 }
 
 /// Identifier-name predicate matching the `label_<hex>` shape
