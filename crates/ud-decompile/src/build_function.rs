@@ -1234,12 +1234,14 @@ fn profile_inputs_from_fn(f: &ud_ast::FnDecl) -> ud_arch_x86::ProfileInputs {
     }
 }
 
-/// True when the function's body contains a `Stmt::Call` (at any
-/// nesting depth). Used by the x86-64 stack-alignment heuristic
-/// to detect leaf-with-call vs leaf-without-call.
+/// True when the function's body contains a real `call` (at any
+/// nesting depth). Tail calls (`Stmt::Call` with a `tail_` name
+/// prefix) don't count — they transfer control without returning,
+/// so the caller's stack alignment isn't a concern for them. Used
+/// by the x86-64 stack-alignment heuristic.
 fn body_contains_call(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        Stmt::Call { .. } => true,
+        Stmt::Call { name, .. } => !name.starts_with("tail_"),
         Stmt::IfBranch {
             pre_body,
             then_body,

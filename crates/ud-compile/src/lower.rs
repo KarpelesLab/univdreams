@@ -247,7 +247,7 @@ fn profile_inputs_from_fn(f: &FnDecl) -> ud_arch_x86::ProfileInputs {
 
 fn body_contains_call(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        Stmt::Call { .. } => true,
+        Stmt::Call { name, .. } => !name.starts_with("tail_"),
         Stmt::IfBranch {
             pre_body,
             then_body,
