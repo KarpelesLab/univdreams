@@ -584,6 +584,17 @@ fn arg_is_unquoted_safe(s: &str) -> bool {
             }
             continue;
         }
+        // Outside string/brackets, demand graphic-ASCII so a bare
+        // space can't break token splitting on parse. Inside
+        // brackets the parser already consumes everything up to
+        // the matching close, so spaces are safe there.
+        if !c.is_ascii_graphic() && depth == 0 {
+            return false;
+        }
+        if c.is_whitespace() && depth > 0 {
+            saw_non_string = true;
+            continue;
+        }
         if !c.is_ascii_graphic() {
             return false;
         }
