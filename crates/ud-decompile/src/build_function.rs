@@ -1975,22 +1975,43 @@ fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::ssa::Livene
                 // means forward-propagation already inlined the
                 // value at the use site, so the intermediate
                 // line is purely redundant in the visible source.
+                //
+                // Control-transfer stmts (goto / if-goto / jmp / call)
+                // hide their semantic reads behind the target's code,
+                // so the "text doesn't mention it" check is unsound
+                // for them — we'd silently absorb the Move's bytes
+                // into a `jmp label_X` whose text only shows the jmp,
+                // breaking the byte/text correspondence the reader
+                // depends on. Restrict the forward-propagation fold
+                // to non-transfer stmts.
                 let forwarded = stmts.get(i + 1).is_some_and(|next| {
                     !stmt_has_top_level_register_read(next, dst)
                         && stmt_bytes_field_ro(next).is_some()
+                        && !stmt_is_control_transfer(next)
                 });
                 if dead_after || forwarded {
                     let prefix = match &stmts[i] {
                         Stmt::Move { bytes, .. } => bytes.clone(),
                         _ => unreachable!(),
                     };
-                    if let Some(next_bytes) = stmts.get_mut(i + 1).and_then(stmt_bytes_field_mut) {
-                        let mut merged = Vec::with_capacity(prefix.len() + next_bytes.len());
-                        merged.extend_from_slice(&prefix);
-                        merged.extend_from_slice(next_bytes);
-                        *next_bytes = merged;
-                        stmts.remove(i);
-                        deleted = true;
+                    // Even when the static analysis says the value is
+                    // dead, never absorb a Move's bytes into a
+                    // control-transfer stmt (jmp / call / ret /
+                    // jcc): the target's code may read the register,
+                    // so silently merging hides a semantic write
+                    // behind misleading text.
+                    let next_is_transfer = stmts.get(i + 1).is_some_and(stmt_is_control_transfer);
+                    if !next_is_transfer {
+                        if let Some(next_bytes) =
+                            stmts.get_mut(i + 1).and_then(stmt_bytes_field_mut)
+                        {
+                            let mut merged = Vec::with_capacity(prefix.len() + next_bytes.len());
+                            merged.extend_from_slice(&prefix);
+                            merged.extend_from_slice(next_bytes);
+                            *next_bytes = merged;
+                            stmts.remove(i);
+                            deleted = true;
+                        }
                     }
                 }
             }
@@ -2006,6 +2027,33 @@ fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::ssa::Livene
         }
         // When `deleted`, cursor stays put because we shifted the
         // bytes onto stmts[i] (which is the former stmts[i+1]).
+    }
+}
+
+/// True when `stmt` is a control-transfer that may read live
+/// registers in its (unseen) target. Used by dead-move folding
+/// to avoid silently absorbing register-setup bytes into a jmp's
+/// `[bytes]` payload where the text doesn't show the setup.
+fn stmt_is_control_transfer(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Goto { .. }
+        | Stmt::IfGoto { .. }
+        | Stmt::IfReturn { .. }
+        | Stmt::Return { .. }
+        | Stmt::ReturnExpr { .. }
+        | Stmt::Epilogue { .. }
+        | Stmt::Call { .. } => true,
+        Stmt::Asm { text, .. } => {
+            // Bare `@asm` lines: a jmp, call, or jcc still counts.
+            // The mnemonic prefix gives it away cheaply.
+            text.starts_with("jmp")
+                || text.starts_with("call")
+                || text.starts_with("ret")
+                || (text.starts_with('j')
+                    && text.len() >= 2
+                    && text.as_bytes()[1].is_ascii_alphabetic())
+        }
+        _ => false,
     }
 }
 
