@@ -3018,6 +3018,14 @@ fn fold_switch_jump_tables(
     bitness: ud_arch_x86::Bitness,
     data: &dyn DataLookup,
 ) {
+    // Build an address→preview map up front so each switch's
+    // per-case hint comment can show what every destination block
+    // actually does. `Stmt::Label` markers haven't been inserted
+    // yet at this point in the pipeline (that happens later, in
+    // `fold_gotos_and_labels`), so we track addresses by
+    // accumulating each statement's byte size from `base_ip`.
+    let label_previews = collect_label_previews(stmts, base_ip);
+
     let mut cursor = base_ip;
     let mut i = 0;
     while i < stmts.len() {
@@ -3048,20 +3056,206 @@ fn fold_switch_jump_tables(
                 bitness,
                 data,
             ) {
+                // Stash a multi-line decode of the dispatch
+                // instructions + per-case destination previews
+                // ahead of the switch. Readers staring at the
+                // 16-byte blob otherwise have no hint as to what
+                // `cmp+ja+jmp[table]` actually means; the
+                // per-case lines turn the goto-only case bodies
+                // into a quick "what does each branch do?" map.
+                let dispatch_lines = describe_switch_dispatch(
+                    &switch_stmt,
+                    cmp_start,
+                    jmp_start,
+                    bitness,
+                    &label_previews,
+                );
                 stmts[i] = switch_stmt;
                 // Remove everything between i+1 and jmp_idx
                 // (inclusive of jmp_idx).
                 for _ in i + 1..=jmp_idx {
                     stmts.remove(i + 1);
                 }
-                cursor += stmt_total_bytes(&stmts[i]) as u64;
-                i += 1;
+                let inserted = dispatch_lines.len();
+                for (off, line) in dispatch_lines.into_iter().enumerate() {
+                    stmts.insert(i + off, Stmt::Comment(line));
+                }
+                cursor += stmt_total_bytes(&stmts[i + inserted]) as u64;
+                i += inserted + 1;
                 continue;
             }
         }
         cursor += cmp_bytes_len;
         i += 1;
     }
+}
+
+/// Walk a function body in-order and record, for each address
+/// that starts an effectful statement, a short rendering of that
+/// statement. Used by the switch-dispatch comment to show each
+/// case's destination behaviour without forcing the reader to
+/// scroll to the matching label.
+///
+/// Tracks addresses via cumulative byte size from `base_ip`
+/// because `Stmt::Label { addr }` markers haven't been inserted
+/// at the point in the decompile pipeline where switch lifting
+/// runs.
+fn collect_label_previews(stmts: &[Stmt], base_ip: u64) -> HashMap<u64, String> {
+    let mut out: HashMap<u64, String> = HashMap::new();
+    let mut cursor = base_ip;
+    for stmt in stmts {
+        let size = stmt_total_bytes(stmt) as u64;
+        if size > 0 {
+            let summary = summarise_stmt_for_preview(stmt);
+            out.entry(cursor).or_insert(summary);
+        }
+        cursor += size;
+    }
+    out
+}
+
+/// Compact one-line summary of a statement, suitable for the
+/// switch-dispatch hint comment. Caps at ~60 chars and falls
+/// back to a coarse label (`<call>`, `<asm>`) for shapes that
+/// don't have a single short text representation.
+fn summarise_stmt_for_preview(stmt: &Stmt) -> String {
+    let raw: String = match stmt {
+        Stmt::Move { dst, src, .. } => format!("{dst} = {src}"),
+        Stmt::Call { name, args, .. } => {
+            if args.is_empty() {
+                format!("{name}()")
+            } else if args.len() == 1 {
+                format!("{name}({})", args[0])
+            } else {
+                format!("{name}(…{} args…)", args.len())
+            }
+        }
+        Stmt::Goto { target_addr, .. } => format!("goto label_{target_addr:x}"),
+        Stmt::IfGoto {
+            cond_text,
+            target_addr,
+            ..
+        } => format!("if ({cond_text}) goto label_{target_addr:x}"),
+        Stmt::IfBranch { cond_text, .. } => format!("if ({cond_text}) {{ … }}"),
+        Stmt::Loop { cond_text, .. } => format!("loop ({cond_text}) {{ … }}"),
+        Stmt::Switch { selector, .. } => format!("switch ({selector}) {{ … }}"),
+        Stmt::Return { value, .. } => format!("return {value}"),
+        Stmt::ReturnExpr { text, .. } => format!("return {text}"),
+        Stmt::Asm { text, .. } => format!("@asm({text:?})"),
+        Stmt::Epilogue { .. } => "epilogue".into(),
+        Stmt::ArgSpill { arg_index, .. } => format!("arg_spill({arg_index})"),
+        _ => "…".into(),
+    };
+    truncate_for_preview(&raw, 64)
+}
+
+fn truncate_for_preview(s: &str, max: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// Build the human-readable hint block we prepend to a
+/// `Stmt::Switch`. Returns one Stmt::Comment-worth of text per
+/// line:
+///
+/// * Line 1 — the dispatch decode (`cmp REG,MAX; ja DEFAULT; jmp
+///   [REG*4+TABLE]`).
+/// * One line per destination block (cases grouped when many
+///   share the same target), each showing the first effectful
+///   statement at that block so the reader can see what every
+///   branch actually does without scrolling.
+/// * A final line for the default target.
+fn describe_switch_dispatch(
+    switch_stmt: &Stmt,
+    cmp_ip: u64,
+    jmp_ip: u64,
+    bitness: ud_arch_x86::Bitness,
+    label_previews: &HashMap<u64, String>,
+) -> Vec<String> {
+    let (cases, default_addr, bytes) = match switch_stmt {
+        Stmt::Switch {
+            cases,
+            default_addr,
+            bytes,
+            ..
+        } => (cases, *default_addr, bytes),
+        _ => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    if let Some(line) = describe_dispatch_insns(bytes, cmp_ip, jmp_ip, bitness) {
+        out.push(line);
+    }
+
+    // Group cases by destination so a switch where N cases all
+    // goto the same label renders as one comment line instead of
+    // N near-duplicates.
+    let mut grouped: Vec<(u64, Vec<usize>)> = Vec::new();
+    for (case_idx, target) in cases.iter().enumerate() {
+        if let Some(slot) = grouped.iter_mut().find(|(t, _)| t == target) {
+            slot.1.push(case_idx);
+        } else {
+            grouped.push((*target, vec![case_idx]));
+        }
+    }
+    // Order by smallest case index for stable rendering.
+    grouped.sort_by_key(|(_, c)| *c.first().unwrap_or(&usize::MAX));
+
+    for (target, case_idxs) in &grouped {
+        let head = if case_idxs.len() == 1 {
+            format!("  case {} → label_{target:x}", case_idxs[0])
+        } else {
+            let nums: Vec<String> = case_idxs.iter().map(ToString::to_string).collect();
+            format!("  cases {} → label_{target:x}", nums.join(", "))
+        };
+        let preview = label_previews
+            .get(target)
+            .map_or("(label not found in body)", String::as_str);
+        out.push(format!("{head}: {preview}"));
+    }
+    let default_preview = label_previews
+        .get(&default_addr)
+        .map_or("(label not found in body)", String::as_str);
+    out.push(format!(
+        "  default → label_{default_addr:x}: {default_preview}"
+    ));
+
+    out
+}
+
+/// Decode the cmp+ja+jmp prefix bytes of a `Stmt::Switch` and
+/// render them as a `cmp REG,MAX; ja DEFAULT; jmp [REG*4+TABLE]`
+/// single-line string suitable for a leading comment.
+fn describe_dispatch_insns(
+    bytes: &[u8],
+    cmp_ip: u64,
+    jmp_ip: u64,
+    bitness: ud_arch_x86::Bitness,
+) -> Option<String> {
+    let cmp_len = (jmp_ip.checked_sub(cmp_ip)?) as usize;
+    if cmp_len > bytes.len() {
+        return None;
+    }
+    let cmp_block = &bytes[..cmp_len];
+    let jmp_block = &bytes[cmp_len..];
+    let cmp_insns = ud_arch_x86::decode(bitness, cmp_block, cmp_ip).ok()?;
+    let jmp_insns = ud_arch_x86::decode(bitness, jmp_block, jmp_ip).ok()?;
+    let mut parts: Vec<String> = Vec::with_capacity(cmp_insns.len() + jmp_insns.len());
+    for ins in &cmp_insns {
+        parts.push(ud_arch_x86::format_intel(&ins.iced));
+    }
+    for ins in &jmp_insns {
+        parts.push(ud_arch_x86::format_intel(&ins.iced));
+    }
+    Some(format!(
+        "switch dispatch ({} bytes): {}",
+        bytes.len(),
+        parts.join("; ")
+    ))
 }
 
 /// Try to recognise an adjacent (cmp+ja, jmp[table+reg*4]) pair
