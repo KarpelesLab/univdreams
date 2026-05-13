@@ -1,0 +1,15 @@
+[package]
+name = "ud-format-macho"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mach-O reader and writer with byte-identical round-trip."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"

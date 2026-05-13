@@ -62,6 +62,13 @@ fn pipeline_bytes(bytes: &[u8]) -> Vec<u8> {
         }
         // PE-shaped but invalid; fall through to byte-copy.
     }
+    if ud_format_macho::is_macho64(bytes) {
+        if let Ok(macho) = ud_format_macho::MachoFile::parse(bytes) {
+            return macho.write_to_vec();
+        }
+        // Mach-O-shaped but rejected by v1 (32-bit, unsupported
+        // cputype, fat wrapper); fall through to byte-copy.
+    }
     bytes.to_vec()
 }
 

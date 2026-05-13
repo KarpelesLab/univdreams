@@ -6,6 +6,7 @@ members = [
     "crates/ud-ast",
     "crates/ud-format-elf",
     "crates/ud-format-pe",
+    "crates/ud-format-macho",
     "crates/ud-format-raw",
     "crates/ud-arch-x86",
     "crates/ud-arch-aarch64",
