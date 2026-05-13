@@ -5608,6 +5608,8 @@ fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
             }
         }
         ArgValue::PrevCallResult => "result".into(),
+        ArgValue::Reg(name) => name.clone(),
+        ArgValue::Raw(text) => text.clone(),
     }
 }
 

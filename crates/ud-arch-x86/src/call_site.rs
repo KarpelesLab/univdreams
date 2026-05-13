@@ -37,6 +37,17 @@ pub enum ArgValue {
     StackLoad { displacement: i64 },
     /// The result of the most-recent call in the same block.
     PrevCallResult,
+    /// A named register's current contents — used when the
+    /// analyzer hasn't tracked an upstream value but the register
+    /// itself is meaningful at the call site (e.g. `push esi`).
+    Reg(String),
+    /// Fall-back: the iced-formatted operand text for an arg whose
+    /// shape doesn't fit the other variants — `[eax+0x20]`,
+    /// `byte ptr [esp+8]`, etc. Used by the i386 stdcall push
+    /// chain analyzer so calls with through-register memory
+    /// operand pushes still produce a readable `foo(arg1, arg2,
+    /// …)` form instead of leaving the pushes on `@asm`.
+    Raw(String),
 }
 
 /// One detected direct-call site, including the index range of the
@@ -159,6 +170,12 @@ struct Analyzer {
     /// Whether we've seen a call in this block already. RAX's
     /// `PrevCallResult` is only meaningful from that point on.
     saw_any_call: bool,
+    /// i386 stdcall (and cdecl, when not using `mov [esp+N]`)
+    /// passes args by pushing them right-to-left immediately
+    /// before the call. We record each push's operand in order
+    /// here; `handle_call` reverses the chain to recover the
+    /// natural left-to-right C-source argument order.
+    push_chain: Vec<ArgValue>,
 }
 
 impl Analyzer {
@@ -193,6 +210,9 @@ impl Analyzer {
             }
             Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 => {
                 // Pure markers — leave the window intact.
+            }
+            Mnemonic::Push => {
+                self.handle_push(insn);
             }
             _ => self.break_window(idx + 1),
         }
@@ -242,6 +262,17 @@ impl Analyzer {
                 None => break,
             }
         }
+        // i386 stdcall (and cdecl that uses push instead of
+        // mov-into-esp): args were pushed right-to-left. Reverse
+        // the chain so the rendered call reads `foo(arg1, arg2,
+        // …)` in source order. Takes precedence over the
+        // mov-into-esp path because push-based setup is the more
+        // common shape in stdcall O0 / O1 codegen.
+        if args.is_empty() && !self.push_chain.is_empty() {
+            let mut chain = std::mem::take(&mut self.push_chain);
+            chain.reverse();
+            args.extend(chain);
+        }
         // i386 cdecl: when no integer arg registers were touched but
         // we saw `mov [esp+OFF], val` / `fstp [esp+OFF]` writes,
         // fall back to those slots in offset order. We skip
@@ -286,8 +317,82 @@ impl Analyzer {
         self.regs.insert(Register::XMM0, ArgValue::PrevCallResult);
         self.fpu_top = Some(ArgValue::PrevCallResult);
         self.stack_args.clear();
+        self.push_chain.clear();
         self.saw_any_call = true;
         self.setup_start = idx + 1;
+    }
+
+    /// Record a `push X` instruction's operand into the per-call
+    /// push chain. Classifies the operand into the richest
+    /// `ArgValue` shape we can, falling back to `Raw` carrying
+    /// the iced-formatted operand text so the call rendering
+    /// stays readable for arbitrary memory operands like
+    /// `[eax+0x20]`.
+    fn handle_push(&mut self, insn: &Instruction) {
+        if insn.op_count() != 1 {
+            self.push_chain.push(self.classify_push_operand(insn));
+            return;
+        }
+        self.push_chain.push(self.classify_push_operand(insn));
+    }
+
+    fn classify_push_operand(&self, insn: &Instruction) -> ArgValue {
+        match insn.op0_kind() {
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => ArgValue::Const(read_signed_immediate(insn)),
+            OpKind::Register => {
+                let reg = insn.op0_register();
+                let full = full_reg(reg);
+                if let Some(v) = self.regs.get(&full) {
+                    return v.clone();
+                }
+                ArgValue::Reg(format!("{reg:?}").to_lowercase())
+            }
+            OpKind::Memory => {
+                if insn.memory_index() == Register::None {
+                    match insn.memory_base() {
+                        Register::RIP => {
+                            return ArgValue::GlobalLoad {
+                                addr: insn.memory_displacement64(),
+                            };
+                        }
+                        Register::RBP | Register::EBP => {
+                            return ArgValue::StackLoad {
+                                displacement: signed_displacement(insn),
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                // Arbitrary memory operand — `[eax+0x20]`,
+                // `[esi+ecx*4]`, etc. Render via iced's formatter
+                // so the call's arg list keeps the operand text
+                // exactly as it would appear in a `push` line.
+                let full = crate::format_intel(insn);
+                let operand = full
+                    .strip_prefix("push ")
+                    .map_or_else(|| full.clone(), str::to_string);
+                let trimmed = operand
+                    .trim_start_matches("dword ptr ")
+                    .trim_start_matches("qword ptr ")
+                    .trim_start_matches("word ptr ")
+                    .to_string();
+                ArgValue::Raw(trimmed)
+            }
+            _ => {
+                let full = crate::format_intel(insn);
+                ArgValue::Raw(
+                    full.strip_prefix("push ")
+                        .map_or_else(|| full.clone(), str::to_string),
+                )
+            }
+        }
     }
 
     fn handle_mov(&mut self, insn: &Instruction) -> bool {
@@ -445,6 +550,9 @@ impl Analyzer {
         if let Some(rax) = prev_rax {
             self.regs.insert(Register::RAX, rax);
         }
+        self.stack_args.clear();
+        self.push_chain.clear();
+        self.fpu_top = None;
         self.setup_start = next_setup_start;
     }
 }
@@ -616,5 +724,40 @@ mod tests {
             sites[0].args
         );
         assert_eq!(sites[0].setup_start, 2); // starts after the unmodelled insn
+    }
+
+    /// i386 stdcall: 14-push chain then call. Every push should be
+    /// folded into the call site's argument list — the pattern
+    /// observed in the msmpeg4 codec where previously only the
+    /// last push made it in.
+    #[test]
+    fn i386_stdcall_push_chain_folds_into_call_args() {
+        let mut bytes: Vec<u8> = Vec::new();
+        // 13 pushes of `dword ptr [eax+disp8]`
+        for disp in [
+            0x20u8, 0x1c, 0x18, 0x14, 0x10, 0x0c, 0x30, 0x2c, 0x28, 0x24, 0x08, 0x04,
+        ] {
+            bytes.extend_from_slice(&[0xff, 0x70, disp]);
+        }
+        bytes.extend_from_slice(&[0xff, 0x30]); // push dword ptr [eax]
+        bytes.extend_from_slice(&[0xff, 0x75, 0x08]); // push dword ptr [ebp+8]
+        bytes.extend_from_slice(&[0xe8, 0x00, 0x00, 0x00, 0x00]); // call rel32
+        let insns = decode(Bitness::Bits32, &bytes, 0x1000).unwrap();
+        let sites = identify_call_sites(&insns);
+        assert_eq!(sites.len(), 1, "exactly one call site");
+        assert_eq!(
+            sites[0].args.len(),
+            14,
+            "all 14 pushes must surface as args, got {} ({:?})",
+            sites[0].args.len(),
+            sites[0].args
+        );
+        assert!(
+            matches!(
+                sites[0].args.first(),
+                Some(ArgValue::StackLoad { displacement: 8 })
+            ),
+            "first arg should be the ebp+8 push (reversed for natural order)"
+        );
     }
 }

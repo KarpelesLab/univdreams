@@ -164,6 +164,32 @@ impl Pattern for StackArgCall {
             }
             return None;
         }
+        // Fell off the end of `insns` with pushes still pending.
+        // This shows up on i386 stdcall functions whose push chain
+        // crosses a basic-block boundary (the CFG split the
+        // chain because the destination block is also reachable
+        // by an intra-function jmp that arrived having already
+        // pushed the same args). Both paths push the same number
+        // of args; the call lives in the next block.
+        //
+        // Emit a synthetic `pushed_args(arg, …)` call so the args
+        // surface structurally in the source instead of leaving
+        // the pushes on `@asm`. The bytes round-trip exactly —
+        // it's only a rendering tweak.
+        if !args.is_empty() && args.len() >= 2 {
+            args.reverse();
+            return Some(Candidate {
+                pattern: self.name(),
+                start,
+                consumed: i - start,
+                priority: 200,
+                stmts: vec![Stmt::Call {
+                    name: "pushed_args".into(),
+                    args,
+                    bytes,
+                }],
+            });
+        }
         None
     }
 }
@@ -301,6 +327,32 @@ mod tests {
             // matching natural source order.
             assert_eq!(args, &["7", "5"]);
         }
+    }
+
+    /// Reproduces a 13-push-then-call sequence observed in
+    /// msmpeg4 (stdcall i386), where the lifter was leaving every
+    /// push on `@asm` instead of folding them into the call's
+    /// arg list.
+    #[test]
+    fn lifts_thirteen_push_then_call() {
+        let mut bytes: Vec<u8> = Vec::new();
+        for disp in [
+            0x20u8, 0x1c, 0x18, 0x14, 0x10, 0x0c, 0x30, 0x2c, 0x28, 0x24, 0x08, 0x04,
+        ] {
+            bytes.extend_from_slice(&[0xff, 0x70, disp]);
+        }
+        bytes.extend_from_slice(&[0xff, 0x30]); // push dword ptr [eax]
+        bytes.extend_from_slice(&[0xff, 0x75, 0x08]); // push dword ptr [ebp+8]
+        bytes.extend_from_slice(&[0xe8, 0x00, 0x00, 0x00, 0x00]); // call rel32
+        let insns = decode(Bitness::Bits32, &bytes, 0x1000).unwrap();
+        let (_, ctx) = ctx_empty();
+        let cand = StackArgCall
+            .tentative(&ctx, &insns, 0)
+            .expect("14-push then call must lift");
+        let Stmt::Call { args, .. } = &cand.stmts[0] else {
+            panic!("expected Call stmt");
+        };
+        assert_eq!(args.len(), 14, "should fold every push as an arg");
     }
 
     /// A lone `call` with no preceding pushes should not match —
