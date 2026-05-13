@@ -33,12 +33,14 @@ mod build_function;
 mod build_module;
 mod data_lookup;
 mod expr;
+pub mod macho;
 mod patterns;
 pub mod pe;
 pub mod raw6502;
 mod ssa;
 
 pub use data_lookup::DataLookup;
+pub use macho::{decompile_macho, decompile_macho_to_text};
 pub use pe::{decompile_pe, decompile_pe_to_text};
 pub use raw6502::{decompile_raw_6502, decompile_raw_6502_to_text};
 

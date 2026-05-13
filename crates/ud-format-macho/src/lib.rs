@@ -39,6 +39,62 @@ pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 /// plus that segment's sections.
 pub const LC_SEGMENT_64: u32 = 0x19;
 
+/// Bit OR'd into `cmd` to mark a command as required for correct
+/// dynamic linker behaviour. Not a kind by itself; ORed with the
+/// concrete `LC_*` value.
+pub const LC_REQ_DYLD: u32 = 0x8000_0000;
+
+/// `LC_SYMTAB`: classical symbol-table command. Body is four u32s:
+/// `symoff`, `nsyms`, `stroff`, `strsize`.
+pub const LC_SYMTAB: u32 = 0x2;
+
+/// `LC_DYSYMTAB`: extended dynamic-link symbol info. Body is 18
+/// u32s describing partitions of the LC_SYMTAB table plus auxiliary
+/// indirect-symbol / module / reference tables.
+pub const LC_DYSYMTAB: u32 = 0xb;
+
+/// `LC_LOAD_DYLINKER`: file path of the dynamic linker. Body is a
+/// `lc_str` offset (u32) followed by the NUL-padded name.
+pub const LC_LOAD_DYLINKER: u32 = 0xe;
+
+/// `LC_UUID`: 16-byte randomly-generated identifier baked into the
+/// binary at link time.
+pub const LC_UUID: u32 = 0x1b;
+
+/// `LC_LOAD_DYLIB`: dependent dynamic library. Body is a
+/// `dylib_command` after the cmd/cmdsize prefix.
+pub const LC_LOAD_DYLIB: u32 = 0xc;
+
+/// `LC_LOAD_WEAK_DYLIB`: dependent library, weak link.
+pub const LC_LOAD_WEAK_DYLIB: u32 = 0x18 | LC_REQ_DYLD;
+
+/// `LC_REEXPORT_DYLIB`: dependent library to re-export.
+pub const LC_REEXPORT_DYLIB: u32 = 0x1f | LC_REQ_DYLD;
+
+/// `LC_ID_DYLIB`: identifies this image when it is itself a dylib.
+pub const LC_ID_DYLIB: u32 = 0xd;
+
+/// `LC_BUILD_VERSION`: platform / minimum-OS / SDK / toolchain.
+pub const LC_BUILD_VERSION: u32 = 0x32;
+
+/// `LC_SOURCE_VERSION`: 64-bit packed source-control version.
+pub const LC_SOURCE_VERSION: u32 = 0x2a;
+
+/// `LC_MAIN`: entry-point load command. Body is `entryoff` (u64)
+/// + `stacksize` (u64).
+pub const LC_MAIN: u32 = 0x28 | LC_REQ_DYLD;
+
+/// `linkedit_data_command` kinds. All share the same 4 + 4 + 4 + 4
+/// body shape: cmd + cmdsize prefix already eaten, then body =
+/// `dataoff` (u32) + `datasize` (u32).
+pub const LC_CODE_SIGNATURE: u32 = 0x1d;
+pub const LC_FUNCTION_STARTS: u32 = 0x26;
+pub const LC_DATA_IN_CODE: u32 = 0x29;
+pub const LC_DYLIB_CODE_SIGN_DRS: u32 = 0x2b;
+pub const LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2e;
+pub const LC_DYLD_EXPORTS_TRIE: u32 = 0x33 | LC_REQ_DYLD;
+pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x34 | LC_REQ_DYLD;
+
 /// On-disk size of `mach_header_64`.
 const MACH_HEADER_64_SIZE: u64 = 32;
 
@@ -559,6 +615,472 @@ impl Segment64 {
             sections,
         })
     }
+
+    /// Serialize this segment back to the bytes that follow the
+    /// 8-byte `cmd`/`cmdsize` prefix of a `LC_SEGMENT_64` load
+    /// command — i.e. the body that round-trips through
+    /// [`LoadCommand::body`]. Output length is
+    /// `64 + 80 * sections.len()`.
+    #[must_use]
+    pub fn write_to_body(&self) -> Vec<u8> {
+        let mut out = vec![0u8; 64 + 80 * self.sections.len()];
+        out[0..16].copy_from_slice(&self.segname);
+        out[16..24].copy_from_slice(&self.vmaddr.to_le_bytes());
+        out[24..32].copy_from_slice(&self.vmsize.to_le_bytes());
+        out[32..40].copy_from_slice(&self.fileoff.to_le_bytes());
+        out[40..48].copy_from_slice(&self.filesize.to_le_bytes());
+        out[48..52].copy_from_slice(&self.maxprot.to_le_bytes());
+        out[52..56].copy_from_slice(&self.initprot.to_le_bytes());
+        out[56..60].copy_from_slice(&self.nsects.to_le_bytes());
+        out[60..64].copy_from_slice(&self.flags.to_le_bytes());
+        for (i, s) in self.sections.iter().enumerate() {
+            let off = 64 + i * 80;
+            out[off..off + 16].copy_from_slice(&s.sectname);
+            out[off + 16..off + 32].copy_from_slice(&s.segname);
+            out[off + 32..off + 40].copy_from_slice(&s.addr.to_le_bytes());
+            out[off + 40..off + 48].copy_from_slice(&s.size.to_le_bytes());
+            out[off + 48..off + 52].copy_from_slice(&s.offset.to_le_bytes());
+            out[off + 52..off + 56].copy_from_slice(&s.align.to_le_bytes());
+            out[off + 56..off + 60].copy_from_slice(&s.reloff.to_le_bytes());
+            out[off + 60..off + 64].copy_from_slice(&s.nreloc.to_le_bytes());
+            out[off + 64..off + 68].copy_from_slice(&s.flags.to_le_bytes());
+            out[off + 68..off + 72].copy_from_slice(&s.reserved1.to_le_bytes());
+            out[off + 72..off + 76].copy_from_slice(&s.reserved2.to_le_bytes());
+            out[off + 76..off + 80].copy_from_slice(&s.reserved3.to_le_bytes());
+        }
+        out
+    }
+}
+
+// ---------- structured load-command bodies ----------
+
+/// Structurally decoded body of an `LC_SYMTAB` command. Four
+/// `u32`s sized exactly 16 bytes on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LcSymtab {
+    /// File offset of the `nlist_64` table.
+    pub symoff: u32,
+    /// Number of symbols in the table.
+    pub nsyms: u32,
+    /// File offset of the string table.
+    pub stroff: u32,
+    /// String table size in bytes.
+    pub strsize: u32,
+}
+
+impl LcSymtab {
+    /// Decode from a 16-byte command body. Returns `None` on
+    /// length mismatch so the caller can fall back to opaque
+    /// bytes for unrecognised inputs.
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() != 16 {
+            return None;
+        }
+        Some(Self {
+            symoff: read_u32(body, 0),
+            nsyms: read_u32(body, 4),
+            stroff: read_u32(body, 8),
+            strsize: read_u32(body, 12),
+        })
+    }
+
+    /// Encode back to the 16-byte body that
+    /// [`LoadCommand::body`] carries.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![0u8; 16];
+        out[0..4].copy_from_slice(&self.symoff.to_le_bytes());
+        out[4..8].copy_from_slice(&self.nsyms.to_le_bytes());
+        out[8..12].copy_from_slice(&self.stroff.to_le_bytes());
+        out[12..16].copy_from_slice(&self.strsize.to_le_bytes());
+        out
+    }
+}
+
+/// Structurally decoded body of an `LC_DYSYMTAB` command — 18
+/// `u32`s describing partitions of the LC_SYMTAB table and
+/// auxiliary indirect-symbol / module / reference tables.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LcDysymtab {
+    pub ilocalsym: u32,
+    pub nlocalsym: u32,
+    pub iextdefsym: u32,
+    pub nextdefsym: u32,
+    pub iundefsym: u32,
+    pub nundefsym: u32,
+    pub tocoff: u32,
+    pub ntoc: u32,
+    pub modtaboff: u32,
+    pub nmodtab: u32,
+    pub extrefsymoff: u32,
+    pub nextrefsyms: u32,
+    pub indirectsymoff: u32,
+    pub nindirectsyms: u32,
+    pub extreloff: u32,
+    pub nextrel: u32,
+    pub locreloff: u32,
+    pub nlocrel: u32,
+}
+
+impl LcDysymtab {
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() != 72 {
+            return None;
+        }
+        Some(Self {
+            ilocalsym: read_u32(body, 0),
+            nlocalsym: read_u32(body, 4),
+            iextdefsym: read_u32(body, 8),
+            nextdefsym: read_u32(body, 12),
+            iundefsym: read_u32(body, 16),
+            nundefsym: read_u32(body, 20),
+            tocoff: read_u32(body, 24),
+            ntoc: read_u32(body, 28),
+            modtaboff: read_u32(body, 32),
+            nmodtab: read_u32(body, 36),
+            extrefsymoff: read_u32(body, 40),
+            nextrefsyms: read_u32(body, 44),
+            indirectsymoff: read_u32(body, 48),
+            nindirectsyms: read_u32(body, 52),
+            extreloff: read_u32(body, 56),
+            nextrel: read_u32(body, 60),
+            locreloff: read_u32(body, 64),
+            nlocrel: read_u32(body, 68),
+        })
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![0u8; 72];
+        for (i, v) in [
+            self.ilocalsym,
+            self.nlocalsym,
+            self.iextdefsym,
+            self.nextdefsym,
+            self.iundefsym,
+            self.nundefsym,
+            self.tocoff,
+            self.ntoc,
+            self.modtaboff,
+            self.nmodtab,
+            self.extrefsymoff,
+            self.nextrefsyms,
+            self.indirectsymoff,
+            self.nindirectsyms,
+            self.extreloff,
+            self.nextrel,
+            self.locreloff,
+            self.nlocrel,
+        ]
+        .iter()
+        .enumerate()
+        {
+            out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// Body of `LC_LOAD_DYLINKER` (and the analogous `LC_ID_DYLINKER`
+/// — same shape). The `offset` is from the start of the command
+/// (including the cmd/cmdsize prefix), which in the canonical
+/// linker output is `0xc` — i.e. the name begins at body offset
+/// 4. `name` holds the C string up to (but not including) the
+/// first NUL; `tail_padding` carries the NUL + any trailing
+/// alignment NULs verbatim, so the encoded length always matches
+/// the original.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LcDylinker {
+    pub offset: u32,
+    pub name: Vec<u8>,
+    pub tail_padding: Vec<u8>,
+}
+
+impl LcDylinker {
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() < 4 {
+            return None;
+        }
+        let offset = read_u32(body, 0);
+        // offset is measured from start-of-command, so the name
+        // begins at body offset `offset - 8`.
+        let name_off = offset.checked_sub(8)? as usize;
+        if name_off > body.len() {
+            return None;
+        }
+        let tail = &body[name_off..];
+        let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        let name = tail[..nul].to_vec();
+        let tail_padding = tail[nul..].to_vec();
+        // Body offset 4..name_off is reserved zero padding the
+        // linker rarely (never?) sets non-zero. We require it to
+        // be zero so the structured form is unambiguous; the
+        // caller falls back to opaque bytes if it isn't.
+        if body[4..name_off].iter().any(|&b| b != 0) {
+            return None;
+        }
+        Some(Self {
+            offset,
+            name,
+            tail_padding,
+        })
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let name_off = (self.offset as usize).saturating_sub(8);
+        let mut out = vec![0u8; name_off + self.name.len() + self.tail_padding.len()];
+        out[0..4].copy_from_slice(&self.offset.to_le_bytes());
+        // bytes 4..name_off stay zero
+        out[name_off..name_off + self.name.len()].copy_from_slice(&self.name);
+        out[name_off + self.name.len()..].copy_from_slice(&self.tail_padding);
+        out
+    }
+}
+
+/// Body of `LC_LOAD_DYLIB` / `LC_ID_DYLIB` / `LC_LOAD_WEAK_DYLIB`
+/// / `LC_REEXPORT_DYLIB`. The same 4-u32 dylib record followed by
+/// the NUL-padded name string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LcDylib {
+    pub offset: u32,
+    pub timestamp: u32,
+    pub current_version: u32,
+    pub compatibility_version: u32,
+    pub name: Vec<u8>,
+    pub tail_padding: Vec<u8>,
+}
+
+impl LcDylib {
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() < 16 {
+            return None;
+        }
+        let offset = read_u32(body, 0);
+        let timestamp = read_u32(body, 4);
+        let current_version = read_u32(body, 8);
+        let compatibility_version = read_u32(body, 12);
+        let name_off = offset.checked_sub(8)? as usize;
+        if name_off > body.len() || name_off < 16 {
+            return None;
+        }
+        if body[16..name_off].iter().any(|&b| b != 0) {
+            return None;
+        }
+        let tail = &body[name_off..];
+        let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        Some(Self {
+            offset,
+            timestamp,
+            current_version,
+            compatibility_version,
+            name: tail[..nul].to_vec(),
+            tail_padding: tail[nul..].to_vec(),
+        })
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let name_off = (self.offset as usize).saturating_sub(8);
+        let mut out = vec![0u8; name_off + self.name.len() + self.tail_padding.len()];
+        out[0..4].copy_from_slice(&self.offset.to_le_bytes());
+        out[4..8].copy_from_slice(&self.timestamp.to_le_bytes());
+        out[8..12].copy_from_slice(&self.current_version.to_le_bytes());
+        out[12..16].copy_from_slice(&self.compatibility_version.to_le_bytes());
+        out[name_off..name_off + self.name.len()].copy_from_slice(&self.name);
+        out[name_off + self.name.len()..].copy_from_slice(&self.tail_padding);
+        out
+    }
+}
+
+/// Body of `LC_BUILD_VERSION`. Records the platform / minimum OS
+/// / SDK / per-tool versions. `ntools` is recovered from
+/// `tools.len()` at encode time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LcBuildVersion {
+    pub platform: u32,
+    pub minos: u32,
+    pub sdk: u32,
+    pub tools: Vec<BuildVersionTool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildVersionTool {
+    pub tool: u32,
+    pub version: u32,
+}
+
+impl LcBuildVersion {
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() < 16 {
+            return None;
+        }
+        let platform = read_u32(body, 0);
+        let minos = read_u32(body, 4);
+        let sdk = read_u32(body, 8);
+        let ntools = read_u32(body, 12) as usize;
+        if body.len() != 16 + 8 * ntools {
+            return None;
+        }
+        let mut tools = Vec::with_capacity(ntools);
+        for i in 0..ntools {
+            let off = 16 + 8 * i;
+            tools.push(BuildVersionTool {
+                tool: read_u32(body, off),
+                version: read_u32(body, off + 4),
+            });
+        }
+        Some(Self {
+            platform,
+            minos,
+            sdk,
+            tools,
+        })
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![0u8; 16 + 8 * self.tools.len()];
+        out[0..4].copy_from_slice(&self.platform.to_le_bytes());
+        out[4..8].copy_from_slice(&self.minos.to_le_bytes());
+        out[8..12].copy_from_slice(&self.sdk.to_le_bytes());
+        out[12..16].copy_from_slice(&(self.tools.len() as u32).to_le_bytes());
+        for (i, t) in self.tools.iter().enumerate() {
+            let off = 16 + 8 * i;
+            out[off..off + 4].copy_from_slice(&t.tool.to_le_bytes());
+            out[off + 4..off + 8].copy_from_slice(&t.version.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// Body of `LC_MAIN`. Entry-point offset + initial stack size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LcMain {
+    pub entryoff: u64,
+    pub stacksize: u64,
+}
+
+impl LcMain {
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() != 16 {
+            return None;
+        }
+        Some(Self {
+            entryoff: read_u64(body, 0),
+            stacksize: read_u64(body, 8),
+        })
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![0u8; 16];
+        out[0..8].copy_from_slice(&self.entryoff.to_le_bytes());
+        out[8..16].copy_from_slice(&self.stacksize.to_le_bytes());
+        out
+    }
+}
+
+/// Body of every `linkedit_data_command`-shaped load command
+/// (LC_CODE_SIGNATURE, LC_FUNCTION_STARTS, LC_DATA_IN_CODE,
+/// LC_DYLD_EXPORTS_TRIE, LC_DYLD_CHAINED_FIXUPS, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LcLinkeditData {
+    pub dataoff: u32,
+    pub datasize: u32,
+}
+
+impl LcLinkeditData {
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() != 8 {
+            return None;
+        }
+        Some(Self {
+            dataoff: read_u32(body, 0),
+            datasize: read_u32(body, 4),
+        })
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![0u8; 8];
+        out[0..4].copy_from_slice(&self.dataoff.to_le_bytes());
+        out[4..8].copy_from_slice(&self.datasize.to_le_bytes());
+        out
+    }
+}
+
+/// Body of `LC_SOURCE_VERSION`: one packed 64-bit version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LcSourceVersion(pub u64);
+
+impl LcSourceVersion {
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() != 8 {
+            return None;
+        }
+        Some(Self(read_u64(body, 0)))
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        self.0.to_le_bytes().to_vec()
+    }
+}
+
+/// Body of `LC_UUID`: 16 raw bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LcUuid(pub [u8; 16]);
+
+impl LcUuid {
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        if body.len() != 16 {
+            return None;
+        }
+        let mut u = [0u8; 16];
+        u.copy_from_slice(body);
+        Some(Self(u))
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+}
+
+/// True when `cmd` is one of the linkedit_data_command-shaped
+/// load commands (the 4+4-byte body pattern).
+#[must_use]
+pub fn is_linkedit_data_cmd(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        LC_CODE_SIGNATURE
+            | LC_FUNCTION_STARTS
+            | LC_DATA_IN_CODE
+            | LC_DYLD_EXPORTS_TRIE
+            | LC_DYLD_CHAINED_FIXUPS
+            | LC_DYLIB_CODE_SIGN_DRS
+            | LC_LINKER_OPTIMIZATION_HINT
+    )
+}
+
+/// True when `cmd` is one of the dylib-shaped load commands.
+#[must_use]
+pub fn is_dylib_cmd(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB | LC_ID_DYLIB
+    )
 }
 
 // ---------- internal helpers ----------

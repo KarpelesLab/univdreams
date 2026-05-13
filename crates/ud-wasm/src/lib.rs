@@ -34,13 +34,18 @@ pub fn decompile(bytes: &[u8]) -> Result<String, JsError> {
             .map_err(|e| JsError::new(&format!("parse PE: {e}")))?;
         return Ok(ud_decompile::decompile_pe_to_text(&pe));
     }
+    if ud_format_macho::is_macho64(bytes) {
+        let macho = ud_format_macho::MachoFile::parse(bytes)
+            .map_err(|e| JsError::new(&format!("parse Mach-O: {e}")))?;
+        return Ok(ud_decompile::decompile_macho_to_text(&macho));
+    }
     if let Some(load_addr) = raw_6502_load_addr(bytes) {
         let image = ud_format_raw::RawImage::new(bytes.to_vec(), load_addr);
         return ud_decompile::decompile_raw_6502_to_text(&image)
             .map_err(|e| JsError::new(&format!("decompile 6502 raw: {e}")));
     }
     Err(JsError::new(
-        "unrecognised binary format (expected ELF64-LE, PE, or a 6502 raw image)",
+        "unrecognised binary format (expected ELF64-LE, PE, Mach-O, or a 6502 raw image)",
     ))
 }
 
@@ -56,7 +61,7 @@ pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
     set_panic_hook();
     let ast = ud_compile::parse(source).map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
     let format = read_string(&ast.module, "format").ok_or_else(|| {
-        JsError::new("missing `@module.format` (expected \"elf\", \"pe\", or \"raw\")")
+        JsError::new("missing `@module.format` (expected \"elf\", \"pe\", \"macho\", or \"raw\")")
     })?;
     let warnings = ud_compile::verify_asm(&ast);
     let bytes = match format.as_str() {
@@ -64,10 +69,13 @@ pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to ELF: {e}"), &warnings))),
         "pe" => ud_compile::lower_to_pe(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to PE: {e}"), &warnings))),
+        "macho" => ud_compile::lower_to_macho(&ast).map_err(|e| {
+            JsError::new(&with_warnings(&format!("lower to Mach-O: {e}"), &warnings))
+        }),
         "raw" => ud_compile::lower_to_raw(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to raw: {e}"), &warnings))),
         other => Err(JsError::new(&format!(
-            "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", or \"raw\")"
+            "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", or \"raw\")"
         ))),
     }?;
     Ok(bytes)

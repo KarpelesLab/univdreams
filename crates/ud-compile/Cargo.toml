@@ -15,6 +15,7 @@ workspace = true
 ud-ast = { path = "../ud-ast" }
 ud-format-elf = { path = "../ud-format-elf" }
 ud-format-pe = { path = "../ud-format-pe" }
+ud-format-macho = { path = "../ud-format-macho" }
 ud-arch-x86 = { path = "../ud-arch-x86" }
 thiserror = "2"
 

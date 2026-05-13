@@ -117,12 +117,16 @@ pub enum SourceRoundTripError {
     ElfFormat(#[from] ud_format_elf::Error),
     #[error(transparent)]
     PeFormat(#[from] ud_format_pe::Error),
+    #[error(transparent)]
+    MachoFormat(#[from] ud_format_macho::Error),
     #[error("parse of decompile output failed: {0}")]
     Parse(String),
     #[error(transparent)]
     ElfLower(#[from] ud_compile::ElfLowerError),
     #[error(transparent)]
     PeLower(#[from] ud_compile::PeLowerError),
+    #[error(transparent)]
+    MachoLower(#[from] ud_compile::MachoLowerError),
     #[error(transparent)]
     RawLower(#[from] ud_compile::RawLowerError),
 }
@@ -157,6 +161,15 @@ pub fn roundtrip_through_source(
             ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
         let warnings = ud_compile::verify_asm(&parsed);
         let rebuilt = ud_compile::lower_to_pe(&parsed)?;
+        (text, warnings, rebuilt)
+    } else if ud_format_macho::is_macho64(&input_bytes) {
+        let macho = ud_format_macho::MachoFile::parse(&input_bytes)?;
+        let ast = ud_decompile::decompile_macho(&macho);
+        let text = ud_ast::emit(&ast);
+        let parsed =
+            ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_compile::verify_asm(&parsed);
+        let rebuilt = ud_compile::lower_to_macho(&parsed)?;
         (text, warnings, rebuilt)
     } else if let Some(load_addr) = raw_6502_load_addr(&input_bytes) {
         let image = ud_format_raw::RawImage::new(input_bytes.clone(), load_addr);

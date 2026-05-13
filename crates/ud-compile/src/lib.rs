@@ -15,6 +15,7 @@
 mod lexer;
 mod lower;
 mod lower_elf;
+mod lower_macho;
 mod lower_pe;
 mod lower_raw;
 mod parser;
@@ -25,6 +26,7 @@ pub use lower::{
     LoweredFunction, LoweredSection,
 };
 pub use lower_elf::{build_elf64, lower_to_elf, ElfLowerError};
+pub use lower_macho::{lower_to_macho, MachoLowerError};
 pub use lower_pe::{lower_to_pe, PeLowerError};
 pub use lower_raw::{lower_to_raw, RawLowerError};
 pub use parser::{parse, ParseError};
