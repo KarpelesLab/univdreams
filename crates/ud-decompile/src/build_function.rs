@@ -2637,13 +2637,28 @@ fn try_match_stack_ref<'a>(text: &str, map: &'a [(i64, String)]) -> Option<(&'a 
         }
         i64::from_str_radix(&lc_full[num_start + 2..i], 16).ok()?
     } else {
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
             i += 1;
         }
         if i == num_start {
             return None;
         }
-        lc_full[num_start..i].parse::<i64>().ok()?
+        // Intel hex suffix (`18h`): if the digit run is followed
+        // by `h` and contains at least one hex letter OR the run
+        // is followed by `h]`, treat as hex. Otherwise decimal.
+        if bytes.get(i) == Some(&b'h') {
+            let v = i64::from_str_radix(&lc_full[num_start..i], 16).ok()?;
+            i += 1; // consume the `h`
+            v
+        } else {
+            // Decimal fallback. Require pure decimal digits, since
+            // we accepted hex digits above for the `h`-suffix case.
+            if lc_full[num_start..i].bytes().all(|b| b.is_ascii_digit()) {
+                lc_full[num_start..i].parse::<i64>().ok()?
+            } else {
+                return None;
+            }
+        }
     };
     while i < bytes.len() && bytes[i] == b' ' {
         i += 1;
