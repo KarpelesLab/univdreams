@@ -4199,9 +4199,12 @@ fn emit_block_stmts(
     lift: Option<&BlockTailLift>,
     ctx: &EmitCtx<'_>,
 ) {
-    if cfg.emit_block_comment {
-        out.push(Stmt::Comment(format!("block: 0x{:x}", block.addr.0)));
-    }
+    // `// block: 0x…` boundary markers used to be emitted at every
+    // basic-block transition. They're redundant in structured
+    // output: `label_<hex>:` markers already flag goto targets, and
+    // structural directives (if/else/loop/switch) make boundaries
+    // visible by code shape. Skip them to reduce visual noise.
+    let _ = cfg.emit_block_comment;
 
     let prologue_consumed = if cfg.is_first {
         if let Some(lifted) = try_lift_prologue_pattern(&block.insns) {
