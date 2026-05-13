@@ -356,6 +356,15 @@ pub fn build_function(
         rewrite_stack_refs(&mut body, &stack_map);
     }
 
+    // Branch-target rename: iced's intel formatter renders jump
+    // targets as `00000000000011E0h`-style full-width hex literals.
+    // When the address matches a `label_<hex>` we emit elsewhere
+    // in the same function, substitute. Pure text rewrite.
+    let labels = collect_label_addrs(&body);
+    if !labels.is_empty() {
+        rewrite_label_refs(&mut body, &labels);
+    }
+
     // Parameter-register rename: in SysV-x64 (the default for ELF
     // x86-64) the first six integer parameters are passed in
     // rdi/rsi/rdx/rcx/r8/r9 (plus xmm0-7 for floats). When the
@@ -2304,6 +2313,138 @@ fn substitute_word_tokens(text: &str, subs: &std::collections::HashMap<String, S
             }
             out.push_str(word);
             continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Walk the body collecting every address that has a
+/// `Stmt::Label { addr }` somewhere — those are the addresses
+/// the `label_<hex>:` markers refer to and are the legitimate
+/// targets a branch-target rewrite can substitute for.
+fn collect_label_addrs(stmts: &[Stmt]) -> std::collections::HashSet<u64> {
+    use std::collections::HashSet;
+    let mut out: HashSet<u64> = HashSet::new();
+    walk_collect_labels(stmts, &mut out);
+    out
+}
+
+fn walk_collect_labels(stmts: &[Stmt], out: &mut std::collections::HashSet<u64>) {
+    for s in stmts {
+        match s {
+            Stmt::Label { addr } => {
+                out.insert(*addr);
+            }
+            Stmt::IfBranch {
+                pre_body,
+                then_body,
+                else_body,
+                ..
+            } => {
+                walk_collect_labels(pre_body, out);
+                walk_collect_labels(then_body, out);
+                if let Some(eb) = else_body {
+                    walk_collect_labels(eb, out);
+                }
+            }
+            Stmt::Loop { body, .. } => walk_collect_labels(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// Replace `00000000000011E0h`-style full-width hex address
+/// literals in `@asm` text with the matching `label_<hex>` name
+/// when the address is known. Only touches Asm text — bytes and
+/// other stmt kinds stay verbatim.
+fn rewrite_label_refs(stmts: &mut [Stmt], labels: &std::collections::HashSet<u64>) {
+    for stmt in stmts.iter_mut() {
+        rewrite_label_refs_in_stmt(stmt, labels);
+    }
+}
+
+fn rewrite_label_refs_in_stmt(stmt: &mut Stmt, labels: &std::collections::HashSet<u64>) {
+    match stmt {
+        Stmt::Asm { text, .. } => {
+            let new_text = rewrite_label_refs_in_text(text, labels);
+            if new_text != *text {
+                *text = new_text;
+            }
+        }
+        Stmt::IfBranch {
+            pre_body,
+            then_body,
+            else_body,
+            ..
+        } => {
+            rewrite_label_refs(pre_body, labels);
+            rewrite_label_refs(then_body, labels);
+            if let Some(eb) = else_body {
+                rewrite_label_refs(eb, labels);
+            }
+        }
+        Stmt::Loop { body, .. } => rewrite_label_refs(body, labels),
+        _ => {}
+    }
+}
+
+fn rewrite_label_refs_in_text(text: &str, labels: &std::collections::HashSet<u64>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    let mut iter = text.char_indices().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+    while let Some((i, c)) = iter.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push('"');
+            continue;
+        }
+        // A hex literal in iced's intel formatter takes the shape
+        // `[0-9a-fA-F]+h` and is always preceded by a non-alphanumeric
+        // char (operand boundary).
+        if c.is_ascii_hexdigit() {
+            let prev = text[..i].chars().last();
+            let boundary_ok = prev.map_or(true, |p| !p.is_ascii_alphanumeric() && p != '_');
+            if boundary_ok {
+                let start = i;
+                let mut end = i + c.len_utf8();
+                while let Some(&(j, nc)) = iter.peek() {
+                    if nc.is_ascii_hexdigit() {
+                        end = j + nc.len_utf8();
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Must be followed by `h` to be a hex literal.
+                if let Some(&(j, 'h')) = iter.peek() {
+                    let hex = &text[start..end];
+                    if let Ok(addr) = u64::from_str_radix(hex, 16) {
+                        if labels.contains(&addr) {
+                            iter.next(); // consume the `h`
+                            let _ = j;
+                            let _ = write!(out, "label_{addr:x}");
+                            continue;
+                        }
+                    }
+                }
+                // Not a label hit: emit the digit run verbatim.
+                out.push_str(&text[start..end]);
+                continue;
+            }
         }
         out.push(c);
     }
