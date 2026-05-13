@@ -296,6 +296,34 @@ impl<'a> Lexer<'a> {
                         't' => text.push('\t'),
                         'r' => text.push('\r'),
                         '0' => text.push('\0'),
+                        'x' => {
+                            // Two hex digits. Used by the emitter to
+                            // escape control chars outside the named
+                            // shortcuts (`\x7f`, `\x1b`, …).
+                            let mut hex = String::new();
+                            for _ in 0..2 {
+                                let Some((_, c)) = self.bump() else {
+                                    return Err(LexError::UnterminatedString { line, col });
+                                };
+                                hex.push(c);
+                            }
+                            let n = u32::from_str_radix(&hex, 16).map_err(|_| {
+                                LexError::InvalidEscape {
+                                    ch: hex.chars().next().unwrap_or('?'),
+                                    line: escape_line,
+                                    col: escape_col,
+                                }
+                            })?;
+                            if let Some(c) = char::from_u32(n) {
+                                text.push(c);
+                            } else {
+                                return Err(LexError::InvalidEscape {
+                                    ch: 'x',
+                                    line: escape_line,
+                                    col: escape_col,
+                                });
+                            }
+                        }
                         other => {
                             return Err(LexError::InvalidEscape {
                                 ch: other,

@@ -926,6 +926,14 @@ fn quote_string(s: &str) -> String {
         match ch {
             '\\' => out.push_str(r"\\"),
             '"' => out.push_str("\\\""),
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            '\t' => out.push_str(r"\t"),
+            '\0' => out.push_str(r"\0"),
+            c if (c as u32) < 0x20 || c == '\x7f' => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
             other => out.push(other),
         }
     }
