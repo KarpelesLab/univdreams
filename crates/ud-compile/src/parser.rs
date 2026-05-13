@@ -621,13 +621,22 @@ impl Parser {
                 return Ok(out);
             }
             self.bump(); // consume `let`
-            let name = self.expect_ident("local variable name")?;
-            self.expect(&TokenKind::Colon, "`:` after local variable name")?;
-            let ty = self.parse_type()?;
-            // Optional `@reg` marker. We don't have a structured
-            // "kind" attribute syntax, so we treat `@reg` as a
-            // dedicated marker word — matching the spelling the
-            // emitter uses.
+                         // Accept a comma-separated list of `name: ty` entries
+                         // on one `let`. The emitter coalesces register-backed
+                         // locals onto a single line to reduce visual noise:
+                         //   `let ebp: u64, esp: u64, edi: u32 @reg;`
+            let mut group: Vec<(String, ud_ast::Type)> = Vec::new();
+            loop {
+                let name = self.expect_ident("local variable name")?;
+                self.expect(&TokenKind::Colon, "`:` after local variable name")?;
+                let ty = self.parse_type()?;
+                group.push((name, ty));
+                if !self.eat_kind(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            // Optional trailing `@reg` marker applies to every name
+            // in the group.
             let kind = if self.eat_kind(&TokenKind::At) {
                 let marker = self.expect_ident("local-decl marker after `@`")?;
                 if marker != "reg" {
@@ -643,7 +652,9 @@ impl Parser {
                 ud_ast::LocalKind::Stack
             };
             self.expect(&TokenKind::Semicolon, "`;` to close `let` declaration")?;
-            out.push(ud_ast::LocalDecl { name, ty, kind });
+            for (name, ty) in group {
+                out.push(ud_ast::LocalDecl { name, ty, kind });
+            }
         }
     }
 

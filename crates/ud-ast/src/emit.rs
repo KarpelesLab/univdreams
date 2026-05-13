@@ -160,18 +160,38 @@ fn emit_fn_indented(out: &mut String, f: &FnDecl, depth: usize) {
 }
 
 /// Render the `let name: ty;` declarations at the head of a function.
-/// Register-backed locals get a trailing `@reg` so the kind is
-/// visible at a glance.
+///
+/// Stack-backed locals get one `let name: ty;` line each — they're
+/// the function's variables. Register-backed locals are coalesced
+/// onto a single trailing `let ebp: u64, esp: u64, …: @reg;` line so
+/// they don't dominate the function visually; they're metadata
+/// (`@reg`-kind types per register the body touches), and the
+/// reader rarely cares about the per-register sizes individually.
 fn emit_locals(out: &mut String, locals: &[crate::types::LocalDecl], indent: &str) {
     use crate::types::LocalKind;
     for l in locals {
-        write!(out, "{indent}let {}: ", l.name).unwrap();
-        emit_type(out, &l.ty);
-        match l.kind {
-            LocalKind::Stack => writeln!(out, ";").unwrap(),
-            LocalKind::Register => writeln!(out, " @reg;").unwrap(),
+        if matches!(l.kind, LocalKind::Stack) {
+            write!(out, "{indent}let {}: ", l.name).unwrap();
+            emit_type(out, &l.ty);
+            writeln!(out, ";").unwrap();
         }
     }
+    let regs: Vec<&crate::types::LocalDecl> = locals
+        .iter()
+        .filter(|l| matches!(l.kind, LocalKind::Register))
+        .collect();
+    if regs.is_empty() {
+        return;
+    }
+    write!(out, "{indent}let ").unwrap();
+    for (i, l) in regs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write!(out, "{}: ", l.name).unwrap();
+        emit_type(out, &l.ty);
+    }
+    writeln!(out, " @reg;").unwrap();
 }
 
 fn emit_stmts(out: &mut String, stmts: &[Stmt], indent: &str) {
