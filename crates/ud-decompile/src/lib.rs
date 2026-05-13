@@ -140,7 +140,169 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
         });
     }
 
+    // After every section is built, harvest the jump-table
+    // metadata from `Stmt::Switch` instances and replace the
+    // corresponding `@raw` byte run in `.rodata` (or any other
+    // section that holds the table) with an `@jump_table`
+    // directive. This is the symbolic form — editing a case
+    // target re-encodes the table at lower time.
+    let tables = collect_switch_tables(&items);
+    replace_raw_with_jump_tables(&mut items, &tables);
+
     Ok(UdFile { module, items })
+}
+
+/// One switch-dispatch table harvested from a `Stmt::Switch`.
+#[derive(Debug, Clone)]
+struct SwitchTable {
+    table_va: u64,
+    dispatch: String,
+    /// Case targets in source order — entry `[i]` is the address
+    /// that case `i` dispatches to.
+    cases: Vec<u64>,
+}
+
+fn collect_switch_tables(items: &[Item]) -> Vec<SwitchTable> {
+    fn walk(items: &[Item], out: &mut Vec<SwitchTable>) {
+        for item in items {
+            match item {
+                Item::Function(f) => collect_in_stmts(&f.body, out),
+                Item::Section { items: nested, .. } => walk(nested, out),
+                _ => {}
+            }
+        }
+    }
+    fn collect_in_stmts(stmts: &[ud_ast::Stmt], out: &mut Vec<SwitchTable>) {
+        for s in stmts {
+            match s {
+                ud_ast::Stmt::Switch {
+                    cases,
+                    dispatch,
+                    table_va,
+                    ..
+                } => {
+                    if *table_va != 0 && !cases.is_empty() {
+                        out.push(SwitchTable {
+                            table_va: *table_va,
+                            dispatch: dispatch.clone(),
+                            cases: cases.clone(),
+                        });
+                    }
+                }
+                ud_ast::Stmt::IfBranch {
+                    pre_body,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect_in_stmts(pre_body, out);
+                    collect_in_stmts(then_body, out);
+                    if let Some(eb) = else_body {
+                        collect_in_stmts(eb, out);
+                    }
+                }
+                ud_ast::Stmt::Loop { body, .. } => collect_in_stmts(body, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(items, &mut out);
+    out
+}
+
+/// Walk the section tree and, for every `@raw` block that fully
+/// contains a known switch table's bytes, split it into:
+///
+/// ```text
+/// @raw(<addr>, [prefix])
+/// @jump_table(<table_va>, dispatch="…") { case_<i>: label_<target>; … }
+/// @raw(<table_end>, [suffix])
+/// ```
+///
+/// Zero-length prefix / suffix slices are omitted. Today the
+/// known dispatch encodings (`gcc_pie_rel32`, `msvc_va32`) both
+/// use 4-byte entries, so each table covers `4 * cases.len()`
+/// bytes starting at `table_va`. Unknown dispatch kinds are
+/// skipped (no replacement, no error).
+fn replace_raw_with_jump_tables(items: &mut Vec<Item>, tables: &[SwitchTable]) {
+    fn entry_size(dispatch: &str) -> Option<u64> {
+        match dispatch {
+            "gcc_pie_rel32" | "msvc_va32" => Some(4),
+            _ => None,
+        }
+    }
+    fn rewrite_section(section_items: &mut Vec<Item>, tables: &[SwitchTable]) {
+        let mut i = 0;
+        while i < section_items.len() {
+            // Try each table; the first that fits splits this raw
+            // block.
+            let mut replacement: Option<(usize, Vec<Item>)> = None;
+            if let Item::Raw { addr, bytes } = &section_items[i] {
+                for t in tables {
+                    let Some(esz) = entry_size(&t.dispatch) else {
+                        continue;
+                    };
+                    let table_size = esz * (t.cases.len() as u64);
+                    let raw_start = *addr;
+                    let raw_end = raw_start.saturating_add(bytes.len() as u64);
+                    let table_end = t.table_va.saturating_add(table_size);
+                    if t.table_va < raw_start || table_end > raw_end {
+                        continue;
+                    }
+                    // Slice the raw into prefix / table / suffix.
+                    let prefix_len = (t.table_va - raw_start) as usize;
+                    let table_len = table_size as usize;
+                    let suffix_start = prefix_len + table_len;
+                    let mut new_items: Vec<Item> = Vec::new();
+                    if prefix_len > 0 {
+                        new_items.push(Item::Raw {
+                            addr: raw_start,
+                            bytes: bytes[..prefix_len].to_vec(),
+                        });
+                    }
+                    let entries = t
+                        .cases
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, target)| ud_ast::JumpTableEntry {
+                            case: idx as u64,
+                            target: *target,
+                        })
+                        .collect();
+                    new_items.push(Item::JumpTable {
+                        addr: t.table_va,
+                        dispatch: t.dispatch.clone(),
+                        entries,
+                    });
+                    if suffix_start < bytes.len() {
+                        new_items.push(Item::Raw {
+                            addr: table_end,
+                            bytes: bytes[suffix_start..].to_vec(),
+                        });
+                    }
+                    replacement = Some((1, new_items));
+                    break;
+                }
+            }
+            if let Some((remove, mut new_items)) = replacement {
+                section_items.remove(i);
+                let added = new_items.len();
+                for (off, it) in new_items.drain(..).enumerate() {
+                    section_items.insert(i + off, it);
+                }
+                let _ = remove; // we always remove exactly one item
+                i += added;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for item in items.iter_mut() {
+        if let Item::Section { items: nested, .. } = item {
+            rewrite_section(nested, tables);
+        }
+    }
 }
 
 /// Walk a section's items in declaration order and drop
@@ -420,4 +582,131 @@ fn build_section_items(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ud_ast::{FnDecl, Stmt};
+
+    #[test]
+    fn replace_raw_with_jump_table_splits_around_table_va() {
+        // Synthetic section: a function with a Stmt::Switch
+        // pointing at a `@raw` data block. The replacement
+        // should split the raw into prefix + jump_table + suffix.
+        let switch_stmt = Stmt::Switch {
+            selector: "ecx".into(),
+            cases: vec![0x117a, 0x1183, 0x118c],
+            default_addr: 0x1200,
+            dispatch: "gcc_pie_rel32".into(),
+            table_va: 0x2008,
+        };
+        // .rodata starts at 0x2000 with 8 bytes of prefix,
+        // 12 bytes of jump table (3 entries × 4 bytes), 4 bytes
+        // of suffix.
+        let raw_bytes = vec![
+            // prefix (0x2000..0x2008)
+            0x01, 0x00, 0x02, 0x00, 0x53, 0x75, 0x6e, 0x00, // table (0x2008..0x2014) — bytes don't matter, will be replaced
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            // suffix (0x2014..0x2018)
+            0xde, 0xad, 0xbe, 0xef,
+        ];
+        let mut items = vec![Item::Section {
+            name: ".text".into(),
+            addr: 0x1000,
+            items: vec![Item::Function(FnDecl {
+                addr: Some(0x1000),
+                name: "f".into(),
+                attrs: Vec::new(),
+                signature: None,
+                locals: Vec::new(),
+                body: vec![switch_stmt],
+            })],
+        }];
+        items.push(Item::Section {
+            name: ".rodata".into(),
+            addr: 0x2000,
+            items: vec![Item::Raw {
+                addr: 0x2000,
+                bytes: raw_bytes,
+            }],
+        });
+        let tables = collect_switch_tables(&items);
+        assert_eq!(tables.len(), 1);
+        replace_raw_with_jump_tables(&mut items, &tables);
+
+        let Item::Section { items: ro_items, .. } = &items[1] else {
+            panic!("expected .rodata section");
+        };
+        // Expect: [Raw(prefix 0x2000..0x2008), JumpTable(0x2008), Raw(suffix 0x2014..)]
+        assert_eq!(ro_items.len(), 3);
+        match &ro_items[0] {
+            Item::Raw { addr, bytes } => {
+                assert_eq!(*addr, 0x2000);
+                assert_eq!(bytes.len(), 8);
+            }
+            other => panic!("expected Raw prefix, got {other:?}"),
+        }
+        match &ro_items[1] {
+            Item::JumpTable {
+                addr,
+                dispatch,
+                entries,
+            } => {
+                assert_eq!(*addr, 0x2008);
+                assert_eq!(dispatch, "gcc_pie_rel32");
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].target, 0x117a);
+                assert_eq!(entries[2].target, 0x118c);
+            }
+            other => panic!("expected JumpTable, got {other:?}"),
+        }
+        match &ro_items[2] {
+            Item::Raw { addr, bytes } => {
+                assert_eq!(*addr, 0x2014);
+                assert_eq!(bytes, &[0xde, 0xad, 0xbe, 0xef]);
+            }
+            other => panic!("expected Raw suffix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_raw_with_jump_table_skips_unknown_dispatch() {
+        let switch_stmt = Stmt::Switch {
+            selector: "ecx".into(),
+            cases: vec![0x100, 0x200],
+            default_addr: 0x300,
+            dispatch: "bogus-dispatch".into(),
+            table_va: 0x2000,
+        };
+        let mut items = vec![
+            Item::Section {
+                name: ".text".into(),
+                addr: 0x1000,
+                items: vec![Item::Function(FnDecl {
+                    addr: Some(0x1000),
+                    name: "f".into(),
+                    attrs: Vec::new(),
+                    signature: None,
+                    locals: Vec::new(),
+                    body: vec![switch_stmt],
+                })],
+            },
+            Item::Section {
+                name: ".rodata".into(),
+                addr: 0x2000,
+                items: vec![Item::Raw {
+                    addr: 0x2000,
+                    bytes: vec![0u8; 8],
+                }],
+            },
+        ];
+        let tables = collect_switch_tables(&items);
+        replace_raw_with_jump_tables(&mut items, &tables);
+        // Unknown dispatch → no replacement → raw stays intact.
+        let Item::Section { items: ro_items, .. } = &items[1] else {
+            panic!()
+        };
+        assert!(matches!(&ro_items[0], Item::Raw { .. }));
+    }
 }
