@@ -3765,6 +3765,15 @@ fn discover_locals(f: &Function<DecodedInsn>, sp_table: &HashMap<u64, i64>) -> V
         });
     }
     for name in &reg_order {
+        // ebp/esp/rbp/rsp are part of the call frame setup. They're
+        // implicit in every function and add visual noise without
+        // carrying semantic information for the reader. Skip them
+        // from the locals list. Round-trip safe: the lower path's
+        // profile_inputs heuristic only consults ebx/esi/edi for
+        // saves anyway.
+        if matches!(name.as_str(), "ebp" | "esp" | "rbp" | "rsp") {
+            continue;
+        }
         let size = regs[name];
         let signed = reg_signed.contains(name);
         out.push(LocalDecl {
