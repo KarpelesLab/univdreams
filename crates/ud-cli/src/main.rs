@@ -110,6 +110,49 @@ enum Command {
         json: bool,
     },
 
+    /// Video for Windows codec tools — drive a codec DLL
+    /// through the VfW `IC*` pipeline inside the sandbox.
+    /// See `ud vfw --help` for the per-command list.
+    Vfw {
+        #[command(subcommand)]
+        command: VfwCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum VfwCommand {
+    /// Load a codec DLL + DllMain + DRV_OPEN + ICGetInfo +
+    /// ICDecompressQuery (RGB24 default). Quick sanity check
+    /// that the codec accepts a reasonable BIH pair.
+    Probe {
+        /// Codec DLL.
+        dll: PathBuf,
+
+        /// FourCC handler override (defaults to the
+        /// filename-based heuristic).
+        #[arg(long = "fcc-handler", value_name = "FCC")]
+        fcc_handler: Option<String>,
+
+        /// Probe-test output pixel format. RGB24 is the
+        /// VfW lingua franca and the format every decoder
+        /// is expected to support.
+        #[arg(long = "pix-format", value_enum, default_value_t = PixFormat::Rgb24)]
+        pix_format: PixFormat,
+
+        /// Test frame width (used for the probe BIH only;
+        /// the codec usually doesn't care at this stage).
+        #[arg(long, default_value_t = 320)]
+        width: u32,
+
+        /// Test frame height.
+        #[arg(long, default_value_t = 240)]
+        height: u32,
+
+        /// Cap the run at this many guest instructions.
+        #[arg(long, default_value_t = 100_000_000)]
+        max_instructions: u64,
+    },
+
     /// Drive `ICDecompress` on a codec bitstream-only frame:
     /// load the codec DLL, run `DllMain(DLL_PROCESS_ATTACH)`,
     /// open the codec via `ICOpen`, run the full
@@ -455,48 +498,65 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             max_instructions,
             json,
         } => analyze(&input, max_instructions, json),
-        Command::Decode {
-            dll,
-            input,
-            width,
-            height,
-            fcc_handler,
-            pix_format,
-            output,
-            max_instructions,
-        } => decode_cmd(
-            &dll,
-            &input,
-            width,
-            height,
-            fcc_handler.as_deref(),
-            pix_format,
-            output.as_deref(),
-            max_instructions,
-        ),
-        Command::Encode {
-            dll,
-            input,
-            width,
-            height,
-            fcc_handler,
-            input_format,
-            quality,
-            keyframe,
-            output,
-            max_instructions,
-        } => encode_cmd(
-            &dll,
-            &input,
-            width,
-            height,
-            fcc_handler.as_deref(),
-            input_format,
-            quality,
-            keyframe,
-            output.as_deref(),
-            max_instructions,
-        ),
+        Command::Vfw { command } => match command {
+            VfwCommand::Probe {
+                dll,
+                fcc_handler,
+                pix_format,
+                width,
+                height,
+                max_instructions,
+            } => vfw_probe(
+                &dll,
+                fcc_handler.as_deref(),
+                pix_format,
+                width,
+                height,
+                max_instructions,
+            ),
+            VfwCommand::Decode {
+                dll,
+                input,
+                width,
+                height,
+                fcc_handler,
+                pix_format,
+                output,
+                max_instructions,
+            } => decode_cmd(
+                &dll,
+                &input,
+                width,
+                height,
+                fcc_handler.as_deref(),
+                pix_format,
+                output.as_deref(),
+                max_instructions,
+            ),
+            VfwCommand::Encode {
+                dll,
+                input,
+                width,
+                height,
+                fcc_handler,
+                input_format,
+                quality,
+                keyframe,
+                output,
+                max_instructions,
+            } => encode_cmd(
+                &dll,
+                &input,
+                width,
+                height,
+                fcc_handler.as_deref(),
+                input_format,
+                quality,
+                keyframe,
+                output.as_deref(),
+                max_instructions,
+            ),
+        },
     }
 }
 
@@ -531,6 +591,140 @@ fn derive_default_fcc(p: &Path) -> String {
 const ICMODE_DECOMPRESS: u32 = 1;
 const ICMODE_COMPRESS: u32 = 2;
 const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
+
+fn vfw_probe(
+    dll_path: &Path,
+    fcc_handler: Option<&str>,
+    pix_format: PixFormat,
+    width: u32,
+    height: u32,
+    max_instructions: u64,
+) -> anyhow::Result<()> {
+    let dll_bytes = std::fs::read(dll_path)
+        .with_context(|| format!("reading {}", dll_path.display()))?;
+    let dll_name = dll_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "codec.dll".into());
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.instruction_budget = Some(max_instructions);
+    sandbox.host.trace_stubs = true;
+
+    let img = sandbox
+        .load(&dll_name, &dll_bytes)
+        .with_context(|| format!("load {}", dll_path.display()))?;
+    let _ = sandbox
+        .call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH)
+        .with_context(|| "DllMain")?;
+    sandbox
+        .install_codec(&img)
+        .with_context(|| "install_codec")?;
+
+    let fcc = fcc_handler
+        .map(str::to_owned)
+        .unwrap_or_else(|| derive_default_fcc(dll_path));
+    let fcc_type = u32::from_le_bytes(*b"VIDC");
+    let fcc_handler_u32 = fourcc_to_u32(&fcc);
+
+    let hic = sandbox
+        .ic_open(fcc_type, fcc_handler_u32, ICMODE_DECOMPRESS)
+        .context("ICOpen(ICMODE_DECOMPRESS)")?;
+    if hic == 0 {
+        anyhow::bail!("codec refused DRV_OPEN");
+    }
+    println!("[probe] loaded {} (image_base 0x{:x})", dll_path.display(), img.image_base);
+    println!("[probe] HIC = {hic}; fcc_handler = {fcc:?}");
+
+    // ICGetInfo: codec metadata.
+    match sandbox.ic_get_info(hic, 568) {
+        Ok(info) => {
+            // ICINFO layout: u32 dwSize, u32 fccType, u32 fccHandler,
+            //   u32 dwFlags, u32 dwVersion, u32 dwVersionICM, then
+            //   szName (utf-16) @ offset 24, szDescription @ offset 88.
+            let read_u32 = |off: usize| -> u32 {
+                if off + 4 <= info.len() {
+                    u32::from_le_bytes(info[off..off + 4].try_into().unwrap_or([0; 4]))
+                } else {
+                    0
+                }
+            };
+            let read_utf16 = |off: usize, max_chars: usize| -> String {
+                let mut out = String::new();
+                for i in 0..max_chars {
+                    let o = off + i * 2;
+                    if o + 2 > info.len() {
+                        break;
+                    }
+                    let c = u16::from_le_bytes([info[o], info[o + 1]]);
+                    if c == 0 {
+                        break;
+                    }
+                    if let Some(ch) = char::from_u32(u32::from(c)) {
+                        out.push(ch);
+                    }
+                }
+                out
+            };
+            let fcc_type_bytes = read_u32(4).to_le_bytes();
+            let fcc_handler_bytes = read_u32(8).to_le_bytes();
+            let flags = read_u32(12);
+            let version = read_u32(16);
+            let version_icm = read_u32(20);
+            let name = read_utf16(24, 16);
+            let desc = read_utf16(24 + 32, 128);
+            println!("[probe] ICINFO:");
+            println!("  fccType      = {:?}", std::str::from_utf8(&fcc_type_bytes).unwrap_or("?"));
+            println!("  fccHandler   = {:?}", std::str::from_utf8(&fcc_handler_bytes).unwrap_or("?"));
+            println!("  dwFlags      = 0x{:08x}", flags);
+            println!("  dwVersion    = 0x{:08x}", version);
+            println!("  dwVersionICM = 0x{:08x}", version_icm);
+            println!("  szName       = {name:?}");
+            println!("  szDescription= {desc:?}");
+        }
+        Err(e) => {
+            println!("[probe] ICGetInfo failed: {e}");
+        }
+    }
+
+    // ICDecompressQuery with an RGB24 default.
+    let in_bih = ud_emulator::Bih {
+        bi_size: 40,
+        width: width as i32,
+        height: height as i32,
+        planes: 1,
+        bit_count: 24,
+        compression: fcc_handler_u32.to_le_bytes(),
+        size_image: 0,
+        ..ud_emulator::Bih::default()
+    };
+    let out_bih = ud_emulator::Bih {
+        bi_size: 40,
+        width: width as i32,
+        height: height as i32,
+        planes: 1,
+        bit_count: pix_format.bi_bit_count(),
+        compression: pix_format.bi_compression(),
+        size_image: width * height * pix_format.bytes_per_pixel(),
+        ..ud_emulator::Bih::default()
+    };
+    match sandbox.ic_decompress_query(hic, &in_bih, Some(&out_bih)) {
+        Ok(q) => println!(
+            "[probe] ICDecompressQuery({}x{} {:?} → {:?}) = {} (0 = ICERR_OK)",
+            width, height, &fcc, pix_format, q as i32
+        ),
+        Err(e) => println!("[probe] ICDecompressQuery failed: {e}"),
+    }
+
+    let _ = sandbox.ic_close(hic);
+    println!();
+    println!(
+        "[probe] Win32 calls: {}; instructions executed: {}",
+        sandbox.host.stub_calls.len(),
+        sandbox.host.instructions_executed
+    );
+    Ok(())
+}
 
 #[allow(clippy::too_many_arguments)]
 fn decode_cmd(
