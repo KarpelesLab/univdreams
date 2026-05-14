@@ -110,6 +110,296 @@ pub enum PeKind {
     Pe32Plus,
 }
 
+/// Parsed `IMAGE_DOS_HEADER` (the 64-byte prefix every PE file
+/// starts with). The fields that aren't meaningful for modern
+/// PE files (the original 16-bit DOS layout descriptors) round
+/// through verbatim — typical values are `e_cblp = 0x90`,
+/// `e_cparhdr = 0x4`, `e_minalloc = 0`, `e_maxalloc = 0xffff`,
+/// `e_sp = 0xb8`, with reserved fields zero. The two fields
+/// that matter for the modern format are `e_magic` (`"MZ"`)
+/// and `e_lfanew` (file offset of the PE signature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DosHeader {
+    pub e_magic: [u8; 2],
+    pub e_cblp: u16,
+    pub e_cp: u16,
+    pub e_crlc: u16,
+    pub e_cparhdr: u16,
+    pub e_minalloc: u16,
+    pub e_maxalloc: u16,
+    pub e_ss: u16,
+    pub e_sp: u16,
+    pub e_csum: u16,
+    pub e_ip: u16,
+    pub e_cs: u16,
+    pub e_lfarlc: u16,
+    pub e_ovno: u16,
+    pub e_res: [u16; 4],
+    pub e_oemid: u16,
+    pub e_oeminfo: u16,
+    pub e_res2: [u16; 10],
+    pub e_lfanew: u32,
+}
+
+impl DosHeader {
+    fn parse(bytes: &[u8]) -> Self {
+        let mut h = DosHeader {
+            e_magic: [bytes[0], bytes[1]],
+            e_cblp: read_u16(bytes, 2),
+            e_cp: read_u16(bytes, 4),
+            e_crlc: read_u16(bytes, 6),
+            e_cparhdr: read_u16(bytes, 8),
+            e_minalloc: read_u16(bytes, 10),
+            e_maxalloc: read_u16(bytes, 12),
+            e_ss: read_u16(bytes, 14),
+            e_sp: read_u16(bytes, 16),
+            e_csum: read_u16(bytes, 18),
+            e_ip: read_u16(bytes, 20),
+            e_cs: read_u16(bytes, 22),
+            e_lfarlc: read_u16(bytes, 24),
+            e_ovno: read_u16(bytes, 26),
+            e_res: [0; 4],
+            e_oemid: read_u16(bytes, 36),
+            e_oeminfo: read_u16(bytes, 38),
+            e_res2: [0; 10],
+            e_lfanew: read_u32(bytes, E_LFANEW_OFFSET),
+        };
+        for i in 0..4 {
+            h.e_res[i] = read_u16(bytes, 28 + 2 * i);
+        }
+        for i in 0..10 {
+            h.e_res2[i] = read_u16(bytes, 40 + 2 * i);
+        }
+        h
+    }
+
+    /// Encode the 64-byte DOS header.
+    #[must_use]
+    pub fn encode(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[0..2].copy_from_slice(&self.e_magic);
+        out[2..4].copy_from_slice(&self.e_cblp.to_le_bytes());
+        out[4..6].copy_from_slice(&self.e_cp.to_le_bytes());
+        out[6..8].copy_from_slice(&self.e_crlc.to_le_bytes());
+        out[8..10].copy_from_slice(&self.e_cparhdr.to_le_bytes());
+        out[10..12].copy_from_slice(&self.e_minalloc.to_le_bytes());
+        out[12..14].copy_from_slice(&self.e_maxalloc.to_le_bytes());
+        out[14..16].copy_from_slice(&self.e_ss.to_le_bytes());
+        out[16..18].copy_from_slice(&self.e_sp.to_le_bytes());
+        out[18..20].copy_from_slice(&self.e_csum.to_le_bytes());
+        out[20..22].copy_from_slice(&self.e_ip.to_le_bytes());
+        out[22..24].copy_from_slice(&self.e_cs.to_le_bytes());
+        out[24..26].copy_from_slice(&self.e_lfarlc.to_le_bytes());
+        out[26..28].copy_from_slice(&self.e_ovno.to_le_bytes());
+        for i in 0..4 {
+            out[28 + 2 * i..30 + 2 * i].copy_from_slice(&self.e_res[i].to_le_bytes());
+        }
+        out[36..38].copy_from_slice(&self.e_oemid.to_le_bytes());
+        out[38..40].copy_from_slice(&self.e_oeminfo.to_le_bytes());
+        for i in 0..10 {
+            out[40 + 2 * i..42 + 2 * i].copy_from_slice(&self.e_res2[i].to_le_bytes());
+        }
+        out[E_LFANEW_OFFSET..E_LFANEW_OFFSET + 4].copy_from_slice(&self.e_lfanew.to_le_bytes());
+        out
+    }
+}
+
+/// Parsed `IMAGE_OPTIONAL_HEADER` / `IMAGE_OPTIONAL_HEADER64`.
+/// One struct handles both PE32 and PE32+ variants; the
+/// 32-bit ImageBase / stack / heap sizes are stored as `u64`
+/// for uniformity and zero-extended on read.
+///
+/// The data directories at the tail of the optional header
+/// aren't stored here — see [`PeFile::data_directories`]. The
+/// `number_of_rva_and_sizes` field tells the encoder how many
+/// directory slots to emit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionalHeader {
+    pub magic: u16,
+    pub major_linker_version: u8,
+    pub minor_linker_version: u8,
+    pub size_of_code: u32,
+    pub size_of_initialized_data: u32,
+    pub size_of_uninitialized_data: u32,
+    pub address_of_entry_point: u32,
+    pub base_of_code: u32,
+    /// PE32 only — the address of the data section. Always 0
+    /// in PE32+ since 64-bit images don't have this field.
+    pub base_of_data: u32,
+    pub image_base: u64,
+    pub section_alignment: u32,
+    pub file_alignment: u32,
+    pub major_operating_system_version: u16,
+    pub minor_operating_system_version: u16,
+    pub major_image_version: u16,
+    pub minor_image_version: u16,
+    pub major_subsystem_version: u16,
+    pub minor_subsystem_version: u16,
+    pub win32_version_value: u32,
+    pub size_of_image: u32,
+    pub size_of_headers: u32,
+    pub check_sum: u32,
+    pub subsystem: u16,
+    pub dll_characteristics: u16,
+    pub size_of_stack_reserve: u64,
+    pub size_of_stack_commit: u64,
+    pub size_of_heap_reserve: u64,
+    pub size_of_heap_commit: u64,
+    pub loader_flags: u32,
+    pub number_of_rva_and_sizes: u32,
+}
+
+impl OptionalHeader {
+    /// Parse from `bytes` (whose length is `coff.size_of_optional_header`).
+    /// Returns `None` when the buffer is too short or the magic is
+    /// neither PE32 nor PE32+; the parser falls back to a default-zero
+    /// header in those cases.
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 2 {
+            return Option::None;
+        }
+        let magic = read_u16(bytes, 0);
+        match magic {
+            OPTIONAL_HEADER_MAGIC_PE32 => Self::parse_pe32(bytes, magic),
+            OPTIONAL_HEADER_MAGIC_PE32_PLUS => Self::parse_pe32_plus(bytes, magic),
+            _ => Option::None,
+        }
+    }
+
+    fn parse_pe32(bytes: &[u8], magic: u16) -> Option<Self> {
+        if bytes.len() < 96 {
+            return Option::None;
+        }
+        Some(Self {
+            magic,
+            major_linker_version: bytes[2],
+            minor_linker_version: bytes[3],
+            size_of_code: read_u32(bytes, 4),
+            size_of_initialized_data: read_u32(bytes, 8),
+            size_of_uninitialized_data: read_u32(bytes, 12),
+            address_of_entry_point: read_u32(bytes, 16),
+            base_of_code: read_u32(bytes, 20),
+            base_of_data: read_u32(bytes, 24),
+            image_base: u64::from(read_u32(bytes, 28)),
+            section_alignment: read_u32(bytes, 32),
+            file_alignment: read_u32(bytes, 36),
+            major_operating_system_version: read_u16(bytes, 40),
+            minor_operating_system_version: read_u16(bytes, 42),
+            major_image_version: read_u16(bytes, 44),
+            minor_image_version: read_u16(bytes, 46),
+            major_subsystem_version: read_u16(bytes, 48),
+            minor_subsystem_version: read_u16(bytes, 50),
+            win32_version_value: read_u32(bytes, 52),
+            size_of_image: read_u32(bytes, 56),
+            size_of_headers: read_u32(bytes, 60),
+            check_sum: read_u32(bytes, 64),
+            subsystem: read_u16(bytes, 68),
+            dll_characteristics: read_u16(bytes, 70),
+            size_of_stack_reserve: u64::from(read_u32(bytes, 72)),
+            size_of_stack_commit: u64::from(read_u32(bytes, 76)),
+            size_of_heap_reserve: u64::from(read_u32(bytes, 80)),
+            size_of_heap_commit: u64::from(read_u32(bytes, 84)),
+            loader_flags: read_u32(bytes, 88),
+            number_of_rva_and_sizes: read_u32(bytes, 92),
+        })
+    }
+
+    fn parse_pe32_plus(bytes: &[u8], magic: u16) -> Option<Self> {
+        if bytes.len() < 112 {
+            return Option::None;
+        }
+        Some(Self {
+            magic,
+            major_linker_version: bytes[2],
+            minor_linker_version: bytes[3],
+            size_of_code: read_u32(bytes, 4),
+            size_of_initialized_data: read_u32(bytes, 8),
+            size_of_uninitialized_data: read_u32(bytes, 12),
+            address_of_entry_point: read_u32(bytes, 16),
+            base_of_code: read_u32(bytes, 20),
+            base_of_data: 0,
+            image_base: read_u64(bytes, 24),
+            section_alignment: read_u32(bytes, 32),
+            file_alignment: read_u32(bytes, 36),
+            major_operating_system_version: read_u16(bytes, 40),
+            minor_operating_system_version: read_u16(bytes, 42),
+            major_image_version: read_u16(bytes, 44),
+            minor_image_version: read_u16(bytes, 46),
+            major_subsystem_version: read_u16(bytes, 48),
+            minor_subsystem_version: read_u16(bytes, 50),
+            win32_version_value: read_u32(bytes, 52),
+            size_of_image: read_u32(bytes, 56),
+            size_of_headers: read_u32(bytes, 60),
+            check_sum: read_u32(bytes, 64),
+            subsystem: read_u16(bytes, 68),
+            dll_characteristics: read_u16(bytes, 70),
+            size_of_stack_reserve: read_u64(bytes, 72),
+            size_of_stack_commit: read_u64(bytes, 80),
+            size_of_heap_reserve: read_u64(bytes, 88),
+            size_of_heap_commit: read_u64(bytes, 96),
+            loader_flags: read_u32(bytes, 104),
+            number_of_rva_and_sizes: read_u32(bytes, 108),
+        })
+    }
+
+    /// Encode the optional header (without trailing data
+    /// directories) into the buffer at offset 0. Returns the
+    /// number of bytes written (96 for PE32, 112 for PE32+).
+    /// The caller appends the data-directory entries after.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(112);
+        out.extend_from_slice(&self.magic.to_le_bytes());
+        out.push(self.major_linker_version);
+        out.push(self.minor_linker_version);
+        out.extend_from_slice(&self.size_of_code.to_le_bytes());
+        out.extend_from_slice(&self.size_of_initialized_data.to_le_bytes());
+        out.extend_from_slice(&self.size_of_uninitialized_data.to_le_bytes());
+        out.extend_from_slice(&self.address_of_entry_point.to_le_bytes());
+        out.extend_from_slice(&self.base_of_code.to_le_bytes());
+        match self.magic {
+            OPTIONAL_HEADER_MAGIC_PE32 => {
+                out.extend_from_slice(&self.base_of_data.to_le_bytes());
+                out.extend_from_slice(&(self.image_base as u32).to_le_bytes());
+            }
+            OPTIONAL_HEADER_MAGIC_PE32_PLUS | _ => {
+                out.extend_from_slice(&self.image_base.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&self.section_alignment.to_le_bytes());
+        out.extend_from_slice(&self.file_alignment.to_le_bytes());
+        out.extend_from_slice(&self.major_operating_system_version.to_le_bytes());
+        out.extend_from_slice(&self.minor_operating_system_version.to_le_bytes());
+        out.extend_from_slice(&self.major_image_version.to_le_bytes());
+        out.extend_from_slice(&self.minor_image_version.to_le_bytes());
+        out.extend_from_slice(&self.major_subsystem_version.to_le_bytes());
+        out.extend_from_slice(&self.minor_subsystem_version.to_le_bytes());
+        out.extend_from_slice(&self.win32_version_value.to_le_bytes());
+        out.extend_from_slice(&self.size_of_image.to_le_bytes());
+        out.extend_from_slice(&self.size_of_headers.to_le_bytes());
+        out.extend_from_slice(&self.check_sum.to_le_bytes());
+        out.extend_from_slice(&self.subsystem.to_le_bytes());
+        out.extend_from_slice(&self.dll_characteristics.to_le_bytes());
+        match self.magic {
+            OPTIONAL_HEADER_MAGIC_PE32 => {
+                out.extend_from_slice(&(self.size_of_stack_reserve as u32).to_le_bytes());
+                out.extend_from_slice(&(self.size_of_stack_commit as u32).to_le_bytes());
+                out.extend_from_slice(&(self.size_of_heap_reserve as u32).to_le_bytes());
+                out.extend_from_slice(&(self.size_of_heap_commit as u32).to_le_bytes());
+            }
+            _ => {
+                out.extend_from_slice(&self.size_of_stack_reserve.to_le_bytes());
+                out.extend_from_slice(&self.size_of_stack_commit.to_le_bytes());
+                out.extend_from_slice(&self.size_of_heap_reserve.to_le_bytes());
+                out.extend_from_slice(&self.size_of_heap_commit.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&self.loader_flags.to_le_bytes());
+        out.extend_from_slice(&self.number_of_rva_and_sizes.to_le_bytes());
+        out
+    }
+}
+
 /// Parsed `IMAGE_FILE_HEADER` (a.k.a. COFF header).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoffHeader {
@@ -186,10 +476,26 @@ pub struct SectionHeader {
 pub struct PeFile {
     /// Optional-header magic (PE32 vs PE32+).
     pub kind: PeKind,
-    /// File offset of the PE signature.
+    /// File offset of the PE signature (same value as
+    /// `dos.e_lfanew`, surfaced separately for convenience).
     pub e_lfanew: u32,
+    /// Parsed DOS header. The fields that don't matter for
+    /// modern PE files (the original 16-bit DOS descriptors)
+    /// round through verbatim.
+    pub dos: DosHeader,
+    /// The DOS stub program — bytes between the end of the DOS
+    /// header (offset 64) and `e_lfanew`. Treated as opaque;
+    /// the loader doesn't execute this in 32/64-bit OS, but
+    /// most linkers ship the canonical "This program cannot be
+    /// run in DOS mode" stub. We preserve whatever bytes are
+    /// there.
+    pub dos_stub: Vec<u8>,
     /// COFF header values.
     pub coff: CoffHeader,
+    /// Optional header values. `None` for object files (which
+    /// have no optional header — `coff.size_of_optional_header`
+    /// is 0).
+    pub optional: Option<OptionalHeader>,
     /// `ImageBase` from the optional header — the run-time virtual
     /// address the loader maps the file to. Section RVAs are added
     /// to this to form full VAs at run time. Zero when the file has
@@ -243,7 +549,14 @@ impl PeFile {
             return Err(Error::BadDosMagic(dos_magic));
         }
 
-        let e_lfanew = read_u32(bytes, E_LFANEW_OFFSET);
+        let dos = DosHeader::parse(&bytes[..DOS_HEADER_SIZE]);
+        let e_lfanew = dos.e_lfanew;
+        let stub_end = (e_lfanew as usize).min(bytes.len());
+        let dos_stub = if stub_end > DOS_HEADER_SIZE {
+            bytes[DOS_HEADER_SIZE..stub_end].to_vec()
+        } else {
+            Vec::new()
+        };
         let pe_off = e_lfanew as usize;
         if (pe_off as u64) > bytes.len() as u64 {
             return Err(Error::LfanewOutOfRange {
@@ -268,6 +581,11 @@ impl PeFile {
         let mut image_base: u64 = 0;
         let mut address_of_entry_point: u32 = 0;
         let mut data_directories: Vec<DataDirectory> = Vec::new();
+        let optional = if opt_size > 0 {
+            OptionalHeader::parse(&bytes[opt_off..opt_off + opt_size])
+        } else {
+            Option::None
+        };
         let kind = if opt_size == 0 {
             // Object files have no optional header. Default to PE32+
             // for typing purposes; the kind is informational only.
@@ -336,7 +654,10 @@ impl PeFile {
         Ok(Self {
             kind,
             e_lfanew,
+            dos,
+            dos_stub,
             coff,
+            optional,
             image_base,
             address_of_entry_point,
             data_directories,
@@ -861,5 +1182,46 @@ mod tests {
     #[test]
     fn is_pe_rejects_short_input() {
         assert!(!is_pe(&[0u8; 10]));
+    }
+
+    #[test]
+    fn dos_header_encode_round_trip() {
+        let bytes = minimal_pe_bytes();
+        let dos = DosHeader::parse(&bytes[..64]);
+        let re = dos.encode();
+        assert_eq!(&re[..], &bytes[..64]);
+    }
+
+    #[test]
+    fn optional_header_encode_round_trip_against_fixture() {
+        // The synthetic `minimal_pe_bytes` has no optional
+        // header, so test against a real PE fixture if one
+        // is available — skip when running against a stripped
+        // tree.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|p| p.join("testdata").is_dir())
+            .map(|p| p.join("testdata/sqrt-mingw15-O0.exe"));
+        let Some(path) = path else {
+            eprintln!("note: testdata/ unavailable; skipping");
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("note: {} unavailable; skipping", path.display());
+            return;
+        };
+        let pe = PeFile::parse(&bytes).expect("parse fixture");
+        let opt = pe
+            .optional
+            .as_ref()
+            .expect("fixture should have an optional header");
+        let opt_off = pe.e_lfanew as usize + 4 + COFF_HEADER_SIZE;
+        let opt_tail = match pe.kind {
+            PeKind::Pe32 => 96,
+            PeKind::Pe32Plus => 112,
+        };
+        let re = opt.encode();
+        assert_eq!(re.len(), opt_tail);
+        assert_eq!(&re[..], &bytes[opt_off..opt_off + opt_tail]);
     }
 }
