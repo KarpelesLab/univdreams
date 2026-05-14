@@ -56,6 +56,17 @@ pub enum LowerError {
     },
 
     #[error(
+        "function `{fn_name}` body index {stmt_index}: re-assembly of \
+         `@asm({text:?})` failed: {message}"
+    )]
+    AsmAssembleFailed {
+        fn_name: String,
+        stmt_index: usize,
+        text: String,
+        message: String,
+    },
+
+    #[error(
         "section `{section}` has a gap: item at 0x{item_addr:x} but cursor was at 0x{cursor:x}"
     )]
     SectionGap {
@@ -351,13 +362,30 @@ fn lower_stmts_into(
         match stmt {
             Stmt::Asm { text, bytes } => {
                 if bytes.is_empty() {
-                    return Err(LowerError::MissingBytes {
+                    // Bytes were dropped at decompile time because
+                    // the canonical text re-assembles to them
+                    // exactly. Re-encode now via the in-crate
+                    // x86 assembler. The IP we feed it is the
+                    // statement's cursor position so RIP-relative
+                    // forms resolve correctly once we cover them.
+                    let ip = base_addr
+                        .map(|a| a.saturating_add(out.len() as u64))
+                        .unwrap_or(0);
+                    let encoded = ud_arch_x86::assemble_intel(
+                        ud_arch_x86::Bitness::Bits64,
+                        text,
+                        ip,
+                    )
+                    .map_err(|e| LowerError::AsmAssembleFailed {
                         fn_name: fn_name.to_string(),
                         stmt_index: i,
                         text: text.clone(),
-                    });
+                        message: e.to_string(),
+                    })?;
+                    out.extend_from_slice(&encoded);
+                } else {
+                    out.extend_from_slice(bytes);
                 }
-                out.extend_from_slice(bytes);
             }
             Stmt::Switch {
                 selector,
@@ -911,7 +939,11 @@ mod tests {
     }
 
     #[test]
-    fn lower_function_without_bytes_errors() {
+    fn lower_function_reassembles_bytesless_asm() {
+        // `@asm("ret")` without a pinned byte list now re-encodes
+        // via the in-crate x86 assembler at lower time. `ret`
+        // is a zero-operand mnemonic the assembler covers, so
+        // the rebuilt function emits `0xc3`.
         let f = FnDecl {
             addr: Some(0x1000),
             name: "f".into(),
@@ -920,18 +952,27 @@ mod tests {
             signature: None,
             body: vec![Stmt::asm_text("ret")],
         };
-        let err = lower_function_bytes(&f).unwrap_err();
-        let LowerError::MissingBytes {
-            fn_name,
-            stmt_index,
-            text,
-        } = err
-        else {
-            panic!("expected MissingBytes")
+        assert_eq!(lower_function_bytes(&f).unwrap(), vec![0xc3]);
+    }
+
+    #[test]
+    fn lower_function_errors_on_unassemblable_bytesless_asm() {
+        // A mnemonic the assembler doesn't yet support and no
+        // pinned bytes is a hard error — otherwise the lower
+        // would silently produce a zero-byte stand-in.
+        let f = FnDecl {
+            addr: Some(0x1000),
+            name: "f".into(),
+            attrs: Vec::new(),
+            locals: Vec::new(),
+            signature: None,
+            body: vec![Stmt::asm_text("completely-fake-insn")],
         };
-        assert_eq!(fn_name, "f");
-        assert_eq!(stmt_index, 0);
-        assert_eq!(text, "ret");
+        let err = lower_function_bytes(&f).unwrap_err();
+        assert!(
+            matches!(err, LowerError::AsmAssembleFailed { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]

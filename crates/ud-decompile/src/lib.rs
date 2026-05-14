@@ -149,7 +149,76 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
     let tables = collect_switch_tables(&items);
     replace_raw_with_jump_tables(&mut items, &tables);
 
+    // Drop the byte list from every `@asm("text", [bytes])`
+    // statement whose text re-assembles to those exact bytes —
+    // we can regenerate them at lower time from the text alone.
+    // This shrinks the .ud source toward "minimal bytes": only
+    // forms the assembler doesn't yet cover keep their pinned
+    // bytes.
+    let bitness = match arch {
+        Arch::X86 { bitness } => Some(bitness),
+        _ => None,
+    };
+    if let Some(bitness) = bitness {
+        drop_regenerable_asm_bytes(&mut items, bitness);
+    }
+
     Ok(UdFile { module, items })
+}
+
+/// Walk every `Stmt::Asm` in the AST. For each, try to encode
+/// `text` via the in-crate x86 assembler at IP 0; if it
+/// succeeds and the encoded bytes equal the pinned `bytes`,
+/// clear the byte list — lower will re-assemble at the real
+/// position.
+///
+/// `assemble_intel` only covers forms whose encoding is
+/// position-independent today (zero-operand mnemonics and
+/// GPR-register operands), so the IP we pass doesn't influence
+/// the test. Once RIP-relative forms join the supported set,
+/// the position-independence check will need to verify the
+/// same bytes also encode at a non-zero IP before we drop.
+fn drop_regenerable_asm_bytes(items: &mut [Item], bitness: ud_arch_x86::Bitness) {
+    fn visit_stmts(stmts: &mut [ud_ast::Stmt], bitness: ud_arch_x86::Bitness) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                ud_ast::Stmt::Asm { text, bytes } => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if let Ok(encoded) = ud_arch_x86::assemble_intel(bitness, text, 0) {
+                        if encoded == *bytes {
+                            bytes.clear();
+                        }
+                    }
+                }
+                ud_ast::Stmt::IfBranch {
+                    pre_body,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    visit_stmts(pre_body, bitness);
+                    visit_stmts(then_body, bitness);
+                    if let Some(eb) = else_body {
+                        visit_stmts(eb, bitness);
+                    }
+                }
+                ud_ast::Stmt::Loop { body, .. } => visit_stmts(body, bitness),
+                _ => {}
+            }
+        }
+    }
+    fn visit_items(items: &mut [Item], bitness: ud_arch_x86::Bitness) {
+        for item in items.iter_mut() {
+            match item {
+                Item::Function(f) => visit_stmts(&mut f.body, bitness),
+                Item::Section { items, .. } => visit_items(items, bitness),
+                _ => {}
+            }
+        }
+    }
+    visit_items(items, bitness);
 }
 
 /// One switch-dispatch table harvested from a `Stmt::Switch`.
