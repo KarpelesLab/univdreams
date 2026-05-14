@@ -83,6 +83,26 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+
+    /// Run a binary inside the bounded i386 emulator and report
+    /// what it does — Win32 calls, code coverage, traps. Treats
+    /// the input as untrusted (it's the whole point of a
+    /// sandboxed run) but inspects the structured execution
+    /// trace, not the raw output. Today supports PE32 DLLs;
+    /// the run drives `DllMain(PROCESS_ATTACH)` and reports
+    /// every Win32 API the codec touched plus a coverage
+    /// summary.
+    Analyze {
+        /// PE32 DLL (or DLL-shaped binary) to analyse.
+        input: PathBuf,
+
+        /// Cap the run at this many guest instructions.
+        /// `DllMain` of a CRT-driven codec usually fits in a
+        /// few million; the cap is just a safety net for
+        /// adversarial samples that loop.
+        #[arg(long, default_value_t = 5_000_000)]
+        max_instructions: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -269,6 +289,84 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 bytes.len(),
                 format,
             );
+            Ok(())
+        }
+        Command::Analyze {
+            input,
+            max_instructions: _max_instructions,
+        } => {
+            let bytes =
+                std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
+            if !ud_format_pe::is_pe(&bytes) {
+                anyhow::bail!(
+                    "ud analyze currently only supports PE32 DLLs; {} is not a PE",
+                    input.display()
+                );
+            }
+            let stem = input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("input");
+
+            let mut sandbox = ud_emulator::Sandbox::new();
+            sandbox.host.trace_stubs = true;
+
+            let image = sandbox
+                .load(stem, &bytes)
+                .with_context(|| format!("load {} into sandbox", input.display()))?;
+
+            println!("loaded: {} (image_base 0x{:x}, entry 0x{:x})",
+                input.display(), image.image_base, image.entry_point);
+
+            let dll_main_result = sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH);
+
+            // Trace lines come back as `dll!name → 0xRET` strings.
+            let trace: Vec<String> = std::mem::take(&mut sandbox.host.stub_trace);
+            println!();
+            println!("Win32 calls observed: {}", trace.len());
+            let mut by_func: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for line in &trace {
+                let key = line.split(" → ").next().unwrap_or(line).to_string();
+                *by_func.entry(key).or_default() += 1;
+            }
+            for (func, count) in &by_func {
+                println!("  {count:5}× {func}");
+            }
+
+            let cov = sandbox.coverage();
+            let ranges = cov.executed_ranges();
+            let writes = cov.written_addresses().count();
+            let smc: Vec<u32> = cov.self_modifying_addresses().collect();
+            println!();
+            println!("Coverage:");
+            println!("  {} distinct EIP addresses executed", cov.executed_count());
+            println!("  {} executed address ranges (contiguous spans)", ranges.len());
+            println!("  {} guest bytes written", writes);
+            println!(
+                "  {} bytes were both written and executed (self-modifying / unpacker)",
+                smc.len()
+            );
+            if !smc.is_empty() {
+                let preview: Vec<String> = smc
+                    .iter()
+                    .take(8)
+                    .map(|a| format!("0x{a:x}"))
+                    .collect();
+                println!("    first few: {}", preview.join(", "));
+            }
+
+            match dll_main_result {
+                Ok(ret) => {
+                    println!();
+                    println!("DllMain(DLL_PROCESS_ATTACH) returned 0x{ret:x}");
+                }
+                Err(e) => {
+                    println!();
+                    println!("DllMain trapped: {e}");
+                }
+            }
+
             Ok(())
         }
     }
