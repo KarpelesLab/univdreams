@@ -416,6 +416,11 @@ impl Cpu {
         {
             mmu.trace.set_eip(entry_eip);
         }
+        // Always-on coverage probe. Records the first byte
+        // of every dispatched instruction so the decompile
+        // pipeline can spot unaligned text and
+        // write-then-execute regions.
+        mmu.coverage.record_exec(entry_eip, 1);
         // Trace-exec sub-feature: emit a per-instruction event
         // when the runtime has flipped exec-trace on.
         #[cfg(feature = "trace-exec")]

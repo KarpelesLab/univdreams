@@ -99,6 +99,13 @@ pub struct Mmu {
     /// `docs/winmf/winmf-emulator.md` §"Trace mode".
     #[cfg(feature = "trace")]
     pub trace: crate::trace::TraceState,
+    /// Execution + write coverage map. Always on; the
+    /// interpreter records every dispatched EIP and every
+    /// guest memory write here. Decompiler-side analysis
+    /// reads this to detect unaligned code, packers, and
+    /// self-modifying regions. See
+    /// [`crate::coverage::CoverageMap`] for the contract.
+    pub coverage: crate::coverage::CoverageMap,
 }
 
 impl Default for Mmu {
@@ -118,6 +125,7 @@ impl Mmu {
             pages,
             #[cfg(feature = "trace")]
             trace: crate::trace::TraceState::new(),
+            coverage: crate::coverage::CoverageMap::default(),
         }
     }
 
@@ -347,6 +355,7 @@ impl Mmu {
     /// Store a byte. Requires `W` permission.
     pub fn store8(&mut self, addr: u32, value: u8) -> Result<(), Trap> {
         self.put_byte(addr, value)?;
+        self.coverage.record_write(addr, 1);
         #[cfg(feature = "trace")]
         self.maybe_emit_write(addr, 1, u64::from(value));
         Ok(())
@@ -357,6 +366,7 @@ impl Mmu {
         let bytes = value.to_le_bytes();
         self.put_byte(addr, bytes[0])?;
         self.put_byte(addr.wrapping_add(1), bytes[1])?;
+        self.coverage.record_write(addr, 2);
         #[cfg(feature = "trace")]
         self.maybe_emit_write(addr, 2, u64::from(value));
         Ok(())
@@ -369,6 +379,7 @@ impl Mmu {
         self.put_byte(addr.wrapping_add(1), bytes[1])?;
         self.put_byte(addr.wrapping_add(2), bytes[2])?;
         self.put_byte(addr.wrapping_add(3), bytes[3])?;
+        self.coverage.record_write(addr, 4);
         #[cfg(feature = "trace")]
         self.maybe_emit_write(addr, 4, u64::from(value));
         Ok(())
@@ -379,6 +390,7 @@ impl Mmu {
         // Bypass per-half trace events to keep one event per call.
         self.store32_untraced(addr, value as u32)?;
         self.store32_untraced(addr.wrapping_add(4), (value >> 32) as u32)?;
+        self.coverage.record_write(addr, 8);
         #[cfg(feature = "trace")]
         self.maybe_emit_write(addr, 8, value);
         Ok(())

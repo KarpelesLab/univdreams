@@ -200,6 +200,7 @@
 #![allow(clippy::all)]
 
 pub mod com;
+pub mod coverage;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 pub mod emulator;
@@ -208,6 +209,8 @@ pub mod runtime;
 #[cfg(feature = "trace")]
 pub mod trace;
 pub mod win32;
+
+pub use coverage::CoverageMap;
 
 pub use com::{
     Guid, GuidParseError, CLSID_MEMORY_ALLOCATOR, IID_IBASEFILTER, IID_ICLASSFACTORY,

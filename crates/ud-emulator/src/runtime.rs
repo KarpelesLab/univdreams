@@ -67,6 +67,23 @@ impl Default for Sandbox {
 }
 
 impl Sandbox {
+    /// Borrow the always-on coverage map populated by the
+    /// interpreter. Records every dispatched instruction's
+    /// entry EIP plus every guest memory write. See
+    /// [`crate::coverage::CoverageMap`] for the consumer
+    /// surface.
+    #[must_use]
+    pub fn coverage(&self) -> &crate::coverage::CoverageMap {
+        &self.mmu.coverage
+    }
+
+    /// Mutable accessor for the coverage map — useful for
+    /// per-export resets (`coverage_mut().clear()`) between
+    /// runs of the same sandbox.
+    pub fn coverage_mut(&mut self) -> &mut crate::coverage::CoverageMap {
+        &mut self.mmu.coverage
+    }
+
     /// Create a fresh sandbox with the heap arena and stack
     /// pre-mapped, the kernel32 stub set registered, and the
     /// CPU's `esp` pointing at a freshly-allocated stack.
