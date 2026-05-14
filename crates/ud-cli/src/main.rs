@@ -352,24 +352,18 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
     };
 
     let dll_main_result = sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH);
-    let trace: Vec<String> = std::mem::take(&mut sandbox.host.stub_trace);
+    let stub_calls = std::mem::take(&mut sandbox.host.stub_calls);
+    let _: Vec<String> = std::mem::take(&mut sandbox.host.stub_trace);
     let instructions_executed = sandbox.host.instructions_executed;
 
-    let win32_calls: Vec<Win32Call> = trace
-        .iter()
-        .filter_map(|line| {
-            // Format: `dll!name → 0xRET`
-            let (lhs, ret) = line.rsplit_once(" → ")?;
-            let (dll, name) = lhs.split_once('!')?;
-            let ret_u32 = ret
-                .strip_prefix("0x")
-                .and_then(|h| u32::from_str_radix(h, 16).ok())
-                .unwrap_or(0);
-            Some(Win32Call {
-                dll: dll.to_string(),
-                name: name.to_string(),
-                return_value: ret_u32,
-            })
+    let win32_calls: Vec<Win32Call> = stub_calls
+        .into_iter()
+        .map(|c| Win32Call {
+            dll: c.dll,
+            name: c.name,
+            args: c.args,
+            return_value: c.ret,
+            call_site_eip: c.call_site_eip,
         })
         .collect();
 
@@ -505,7 +499,9 @@ enum DllMainOutcome {
 struct Win32Call {
     dll: String,
     name: String,
+    args: Vec<u32>,
     return_value: u32,
+    call_site_eip: u32,
 }
 
 #[derive(serde::Serialize)]

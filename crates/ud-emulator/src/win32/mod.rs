@@ -54,6 +54,28 @@ const THUNK_STRIDE: u32 = 16;
 /// before returning to the IAT caller).
 pub type StubFn = fn(&mut Cpu, &mut Mmu, &mut HostState, &Registry) -> Result<u32, Win32Error>;
 
+/// One stub call recorded for analysis. Populated whenever
+/// [`HostState::trace_stubs`] is set; the [`HostState::stub_calls`]
+/// vector accumulates these in call order.
+#[derive(Clone, Debug)]
+pub struct StubCall {
+    /// The DLL the call targeted (`"kernel32.dll"`, …).
+    pub dll: String,
+    /// The function name (`"CreateFileA"`, …).
+    pub name: String,
+    /// Dword arguments captured off the guest stack at call
+    /// entry, before the stub ran. Length is the stdcall
+    /// `arg_dwords` count, or a per-call override for known
+    /// cdecl shapes.
+    pub args: Vec<u32>,
+    /// Whatever `eax` value the stub returned.
+    pub ret: u32,
+    /// Call-site EIP — the saved return address on the guest
+    /// stack at call entry, i.e. the instruction the codec
+    /// will resume at when the stub returns.
+    pub call_site_eip: u32,
+}
+
 /// Information stored alongside each stub.
 #[derive(Clone)]
 pub struct StubEntry {
@@ -224,7 +246,16 @@ pub struct HostState {
     /// it on while triaging which stub returns a bad value.
     pub trace_stubs: bool,
     /// Per-call trace lines populated when [`trace_stubs`] is on.
+    /// Format: `dll!name(arg0, arg1, …) → 0xRET`. The args are
+    /// the first `arg_dwords` (or, for known cdecl shapes, the
+    /// override from [`cdecl_trace_arg_count`]) dwords off the
+    /// guest stack, captured BEFORE the stub mutates them.
     pub stub_trace: Vec<String>,
+    /// Structured per-call log, populated when [`trace_stubs`]
+    /// is on. Parallel to [`stub_trace`]; analysis front-ends
+    /// (the `ud analyze` JSON output) consume this directly so
+    /// they don't have to re-parse the formatted string.
+    pub stub_calls: Vec<StubCall>,
     /// Set of `DriverProc` VAs that have already received the
     /// one-time `DRV_LOAD` + `DRV_ENABLE` initialisation pair.
     /// Round 11 — without this, `IR50_32.DLL`'s `DRV_LOAD` handler
@@ -307,6 +338,7 @@ impl HostState {
             next_hwnd_index: 0,
             trace_stubs: false,
             stub_trace: Vec::new(),
+            stub_calls: Vec::new(),
             loaded_drivers: std::collections::BTreeSet::new(),
             module_resource_dirs: BTreeMap::new(),
             com: crate::com::ComObjectTable::new(),
@@ -700,22 +732,27 @@ pub fn dispatch_stub(
             name: format!("@{:#010x}", addr),
         })?
         .clone();
-    // Trace probe (gated): capture the call-site EIP (= the
-    // saved return address pushed by the guest CALL — the
-    // instruction right after the CALL, not the thunk address)
-    // and the first few args off the guest stack BEFORE running
-    // the stub, since the stub mutates the stack.
+    // Snapshot the call-site EIP (= the saved return address
+    // pushed by the guest CALL — the instruction right after
+    // the CALL, not the thunk address) and the first few args
+    // off the guest stack BEFORE running the stub, since the
+    // stub mutates the stack.
     //
     // Argument count: `entry.arg_dwords` carries the stdcall
-    // count (the value used to pop the stack on return).
-    // For cdecl stubs this is 0 — but for known cdecl shapes
+    // count (the value used to pop the stack on return). For
+    // cdecl stubs this is 0 — but for known cdecl shapes
     // (msvcrt heap entries) [`cdecl_trace_arg_count`] supplies a
-    // per-call override so trace events surface the size /
-    // pointer args rather than `args:[]`. See
-    // `docs/video/msmpeg4/audit/06-sandbox-O3-quant-init.md`
-    // §5.2.3 for the auditor requirement.
+    // per-call override so the trace surfaces the size / pointer
+    // args rather than `args:[]`.
+    //
+    // The snapshot is always-on when `state.trace_stubs` is set
+    // (the structured `stub_calls` vector consumes it) and is
+    // additionally emitted as a JSONL event under the `trace`
+    // feature flag.
+    let capture_args = state.trace_stubs;
     #[cfg(feature = "trace")]
-    let trace_args: Option<(u32, Vec<u32>)> = if mmu.trace.has_sink() {
+    let capture_args = capture_args || mmu.trace.has_sink();
+    let snapshot: Option<(u32, Vec<u32>)> = if capture_args {
         let call_site_eip = mmu.load32(cpu.regs.esp()).unwrap_or(0);
         let n_args = cdecl_trace_arg_count(&entry.dll, &entry.name).unwrap_or(entry.arg_dwords);
         let mut args = Vec::with_capacity(n_args as usize);
@@ -730,15 +767,28 @@ pub fn dispatch_stub(
     // Run the host-side stub.
     let ret = (entry.func)(cpu, mmu, state, registry)?;
     if state.trace_stubs {
+        let (call_site_eip, args) = snapshot.clone().unwrap_or((0, Vec::new()));
+        let args_str = args
+            .iter()
+            .map(|a| format!("{a:#010x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         state
             .stub_trace
-            .push(format!("{}!{} → {:#010x}", entry.dll, entry.name, ret));
+            .push(format!("{}!{}({args_str}) → {:#010x}", entry.dll, entry.name, ret));
+        state.stub_calls.push(StubCall {
+            dll: entry.dll.clone(),
+            name: entry.name.clone(),
+            args,
+            ret,
+            call_site_eip,
+        });
     }
     // Emit the trace event with the captured args + the actual
     // return value. Done before stack unwind so the EIP we log
     // is the call site, not the post-return PC.
     #[cfg(feature = "trace")]
-    if let Some((call_site_eip, args)) = trace_args {
+    if let Some((call_site_eip, args)) = snapshot {
         mmu.trace
             .ev_win32_call(&entry.dll, &entry.name, &args, ret, call_site_eip);
     }
