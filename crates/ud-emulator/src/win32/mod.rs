@@ -80,6 +80,13 @@ pub enum Win32Error {
     InvalidArgument { stub: &'static str, reason: String },
     /// Heap call referenced an unknown allocation.
     InvalidHeapBlock { stub: &'static str, addr: u32 },
+    /// The per-run instruction budget set on
+    /// [`HostState::instruction_budget`] was exhausted before
+    /// the guest reached `RET_SENTINEL`. Analysis front-ends
+    /// use this to cap adversarial samples that loop. The
+    /// state captured up to the budget point — coverage
+    /// map, stub trace, register snapshot — is still valid.
+    BudgetExhausted { executed: u64 },
 }
 
 impl core::fmt::Display for Win32Error {
@@ -93,6 +100,12 @@ impl core::fmt::Display for Win32Error {
             }
             Win32Error::InvalidHeapBlock { stub, addr } => {
                 write!(f, "{stub}: unknown heap allocation {addr:#010x}")
+            }
+            Win32Error::BudgetExhausted { executed } => {
+                write!(
+                    f,
+                    "instruction budget exhausted after {executed} steps without reaching RET_SENTINEL"
+                )
             }
         }
     }
@@ -166,6 +179,19 @@ pub struct HostState {
     /// run-loop converts this into a clean return so the calling
     /// host code can introspect what happened.
     pub exit_requested: Option<u32>,
+    /// Optional per-run instruction budget. Decremented at each
+    /// top-of-loop iteration in [`run_until_sentinel`] (both
+    /// instruction steps and stub dispatches count). When it
+    /// hits zero the run loop bails with
+    /// [`crate::Error::BudgetExhausted`] so adversarial guests
+    /// can't loop the host. `None` (the default) keeps the
+    /// historical unbounded behaviour.
+    pub instruction_budget: Option<u64>,
+    /// Counts how many instructions actually ran in the last
+    /// (or current) run-loop session. Useful for the analysis
+    /// front-ends to report "ran for N instructions, budget
+    /// was M". Reset to zero on each top-level run entry.
+    pub instructions_executed: u64,
     /// Read-only constant-data arena. Used by stubs like
     /// `GetCommandLineA` / `GetEnvironmentStrings` that need to
     /// hand out stable guest pointers to canned strings. The
@@ -270,6 +296,8 @@ impl HostState {
             next_hic: 1,
             default_driver_proc: 0,
             exit_requested: None,
+            instruction_budget: None,
+            instructions_executed: 0,
             const_arena_cursor: 0,
             const_arena_end: 0,
             command_line_ptr: 0,
@@ -741,6 +769,10 @@ pub fn run_until_sentinel(
     state: &mut HostState,
 ) -> Result<(), crate::Error> {
     use crate::emulator::isa_int::{StepOk, RET_SENTINEL};
+    // Reset the per-run instruction counter so analysis
+    // front-ends can ask "how many did this top-level call
+    // burn?" without subtracting from a stale snapshot.
+    state.instructions_executed = 0;
     loop {
         if state.exit_requested.is_some() {
             // `kernel32!ExitProcess` was called. Force eip to
@@ -752,6 +784,21 @@ pub fn run_until_sentinel(
         if cpu.regs.eip == RET_SENTINEL {
             return Ok(());
         }
+        // Optional instruction budget — both instruction steps
+        // and stub dispatches are counted as one "step" each,
+        // since either is a unit of progress the host attributed
+        // to the guest. When the budget hits zero, bail with a
+        // clean `BudgetExhausted` so adversarial samples can't
+        // loop the analyser host.
+        if let Some(remaining) = state.instruction_budget.as_mut() {
+            if *remaining == 0 {
+                return Err(crate::Error::Win32(Win32Error::BudgetExhausted {
+                    executed: state.instructions_executed,
+                }));
+            }
+            *remaining -= 1;
+        }
+        state.instructions_executed = state.instructions_executed.saturating_add(1);
         if registry.is_thunk(cpu.regs.eip) {
             match dispatch_stub(cpu, mmu, registry, state) {
                 Ok(()) => continue,

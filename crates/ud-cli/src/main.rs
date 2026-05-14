@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
@@ -102,6 +102,12 @@ enum Command {
         /// adversarial samples that loop.
         #[arg(long, default_value_t = 5_000_000)]
         max_instructions: u64,
+
+        /// Emit a JSON report on stdout instead of the
+        /// human-readable summary. Suitable for piping into
+        /// downstream analysis tooling.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -293,83 +299,228 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Analyze {
             input,
-            max_instructions: _max_instructions,
-        } => {
-            let bytes =
-                std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
-            if !ud_format_pe::is_pe(&bytes) {
-                anyhow::bail!(
-                    "ud analyze currently only supports PE32 DLLs; {} is not a PE",
-                    input.display()
-                );
+            max_instructions,
+            json,
+        } => analyze(&input, max_instructions, json),
+    }
+}
+
+fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result<()> {
+    let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    if !ud_format_pe::is_pe(&bytes) {
+        anyhow::bail!(
+            "ud analyze currently only supports PE32 DLLs; {} is not a PE",
+            input.display()
+        );
+    }
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("input");
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.trace_stubs = true;
+    sandbox.host.instruction_budget = Some(max_instructions);
+
+    let load_result = sandbox.load(stem, &bytes);
+    let image = match load_result {
+        Ok(img) => img,
+        Err(e) => {
+            // Surface load failures cleanly in both text and
+            // JSON shapes — the front-end consumer cares
+            // whether the load even got off the ground.
+            if as_json {
+                let report = AnalyzeReport {
+                    input: input.display().to_string(),
+                    image_base: 0,
+                    entry_point: 0,
+                    dll_main: DllMainOutcome::LoadFailed {
+                        message: e.to_string(),
+                    },
+                    win32_calls: Vec::new(),
+                    win32_calls_by_function: Vec::new(),
+                    coverage: CoverageSummary::default(),
+                    instructions_executed: 0,
+                    instruction_budget: max_instructions,
+                };
+                let s = serde_json::to_string_pretty(&report)?;
+                println!("{s}");
+                return Ok(());
             }
-            let stem = input
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("input");
+            anyhow::bail!("load {}: {}", input.display(), e);
+        }
+    };
 
-            let mut sandbox = ud_emulator::Sandbox::new();
-            sandbox.host.trace_stubs = true;
+    let dll_main_result = sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH);
+    let trace: Vec<String> = std::mem::take(&mut sandbox.host.stub_trace);
+    let instructions_executed = sandbox.host.instructions_executed;
 
-            let image = sandbox
-                .load(stem, &bytes)
-                .with_context(|| format!("load {} into sandbox", input.display()))?;
+    let win32_calls: Vec<Win32Call> = trace
+        .iter()
+        .filter_map(|line| {
+            // Format: `dll!name → 0xRET`
+            let (lhs, ret) = line.rsplit_once(" → ")?;
+            let (dll, name) = lhs.split_once('!')?;
+            let ret_u32 = ret
+                .strip_prefix("0x")
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .unwrap_or(0);
+            Some(Win32Call {
+                dll: dll.to_string(),
+                name: name.to_string(),
+                return_value: ret_u32,
+            })
+        })
+        .collect();
 
-            println!("loaded: {} (image_base 0x{:x}, entry 0x{:x})",
-                input.display(), image.image_base, image.entry_point);
+    let mut by_func: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for c in &win32_calls {
+        *by_func.entry(format!("{}!{}", c.dll, c.name)).or_default() += 1;
+    }
+    let win32_calls_by_function: Vec<Win32CallCount> = by_func
+        .into_iter()
+        .map(|(function, count)| Win32CallCount { function, count })
+        .collect();
 
-            let dll_main_result = sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH);
+    let cov = sandbox.coverage();
+    let ranges = cov.executed_ranges();
+    let writes = cov.written_addresses().count();
+    let smc: Vec<u32> = cov.self_modifying_addresses().collect();
+    let coverage = CoverageSummary {
+        executed_addresses: cov.executed_count(),
+        executed_ranges: ranges.len(),
+        bytes_written: writes,
+        self_modifying_bytes: smc.len(),
+        self_modifying_sample: smc.iter().take(8).copied().collect(),
+    };
 
-            // Trace lines come back as `dll!name → 0xRET` strings.
-            let trace: Vec<String> = std::mem::take(&mut sandbox.host.stub_trace);
-            println!();
-            println!("Win32 calls observed: {}", trace.len());
-            let mut by_func: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
-            for line in &trace {
-                let key = line.split(" → ").next().unwrap_or(line).to_string();
-                *by_func.entry(key).or_default() += 1;
+    let dll_main = match &dll_main_result {
+        Ok(ret) => DllMainOutcome::Returned { value: *ret },
+        Err(e) => DllMainOutcome::Trapped {
+            message: e.to_string(),
+        },
+    };
+
+    let report = AnalyzeReport {
+        input: input.display().to_string(),
+        image_base: image.image_base,
+        entry_point: image.entry_point,
+        dll_main,
+        win32_calls,
+        win32_calls_by_function,
+        coverage,
+        instructions_executed,
+        instruction_budget: max_instructions,
+    };
+
+    if as_json {
+        let s = serde_json::to_string_pretty(&report)?;
+        println!("{s}");
+    } else {
+        report.write_text(input);
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct AnalyzeReport {
+    input: String,
+    image_base: u32,
+    entry_point: u32,
+    dll_main: DllMainOutcome,
+    win32_calls: Vec<Win32Call>,
+    win32_calls_by_function: Vec<Win32CallCount>,
+    coverage: CoverageSummary,
+    instructions_executed: u64,
+    instruction_budget: u64,
+}
+
+impl AnalyzeReport {
+    fn write_text(&self, input: &Path) {
+        println!(
+            "loaded: {} (image_base 0x{:x}, entry 0x{:x})",
+            input.display(),
+            self.image_base,
+            self.entry_point
+        );
+        println!();
+        println!("Win32 calls observed: {}", self.win32_calls.len());
+        for c in &self.win32_calls_by_function {
+            println!("  {:5}× {}", c.count, c.function);
+        }
+        println!();
+        println!("Coverage:");
+        println!(
+            "  {} distinct EIP addresses executed",
+            self.coverage.executed_addresses
+        );
+        println!(
+            "  {} executed address ranges (contiguous spans)",
+            self.coverage.executed_ranges
+        );
+        println!("  {} guest bytes written", self.coverage.bytes_written);
+        println!(
+            "  {} bytes were both written and executed (self-modifying / unpacker)",
+            self.coverage.self_modifying_bytes
+        );
+        if !self.coverage.self_modifying_sample.is_empty() {
+            let preview: Vec<String> = self
+                .coverage
+                .self_modifying_sample
+                .iter()
+                .map(|a| format!("0x{a:x}"))
+                .collect();
+            println!("    first few: {}", preview.join(", "));
+        }
+        println!();
+        println!(
+            "Instructions executed: {} of {}",
+            self.instructions_executed, self.instruction_budget
+        );
+        println!();
+        match &self.dll_main {
+            DllMainOutcome::Returned { value } => {
+                println!("DllMain(DLL_PROCESS_ATTACH) returned 0x{value:x}");
             }
-            for (func, count) in &by_func {
-                println!("  {count:5}× {func}");
+            DllMainOutcome::Trapped { message } => {
+                println!("DllMain trapped: {message}");
             }
-
-            let cov = sandbox.coverage();
-            let ranges = cov.executed_ranges();
-            let writes = cov.written_addresses().count();
-            let smc: Vec<u32> = cov.self_modifying_addresses().collect();
-            println!();
-            println!("Coverage:");
-            println!("  {} distinct EIP addresses executed", cov.executed_count());
-            println!("  {} executed address ranges (contiguous spans)", ranges.len());
-            println!("  {} guest bytes written", writes);
-            println!(
-                "  {} bytes were both written and executed (self-modifying / unpacker)",
-                smc.len()
-            );
-            if !smc.is_empty() {
-                let preview: Vec<String> = smc
-                    .iter()
-                    .take(8)
-                    .map(|a| format!("0x{a:x}"))
-                    .collect();
-                println!("    first few: {}", preview.join(", "));
+            DllMainOutcome::LoadFailed { message } => {
+                println!("load failed: {message}");
             }
-
-            match dll_main_result {
-                Ok(ret) => {
-                    println!();
-                    println!("DllMain(DLL_PROCESS_ATTACH) returned 0x{ret:x}");
-                }
-                Err(e) => {
-                    println!();
-                    println!("DllMain trapped: {e}");
-                }
-            }
-
-            Ok(())
         }
     }
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum DllMainOutcome {
+    Returned { value: u32 },
+    Trapped { message: String },
+    LoadFailed { message: String },
+}
+
+#[derive(serde::Serialize)]
+struct Win32Call {
+    dll: String,
+    name: String,
+    return_value: u32,
+}
+
+#[derive(serde::Serialize)]
+struct Win32CallCount {
+    function: String,
+    count: usize,
+}
+
+#[derive(serde::Serialize, Default)]
+struct CoverageSummary {
+    executed_addresses: usize,
+    executed_ranges: usize,
+    bytes_written: usize,
+    self_modifying_bytes: usize,
+    self_modifying_sample: Vec<u32>,
 }
 
 fn format_warning(w: &ud_compile::AsmWarning) -> String {
