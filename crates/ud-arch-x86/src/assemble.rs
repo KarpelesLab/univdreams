@@ -144,35 +144,100 @@ fn split_operands(s: &str) -> Vec<&str> {
 fn parse_single_operand(
     mnemonic: &str,
     operand: &str,
-    _bitness: Bitness,
+    bitness: Bitness,
     text: &str,
 ) -> Result<Instruction, AssembleError> {
-    let reg = match parse_register(operand) {
-        Some(r) => r,
-        None => {
-            return Err(AssembleError::Unsupported {
-                form: text.to_string(),
-            });
+    // Register operand?
+    if let Some(reg) = parse_register(operand) {
+        let code = match mnemonic {
+            "push" => match register_width(reg) {
+                Some(64) => Code::Push_r64,
+                Some(32) => Code::Push_r32,
+                Some(16) => Code::Push_r16,
+                _ => return unsupported(text),
+            },
+            "pop" => match register_width(reg) {
+                Some(64) => Code::Pop_r64,
+                Some(32) => Code::Pop_r32,
+                Some(16) => Code::Pop_r16,
+                _ => return unsupported(text),
+            },
+            "call" => match (bitness, register_width(reg)) {
+                (Bitness::Bits64, Some(64)) => Code::Call_rm64,
+                (Bitness::Bits32 | Bitness::Bits16, Some(32)) => Code::Call_rm32,
+                _ => return unsupported(text),
+            },
+            "jmp" => match (bitness, register_width(reg)) {
+                (Bitness::Bits64, Some(64)) => Code::Jmp_rm64,
+                (Bitness::Bits32 | Bitness::Bits16, Some(32)) => Code::Jmp_rm32,
+                _ => return unsupported(text),
+            },
+            _ => return unsupported(text),
+        };
+        return Instruction::with1(code, reg).map_err(|e| AssembleError::EncodeFailed {
+            message: format!("{e:?}"),
+        });
+    }
+
+    // Immediate operand?
+    if let Some(imm) = parse_immediate(operand) {
+        match mnemonic {
+            "push" => {
+                // Pick the shorter encoding when the immediate
+                // fits sign-extended in 8 bits. iced's decoder
+                // prefers the imm8 form when the source bytes
+                // pick it, so we have to match that choice on
+                // re-encode for the round-trip to hold.
+                let (code, value): (Code, i64) = if (-128..=127).contains(&imm) {
+                    (Code::Pushq_imm8, imm)
+                } else {
+                    (Code::Pushq_imm32, imm)
+                };
+                return Instruction::with1::<i32>(code, value as i32).map_err(|e| {
+                    AssembleError::EncodeFailed {
+                        message: format!("{e:?}"),
+                    }
+                });
+            }
+            _ => return unsupported(text),
         }
-    };
-    let code = match mnemonic {
-        "push" => match register_width(reg) {
-            Some(64) => Code::Push_r64,
-            Some(32) => Code::Push_r32,
-            Some(16) => Code::Push_r16,
+    }
+
+    // Memory operand?
+    if let Some(mem) = parse_memory(operand) {
+        let code = match mnemonic {
+            "call" => match (bitness, mem.size_hint) {
+                (Bitness::Bits64, Some(MemSize::Qword)) => Code::Call_rm64,
+                (Bitness::Bits32 | Bitness::Bits16, Some(MemSize::Dword)) => Code::Call_rm32,
+                _ => return unsupported(text),
+            },
+            "jmp" => match (bitness, mem.size_hint) {
+                (Bitness::Bits64, Some(MemSize::Qword)) => Code::Jmp_rm64,
+                (Bitness::Bits32 | Bitness::Bits16, Some(MemSize::Dword)) => Code::Jmp_rm32,
+                _ => return unsupported(text),
+            },
+            "nop" => match mem.size_hint {
+                // The Intel formatter omits the size prefix for
+                // `nop [mem]`. Decoded bytes `0F 1F /0` are
+                // `Nop_rm32` (default 32-bit operand size in
+                // 64-bit mode — no REX.W). Same opcode + REX.W
+                // would be `Nop_rm64` but the decoder spells
+                // that "nop qword ptr [mem]", which we don't
+                // see in our output.
+                Some(MemSize::None) => Code::Nop_rm32,
+                _ => return unsupported(text),
+            },
             _ => return unsupported(text),
-        },
-        "pop" => match register_width(reg) {
-            Some(64) => Code::Pop_r64,
-            Some(32) => Code::Pop_r32,
-            Some(16) => Code::Pop_r16,
-            _ => return unsupported(text),
-        },
-        _ => return unsupported(text),
-    };
-    Instruction::with1(code, reg).map_err(|e| AssembleError::EncodeFailed {
-        message: format!("{e:?}"),
-    })
+        };
+        let mem_op = build_memory_operand(&mem)?;
+        return Instruction::with1::<iced_x86::MemoryOperand>(code, mem_op).map_err(|e| {
+            AssembleError::EncodeFailed {
+                message: format!("{e:?}"),
+            }
+        });
+    }
+
+    unsupported(text)
 }
 
 fn parse_two_operand(
@@ -220,6 +285,153 @@ fn unsupported(text: &str) -> Result<Instruction, AssembleError> {
     Err(AssembleError::Unsupported {
         form: text.to_string(),
     })
+}
+
+/// Parse a hex (`0x…`) or decimal immediate. Returns `None` for
+/// anything else (register names, brackets, etc.); the caller
+/// falls through to other operand kinds.
+fn parse_immediate(s: &str) -> Option<i64> {
+    let neg = s.starts_with('-');
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let v: i64 = if let Some(rest) = body.strip_prefix("0x") {
+        i64::from_str_radix(rest, 16).ok()?
+    } else if body.chars().all(|c| c.is_ascii_digit()) && !body.is_empty() {
+        body.parse().ok()?
+    } else {
+        return Option::None;
+    };
+    Some(if neg { -v } else { v })
+}
+
+/// Memory operand size prefix in canonical iced output:
+/// `byte ptr`, `word ptr`, `dword ptr`, `qword ptr`, plus
+/// `xmmword ptr` / `ymmword ptr` for SSE/AVX. `None` indicates
+/// no explicit size prefix, which is what `nop [rax]` uses
+/// (size implied by the mnemonic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemSize {
+    None,
+    Byte,
+    Word,
+    Dword,
+    Qword,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedMemory {
+    size_hint: Option<MemSize>,
+    base: Register,
+    index: Register,
+    scale: u32,
+    displacement: i64,
+}
+
+/// Parse a memory operand like `[rax]`, `[rax+rbx]`,
+/// `qword ptr [0x3fb8]`, `dword ptr [rbp-4]`. Returns `None`
+/// if the token doesn't have the expected `[…]` shape, so the
+/// caller can fall through to other operand kinds.
+fn parse_memory(s: &str) -> Option<ParsedMemory> {
+    let (size_hint, body) = parse_size_prefix(s);
+    let inner = body.strip_prefix('[')?.strip_suffix(']')?;
+    let inner = inner.trim();
+
+    // Split on '+' and '-' while preserving the sign.
+    let mut base = Register::None;
+    let mut index = Register::None;
+    let mut scale: u32 = 1;
+    let mut disp: i64 = 0;
+
+    for (sign, term) in tokenize_addr(inner) {
+        let term = term.trim();
+        // `reg*scale`?
+        if let Some((reg_part, scale_part)) = term.split_once('*') {
+            let r = parse_register(reg_part.trim())?;
+            let sc: u32 = scale_part.trim().parse().ok()?;
+            if index != Register::None {
+                return Option::None;
+            }
+            index = r;
+            scale = sc;
+            continue;
+        }
+        // Plain register?
+        if let Some(r) = parse_register(term) {
+            if base == Register::None {
+                base = r;
+            } else if index == Register::None {
+                index = r;
+            } else {
+                return Option::None;
+            }
+            continue;
+        }
+        // Immediate displacement?
+        if let Some(v) = parse_immediate(term) {
+            disp = disp.checked_add(if sign { -v } else { v })?;
+            continue;
+        }
+        return Option::None;
+    }
+    Some(ParsedMemory {
+        size_hint: Some(size_hint),
+        base,
+        index,
+        scale,
+        displacement: disp,
+    })
+}
+
+fn parse_size_prefix(s: &str) -> (MemSize, &str) {
+    for (prefix, sz) in &[
+        ("qword ptr ", MemSize::Qword),
+        ("dword ptr ", MemSize::Dword),
+        ("word ptr ", MemSize::Word),
+        ("byte ptr ", MemSize::Byte),
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return (*sz, rest);
+        }
+    }
+    (MemSize::None, s)
+}
+
+/// Split `rax+rbx*4-0x10` into `[(false, "rax"), (false, "rbx*4"),
+/// (true, "0x10")]`. The first term has an implicit `+` sign.
+fn tokenize_addr(s: &str) -> Vec<(bool, &str)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut neg = false;
+    for (i, c) in s.char_indices() {
+        if (c == '+' || c == '-') && i > start {
+            out.push((neg, &s[start..i]));
+            neg = c == '-';
+            start = i + 1;
+        }
+    }
+    out.push((neg, &s[start..]));
+    out
+}
+
+fn build_memory_operand(mem: &ParsedMemory) -> Result<iced_x86::MemoryOperand, AssembleError> {
+    use iced_x86::MemoryOperand;
+    // The `displ_size` parameter selects the encoded displacement
+    // width. Picking 0 lets iced choose the shortest legal
+    // form. For absolute `[0x…]` addresses in 64-bit mode iced
+    // wires it through as a RIP-relative or absolute encoding
+    // depending on context — that's handled by the encoder
+    // itself when we feed `Register::None` as the base.
+    Ok(MemoryOperand::with_base_index_scale_displ_size(
+        mem.base,
+        mem.index,
+        mem.scale,
+        mem.displacement,
+        if mem.displacement == 0 && mem.base != Register::None && mem.index == Register::None {
+            0
+        } else {
+            // Let iced pick (most likely 4 bytes for absolute).
+            0
+        },
+    ))
 }
 
 /// Map a canonical x86 register name to iced's `Register` enum.
@@ -401,7 +613,31 @@ mod tests {
     }
 
     #[test]
-    fn memory_operand_form_is_still_unsupported() {
+    fn call_jmp_register_x86_64() {
+        round_trip(Bitness::Bits64, "call rax", &[0xff, 0xd0]);
+        round_trip(Bitness::Bits64, "jmp rax", &[0xff, 0xe0]);
+        round_trip(Bitness::Bits64, "call r12", &[0x41, 0xff, 0xd4]);
+        round_trip(Bitness::Bits64, "jmp r12", &[0x41, 0xff, 0xe4]);
+    }
+
+    #[test]
+    fn push_immediate_x86_64() {
+        round_trip(Bitness::Bits64, "push 0", &[0x6a, 0x00]);
+        round_trip(Bitness::Bits64, "push 1", &[0x6a, 0x01]);
+    }
+
+    #[test]
+    fn nop_with_memory_operand_x86_64() {
+        round_trip(Bitness::Bits64, "nop [rax]", &[0x0f, 0x1f, 0x00]);
+        round_trip(
+            Bitness::Bits64,
+            "nop [rax+rax]",
+            &[0x0f, 0x1f, 0x04, 0x00],
+        );
+    }
+
+    #[test]
+    fn mov_mem_operand_is_still_unsupported() {
         match assemble_intel(Bitness::Bits64, "mov rax,[rbx]", 0x1000) {
             Err(AssembleError::Unsupported { .. }) => {}
             other => panic!("expected Unsupported, got {other:?}"),
