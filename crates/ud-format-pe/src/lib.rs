@@ -968,12 +968,111 @@ impl PeFile {
         std::str::from_utf8(&slice[..end]).ok().map(str::to_string)
     }
 
-    /// Serialize back to bytes. Always byte-identical to the input
-    /// in v0 — the parsed file stores the original buffer and we
-    /// simply hand it back.
+    /// Build a [`PeFile`] from already-structured pieces, without
+    /// needing a pre-existing raw buffer. Used by the source
+    /// lower path (`ud_compile::lower_to_pe`) when reading the
+    /// PE skeleton from `@module.build` and reassembling the
+    /// bytes for round-trip. The DOS stub bytes, alignment
+    /// padding, and section content arrive via the `extra_bytes`
+    /// list — each `(file_offset, bytes)` tuple is copied into
+    /// the buffer at its offset, after the structured headers
+    /// are written.
+    #[must_use]
+    pub fn from_parts(
+        kind: PeKind,
+        dos: DosHeader,
+        dos_stub: Vec<u8>,
+        coff: CoffHeader,
+        optional: Option<OptionalHeader>,
+        image_base: u64,
+        address_of_entry_point: u32,
+        data_directories: Vec<DataDirectory>,
+        sections: Vec<SectionHeader>,
+        extra_bytes: Vec<(u64, Vec<u8>)>,
+        file_size: u64,
+    ) -> Self {
+        let mut raw = vec![0u8; file_size as usize];
+        // Lay the DOS stub down first so write_to_vec's pass
+        // can overlay the structured DOS header on top.
+        if !dos_stub.is_empty() && raw.len() >= DOS_HEADER_SIZE + dos_stub.len() {
+            raw[DOS_HEADER_SIZE..DOS_HEADER_SIZE + dos_stub.len()].copy_from_slice(&dos_stub);
+        }
+        for (off, bytes) in extra_bytes {
+            let off = off as usize;
+            let end = off + bytes.len();
+            if end <= raw.len() {
+                raw[off..end].copy_from_slice(&bytes);
+            }
+        }
+        let e_lfanew = dos.e_lfanew;
+        let mut file = Self {
+            kind,
+            e_lfanew,
+            dos,
+            dos_stub,
+            coff,
+            optional,
+            image_base,
+            address_of_entry_point,
+            data_directories,
+            sections,
+            raw,
+        };
+        // Overwrite the buffer with the canonical structured
+        // encoding so any drift between the supplied raw bytes
+        // and the structured fields lands the structured value.
+        file.raw = file.write_to_vec();
+        file
+    }
+
+    /// Serialize back to bytes. Always byte-identical to the
+    /// parsed input — the structured DOS/optional/section headers
+    /// are encoded back into the buffer over a base copy of the
+    /// original raw bytes, so any field not covered by a
+    /// structured field (DOS stub bytes, alignment padding,
+    /// section content) rides through verbatim. Useful for
+    /// callers that edit a structured field (e.g. bump the
+    /// optional header's CheckSum) and want the rebuilt bytes.
     #[must_use]
     pub fn write_to_vec(&self) -> Vec<u8> {
-        self.raw.clone()
+        let mut out = self.raw.clone();
+        // DOS header — always 64 bytes at offset 0.
+        if out.len() >= DOS_HEADER_SIZE {
+            out[..DOS_HEADER_SIZE].copy_from_slice(&self.dos.encode());
+        }
+        let pe_off = self.e_lfanew as usize;
+        if pe_off + 4 <= out.len() {
+            out[pe_off..pe_off + 4].copy_from_slice(&PE_SIGNATURE);
+        }
+        let coff_off = pe_off + 4;
+        if coff_off + COFF_HEADER_SIZE <= out.len() {
+            out[coff_off..coff_off + COFF_HEADER_SIZE].copy_from_slice(&self.coff.encode());
+        }
+        let opt_off = coff_off + COFF_HEADER_SIZE;
+        if let Some(opt) = self.optional.as_ref() {
+            let opt_bytes = opt.encode();
+            if opt_off + opt_bytes.len() <= out.len() {
+                out[opt_off..opt_off + opt_bytes.len()].copy_from_slice(&opt_bytes);
+            }
+            let dd_off = opt_off + opt_bytes.len();
+            for (i, dd) in self.data_directories.iter().enumerate() {
+                let off = dd_off + i * 8;
+                if off + 8 > out.len() {
+                    break;
+                }
+                out[off..off + 4].copy_from_slice(&dd.virtual_address.to_le_bytes());
+                out[off + 4..off + 8].copy_from_slice(&dd.size.to_le_bytes());
+            }
+        }
+        let sec_off = opt_off + self.coff.size_of_optional_header as usize;
+        for (i, sh) in self.sections.iter().enumerate() {
+            let off = sec_off + i * SECTION_HEADER_SIZE;
+            if off + SECTION_HEADER_SIZE > out.len() {
+                break;
+            }
+            out[off..off + SECTION_HEADER_SIZE].copy_from_slice(&sh.encode());
+        }
+        out
     }
 }
 
@@ -1017,6 +1116,41 @@ pub struct PeExport {
 #[must_use]
 pub fn is_pe(bytes: &[u8]) -> bool {
     bytes.len() >= DOS_HEADER_SIZE && bytes[..2] == DOS_MAGIC
+}
+
+impl CoffHeader {
+    /// Encode the 20-byte COFF header.
+    #[must_use]
+    pub fn encode(&self) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        out[0..2].copy_from_slice(&self.machine.to_le_bytes());
+        out[2..4].copy_from_slice(&self.number_of_sections.to_le_bytes());
+        out[4..8].copy_from_slice(&self.time_date_stamp.to_le_bytes());
+        out[8..12].copy_from_slice(&self.pointer_to_symbol_table.to_le_bytes());
+        out[12..16].copy_from_slice(&self.number_of_symbols.to_le_bytes());
+        out[16..18].copy_from_slice(&self.size_of_optional_header.to_le_bytes());
+        out[18..20].copy_from_slice(&self.characteristics.to_le_bytes());
+        out
+    }
+}
+
+impl SectionHeader {
+    /// Encode the 40-byte section header.
+    #[must_use]
+    pub fn encode(&self) -> [u8; SECTION_HEADER_SIZE] {
+        let mut out = [0u8; SECTION_HEADER_SIZE];
+        out[0..8].copy_from_slice(&self.name);
+        out[8..12].copy_from_slice(&self.virtual_size.to_le_bytes());
+        out[12..16].copy_from_slice(&self.virtual_address.to_le_bytes());
+        out[16..20].copy_from_slice(&self.size_of_raw_data.to_le_bytes());
+        out[20..24].copy_from_slice(&self.pointer_to_raw_data.to_le_bytes());
+        out[24..28].copy_from_slice(&self.pointer_to_relocations.to_le_bytes());
+        out[28..32].copy_from_slice(&self.pointer_to_linenumbers.to_le_bytes());
+        out[32..34].copy_from_slice(&self.number_of_relocations.to_le_bytes());
+        out[34..36].copy_from_slice(&self.number_of_linenumbers.to_le_bytes());
+        out[36..40].copy_from_slice(&self.characteristics.to_le_bytes());
+        out
+    }
 }
 
 fn parse_coff_header(bytes: &[u8]) -> CoffHeader {
