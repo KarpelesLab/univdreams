@@ -109,6 +109,159 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Drive `ICDecompress` on a codec bitstream-only frame:
+    /// load the codec DLL, run `DllMain(DLL_PROCESS_ATTACH)`,
+    /// open the codec via `ICOpen`, run the full
+    /// `ICDecompressQuery → Begin → Decompress → End → Close`
+    /// sequence, and write the decoded frame to the output file.
+    Decode {
+        /// Codec DLL.
+        dll: PathBuf,
+
+        /// Raw codec frame (no container — extract from any
+        /// AVI / MOV wrapper beforehand).
+        #[arg(long, value_name = "FILE")]
+        input: PathBuf,
+
+        /// Output frame width (pixels).
+        #[arg(long)]
+        width: u32,
+
+        /// Output frame height (pixels).
+        #[arg(long)]
+        height: u32,
+
+        /// FourCC handler override (`MP43`, `IV31`, `cvid`, …).
+        /// Defaults: derived from the DLL filename.
+        #[arg(long = "fcc-handler", value_name = "FCC")]
+        fcc_handler: Option<String>,
+
+        /// Output pixel format.
+        #[arg(long = "pix-format", value_enum, default_value_t = PixFormat::Rgb24)]
+        pix_format: PixFormat,
+
+        /// Write decoded frame here. Defaults to stdout.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+
+        /// Cap the run at this many guest instructions.
+        #[arg(long, default_value_t = 100_000_000)]
+        max_instructions: u64,
+    },
+
+    /// Drive `ICCompress` on uncompressed pixel input: load
+    /// the codec DLL, run `DllMain`, open the codec in
+    /// compress mode, query / begin / compress / end / close.
+    /// Outputs the encoded codec bitstream.
+    Encode {
+        /// Codec DLL.
+        dll: PathBuf,
+
+        /// Raw uncompressed pixel input (no header — bytes
+        /// only). Required.
+        #[arg(long, value_name = "FILE")]
+        input: PathBuf,
+
+        /// Input frame width (pixels).
+        #[arg(long)]
+        width: u32,
+
+        /// Input frame height (pixels).
+        #[arg(long)]
+        height: u32,
+
+        /// FourCC handler override.
+        #[arg(long = "fcc-handler", value_name = "FCC")]
+        fcc_handler: Option<String>,
+
+        /// Uncompressed-input pixel format.
+        #[arg(long = "input-format", value_enum, default_value_t = InputFormat::Bgr24)]
+        input_format: InputFormat,
+
+        /// Encoder quality (VfW convention, `0..=10000`).
+        #[arg(long, default_value_t = 5000)]
+        quality: u32,
+
+        /// Request a keyframe (sets `ICCOMPRESS_KEYFRAME`).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        keyframe: bool,
+
+        /// Write encoded frame here. Defaults to stdout.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+
+        /// Cap the run at this many guest instructions.
+        #[arg(long, default_value_t = 100_000_000)]
+        max_instructions: u64,
+    },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PixFormat {
+    Rgb24,
+    Rgb32,
+    Yuv,
+}
+
+impl PixFormat {
+    fn bi_bit_count(self) -> u16 {
+        match self {
+            PixFormat::Rgb24 => 24,
+            PixFormat::Rgb32 => 32,
+            PixFormat::Yuv => 16,
+        }
+    }
+    fn bi_compression(self) -> [u8; 4] {
+        match self {
+            PixFormat::Rgb24 | PixFormat::Rgb32 => [0; 4],
+            PixFormat::Yuv => *b"YUY2",
+        }
+    }
+    fn bytes_per_pixel(self) -> u32 {
+        match self {
+            PixFormat::Rgb24 => 3,
+            PixFormat::Rgb32 => 4,
+            PixFormat::Yuv => 2,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum InputFormat {
+    Bgr24,
+    Bgr32,
+    Yv12,
+    I420,
+    Yuy2,
+}
+
+impl InputFormat {
+    fn bi_bit_count(self) -> u16 {
+        match self {
+            InputFormat::Bgr24 => 24,
+            InputFormat::Bgr32 => 32,
+            InputFormat::Yv12 | InputFormat::I420 => 12,
+            InputFormat::Yuy2 => 16,
+        }
+    }
+    fn bi_compression(self) -> [u8; 4] {
+        match self {
+            InputFormat::Bgr24 | InputFormat::Bgr32 => [0; 4],
+            InputFormat::Yv12 => *b"YV12",
+            InputFormat::I420 => *b"I420",
+            InputFormat::Yuy2 => *b"YUY2",
+        }
+    }
+    fn frame_bytes(self, width: u32, height: u32) -> u32 {
+        let pixels = width.saturating_mul(height);
+        match self {
+            InputFormat::Bgr24 => pixels * 3,
+            InputFormat::Bgr32 => pixels * 4,
+            InputFormat::Yv12 | InputFormat::I420 => pixels * 3 / 2,
+            InputFormat::Yuy2 => pixels * 2,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -302,7 +455,322 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             max_instructions,
             json,
         } => analyze(&input, max_instructions, json),
+        Command::Decode {
+            dll,
+            input,
+            width,
+            height,
+            fcc_handler,
+            pix_format,
+            output,
+            max_instructions,
+        } => decode_cmd(
+            &dll,
+            &input,
+            width,
+            height,
+            fcc_handler.as_deref(),
+            pix_format,
+            output.as_deref(),
+            max_instructions,
+        ),
+        Command::Encode {
+            dll,
+            input,
+            width,
+            height,
+            fcc_handler,
+            input_format,
+            quality,
+            keyframe,
+            output,
+            max_instructions,
+        } => encode_cmd(
+            &dll,
+            &input,
+            width,
+            height,
+            fcc_handler.as_deref(),
+            input_format,
+            quality,
+            keyframe,
+            output.as_deref(),
+            max_instructions,
+        ),
     }
+}
+
+fn fourcc_to_u32(s: &str) -> u32 {
+    let mut b = [b' '; 4];
+    for (i, c) in s.bytes().take(4).enumerate() {
+        b[i] = c;
+    }
+    u32::from_le_bytes(b)
+}
+
+fn derive_default_fcc(p: &Path) -> String {
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_uppercase())
+        .unwrap_or_default();
+    if stem.contains("IR32") {
+        "IV31".into()
+    } else if stem.contains("IR41") {
+        "IV41".into()
+    } else if stem.contains("IR50") {
+        "IV50".into()
+    } else if stem.contains("CVID") || stem.contains("ICCVID") {
+        "cvid".into()
+    } else if stem.contains("MPG4C32") || stem.contains("MPG4") {
+        "MP43".into()
+    } else {
+        "IV31".into()
+    }
+}
+
+const ICMODE_DECOMPRESS: u32 = 1;
+const ICMODE_COMPRESS: u32 = 2;
+const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
+
+#[allow(clippy::too_many_arguments)]
+fn decode_cmd(
+    dll_path: &Path,
+    input: &Path,
+    width: u32,
+    height: u32,
+    fcc_handler: Option<&str>,
+    pix_format: PixFormat,
+    output: Option<&Path>,
+    max_instructions: u64,
+) -> anyhow::Result<()> {
+    let dll_bytes = std::fs::read(dll_path)
+        .with_context(|| format!("reading {}", dll_path.display()))?;
+    let dll_name = dll_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "codec.dll".into());
+    let frame = std::fs::read(input)
+        .with_context(|| format!("reading frame {}", input.display()))?;
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.instruction_budget = Some(max_instructions);
+
+    let img = sandbox
+        .load(&dll_name, &dll_bytes)
+        .with_context(|| format!("load {}", dll_path.display()))?;
+    let _ = sandbox
+        .call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH)
+        .with_context(|| "DllMain")?;
+    sandbox
+        .install_codec(&img)
+        .with_context(|| "install_codec")?;
+
+    let fcc = fcc_handler
+        .map(str::to_owned)
+        .unwrap_or_else(|| derive_default_fcc(dll_path));
+    let fcc_type = u32::from_le_bytes(*b"VIDC");
+    let fcc_handler_u32 = fourcc_to_u32(&fcc);
+
+    let in_bih = ud_emulator::Bih {
+        bi_size: 40,
+        width: width as i32,
+        height: height as i32,
+        planes: 1,
+        bit_count: 24,
+        compression: fcc_handler_u32.to_le_bytes(),
+        size_image: frame.len() as u32,
+        ..ud_emulator::Bih::default()
+    };
+    let out_bih = ud_emulator::Bih {
+        bi_size: 40,
+        width: width as i32,
+        height: height as i32,
+        planes: 1,
+        bit_count: pix_format.bi_bit_count(),
+        compression: pix_format.bi_compression(),
+        size_image: width * height * pix_format.bytes_per_pixel(),
+        ..ud_emulator::Bih::default()
+    };
+
+    let hic = sandbox
+        .ic_open(fcc_type, fcc_handler_u32, ICMODE_DECOMPRESS)
+        .context("ICOpen(ICMODE_DECOMPRESS)")?;
+    if hic == 0 {
+        anyhow::bail!("codec refused DRV_OPEN");
+    }
+    eprintln!("[decode] HIC = {hic}; fcc_handler = {fcc:?}");
+
+    let q = sandbox
+        .ic_decompress_query(hic, &in_bih, Some(&out_bih))
+        .context("ICDecompressQuery")?;
+    eprintln!(
+        "[decode] ICDecompressQuery = {} (0 = ICERR_OK)",
+        q as i32
+    );
+
+    if (q as i32) != 0 {
+        anyhow::bail!("codec rejected the in/out BIH pair");
+    }
+
+    let _ = sandbox.ic_decompress_begin(hic, &in_bih, &out_bih);
+    let out_capacity = width * height * pix_format.bytes_per_pixel();
+    let (rc, decoded) = sandbox
+        .ic_decompress(hic, 0, &in_bih, &frame, &out_bih, out_capacity)
+        .context("ICDecompress")?;
+    eprintln!(
+        "[decode] ICDecompress = {} (output {} bytes)",
+        rc as i32,
+        decoded.len()
+    );
+
+    if let Some(path) = output {
+        std::fs::write(path, &decoded)
+            .with_context(|| format!("writing output {}", path.display()))?;
+        eprintln!("[decode] wrote {} bytes to {}", decoded.len(), path.display());
+    } else {
+        use std::io::Write as _;
+        std::io::stdout().write_all(&decoded)?;
+    }
+
+    let _ = sandbox.ic_decompress_end(hic);
+    let _ = sandbox.ic_close(hic);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_cmd(
+    dll_path: &Path,
+    input: &Path,
+    width: u32,
+    height: u32,
+    fcc_handler: Option<&str>,
+    input_format: InputFormat,
+    quality: u32,
+    keyframe: bool,
+    output: Option<&Path>,
+    max_instructions: u64,
+) -> anyhow::Result<()> {
+    let dll_bytes = std::fs::read(dll_path)
+        .with_context(|| format!("reading {}", dll_path.display()))?;
+    let dll_name = dll_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "codec.dll".into());
+
+    let frame = std::fs::read(input)
+        .with_context(|| format!("reading input frame {}", input.display()))?;
+    let expected_frame_bytes = input_format.frame_bytes(width, height) as usize;
+    if frame.len() < expected_frame_bytes {
+        anyhow::bail!(
+            "input frame is {} bytes but {}x{} {:?} expects {} bytes",
+            frame.len(),
+            width,
+            height,
+            input_format,
+            expected_frame_bytes
+        );
+    }
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.instruction_budget = Some(max_instructions);
+
+    let img = sandbox
+        .load(&dll_name, &dll_bytes)
+        .with_context(|| format!("load {}", dll_path.display()))?;
+    let _ = sandbox
+        .call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH)
+        .with_context(|| "DllMain")?;
+    sandbox
+        .install_codec(&img)
+        .with_context(|| "install_codec")?;
+
+    let fcc = fcc_handler
+        .map(str::to_owned)
+        .unwrap_or_else(|| derive_default_fcc(dll_path));
+    let fcc_type = u32::from_le_bytes(*b"VIDC");
+    let fcc_handler_u32 = fourcc_to_u32(&fcc);
+
+    let in_bih = ud_emulator::Bih {
+        bi_size: 40,
+        width: width as i32,
+        height: height as i32,
+        planes: 1,
+        bit_count: input_format.bi_bit_count(),
+        compression: input_format.bi_compression(),
+        size_image: input_format.frame_bytes(width, height),
+        ..ud_emulator::Bih::default()
+    };
+
+    let hic = sandbox
+        .ic_open(fcc_type, fcc_handler_u32, ICMODE_COMPRESS)
+        .context("ICOpen(ICMODE_COMPRESS)")?;
+    if hic == 0 {
+        anyhow::bail!("codec refused DRV_OPEN(COMPRESS)");
+    }
+    eprintln!("[encode] HIC = {hic}; fcc_handler = {fcc:?}");
+
+    let (_, out_bih) = sandbox
+        .ic_compress_get_format(hic, &in_bih)
+        .context("ICCompressGetFormat")?;
+    eprintln!(
+        "[encode] codec picked output: bit_count={} compression={:?} size_image={}",
+        out_bih.bit_count, out_bih.compression, out_bih.size_image
+    );
+
+    let q = sandbox
+        .ic_compress_query(hic, &in_bih, Some(&out_bih))
+        .context("ICCompressQuery")?;
+    eprintln!(
+        "[encode] ICCompressQuery = {} (0 = ICERR_OK)",
+        q as i32
+    );
+    if (q as i32) != 0 {
+        anyhow::bail!("codec rejected the input/output BIH pair");
+    }
+
+    let cap = sandbox
+        .ic_compress_get_size(hic, &in_bih, &out_bih)
+        .context("ICCompressGetSize")?;
+    eprintln!("[encode] ICCompressGetSize = {cap} bytes");
+
+    let _ = sandbox.ic_compress_begin(hic, &in_bih, &out_bih);
+    let flags = if keyframe { ICCOMPRESS_KEYFRAME } else { 0 };
+    let frame_slice = &frame[..expected_frame_bytes];
+    let result = sandbox
+        .ic_compress(
+            hic,
+            flags,
+            &in_bih,
+            frame_slice,
+            &out_bih,
+            cap,
+            0,     // ckid
+            0,     // frame_num
+            0,     // frame_size_limit
+            quality,
+            None,  // prev_bih
+            None,  // prev_bytes
+        )
+        .context("ICCompress")?;
+    eprintln!(
+        "[encode] ICCompress = {} (output {} bytes, output_bih.size_image={})",
+        result.lresult as i32,
+        result.bytes.len(),
+        result.output_bih.size_image,
+    );
+
+    if let Some(path) = output {
+        std::fs::write(path, &result.bytes)
+            .with_context(|| format!("writing output {}", path.display()))?;
+        eprintln!("[encode] wrote {} bytes to {}", result.bytes.len(), path.display());
+    } else {
+        use std::io::Write as _;
+        std::io::stdout().write_all(&result.bytes)?;
+    }
+
+    let _ = sandbox.ic_compress_end(hic);
+    let _ = sandbox.ic_close(hic);
+    Ok(())
 }
 
 fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result<()> {
