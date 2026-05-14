@@ -18,7 +18,7 @@
 //! applied so `MOV RAX, RBX` and `mov rax,rbx` parse to the
 //! same Instruction.
 
-use iced_x86::{Code, Encoder, Instruction};
+use iced_x86::{Code, Encoder, Instruction, Register};
 
 use crate::Bitness;
 
@@ -101,17 +101,182 @@ fn split_mnemonic_and_rest(s: &str) -> (&str, &str) {
     }
 }
 
-fn parse_text(text: &str, _bitness: Bitness) -> Result<Instruction, AssembleError> {
+fn parse_text(text: &str, bitness: Bitness) -> Result<Instruction, AssembleError> {
     let (mnemonic, operands) = split_mnemonic_and_rest(text);
-    if !operands.is_empty() {
-        return Err(AssembleError::Unsupported {
+    if operands.is_empty() {
+        let code = zero_operand_code(mnemonic).ok_or_else(|| AssembleError::Unsupported {
             form: text.to_string(),
-        });
+        })?;
+        return Ok(Instruction::with(code));
     }
-    let code = zero_operand_code(mnemonic).ok_or_else(|| AssembleError::Unsupported {
+
+    let ops = split_operands(operands);
+    match ops.as_slice() {
+        [a] => parse_single_operand(mnemonic, a, bitness, text),
+        [a, b] => parse_two_operand(mnemonic, a, b, bitness, text),
+        _ => Err(AssembleError::Unsupported {
+            form: text.to_string(),
+        }),
+    }
+}
+
+/// Comma-split a normalized operand list, ignoring commas
+/// inside `[ … ]` memory operands.
+fn split_operands(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out
+}
+
+fn parse_single_operand(
+    mnemonic: &str,
+    operand: &str,
+    _bitness: Bitness,
+    text: &str,
+) -> Result<Instruction, AssembleError> {
+    let reg = match parse_register(operand) {
+        Some(r) => r,
+        None => {
+            return Err(AssembleError::Unsupported {
+                form: text.to_string(),
+            });
+        }
+    };
+    let code = match mnemonic {
+        "push" => match register_width(reg) {
+            Some(64) => Code::Push_r64,
+            Some(32) => Code::Push_r32,
+            Some(16) => Code::Push_r16,
+            _ => return unsupported(text),
+        },
+        "pop" => match register_width(reg) {
+            Some(64) => Code::Pop_r64,
+            Some(32) => Code::Pop_r32,
+            Some(16) => Code::Pop_r16,
+            _ => return unsupported(text),
+        },
+        _ => return unsupported(text),
+    };
+    Instruction::with1(code, reg).map_err(|e| AssembleError::EncodeFailed {
+        message: format!("{e:?}"),
+    })
+}
+
+fn parse_two_operand(
+    mnemonic: &str,
+    a: &str,
+    b: &str,
+    _bitness: Bitness,
+    text: &str,
+) -> Result<Instruction, AssembleError> {
+    let (Some(ra), Some(rb)) = (parse_register(a), parse_register(b)) else {
+        return unsupported(text);
+    };
+    let wa = register_width(ra).ok_or_else(|| AssembleError::Unsupported {
         form: text.to_string(),
     })?;
-    Ok(Instruction::with(code))
+    let wb = register_width(rb).ok_or_else(|| AssembleError::Unsupported {
+        form: text.to_string(),
+    })?;
+    if wa != wb {
+        return unsupported(text);
+    }
+    let code = match mnemonic {
+        "xchg" => match wa {
+            64 => Code::Xchg_rm64_r64,
+            32 => Code::Xchg_rm32_r32,
+            16 => Code::Xchg_rm16_r16,
+            8 => Code::Xchg_rm8_r8,
+            _ => return unsupported(text),
+        },
+        "mov" => match wa {
+            64 => Code::Mov_rm64_r64,
+            32 => Code::Mov_rm32_r32,
+            16 => Code::Mov_rm16_r16,
+            8 => Code::Mov_rm8_r8,
+            _ => return unsupported(text),
+        },
+        _ => return unsupported(text),
+    };
+    Instruction::with2(code, ra, rb).map_err(|e| AssembleError::EncodeFailed {
+        message: format!("{e:?}"),
+    })
+}
+
+fn unsupported(text: &str) -> Result<Instruction, AssembleError> {
+    Err(AssembleError::Unsupported {
+        form: text.to_string(),
+    })
+}
+
+/// Map a canonical x86 register name to iced's `Register` enum.
+/// Lower-case input (`rax`, `eax`, `ax`, `al`, `ah`, `r8`, `r8d`,
+/// `r8w`, `r8b`, `xmm0` …); anything we don't recognise returns
+/// `None` so the caller can surface `Unsupported`.
+fn parse_register(name: &str) -> Option<Register> {
+    use Register::*;
+    Some(match name {
+        // 64-bit
+        "rax" => RAX, "rcx" => RCX, "rdx" => RDX, "rbx" => RBX,
+        "rsp" => RSP, "rbp" => RBP, "rsi" => RSI, "rdi" => RDI,
+        "r8" => R8, "r9" => R9, "r10" => R10, "r11" => R11,
+        "r12" => R12, "r13" => R13, "r14" => R14, "r15" => R15,
+        // 32-bit
+        "eax" => EAX, "ecx" => ECX, "edx" => EDX, "ebx" => EBX,
+        "esp" => ESP, "ebp" => EBP, "esi" => ESI, "edi" => EDI,
+        "r8d" => R8D, "r9d" => R9D, "r10d" => R10D, "r11d" => R11D,
+        "r12d" => R12D, "r13d" => R13D, "r14d" => R14D, "r15d" => R15D,
+        // 16-bit
+        "ax" => AX, "cx" => CX, "dx" => DX, "bx" => BX,
+        "sp" => SP, "bp" => BP, "si" => SI, "di" => DI,
+        "r8w" => R8W, "r9w" => R9W, "r10w" => R10W, "r11w" => R11W,
+        "r12w" => R12W, "r13w" => R13W, "r14w" => R14W, "r15w" => R15W,
+        // 8-bit
+        "al" => AL, "cl" => CL, "dl" => DL, "bl" => BL,
+        "ah" => AH, "ch" => CH, "dh" => DH, "bh" => BH,
+        "spl" => SPL, "bpl" => BPL, "sil" => SIL, "dil" => DIL,
+        "r8b" | "r8l" => R8L, "r9b" | "r9l" => R9L,
+        "r10b" | "r10l" => R10L, "r11b" | "r11l" => R11L,
+        "r12b" | "r12l" => R12L, "r13b" | "r13l" => R13L,
+        "r14b" | "r14l" => R14L, "r15b" | "r15l" => R15L,
+        // XMM
+        "xmm0" => XMM0, "xmm1" => XMM1, "xmm2" => XMM2, "xmm3" => XMM3,
+        "xmm4" => XMM4, "xmm5" => XMM5, "xmm6" => XMM6, "xmm7" => XMM7,
+        "xmm8" => XMM8, "xmm9" => XMM9, "xmm10" => XMM10, "xmm11" => XMM11,
+        "xmm12" => XMM12, "xmm13" => XMM13, "xmm14" => XMM14, "xmm15" => XMM15,
+        _ => return Option::None, // ::None to avoid Register::None from the glob.
+    })
+}
+
+/// Operand bit width for a general-purpose register. XMM and
+/// segment registers return `None` because they use different
+/// encoders.
+fn register_width(reg: Register) -> Option<u32> {
+    use Register::*;
+    match reg {
+        RAX | RCX | RDX | RBX | RSP | RBP | RSI | RDI | R8 | R9 | R10 | R11 | R12 | R13 | R14
+        | R15 => Some(64),
+        EAX | ECX | EDX | EBX | ESP | EBP | ESI | EDI | R8D | R9D | R10D | R11D | R12D | R13D
+        | R14D | R15D => Some(32),
+        AX | CX | DX | BX | SP | BP | SI | DI | R8W | R9W | R10W | R11W | R12W | R13W | R14W
+        | R15W => Some(16),
+        AL | CL | DL | BL | AH | CH | DH | BH | SPL | BPL | SIL | DIL | R8L | R9L | R10L | R11L
+        | R12L | R13L | R14L | R15L => Some(8),
+        _ => Option::None, // ::None to avoid Register::None from the glob.
+    }
 }
 
 /// Iced's `Code` for every zero-operand mnemonic we currently
@@ -211,11 +376,33 @@ mod tests {
     }
 
     #[test]
-    fn operand_form_is_unsupported_today() {
-        // Make sure the gate is firmly closed for forms we
-        // haven't implemented yet. The fallback to pinned bytes
-        // is what makes this safe to ship incrementally.
-        match assemble_intel(Bitness::Bits64, "mov rax, rbx", 0x1000) {
+    fn push_pop_register_x86_64() {
+        round_trip(Bitness::Bits64, "push rax", &[0x50]);
+        round_trip(Bitness::Bits64, "push rdi", &[0x57]);
+        round_trip(Bitness::Bits64, "push r8", &[0x41, 0x50]);
+        round_trip(Bitness::Bits64, "push r15", &[0x41, 0x57]);
+        round_trip(Bitness::Bits64, "pop rax", &[0x58]);
+        round_trip(Bitness::Bits64, "pop r12", &[0x41, 0x5c]);
+    }
+
+    #[test]
+    fn xchg_register_register_x86_64() {
+        // xchg rcx,rcx — used as a 3-byte NOP pad by some
+        // compilers when they need to fill an exact slot.
+        round_trip(Bitness::Bits64, "xchg rcx,rcx", &[0x48, 0x87, 0xc9]);
+        round_trip(Bitness::Bits64, "xchg eax,edx", &[0x87, 0xd0]);
+    }
+
+    #[test]
+    fn mov_register_register_x86_64() {
+        round_trip(Bitness::Bits64, "mov rax,rbx", &[0x48, 0x89, 0xd8]);
+        round_trip(Bitness::Bits64, "mov eax,edx", &[0x89, 0xd0]);
+        round_trip(Bitness::Bits64, "mov r8,r15", &[0x4d, 0x89, 0xf8]);
+    }
+
+    #[test]
+    fn memory_operand_form_is_still_unsupported() {
+        match assemble_intel(Bitness::Bits64, "mov rax,[rbx]", 0x1000) {
             Err(AssembleError::Unsupported { .. }) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
