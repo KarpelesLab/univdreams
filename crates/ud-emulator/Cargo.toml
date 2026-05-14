@@ -43,3 +43,8 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
+# Fetched-fixture corpus runner (`tests/codec_corpus.rs`).
+# Pulls codec DLLs from samples.oxideav.org with a local cache.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
