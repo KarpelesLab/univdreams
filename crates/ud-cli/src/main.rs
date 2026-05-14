@@ -330,6 +330,11 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
             // JSON shapes — the front-end consumer cares
             // whether the load even got off the ground.
             if as_json {
+                let pe = ud_format_pe::PeFile::parse(&bytes).ok();
+                let indicators = pe
+                    .as_ref()
+                    .map(extract_indicators)
+                    .unwrap_or_default();
                 let report = AnalyzeReport {
                     input: input.display().to_string(),
                     image_base: 0,
@@ -340,6 +345,7 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
                     win32_calls: Vec::new(),
                     win32_calls_by_function: Vec::new(),
                     coverage: CoverageSummary::default(),
+                    indicators,
                     instructions_executed: 0,
                     instruction_budget: max_instructions,
                 };
@@ -396,6 +402,18 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
         },
     };
 
+    // Static-side indicator extraction: scan the data
+    // sections of the parsed PE for printable ASCII / UTF-16
+    // strings, classify a few well-known shapes (URLs, file
+    // paths, registry keys), and report. Doesn't depend on
+    // the run completing, so even codecs that trap mid-DllMain
+    // surface their string indicators.
+    let pe = ud_format_pe::PeFile::parse(&bytes).ok();
+    let indicators = pe
+        .as_ref()
+        .map(extract_indicators)
+        .unwrap_or_default();
+
     let report = AnalyzeReport {
         input: input.display().to_string(),
         image_base: image.image_base,
@@ -404,6 +422,7 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
         win32_calls,
         win32_calls_by_function,
         coverage,
+        indicators,
         instructions_executed,
         instruction_budget: max_instructions,
     };
@@ -426,8 +445,120 @@ struct AnalyzeReport {
     win32_calls: Vec<Win32Call>,
     win32_calls_by_function: Vec<Win32CallCount>,
     coverage: CoverageSummary,
+    indicators: Indicators,
     instructions_executed: u64,
     instruction_budget: u64,
+}
+
+#[derive(serde::Serialize, Default)]
+struct Indicators {
+    /// Strings flagged as URLs (`http://…`, `https://…`,
+    /// `ftp://…`).
+    urls: Vec<String>,
+    /// Strings flagged as file paths — anything containing a
+    /// drive-letter prefix `X:\\` or matching the Windows
+    /// `\\\\?\\` long-path scheme.
+    file_paths: Vec<String>,
+    /// Strings flagged as registry keys (`HKEY_…`,
+    /// `HKCR\\…`).
+    registry_keys: Vec<String>,
+    /// All printable ASCII strings of length ≥ `STRING_MIN_LEN`
+    /// extracted from the PE's data sections. The classified
+    /// shapes above are a subset of this list.
+    ascii_strings: Vec<String>,
+}
+
+const STRING_MIN_LEN: usize = 5;
+
+fn extract_indicators(pe: &ud_format_pe::PeFile) -> Indicators {
+    let mut all: Vec<String> = Vec::new();
+    for (idx, sh) in pe.sections.iter().enumerate() {
+        // Skip executable code sections — strings landing in
+        // `.text` are usually false positives off instruction
+        // operands. Data and read-only data sections are the
+        // primary indicator source.
+        let is_exec = sh.characteristics & 0x2000_0000 != 0;
+        if is_exec {
+            continue;
+        }
+        let Some(data) = pe.section_data(idx) else {
+            continue;
+        };
+        scan_ascii_strings(data, &mut all);
+    }
+    all.sort();
+    all.dedup();
+
+    let urls = all
+        .iter()
+        .filter(|s| {
+            s.starts_with("http://")
+                || s.starts_with("https://")
+                || s.starts_with("ftp://")
+                || s.starts_with("ws://")
+                || s.starts_with("wss://")
+        })
+        .cloned()
+        .collect();
+    let file_paths = all
+        .iter()
+        .filter(|s| {
+            // Drive-letter path like `C:\foo` or UNC-style
+            // `\\server\share` (with the backslashes preserved
+            // in the captured string).
+            let bytes = s.as_bytes();
+            (bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes[2] == b'\\' || bytes[2] == b'/'))
+                || s.starts_with("\\\\?\\")
+                || s.starts_with("\\\\.\\")
+        })
+        .cloned()
+        .collect();
+    let registry_keys = all
+        .iter()
+        .filter(|s| {
+            s.starts_with("HKEY_")
+                || s.starts_with("HKLM\\")
+                || s.starts_with("HKCU\\")
+                || s.starts_with("HKCR\\")
+                || s.starts_with("HKU\\")
+        })
+        .cloned()
+        .collect();
+    Indicators {
+        urls,
+        file_paths,
+        registry_keys,
+        ascii_strings: all,
+    }
+}
+
+fn scan_ascii_strings(buf: &[u8], out: &mut Vec<String>) {
+    let mut start: Option<usize> = None;
+    for (i, &b) in buf.iter().enumerate() {
+        let printable = matches!(b, 0x20..=0x7e);
+        if printable {
+            start.get_or_insert(i);
+        } else {
+            if let Some(s) = start.take() {
+                if i - s >= STRING_MIN_LEN {
+                    if let Ok(text) = std::str::from_utf8(&buf[s..i]) {
+                        out.push(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(s) = start {
+        let end = buf.len();
+        if end - s >= STRING_MIN_LEN {
+            if let Ok(text) = std::str::from_utf8(&buf[s..end]) {
+                out.push(text.to_string());
+            }
+        }
+    }
 }
 
 impl AnalyzeReport {
@@ -472,6 +603,30 @@ impl AnalyzeReport {
             "Instructions executed: {} of {}",
             self.instructions_executed, self.instruction_budget
         );
+        println!();
+        println!("Indicators:");
+        println!("  {} ASCII strings extracted from data sections", self.indicators.ascii_strings.len());
+        if !self.indicators.urls.is_empty() {
+            println!("  URLs ({}):", self.indicators.urls.len());
+            for u in &self.indicators.urls {
+                println!("    {u}");
+            }
+        }
+        if !self.indicators.file_paths.is_empty() {
+            println!("  File paths ({}):", self.indicators.file_paths.len());
+            for p in self.indicators.file_paths.iter().take(8) {
+                println!("    {p}");
+            }
+            if self.indicators.file_paths.len() > 8 {
+                println!("    … {} more", self.indicators.file_paths.len() - 8);
+            }
+        }
+        if !self.indicators.registry_keys.is_empty() {
+            println!("  Registry keys ({}):", self.indicators.registry_keys.len());
+            for k in &self.indicators.registry_keys {
+                println!("    {k}");
+            }
+        }
         println!();
         match &self.dll_main {
             DllMainOutcome::Returned { value } => {
