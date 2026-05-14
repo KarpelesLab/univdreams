@@ -1164,7 +1164,7 @@ fn simplify_stmt(stmt: &mut Stmt, width: crate::expr::BitWidth) {
 /// source); as long as both sides see the same `FnDecl`,
 /// they compute the same default, and the @prologue / @epilogue
 /// can be safely omitted from source.
-fn profile_inputs_from_fn(f: &ud_ast::FnDecl) -> ud_arch_x86::ProfileInputs {
+pub fn profile_inputs_from_fn(f: &ud_ast::FnDecl) -> ud_arch_x86::ProfileInputs {
     let abi = f
         .attrs
         .iter()

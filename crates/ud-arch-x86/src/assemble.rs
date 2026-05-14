@@ -216,6 +216,11 @@ fn parse_single_operand(
                 (Bitness::Bits32 | Bitness::Bits16, Some(MemSize::Dword)) => Code::Jmp_rm32,
                 _ => return unsupported(text),
             },
+            "push" => match (bitness, mem.size_hint) {
+                (Bitness::Bits64, Some(MemSize::Qword)) => Code::Push_rm64,
+                (Bitness::Bits32 | Bitness::Bits16, Some(MemSize::Dword)) => Code::Push_rm32,
+                _ => return unsupported(text),
+            },
             "nop" => match mem.size_hint {
                 // The Intel formatter omits the size prefix for
                 // `nop [mem]`. Decoded bytes `0F 1F /0` are
@@ -229,7 +234,18 @@ fn parse_single_operand(
             },
             _ => return unsupported(text),
         };
-        let mem_op = build_memory_operand(&mem)?;
+        // Bare `[disp]` in 64-bit mode is RIP-relative — that's
+        // how the Intel formatter writes both `jmp [rip+disp]`
+        // and `jmp [abs]` for indirect-through-GOT calls. Tell
+        // iced to compute the relative offset itself.
+        let mem_op = if bitness == Bitness::Bits64
+            && mem.base == Register::None
+            && mem.index == Register::None
+        {
+            build_rip_relative_operand(mem.displacement)
+        } else {
+            build_memory_operand(&mem)?
+        };
         return Instruction::with1::<iced_x86::MemoryOperand>(code, mem_op).map_err(|e| {
             AssembleError::EncodeFailed {
                 message: format!("{e:?}"),
@@ -260,13 +276,32 @@ fn parse_two_operand(
         return unsupported(text);
     }
     let code = match mnemonic {
-        "xchg" => match wa {
-            64 => Code::Xchg_rm64_r64,
-            32 => Code::Xchg_rm32_r32,
-            16 => Code::Xchg_rm16_r16,
-            8 => Code::Xchg_rm8_r8,
-            _ => return unsupported(text),
-        },
+        "xchg" => {
+            // Special case: `xchg ax,ax` / `xchg eax,eax` / `xchg rax,rax`
+            // are all single-byte NOPs (`66 90` / `90` / `48 90`) and
+            // iced spells them that way in the formatter — so a
+            // round-trip via Xchg_rm16_r16/etc would produce 3-byte
+            // `87 /r` encodings instead. Detect the same-register
+            // forms here and emit the zero-operand NOP variant.
+            if ra == rb {
+                let nop_code = match wa {
+                    16 if ra == Register::AX => Some(Code::Nopw),
+                    32 if ra == Register::EAX => Some(Code::Nopd),
+                    64 if ra == Register::RAX => Some(Code::Nopq),
+                    _ => Option::None,
+                };
+                if let Some(c) = nop_code {
+                    return Ok(Instruction::with(c));
+                }
+            }
+            match wa {
+                64 => Code::Xchg_rm64_r64,
+                32 => Code::Xchg_rm32_r32,
+                16 => Code::Xchg_rm16_r16,
+                8 => Code::Xchg_rm8_r8,
+                _ => return unsupported(text),
+            }
+        }
         "mov" => match wa {
             64 => Code::Mov_rm64_r64,
             32 => Code::Mov_rm32_r32,
@@ -414,24 +449,32 @@ fn tokenize_addr(s: &str) -> Vec<(bool, &str)> {
 
 fn build_memory_operand(mem: &ParsedMemory) -> Result<iced_x86::MemoryOperand, AssembleError> {
     use iced_x86::MemoryOperand;
-    // The `displ_size` parameter selects the encoded displacement
-    // width. Picking 0 lets iced choose the shortest legal
-    // form. For absolute `[0x…]` addresses in 64-bit mode iced
-    // wires it through as a RIP-relative or absolute encoding
-    // depending on context — that's handled by the encoder
-    // itself when we feed `Register::None` as the base.
     Ok(MemoryOperand::with_base_index_scale_displ_size(
         mem.base,
         mem.index,
         mem.scale,
         mem.displacement,
-        if mem.displacement == 0 && mem.base != Register::None && mem.index == Register::None {
-            0
-        } else {
-            // Let iced pick (most likely 4 bytes for absolute).
-            0
-        },
+        // Let iced pick the displacement size based on the
+        // operand shape (Mod=00 / disp8 / disp32 for ModR/M
+        // forms; always disp32 for RIP-relative).
+        0,
     ))
+}
+
+/// Build a 64-bit RIP-relative memory operand from an absolute
+/// target address. iced computes the encode-time displacement
+/// (`target − (rip + insn_size)`) from `rip` so we hand it the
+/// absolute address directly.
+fn build_rip_relative_operand(target: i64) -> iced_x86::MemoryOperand {
+    use iced_x86::MemoryOperand;
+    MemoryOperand::with_base_index_scale_displ_size(
+        Register::RIP,
+        Register::None,
+        1,
+        target,
+        // RIP-relative always encodes a 4-byte displacement.
+        4,
+    )
 }
 
 /// Map a canonical x86 register name to iced's `Register` enum.
@@ -642,5 +685,37 @@ mod tests {
             Err(AssembleError::Unsupported { .. }) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn xchg_same_register_emits_nop_variant() {
+        // `xchg ax,ax` / `eax,eax` / `rax,rax` are the 1-byte (with
+        // prefix) NOP encodings. The Intel formatter prints them
+        // with the xchg mnemonic, so the assembler has to map
+        // them back to `Nopw` / `Nopd` / `Nopq` not the generic
+        // `Xchg_rm…_r…` Codes.
+        round_trip(Bitness::Bits64, "xchg ax,ax", &[0x66, 0x90]);
+        // Note: `xchg eax,eax` in 64-bit mode isn't safe (it would
+        // zero the upper 32 bits) so iced's decoder spells `90` as
+        // `nop` not `xchg eax,eax`. We don't need the 32-bit
+        // same-reg variant in 64-bit mode.
+        round_trip(Bitness::Bits64, "xchg rax,rax", &[0x48, 0x90]);
+    }
+
+    #[test]
+    fn rip_relative_indirect_jmp_call_push_x86_64() {
+        // `jmp [abs]` in 64-bit mode encodes as `FF 25 disp32`
+        // where disp32 = target - (rip + insn_size). The encoder
+        // computes that from the RIP we pass.
+        // Test at IP 0x1030: target = 0x3fc0, insn_size = 6,
+        // disp = 0x3fc0 - (0x1030 + 6) = 0x2f8a.
+        let bytes = assemble_intel(Bitness::Bits64, "jmp qword ptr [0x3fc0]", 0x1030).unwrap();
+        assert_eq!(bytes, vec![0xff, 0x25, 0x8a, 0x2f, 0x00, 0x00]);
+
+        let bytes = assemble_intel(Bitness::Bits64, "call qword ptr [0x3fd8]", 0x1030).unwrap();
+        assert_eq!(bytes, vec![0xff, 0x15, 0xa2, 0x2f, 0x00, 0x00]);
+
+        let bytes = assemble_intel(Bitness::Bits64, "push qword ptr [0x3fb8]", 0x1030).unwrap();
+        assert_eq!(bytes, vec![0xff, 0x35, 0x82, 0x2f, 0x00, 0x00]);
     }
 }

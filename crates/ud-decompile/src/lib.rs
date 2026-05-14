@@ -167,58 +167,213 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
 }
 
 /// Walk every `Stmt::Asm` in the AST. For each, try to encode
-/// `text` via the in-crate x86 assembler at IP 0; if it
-/// succeeds and the encoded bytes equal the pinned `bytes`,
-/// clear the byte list — lower will re-assemble at the real
-/// position.
+/// `text` via the in-crate x86 assembler at the statement's
+/// actual IP; if it succeeds and the encoded bytes equal the
+/// pinned `bytes`, clear the byte list — lower will re-assemble
+/// at the same IP and reproduce the same bytes.
 ///
-/// `assemble_intel` only covers forms whose encoding is
-/// position-independent today (zero-operand mnemonics and
-/// GPR-register operands), so the IP we pass doesn't influence
-/// the test. Once RIP-relative forms join the supported set,
-/// the position-independence check will need to verify the
-/// same bytes also encode at a non-zero IP before we drop.
+/// The IP threading matters for RIP-relative encodings
+/// (`jmp/call/push qword ptr [abs]` in 64-bit mode): the
+/// emitted bytes carry `disp32 = target − (rip + insn_size)`,
+/// so assembling at IP 0 would produce a different disp than
+/// the original bytes at the real IP. Threading the cursor
+/// through gives us both the regen path and the drop test
+/// against the same fixed reference point.
 fn drop_regenerable_asm_bytes(items: &mut [Item], bitness: ud_arch_x86::Bitness) {
-    fn visit_stmts(stmts: &mut [ud_ast::Stmt], bitness: ud_arch_x86::Bitness) {
+    /// Return the encoded byte size of `stmt` so the cursor can
+    /// step past it. For `Stmt::Asm`, the pinned bytes' length
+    /// is the source of truth; for re-encoded forms the size is
+    /// what our assembler would emit.
+    fn asm_size(stmt: &ud_ast::Stmt, bitness: ud_arch_x86::Bitness, ip: u64) -> u64 {
+        if let ud_ast::Stmt::Asm { text, bytes } = stmt {
+            if !bytes.is_empty() {
+                return bytes.len() as u64;
+            }
+            if let Ok(encoded) = ud_arch_x86::assemble_intel(bitness, text, ip) {
+                return encoded.len() as u64;
+            }
+        }
+        0
+    }
+
+    fn visit_stmts(
+        stmts: &mut [ud_ast::Stmt],
+        bitness: ud_arch_x86::Bitness,
+        ip: &mut u64,
+    ) {
         for stmt in stmts.iter_mut() {
+            let here = *ip;
             match stmt {
                 ud_ast::Stmt::Asm { text, bytes } => {
                     if bytes.is_empty() {
+                        *ip = ip.saturating_add(asm_size(stmt, bitness, here));
                         continue;
                     }
-                    if let Ok(encoded) = ud_arch_x86::assemble_intel(bitness, text, 0) {
+                    if let Ok(encoded) = ud_arch_x86::assemble_intel(bitness, text, here) {
                         if encoded == *bytes {
                             bytes.clear();
                         }
                     }
+                    *ip = ip.saturating_add(asm_size(stmt, bitness, here));
                 }
                 ud_ast::Stmt::IfBranch {
                     pre_body,
+                    cond_bytes,
                     then_body,
                     else_body,
                     ..
                 } => {
-                    visit_stmts(pre_body, bitness);
-                    visit_stmts(then_body, bitness);
+                    visit_stmts(pre_body, bitness, ip);
+                    *ip = ip.saturating_add(cond_bytes.len() as u64);
+                    visit_stmts(then_body, bitness, ip);
                     if let Some(eb) = else_body {
-                        visit_stmts(eb, bitness);
+                        visit_stmts(eb, bitness, ip);
                     }
                 }
-                ud_ast::Stmt::Loop { body, .. } => visit_stmts(body, bitness),
-                _ => {}
+                ud_ast::Stmt::Loop {
+                    entry_jmp_bytes,
+                    body,
+                    tail_bytes,
+                    ..
+                } => {
+                    if let Some(jmp) = entry_jmp_bytes {
+                        *ip = ip.saturating_add(jmp.len() as u64);
+                    }
+                    visit_stmts(body, bitness, ip);
+                    *ip = ip.saturating_add(tail_bytes.len() as u64);
+                }
+                other => {
+                    // Conservative fallback: bump the cursor by
+                    // any byte-bearing sub-field we know about.
+                    // Inaccurate for some statement kinds but
+                    // sufficient since RIP-relative forms only
+                    // appear in `Stmt::Asm` today.
+                    *ip = ip.saturating_add(stmt_min_size(other));
+                }
             }
         }
     }
-    fn visit_items(items: &mut [Item], bitness: ud_arch_x86::Bitness) {
+
+    fn auto_prologue_size(f: &ud_ast::FnDecl) -> u64 {
+        let has_flag = f.attrs.iter().any(|a| {
+            (a.key == "autogen_pro" || a.key == "autogen_pro_legacy")
+                && matches!(a.value, ud_ast::AttrValue::Flag)
+        });
+        if !has_flag {
+            return 0;
+        }
+        let profile = build_function::profile_inputs_from_fn(f);
+        let cb = if profile.bits == 64 {
+            ud_arch_x86::CodecBits::Bits64
+        } else {
+            ud_arch_x86::CodecBits::Bits32
+        };
+        let pro = ud_arch_x86::default_prologue(&profile);
+        ud_arch_x86::encode_prologue(&pro, cb).len() as u64
+    }
+
+    fn auto_epilogue_size(f: &ud_ast::FnDecl) -> u64 {
+        let has_flag = f.attrs.iter().any(|a| {
+            (a.key == "autogen_pro" || a.key == "autogen_pro_legacy")
+                && matches!(a.value, ud_ast::AttrValue::Flag)
+        });
+        if !has_flag {
+            return 0;
+        }
+        let profile = build_function::profile_inputs_from_fn(f);
+        let cb = if profile.bits == 64 {
+            ud_arch_x86::CodecBits::Bits64
+        } else {
+            ud_arch_x86::CodecBits::Bits32
+        };
+        let epi = ud_arch_x86::default_epilogue(&profile);
+        ud_arch_x86::encode_epilogue(&epi, cb).len() as u64
+    }
+
+    fn stmt_min_size(stmt: &ud_ast::Stmt) -> u64 {
+        use ud_ast::Stmt::*;
+        match stmt {
+            Asm { bytes, .. }
+            | Return { bytes, .. }
+            | Prologue { bytes, .. }
+            | Epilogue { bytes, .. }
+            | Save { bytes, .. }
+            | Restore { bytes, .. }
+            | ReturnExpr { bytes, .. }
+            | ArgSpill { bytes, .. }
+            | LocalSet { bytes, .. }
+            | LocalArith { bytes, .. }
+            | LocalCompound { bytes, .. }
+            | Move { bytes, .. }
+            | Inc16 { bytes, .. }
+            | SehInstall { bytes }
+            | SehRestore { bytes } => bytes.len() as u64,
+            Call {
+                bytes,
+                direct_target,
+                ..
+            } => bytes.len() as u64 + if direct_target.is_some() { 5 } else { 0 },
+            Goto { wide, .. } => {
+                if *wide {
+                    5
+                } else {
+                    2
+                }
+            }
+            IfGoto {
+                cmp_bytes, wide, ..
+            }
+            | IfReturn {
+                cmp_bytes, wide, ..
+            } => cmp_bytes.len() as u64 + if *wide { 6 } else { 2 },
+            _ => 0,
+        }
+    }
+
+    fn visit_items(items: &mut [Item], bitness: ud_arch_x86::Bitness, section_cursor: u64) {
+        let mut cursor = section_cursor;
         for item in items.iter_mut() {
             match item {
-                Item::Function(f) => visit_stmts(&mut f.body, bitness),
-                Item::Section { items, .. } => visit_items(items, bitness),
-                _ => {}
+                Item::Function(f) => {
+                    let fn_ip = f.addr.unwrap_or(cursor);
+                    let mut ip = fn_ip;
+                    // Account for the auto-generated prologue
+                    // bytes the lower path will emit when
+                    // `@autogen_pro` (or its legacy alias) is
+                    // set — the first body statement's IP sits
+                    // past those bytes.
+                    ip = ip.saturating_add(auto_prologue_size(f));
+                    visit_stmts(&mut f.body, bitness, &mut ip);
+                    // The trailing autogen epilogue, when set,
+                    // also lives in the function's bytes but
+                    // emits after the body — for cursor
+                    // tracking past the function, add it.
+                    ip = ip.saturating_add(auto_epilogue_size(f));
+                    cursor = ip;
+                }
+                Item::Section {
+                    addr,
+                    items: nested,
+                    ..
+                } => visit_items(nested, bitness, *addr),
+                Item::Raw { addr, bytes } => {
+                    cursor = (*addr).saturating_add(bytes.len() as u64);
+                }
+                Item::Strings { addr, strings } => {
+                    cursor = (*addr)
+                        .saturating_add(strings.iter().map(|s| (s.len() + 1) as u64).sum());
+                }
+                Item::Notes { addr, .. } => {
+                    cursor = *addr;
+                }
+                Item::JumpTable { addr, entries, .. } => {
+                    cursor = (*addr).saturating_add((entries.len() as u64) * 4);
+                }
+                Item::Comment(_) => {}
             }
         }
     }
-    visit_items(items, bitness);
+    visit_items(items, bitness, 0);
 }
 
 /// One switch-dispatch table harvested from a `Stmt::Switch`.
