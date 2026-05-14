@@ -638,6 +638,61 @@ fn compute_sp_delta_cfg(f: &Function<DecodedInsn>) -> HashMap<u64, i64> {
 /// holds — so the substituted output reads as the computation the
 /// programmer wrote, before the compiler threaded everything
 /// through a scratch register.
+/// Maximum tracked expression length per register. Past this,
+/// forward propagation drops the register from the state. 200
+/// chars covers most legitimate hand-written-looking
+/// substitutions and cuts off the recursive-fold cases that
+/// produce the `((((var_74 | var_58) & X) | var_58) & …)`
+/// chains.
+const PROP_MAX_LEN: usize = 200;
+
+/// Maximum number of occurrences of any single identifier in a
+/// tracked value. A computation that mentions `var_74` more
+/// than this many times has stopped being a recoverable
+/// expression and become a compound of prior compounds —
+/// forward-prop drops the register instead of perpetuating it.
+const PROP_MAX_IDENT_REPEATS: usize = 4;
+
+/// Walk `text` and look for any identifier that occurs more
+/// than `limit` times. An identifier is a maximal run of
+/// `[A-Za-z_][A-Za-z0-9_]*`. Strings and bracketed segments
+/// count because the explosion happens in arithmetic
+/// expressions, not memory operands.
+fn any_ident_repeats(text: &str, limit: usize) -> bool {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut start = Option::<usize>::None;
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_ident = b.is_ascii_alphanumeric() || b == b'_';
+        match (start, is_ident) {
+            (None, true) => start = Some(i),
+            (Some(s), false) => {
+                let ident = &text[s..i];
+                if !ident.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                    let n = counts.entry(ident).or_insert(0);
+                    *n += 1;
+                    if *n > limit {
+                        return true;
+                    }
+                }
+                start = Option::None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        let ident = &text[s..];
+        if !ident.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            let n = counts.entry(ident).or_insert(0);
+            *n += 1;
+            if *n > limit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[derive(Default, Clone)]
 struct RegState {
     values: std::collections::HashMap<String, String>,
@@ -645,6 +700,25 @@ struct RegState {
 
 impl RegState {
     fn write(&mut self, reg: &str, value: String) {
+        // Cap propagated expression complexity. The forward
+        // propagator builds each register's tracked value by
+        // substituting prior values into the new RHS, so a
+        // chain `r = r op x` quickly compounds: at iteration
+        // N the stored value contains 2^N copies of the
+        // original `x`. Once the value crosses a sanity
+        // threshold we stop tracking the register (callers
+        // see the bare name) — the displayed code is still
+        // correct, just less aggressively folded.
+        //
+        // The cutoff covers both raw size and a heuristic on
+        // repeated identifier usage: when a variable's name
+        // shows up more than a handful of times the expression
+        // has stopped being "the computation the programmer
+        // wrote" and become a fold-explosion artifact.
+        if value.len() > PROP_MAX_LEN || any_ident_repeats(&value, PROP_MAX_IDENT_REPEATS) {
+            self.values.remove(reg);
+            return;
+        }
         self.values.insert(reg.to_string(), value);
     }
 
