@@ -1,0 +1,45 @@
+[package]
+name = "ud-emulator"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust 32-bit x86 emulator + PE runtime loader + Win32 host shims. Mirrors oxideav-vfw; intended to grow into the dynamic-analysis backend that informs decompilation (indirect-target recovery, constant-data discovery)."
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+# Trace mode — adds reverse-engineering instrumentation surface
+# (Win32 stub calls, memory watchpoints, traps) that emits JSONL
+# events. Off by default; consumers do not pay for the probe-site
+# branches.
+trace = []
+
+# Per-instruction execution trace inside `trace` mode. Imposes
+# ~3× extra overhead on top of `trace`. Has no effect unless
+# `trace` is also enabled.
+trace-exec = ["trace"]
+
+# Codec-discovery — walks a host filesystem path looking for VFW
+# / DirectShow codec DLLs and registers them. Mirrored from
+# oxideav-vfw verbatim, but in univdreams it has no consumer
+# (oxideav-core isn't a dep here). Kept gated for parity; only
+# enable when integrating with a codec runtime.
+discovery = []
+
+[dependencies]
+thiserror = "2"
+
+# Used by the trace module for JSONL emission and by the
+# discovery module's codec.json index. Both are feature-gated
+# so the default build is dep-light.
+log = { version = "0.4", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
