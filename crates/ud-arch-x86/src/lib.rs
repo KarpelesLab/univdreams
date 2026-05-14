@@ -30,11 +30,13 @@ pub use iced_x86::{
 use ud_core::VAddr;
 use ud_ir::ArchInsn;
 
+mod assemble;
 mod call_site;
 mod encode_text;
 mod expr;
 mod lift;
 mod prologue_codec;
+pub use assemble::{assemble_intel, AssembleError};
 pub use call_site::{
     detect_post_call_spill, identify_call_sites, ArgValue, CallSite, PostCallSpill,
 };
