@@ -19,8 +19,8 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-ud-ast = { version = "0.1.0", path = "../ud-ast" }
-ud-format = { version = "0.1.0", path = "../ud-format" }
-ud-translate = { version = "0.1.0", path = "../ud-translate" }
+ud-ast = { version = "0.1.1", path = "../ud-ast" }
+ud-format = { version = "0.1.1", path = "../ud-format" }
+ud-translate = { version = "0.1.1", path = "../ud-translate" }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"

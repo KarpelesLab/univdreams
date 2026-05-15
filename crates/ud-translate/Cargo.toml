@@ -15,13 +15,13 @@ description = "The .ud source-language translation engine: binary → .ud source
 workspace = true
 
 [dependencies]
-ud-core = { version = "0.1.0", path = "../ud-core" }
-ud-ir = { version = "0.1.0", path = "../ud-ir" }
-ud-ast = { version = "0.1.0", path = "../ud-ast" }
-ud-analysis = { version = "0.1.0", path = "../ud-analysis" }
-ud-debug = { version = "0.1.0", path = "../ud-debug" }
-ud-arch-x86 = { version = "0.1.0", path = "../ud-arch-x86" }
-ud-arch-aarch64 = { version = "0.1.0", path = "../ud-arch-aarch64" }
-ud-arch-6502 = { version = "0.1.0", path = "../ud-arch-6502" }
-ud-format = { version = "0.1.0", path = "../ud-format" }
+ud-core = { version = "0.1.1", path = "../ud-core" }
+ud-ir = { version = "0.1.1", path = "../ud-ir" }
+ud-ast = { version = "0.1.1", path = "../ud-ast" }
+ud-analysis = { version = "0.1.1", path = "../ud-analysis" }
+ud-debug = { version = "0.1.1", path = "../ud-debug" }
+ud-arch-x86 = { version = "0.1.1", path = "../ud-arch-x86" }
+ud-arch-aarch64 = { version = "0.1.1", path = "../ud-arch-aarch64" }
+ud-arch-6502 = { version = "0.1.1", path = "../ud-arch-6502" }
+ud-format = { version = "0.1.1", path = "../ud-format" }
 thiserror = "2"

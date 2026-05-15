@@ -15,5 +15,5 @@ description = "Binary container formats for univdreams — ELF, PE/COFF, Mach-O,
 workspace = true
 
 [dependencies]
-ud-core = { version = "0.1.0", path = "../ud-core" }
+ud-core = { version = "0.1.1", path = "../ud-core" }
 thiserror = "2"
