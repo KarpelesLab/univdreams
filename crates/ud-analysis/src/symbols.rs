@@ -7,7 +7,7 @@
 //! get filtered out.
 
 use ud_core::VAddr;
-use ud_format_elf::{Elf64File, ElfClass, SHT_DYNSYM, SHT_SYMTAB};
+use ud_format::elf::{Elf64File, ElfClass, SHT_DYNSYM, SHT_SYMTAB};
 
 use crate::function_map::{Function, FunctionSource};
 

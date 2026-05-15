@@ -394,21 +394,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Decompile { input, out } => {
             let bytes =
                 std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
-            let source = if ud_format_elf::is_elf64_le(&bytes) {
-                let elf = ud_format_elf::Elf64File::parse(&bytes)
+            let source = if ud_format::elf::is_elf64_le(&bytes) {
+                let elf = ud_format::elf::Elf64File::parse(&bytes)
                     .with_context(|| format!("parse {} as ELF", input.display()))?;
                 ud_translate::decompile::decompile_to_text(&elf)
                     .with_context(|| format!("decompile {}", input.display()))?
-            } else if ud_format_pe::is_pe(&bytes) {
-                let pe = ud_format_pe::PeFile::parse(&bytes)
+            } else if ud_format::pe::is_pe(&bytes) {
+                let pe = ud_format::pe::PeFile::parse(&bytes)
                     .with_context(|| format!("parse {} as PE", input.display()))?;
                 ud_translate::decompile::decompile_pe_to_text(&pe)
-            } else if ud_format_macho::is_macho64(&bytes) {
-                let macho = ud_format_macho::MachoFile::parse(&bytes)
+            } else if ud_format::macho::is_macho64(&bytes) {
+                let macho = ud_format::macho::MachoFile::parse(&bytes)
                     .with_context(|| format!("parse {} as Mach-O", input.display()))?;
                 ud_translate::decompile::decompile_macho_to_text(&macho)
             } else if let Some(load_addr) = ud_cli::raw_6502_load_addr(&bytes) {
-                let image = ud_format_raw::RawImage::new(bytes, load_addr);
+                let image = ud_format::raw::RawImage::new(bytes, load_addr);
                 ud_translate::decompile::decompile_raw_6502_to_text(&image)
                     .with_context(|| format!("decompile {} as 6502 raw", input.display()))?
             } else {
@@ -969,7 +969,7 @@ fn encode_cmd(
 
 fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
-    if !ud_format_pe::is_pe(&bytes) {
+    if !ud_format::pe::is_pe(&bytes) {
         anyhow::bail!(
             "ud analyze currently only supports PE32 DLLs; {} is not a PE",
             input.display()
@@ -992,7 +992,7 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
             // JSON shapes — the front-end consumer cares
             // whether the load even got off the ground.
             if as_json {
-                let pe = ud_format_pe::PeFile::parse(&bytes).ok();
+                let pe = ud_format::pe::PeFile::parse(&bytes).ok();
                 let indicators = pe
                     .as_ref()
                     .map(extract_indicators)
@@ -1070,7 +1070,7 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
     // paths, registry keys), and report. Doesn't depend on
     // the run completing, so even codecs that trap mid-DllMain
     // surface their string indicators.
-    let pe = ud_format_pe::PeFile::parse(&bytes).ok();
+    let pe = ud_format::pe::PeFile::parse(&bytes).ok();
     let indicators = pe
         .as_ref()
         .map(extract_indicators)
@@ -1132,7 +1132,7 @@ struct Indicators {
 
 const STRING_MIN_LEN: usize = 5;
 
-fn extract_indicators(pe: &ud_format_pe::PeFile) -> Indicators {
+fn extract_indicators(pe: &ud_format::pe::PeFile) -> Indicators {
     let mut all: Vec<String> = Vec::new();
     for (idx, sh) in pe.sections.iter().enumerate() {
         // Skip executable code sections — strings landing in

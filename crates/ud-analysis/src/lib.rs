@@ -33,7 +33,7 @@ pub use signatures::discover_from_signatures;
 pub use symbols::{discover_from_symbol_tables, SymbolError};
 
 use ud_core::VAddr;
-use ud_format_elf::Elf64File;
+use ud_format::elf::Elf64File;
 
 /// Crate-level error type.
 #[derive(Debug, thiserror::Error)]
@@ -84,7 +84,7 @@ pub fn discover_functions(elf: &Elf64File) -> Result<FunctionMap> {
 /// the section, if it's the last). Functions without a containing
 /// executable section keep `size = 0`.
 fn fill_in_sizes_from_neighbors(map: &mut FunctionMap, elf: &Elf64File) {
-    use ud_format_elf::SHF_EXECINSTR;
+    use ud_format::elf::SHF_EXECINSTR;
 
     let func_addrs: Vec<u64> = map.iter().map(|f| f.addr.0).collect();
 

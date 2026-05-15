@@ -23,8 +23,5 @@ ud-debug = { version = "0.1.0", path = "../ud-debug" }
 ud-arch-x86 = { version = "0.1.0", path = "../ud-arch-x86" }
 ud-arch-aarch64 = { version = "0.1.0", path = "../ud-arch-aarch64" }
 ud-arch-6502 = { version = "0.1.0", path = "../ud-arch-6502" }
-ud-format-elf = { version = "0.1.0", path = "../ud-format-elf" }
-ud-format-pe = { version = "0.1.0", path = "../ud-format-pe" }
-ud-format-macho = { version = "0.1.0", path = "../ud-format-macho" }
-ud-format-raw = { version = "0.1.0", path = "../ud-format-raw" }
+ud-format = { version = "0.1.0", path = "../ud-format" }
 thiserror = "2"

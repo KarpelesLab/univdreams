@@ -14,7 +14,7 @@ use ud_core::{assert_bytes_equal, Error, Result};
 ///
 /// The pipeline routes by detected format:
 ///
-/// * **ELF64-LE** is parsed via [`ud_format_elf::Elf64File`] and re-emitted.
+/// * **ELF64-LE** is parsed via [`ud_format::elf::Elf64File`] and re-emitted.
 ///   This actually exercises the format reader/writer, so any drift in
 ///   either path is caught here.
 /// * **Anything else** (32-bit ELF, PE, Mach-O, raw bytes) falls through
@@ -49,21 +49,21 @@ pub fn roundtrip(input: &Path, output: &Path) -> Result<()> {
 ///
 /// Split out so it's directly testable without filesystem I/O.
 fn pipeline_bytes(bytes: &[u8]) -> Vec<u8> {
-    if ud_format_elf::is_elf64_le(bytes) {
-        if let Ok(elf) = ud_format_elf::Elf64File::parse(bytes) {
+    if ud_format::elf::is_elf64_le(bytes) {
+        if let Ok(elf) = ud_format::elf::Elf64File::parse(bytes) {
             return elf.write_to_vec();
         }
         // ELF that we still can't parse (e.g. malformed header sizes).
         // Fall through to byte-copy so the round-trip contract holds.
     }
-    if ud_format_pe::is_pe(bytes) {
-        if let Ok(pe) = ud_format_pe::PeFile::parse(bytes) {
+    if ud_format::pe::is_pe(bytes) {
+        if let Ok(pe) = ud_format::pe::PeFile::parse(bytes) {
             return pe.write_to_vec();
         }
         // PE-shaped but invalid; fall through to byte-copy.
     }
-    if ud_format_macho::is_macho64(bytes) {
-        if let Ok(macho) = ud_format_macho::MachoFile::parse(bytes) {
+    if ud_format::macho::is_macho64(bytes) {
+        if let Ok(macho) = ud_format::macho::MachoFile::parse(bytes) {
             return macho.write_to_vec();
         }
         // Mach-O-shaped but rejected by v1 (32-bit, unsupported
@@ -114,11 +114,11 @@ pub enum SourceRoundTripError {
     #[error(transparent)]
     Decompile6502(#[from] ud_translate::decompile::raw6502::Error),
     #[error(transparent)]
-    ElfFormat(#[from] ud_format_elf::Error),
+    ElfFormat(#[from] ud_format::elf::Error),
     #[error(transparent)]
-    PeFormat(#[from] ud_format_pe::Error),
+    PeFormat(#[from] ud_format::pe::Error),
     #[error(transparent)]
-    MachoFormat(#[from] ud_format_macho::Error),
+    MachoFormat(#[from] ud_format::macho::Error),
     #[error("parse of decompile output failed: {0}")]
     Parse(String),
     #[error(transparent)]
@@ -144,8 +144,8 @@ pub fn roundtrip_through_source(
 ) -> std::result::Result<SourceRoundTripReport, SourceRoundTripError> {
     let input_bytes = std::fs::read(input).map_err(SourceRoundTripError::Io)?;
 
-    let (text, warnings, rebuilt) = if ud_format_elf::is_elf64_le(&input_bytes) {
-        let elf = ud_format_elf::Elf64File::parse(&input_bytes)?;
+    let (text, warnings, rebuilt) = if ud_format::elf::is_elf64_le(&input_bytes) {
+        let elf = ud_format::elf::Elf64File::parse(&input_bytes)?;
         let ast = ud_translate::decompile::decompile(&elf)?;
         let text = ud_ast::emit(&ast);
         let parsed =
@@ -153,8 +153,8 @@ pub fn roundtrip_through_source(
         let warnings = ud_translate::compile::verify_asm(&parsed);
         let rebuilt = ud_translate::compile::lower_to_elf(&parsed)?;
         (text, warnings, rebuilt)
-    } else if ud_format_pe::is_pe(&input_bytes) {
-        let pe = ud_format_pe::PeFile::parse(&input_bytes)?;
+    } else if ud_format::pe::is_pe(&input_bytes) {
+        let pe = ud_format::pe::PeFile::parse(&input_bytes)?;
         let ast = ud_translate::decompile::decompile_pe(&pe);
         let text = ud_ast::emit(&ast);
         let parsed =
@@ -162,8 +162,8 @@ pub fn roundtrip_through_source(
         let warnings = ud_translate::compile::verify_asm(&parsed);
         let rebuilt = ud_translate::compile::lower_to_pe(&parsed)?;
         (text, warnings, rebuilt)
-    } else if ud_format_macho::is_macho64(&input_bytes) {
-        let macho = ud_format_macho::MachoFile::parse(&input_bytes)?;
+    } else if ud_format::macho::is_macho64(&input_bytes) {
+        let macho = ud_format::macho::MachoFile::parse(&input_bytes)?;
         let ast = ud_translate::decompile::decompile_macho(&macho);
         let text = ud_ast::emit(&ast);
         let parsed =
@@ -172,7 +172,7 @@ pub fn roundtrip_through_source(
         let rebuilt = ud_translate::compile::lower_to_macho(&parsed)?;
         (text, warnings, rebuilt)
     } else if let Some(load_addr) = raw_6502_load_addr(&input_bytes) {
-        let image = ud_format_raw::RawImage::new(input_bytes.clone(), load_addr);
+        let image = ud_format::raw::RawImage::new(input_bytes.clone(), load_addr);
         let ast = ud_translate::decompile::decompile_raw_6502(&image)?;
         let text = ud_ast::emit(&ast);
         let parsed =

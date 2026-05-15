@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use ud_translate::compile::{lower_to_macho, parse};
-use ud_format_macho::{is_macho64, MachoFile};
+use ud_format::macho::{is_macho64, MachoFile};
 
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

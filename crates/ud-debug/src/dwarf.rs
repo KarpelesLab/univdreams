@@ -16,7 +16,7 @@ use gimli::{
     AttributeValue, DebuggingInformationEntry, EndianSlice, LittleEndian, Reader, UnitOffset,
 };
 use ud_ast::{Param, Type};
-use ud_format_elf::Elf64File;
+use ud_format::elf::Elf64File;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DebugError {

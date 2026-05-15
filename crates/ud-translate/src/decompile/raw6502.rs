@@ -26,7 +26,7 @@ use ud_arch_6502::{
     classify, decode_range, format_insn_with, AddressingMode, DecodedInsn, InsnKind, Mnemonic,
 };
 use ud_ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
-use ud_format_raw::RawImage;
+use ud_format::raw::RawImage;
 
 /// 6502 reset / NMI / IRQ vectors live at $FFFA-$FFFF. Six bytes.
 const VECTORS_BASE: u64 = 0xFFFA;

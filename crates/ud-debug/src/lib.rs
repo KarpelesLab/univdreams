@@ -17,7 +17,7 @@ pub use dwarf::{DebugError, DebugFunction};
 
 use std::collections::HashMap;
 
-use ud_format_elf::Elf64File;
+use ud_format::elf::Elf64File;
 
 /// Read every supported debug-info section from `elf` and return a
 /// map keyed by function start address. Empty when no debug info is

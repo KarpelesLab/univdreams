@@ -43,11 +43,11 @@ fn pe_fixtures_roundtrip_byte_identical() {
 
     for fixture in &fixtures {
         let bytes = std::fs::read(fixture).expect("read fixture");
-        if !ud_format_pe::is_pe(&bytes) {
+        if !ud_format::pe::is_pe(&bytes) {
             continue;
         }
 
-        match ud_format_pe::PeFile::parse(&bytes) {
+        match ud_format::pe::PeFile::parse(&bytes) {
             Ok(file) => {
                 let rebuilt = file.write_to_vec();
                 if rebuilt == bytes {
@@ -104,7 +104,7 @@ fn coff_symbols_parse_from_mingw_fixture() {
         eprintln!("note: {} unavailable; skipping", path.display());
         return;
     };
-    let pe = ud_format_pe::PeFile::parse(&bytes).expect("parse");
+    let pe = ud_format::pe::PeFile::parse(&bytes).expect("parse");
     let symbols = pe.coff_symbols();
     assert!(
         !symbols.is_empty(),

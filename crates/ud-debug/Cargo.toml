@@ -16,6 +16,6 @@ workspace = true
 
 [dependencies]
 ud-ast = { version = "0.1.0", path = "../ud-ast" }
-ud-format-elf = { version = "0.1.0", path = "../ud-format-elf" }
+ud-format = { version = "0.1.0", path = "../ud-format" }
 gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
 thiserror = "2"

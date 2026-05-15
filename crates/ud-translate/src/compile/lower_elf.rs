@@ -14,13 +14,13 @@
 //!
 //! This is the strongest source-level invariant the project defends.
 //!
-//! [`Elf64File::from_parts`]: ud_format_elf::Elf64File::from_parts
-//! [`Elf64File::write_to_vec`]: ud_format_elf::Elf64File::write_to_vec
+//! [`Elf64File::from_parts`]: ud_format::elf::Elf64File::from_parts
+//! [`Elf64File::write_to_vec`]: ud_format::elf::Elf64File::write_to_vec
 
 use std::collections::HashMap;
 
 use ud_ast::{Item, Module, UdFile, Value};
-use ud_format_elf::{Ehdr64, Elf64File, ElfClass, Phdr64, Shdr64};
+use ud_format::elf::{Ehdr64, Elf64File, ElfClass, Phdr64, Shdr64};
 
 use crate::compile::lower::{lower_section_bytes, LowerError};
 

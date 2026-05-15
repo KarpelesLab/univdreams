@@ -19,7 +19,7 @@
 //! flat `@raw` blocks with structured items.
 
 use ud_ast::{Field, Item, Module, UdFile, Value};
-use ud_format_pe::{
+use ud_format::pe::{
     CoffHeader, DataDirectory, DosHeader, OptionalHeader, PeFile, PeKind, SectionHeader,
     OPTIONAL_HEADER_MAGIC_PE32, OPTIONAL_HEADER_MAGIC_PE32_PLUS,
 };

@@ -12,10 +12,10 @@
 //! ELF / PE so the same `.ud` file can hold any format and the
 //! compiler routes correctly.
 //!
-//! [`MachoFile`]: ud_format_macho::MachoFile
+//! [`MachoFile`]: ud_format::macho::MachoFile
 
 use ud_ast::{Field, Item, Module, UdFile, Value};
-use ud_format_macho::{
+use ud_format::macho::{
     is_dylib_cmd, is_linkedit_data_cmd, LcBuildVersion, LcDylib, LcDylinker, LcDysymtab,
     LcLinkeditData, LcMain, LcSourceVersion, LcSymtab, LcUuid, LoadCommand, MachoCpu, MachoFile,
     Section64, Segment64, LC_BUILD_VERSION, LC_DYSYMTAB, LC_LOAD_DYLINKER, LC_MAIN, LC_SEGMENT_64,

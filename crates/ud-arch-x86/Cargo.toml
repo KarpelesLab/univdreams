@@ -28,5 +28,5 @@ iced-x86 = { version = "1", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-ud-format-elf = { version = "0.1.0", path = "../ud-format-elf" }
+ud-format = { version = "0.1.0", path = "../ud-format" }
 ud-analysis = { version = "0.1.0", path = "../ud-analysis" }

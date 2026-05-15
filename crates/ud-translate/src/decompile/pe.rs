@@ -14,14 +14,14 @@
 //! ELF case so the same `.ud` file can hold either format and the
 //! compiler routes correctly.
 //!
-//! [`PeFile`]: ud_format_pe::PeFile
+//! [`PeFile`]: ud_format::pe::PeFile
 //! [`ud_compile::lower_to_pe`]: ../../ud-compile/index.html
 
 use std::collections::HashMap;
 
 use ud_arch_x86::{lift_function, Bitness};
 use ud_ast::{Field, Item, Module, UdFile, Value};
-use ud_format_pe::{
+use ud_format::pe::{
     CoffSymbol, PeExport, PeFile, PeKind, COFF_SYM_CLASS_EXTERNAL, COFF_SYM_CLASS_STATIC,
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386,
 };
@@ -662,10 +662,10 @@ fn pe_header_region_end(pe: &PeFile) -> usize {
     let pe_off = pe.e_lfanew as usize;
     let opt_off = pe_off + PE_SIG_SIZE + COFF_HEADER_SIZE;
     let sec_off = opt_off + opt_size;
-    sec_off + pe.sections.len() * ud_format_pe::SECTION_HEADER_SIZE
+    sec_off + pe.sections.len() * ud_format::pe::SECTION_HEADER_SIZE
 }
 
-fn build_dos_block(dos: &ud_format_pe::DosHeader) -> Value {
+fn build_dos_block(dos: &ud_format::pe::DosHeader) -> Value {
     Value::Block(vec![
         field("e_magic", byte_list(&dos.e_magic)),
         field("e_cblp", Value::Int(u64::from(dos.e_cblp))),
@@ -705,7 +705,7 @@ fn build_dos_block(dos: &ud_format_pe::DosHeader) -> Value {
     ])
 }
 
-fn build_optional_block(opt: &ud_format_pe::OptionalHeader) -> Value {
+fn build_optional_block(opt: &ud_format::pe::OptionalHeader) -> Value {
     Value::Block(vec![
         field("magic", Value::Int(u64::from(opt.magic))),
         field(

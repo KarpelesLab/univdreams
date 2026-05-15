@@ -6,10 +6,10 @@
 //! preserves enough information for [`Elf64File::from_parts`] to
 //! reproduce the file's layout exactly.
 //!
-//! [`Elf64File::from_parts`]: ud_format_elf::Elf64File::from_parts
+//! [`Elf64File::from_parts`]: ud_format::elf::Elf64File::from_parts
 
 use ud_ast::{Field, Module, Value};
-use ud_format_elf::{Elf64File, Phdr64, EM_X86_64};
+use ud_format::elf::{Elf64File, Phdr64, EM_X86_64};
 
 /// Construct a [`Module`] capturing the full ELF metadata: the
 /// interpreted header fields, the program-header table, the section-
@@ -84,8 +84,8 @@ pub fn build_module(elf: &Elf64File) -> Module {
     ]);
 
     let bits = match elf.class {
-        ud_format_elf::ElfClass::Elf32 => 32,
-        ud_format_elf::ElfClass::Elf64 => 64,
+        ud_format::elf::ElfClass::Elf32 => 32,
+        ud_format::elf::ElfClass::Elf64 => 64,
     };
 
     Module {
@@ -119,7 +119,7 @@ fn phdr_block(p: &Phdr64) -> Value {
     ])
 }
 
-fn shdr_block(elf: &Elf64File, idx: usize, s: &ud_format_elf::Shdr64) -> Value {
+fn shdr_block(elf: &Elf64File, idx: usize, s: &ud_format::elf::Shdr64) -> Value {
     let name = elf.section_name(idx).unwrap_or("").to_string();
     Value::Block(vec![
         field("name", Value::String(name)),

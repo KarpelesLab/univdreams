@@ -9,7 +9,7 @@
 //! section data) and PE (via `SectionHeader::virtual_address` /
 //! the file's raw bytes at the section's `pointer_to_raw_data`).
 //!
-//! [`Elf64File`]: ud_format_elf::Elf64File
+//! [`Elf64File`]: ud_format::elf::Elf64File
 
 /// Look up which section contains a given virtual address.
 pub trait DataLookup {
@@ -29,7 +29,7 @@ pub trait DataLookup {
     }
 }
 
-impl DataLookup for ud_format_elf::Elf64File {
+impl DataLookup for ud_format::elf::Elf64File {
     fn section_at(&self, vaddr: u64) -> Option<(&str, &[u8], usize)> {
         for (idx, sh, data) in self.sections() {
             if sh.sh_size == 0 {
@@ -46,7 +46,7 @@ impl DataLookup for ud_format_elf::Elf64File {
     }
 }
 
-impl DataLookup for ud_format_pe::PeFile {
+impl DataLookup for ud_format::pe::PeFile {
     fn image_base(&self) -> u64 {
         self.image_base
     }
@@ -77,7 +77,7 @@ trait PeFileExt {
     fn section_at_rva(&self, rva: u64) -> Option<(&str, &[u8], usize)>;
 }
 
-impl PeFileExt for ud_format_pe::PeFile {
+impl PeFileExt for ud_format::pe::PeFile {
     fn section_at_rva(&self, rva: u64) -> Option<(&str, &[u8], usize)> {
         for (idx, sh) in self.sections.iter().enumerate() {
             let start = u64::from(sh.virtual_address);

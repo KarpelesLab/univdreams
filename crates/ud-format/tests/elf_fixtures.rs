@@ -48,12 +48,12 @@ fn elf64_fixtures_roundtrip_byte_identical() {
 
     for fixture in &fixtures {
         let bytes = std::fs::read(fixture).expect("read fixture");
-        if !ud_format_elf::is_elf64_le(&bytes) {
+        if !ud_format::elf::is_elf64_le(&bytes) {
             eprintln!("skip  {} (not ELF64-LE)", fixture.display());
             continue;
         }
 
-        match ud_format_elf::Elf64File::parse(&bytes) {
+        match ud_format::elf::Elf64File::parse(&bytes) {
             Ok(file) => {
                 let rebuilt = file.write_to_vec();
                 if rebuilt == bytes {

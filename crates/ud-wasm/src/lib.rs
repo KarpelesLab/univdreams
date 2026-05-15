@@ -47,13 +47,13 @@ pub fn decompile(bytes: &[u8], format: &str) -> Result<String, JsError> {
 }
 
 fn decompile_auto(bytes: &[u8]) -> Result<String, JsError> {
-    if ud_format_elf::is_elf64_le(bytes) {
+    if ud_format::elf::is_elf64_le(bytes) {
         return decompile_as_elf(bytes);
     }
-    if ud_format_pe::is_pe(bytes) {
+    if ud_format::pe::is_pe(bytes) {
         return decompile_as_pe(bytes);
     }
-    if ud_format_macho::is_macho64(bytes) {
+    if ud_format::macho::is_macho64(bytes) {
         return decompile_as_macho(bytes);
     }
     Err(JsError::new(
@@ -62,19 +62,19 @@ fn decompile_auto(bytes: &[u8]) -> Result<String, JsError> {
 }
 
 fn decompile_as_elf(bytes: &[u8]) -> Result<String, JsError> {
-    let elf = ud_format_elf::Elf64File::parse(bytes)
+    let elf = ud_format::elf::Elf64File::parse(bytes)
         .map_err(|e| JsError::new(&format!("parse ELF: {e}")))?;
     ud_translate::decompile::decompile_to_text(&elf).map_err(|e| JsError::new(&format!("decompile ELF: {e}")))
 }
 
 fn decompile_as_pe(bytes: &[u8]) -> Result<String, JsError> {
     let pe =
-        ud_format_pe::PeFile::parse(bytes).map_err(|e| JsError::new(&format!("parse PE: {e}")))?;
+        ud_format::pe::PeFile::parse(bytes).map_err(|e| JsError::new(&format!("parse PE: {e}")))?;
     Ok(ud_translate::decompile::decompile_pe_to_text(&pe))
 }
 
 fn decompile_as_macho(bytes: &[u8]) -> Result<String, JsError> {
-    let macho = ud_format_macho::MachoFile::parse(bytes)
+    let macho = ud_format::macho::MachoFile::parse(bytes)
         .map_err(|e| JsError::new(&format!("parse Mach-O: {e}")))?;
     Ok(ud_translate::decompile::decompile_macho_to_text(&macho))
 }
@@ -85,7 +85,7 @@ fn decompile_as_raw_6502(bytes: &[u8]) -> Result<String, JsError> {
             "6502 raw image: file must be 6..=65536 bytes and the reset vector at $FFFC must point inside the image",
         )
     })?;
-    let image = ud_format_raw::RawImage::new(bytes.to_vec(), load_addr);
+    let image = ud_format::raw::RawImage::new(bytes.to_vec(), load_addr);
     ud_translate::decompile::decompile_raw_6502_to_text(&image)
         .map_err(|e| JsError::new(&format!("decompile 6502 raw: {e}")))
 }

@@ -50,7 +50,7 @@ use ud_analysis::{discover_functions, FunctionMap};
 use ud_arch_x86::{decode, lift_function, Bitness};
 use ud_ast::{Item, UdFile};
 use ud_debug::DebugFunction;
-use ud_format_elf::{Elf64File, ElfClass, Shdr64, EM_386, EM_AARCH64, EM_X86_64};
+use ud_format::elf::{Elf64File, ElfClass, Shdr64, EM_386, EM_AARCH64, EM_X86_64};
 
 /// Which arch backend to drive for a given ELF.
 #[derive(Debug, Clone, Copy)]

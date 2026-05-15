@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use ud_arch_x86::{roundtrip_bytes, Bitness};
-use ud_format_elf::{is_elf64_le, Elf64File, EM_X86_64, SHF_EXECINSTR};
+use ud_format::elf::{is_elf64_le, Elf64File, EM_X86_64, SHF_EXECINSTR};
 
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

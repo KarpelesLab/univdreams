@@ -14,7 +14,7 @@
 
 use gimli::{BaseAddresses, CieOrFde, EhFrame, LittleEndian, UnwindSection};
 use ud_core::VAddr;
-use ud_format_elf::Elf64File;
+use ud_format::elf::Elf64File;
 
 use crate::function_map::{Function, FunctionSource};
 

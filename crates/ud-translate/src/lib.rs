@@ -21,7 +21,7 @@
 //! Typical use:
 //!
 //! ```no_run
-//! # use ud_format_elf::Elf64File;
+//! # use ud_format::elf::Elf64File;
 //! # fn run(elf: &Elf64File) -> Result<(), Box<dyn std::error::Error>> {
 //! // Binary → editable .ud text.
 //! let text = ud_translate::decompile::decompile_to_text(elf)?;
