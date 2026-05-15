@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 /// Sentinel handle for `CreateCompatibleDC` / `GetDC`. Every
 /// `HDC` we hand out is the same value; `DeleteDC` /
-/// `ReleaseDC` validates against [`HostState::valid_hdcs`] (a
+/// `ReleaseDC` validates against `HostState::valid_hdcs` (a
 /// per-sandbox `BTreeSet`).
 pub const SENTINEL_HDC: u32 = 0xDEAD_C011;
 

@@ -800,8 +800,9 @@ fn parse_unsigned_disp(s: &str) -> Option<u64> {
 ///
 /// Falls back to the literal assembly form (`"cmp X,Y; jcc T"`) when
 /// the jcc isn't one we have a clean source-level mapping for (e.g.
-/// `js`, `jp`, `jo`). The encoder in [`encode_text`] accepts the
-/// high-level form and continues to auto-derive `head_bytes`.
+/// `js`, `jp`, `jo`). The crate-internal `encode_text` encoder
+/// accepts the high-level form and continues to auto-derive
+/// `head_bytes`.
 #[must_use]
 pub fn render_cond_source(cmp: &Instruction, jcc: &Instruction) -> String {
     let cmp_text = format_intel(cmp);

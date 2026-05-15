@@ -4,7 +4,7 @@
 //! Each stub is a Rust function pointer with the signature
 //! [`StubFn`]. The PE loader, when populating the IAT, looks up
 //! `(dll_name_lowercased, function_name)` in [`Registry`] and
-//! writes the synthetic [`StubAddr`] (a guest address that lives
+//! writes the synthetic `StubAddr` (a guest address that lives
 //! in the unmapped "thunk space" near `0xFFFE_0000`) into the
 //! IAT slot.
 //!
@@ -97,7 +97,7 @@ pub struct StubEntry {
 pub enum Win32Error {
     /// No stub registered for the requested `(dll, name)` pair.
     /// PE-load-time error; surfaces from
-    /// [`crate::pe::Loader::resolve_imports`].
+    /// `crate::pe::Loader::resolve_imports`.
     UnknownImport { dll: String, name: String },
     /// Stub-side argument validation failed.
     InvalidArgument { stub: &'static str, reason: String },
@@ -206,7 +206,7 @@ pub struct HostState {
     /// top-of-loop iteration in [`run_until_sentinel`] (both
     /// instruction steps and stub dispatches count). When it
     /// hits zero the run loop bails with
-    /// [`crate::Error::BudgetExhausted`] so adversarial guests
+    /// [`Win32Error::BudgetExhausted`] so adversarial guests
     /// can't loop the host. `None` (the default) keeps the
     /// historical unbounded behaviour.
     pub instruction_budget: Option<u64>,
@@ -249,17 +249,17 @@ pub struct HostState {
     /// 0; first HWND handed out is `HWND_BASE + 0`.
     pub next_hwnd_index: u32,
     /// When `true`, [`dispatch_stub`] appends one line per Win32
-    /// call to [`stub_trace`]. Off by default; round-8 tests flip
+    /// call to [`HostState::stub_trace`]. Off by default; round-8 tests flip
     /// it on while triaging which stub returns a bad value.
     pub trace_stubs: bool,
-    /// Per-call trace lines populated when [`trace_stubs`] is on.
+    /// Per-call trace lines populated when [`HostState::trace_stubs`] is on.
     /// Format: `dll!name(arg0, arg1, …) → 0xRET`. The args are
     /// the first `arg_dwords` (or, for known cdecl shapes, the
     /// override from [`cdecl_trace_arg_count`]) dwords off the
     /// guest stack, captured BEFORE the stub mutates them.
     pub stub_trace: Vec<String>,
-    /// Structured per-call log, populated when [`trace_stubs`]
-    /// is on. Parallel to [`stub_trace`]; analysis front-ends
+    /// Structured per-call log, populated when [`HostState::trace_stubs`]
+    /// is on. Parallel to [`HostState::stub_trace`]; analysis front-ends
     /// (the `ud analyze` JSON output) consume this directly so
     /// they don't have to re-parse the formatted string.
     pub stub_calls: Vec<StubCall>,

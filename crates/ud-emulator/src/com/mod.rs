@@ -852,7 +852,7 @@ pub fn method_va(mmu: &Mmu, obj: u32, slot: u32) -> Result<u32, crate::emulator:
     mmu.load32(vtbl.wrapping_add(slot.wrapping_mul(4)))
 }
 
-/// Free helper used by [`crate::win32::ole32::stub_co_create_instance`]:
+/// Free helper used by `win32::ole32::stub_co_create_instance`:
 /// search the host class-factory cache for `clsid` and report
 /// whether the requested IID is one of `IUnknown`, `IClassFactory`
 /// — the only IIDs `CoCreateInstance` accepts when caller passes

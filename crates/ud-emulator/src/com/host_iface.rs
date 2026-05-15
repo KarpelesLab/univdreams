@@ -639,12 +639,12 @@ pub fn media_sample_set_payload(
 /// |--------|-----------------------------------|
 /// | obj    | vtbl_ptr (= obj + 8)             |
 /// | obj+4  | refcount (initialised to 1)      |
-/// | obj+8  | vtbl[0] = QueryInterface thunk   |
-/// | obj+12 | vtbl[1] = AddRef thunk           |
-/// | obj+16 | vtbl[2] = Release thunk          |
-/// | obj+20 | vtbl[3] = AddFilter thunk        |
+/// | obj+8  | vtbl 0 = QueryInterface thunk   |
+/// | obj+12 | vtbl 1 = AddRef thunk           |
+/// | obj+16 | vtbl 2 = Release thunk          |
+/// | obj+20 | vtbl 3 = AddFilter thunk        |
 /// | …      | …                                |
-/// | obj+48 | vtbl[10] = SetDefaultSyncSource  |
+/// | obj+48 | vtbl 10 = SetDefaultSyncSource  |
 ///
 /// Total footprint is `8 + 11*4 = 52 bytes`; the arena allocator
 /// rounds to 16 so we consume 64 bytes per host filter graph.
@@ -694,7 +694,7 @@ pub fn mint_host_filter_graph(
 /// as the `pConnector` argument of `IPin::ReceiveConnection`.
 ///
 /// **Round 37** — extended with parent-filter + connected-pin slots
-/// so [`pin_query_pin_info`] / [`pin_connected_to`] can answer the
+/// so `pin_query_pin_info` / `pin_connected_to` can answer the
 /// codec's introspection of the upstream pin.  Per MSDN
 /// `IPin::QueryPinInfo` returns a `PIN_INFO { IBaseFilter* pFilter,
 /// PIN_DIRECTION dir, WCHAR achName[128] }`; the codec uses
@@ -732,8 +732,8 @@ pub fn mint_host_output_pin(
 
 /// Round 37 — same as [`mint_host_output_pin`] but also stamps the
 /// codec's input-pin pointer (`connected_pin`) into the new pin
-/// object so [`pin_connected_to`] can return it, and synthesizes a
-/// host `IBaseFilter` parent so [`pin_query_pin_info`] can fill in
+/// object so `pin_connected_to` can return it, and synthesizes a
+/// host `IBaseFilter` parent so `pin_query_pin_info` can fill in
 /// `PIN_INFO::pFilter`.
 ///
 /// `connected_pin == 0` is allowed (pre-r37 behaviour); in that

@@ -7,7 +7,7 @@
 //! `DRVCNF_OK = 1` so the codec's "configure" path completes.
 //!
 //! Reference: MSDN `DefDriverProc` —
-//! https://learn.microsoft.com/en-us/windows/win32/api/mmiscapi/nf-mmiscapi-defdriverproc
+//! <https://learn.microsoft.com/en-us/windows/win32/api/mmiscapi/nf-mmiscapi-defdriverproc>
 
 use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
 use crate::emulator::{Cpu, Mmu};

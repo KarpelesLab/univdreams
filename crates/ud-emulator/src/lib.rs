@@ -172,7 +172,7 @@
 //! a registered watchpoint (`kind=mem_write` / `kind=mem_read`),
 //! every trap that bubbles out of the run loop (`kind=trap`),
 //! and — under the `trace-exec` sub-feature plus
-//! [`Sandbox::set_exec_trace(true)`] — every executed
+//! `Sandbox::set_exec_trace(true)` — every executed
 //! instruction (`kind=exec`). Output is JSONL on a sink
 //! configured via `OXIDEAV_VFW_TRACE_FILE=<path|2>` or
 //! [`Sandbox::set_trace_sink`]. With the feature off, every
@@ -202,8 +202,6 @@
 pub mod com;
 pub mod context;
 pub mod coverage;
-#[cfg(feature = "discovery")]
-pub mod discovery;
 pub mod emulator;
 pub mod pe;
 pub mod runtime;

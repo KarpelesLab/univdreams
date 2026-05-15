@@ -190,7 +190,7 @@ impl Flags {
         v
     }
 
-    /// Inverse of [`pack`]. Reserved/unmodelled bits silently
+    /// Inverse of `pack`. Reserved/unmodelled bits silently
     /// dropped.
     pub fn unpack(v: u32) -> Self {
         Flags {

@@ -28,22 +28,13 @@ trace = []
 # `trace` is also enabled.
 trace-exec = ["trace"]
 
-# Codec-discovery — walks a host filesystem path looking for VFW
-# / DirectShow codec DLLs and registers them. Mirrored from
-# oxideav-vfw verbatim, but in univdreams it has no consumer
-# (oxideav-core isn't a dep here). Kept gated for parity; only
-# enable when integrating with a codec runtime.
-discovery = []
+# docs.rs builds with `trace` + `trace-exec` enabled so the
+# trace-gated public items resolve in the rendered docs.
+[package.metadata.docs.rs]
+features = ["trace", "trace-exec"]
 
 [dependencies]
 thiserror = "2"
-
-# Used by the trace module for JSONL emission and by the
-# discovery module's codec.json index. Both are feature-gated
-# so the default build is dep-light.
-log = { version = "0.4", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 # Fetched-fixture corpus runner (`tests/codec_corpus.rs`).

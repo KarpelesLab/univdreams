@@ -466,7 +466,7 @@ pub struct SectionHeader {
 }
 
 /// A parsed PE file. The structured fields are read-only views; the
-/// authoritative bytes live in [`PeFile::raw`] and are what
+/// authoritative bytes live in the private `raw` buffer and are what
 /// [`write_to_vec`] returns. Future iterations will replace this with
 /// a re-derive-on-write path; for v0 the round-trip is guaranteed
 /// trivially because we don't mutate the buffer.

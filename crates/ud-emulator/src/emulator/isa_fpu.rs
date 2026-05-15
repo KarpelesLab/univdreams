@@ -50,7 +50,7 @@ pub const SW_C3: u16 = 1 << 14;
 
 /// FPU state attached to [`Cpu`] in round 21+. Eight
 /// architectural ST(i) slots plus a top-of-stack pointer and
-/// a status word. Tag word is implicit in [`FpuState::tag`]:
+/// a status word. Tag word is implicit in `FpuState::tag`:
 /// each entry is either `Empty` (free) or `Valid(f64)`.
 #[derive(Clone, Debug)]
 pub struct FpuState {
@@ -137,7 +137,7 @@ impl FpuState {
 }
 
 /// Dispatch one of the eight x87 escapes. `opcode` is the
-/// first byte (D8..DF). On entry, [`Cpu::regs.eip`] points
+/// first byte (D8..DF). On entry, `Cpu::regs.eip` points
 /// past the opcode (the next byte is the ModR/M).
 ///
 /// Returns `Ok(StepOk::Continued)` on success or a [`Trap`]

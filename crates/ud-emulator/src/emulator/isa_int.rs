@@ -113,7 +113,7 @@ pub struct Cpu {
     /// successfully dispatched. Round-13 sentinel — lets a test
     /// confirm MMX semantics actually ran rather than the codec
     /// happening to take an integer-only path. Incremented in
-    /// [`super::isa_mmx::dispatch`].
+    /// `isa_mmx::dispatch`.
     pub mmx_dispatch_count: u64,
     /// Count of `CPUID` (`0F A2`) instructions executed. Round-14
     /// sentinel — when a codec's MMX path stays unreachable
