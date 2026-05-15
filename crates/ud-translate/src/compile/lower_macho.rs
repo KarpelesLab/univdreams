@@ -59,7 +59,7 @@ pub enum MachoLowerError {
     FunctionWithoutAddr { name: String },
 
     #[error(transparent)]
-    InnerLower(#[from] crate::lower::LowerError),
+    InnerLower(#[from] crate::compile::lower::LowerError),
 }
 
 /// Lower a `.ud` file describing a Mach-O image to its bytes.
@@ -92,7 +92,7 @@ pub fn lower_to_macho(file: &UdFile) -> Result<Vec<u8>, MachoLowerError> {
                 let addr = f.addr.ok_or_else(|| MachoLowerError::FunctionWithoutAddr {
                     name: f.name.clone(),
                 })?;
-                let bytes = crate::lower::lower_function_bytes(f)?;
+                let bytes = crate::compile::lower::lower_function_bytes(f)?;
                 raws.push((addr, bytes));
             }
             Item::Comment(_)

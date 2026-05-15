@@ -1464,8 +1464,10 @@ fn stub_ci_log(
 }
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::emulator::isa_int::RET_SENTINEL;
     use crate::emulator::mmu::Perm;
+    #[allow(unused_imports)]
     use crate::emulator::regs::Reg32;
 
     #[allow(dead_code)]

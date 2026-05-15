@@ -28,7 +28,7 @@ fn ast_for(path: &Path) -> Option<UdFile> {
     if elf.ehdr.e_machine != EM_X86_64 {
         return None;
     }
-    Some(ud_decompile::decompile(&elf).expect("decompile"))
+    Some(ud_translate::decompile::decompile(&elf).expect("decompile"))
 }
 
 fn function_names(ast: &UdFile) -> Vec<&str> {
@@ -170,7 +170,7 @@ fn count_function_bytes_as_insns(items: &[Item]) -> usize {
             match item {
                 Item::Function(f) => {
                     let ip = f.addr.or(cursor);
-                    let bytes = ud_compile::lower_function_bytes_at(f, ip).expect("lower");
+                    let bytes = ud_translate::compile::lower_function_bytes_at(f, ip).expect("lower");
                     let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, &bytes, 0)
                         .expect("decode");
                     *n += insns.len();
@@ -260,7 +260,7 @@ fn parse_of_decompile_to_text_equals_decompile() {
     let path = workspace_root().join("testdata/sqrt-gcc13-O0");
     let Some(ast) = ast_for(&path) else { return };
     let text = ud_ast::emit(&ast);
-    let reparsed = ud_compile::parse(&text).expect("parse decompile output");
+    let reparsed = ud_translate::compile::parse(&text).expect("parse decompile output");
     assert_eq!(
         reparsed, ast,
         "parse(decompile_to_text(elf)) != decompile(elf)"

@@ -75,7 +75,7 @@ pub enum PeLowerError {
     FunctionWithoutAddr { name: String },
 
     #[error(transparent)]
-    InnerLower(#[from] crate::lower::LowerError),
+    InnerLower(#[from] crate::compile::lower::LowerError),
 }
 
 /// Lower a `.ud` file describing a PE image to its bytes.
@@ -145,7 +145,7 @@ pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
                     name: f.name.clone(),
                 })?;
                 let ip_base = file_offset_to_rva(addr, &section_vaddrs);
-                let bytes = crate::lower::lower_function_bytes_at(f, ip_base)?;
+                let bytes = crate::compile::lower::lower_function_bytes_at(f, ip_base)?;
                 placements.push((addr, bytes));
             }
             Item::Comment(_)

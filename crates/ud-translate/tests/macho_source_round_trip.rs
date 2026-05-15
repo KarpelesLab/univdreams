@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ud_compile::{lower_to_macho, parse};
+use ud_translate::compile::{lower_to_macho, parse};
 use ud_format_macho::{is_macho64, MachoFile};
 
 fn workspace_root() -> PathBuf {
@@ -67,7 +67,7 @@ fn macho_whole_binary_byte_identity_through_source() {
             continue;
         };
 
-        let text = ud_decompile::decompile_macho_to_text(&macho);
+        let text = ud_translate::decompile::decompile_macho_to_text(&macho);
         let ast = match parse(&text) {
             Ok(a) => a,
             Err(e) => {

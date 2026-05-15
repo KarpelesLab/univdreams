@@ -5,7 +5,7 @@
 //! self-consistent.
 //!
 //! This is the smoke test for the auto-resize cascade in
-//! [`ud_compile::build_elf64`]. Unedited input has zero deltas
+//! [`ud_translate::compile::build_elf64`]. Unedited input has zero deltas
 //! and the existing whole-binary round-trip test covers that
 //! path; here we deliberately grow `.text` by 1 byte and
 //! re-parse the result.
@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use ud_ast::{Item, Stmt};
-use ud_compile::{lower_to_elf, parse};
+use ud_translate::compile::{lower_to_elf, parse};
 use ud_format_elf::Elf64File;
 
 fn workspace_root() -> PathBuf {
@@ -73,7 +73,7 @@ fn nop_insertion_lowers_to_a_parseable_elf() {
         return;
     };
     let elf = Elf64File::parse(&bytes).expect("parse fixture");
-    let text = ud_decompile::decompile_to_text(&elf).expect("decompile");
+    let text = ud_translate::decompile::decompile_to_text(&elf).expect("decompile");
     let mut ast = parse(&text).expect("parse .ud");
 
     let Some((sec_idx, fn_idx)) = pick_extendable_function(&ast.items) else {
@@ -117,7 +117,7 @@ fn unedited_lower_to_elf_is_still_byte_identical() {
         return;
     };
     let elf = Elf64File::parse(&bytes).expect("parse fixture");
-    let text = ud_decompile::decompile_to_text(&elf).expect("decompile");
+    let text = ud_translate::decompile::decompile_to_text(&elf).expect("decompile");
     let ast = parse(&text).expect("parse .ud");
     let rebuilt = lower_to_elf(&ast).expect("lower_to_elf without edits");
     assert_eq!(

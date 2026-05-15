@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use ud_compile::AsmWarning;
+use ud_translate::compile::AsmWarning;
 use ud_core::{assert_bytes_equal, Error, Result};
 
 /// Run the round-trip pipeline on `input`, write the result to `output`,
@@ -110,9 +110,9 @@ pub enum SourceRoundTripError {
     #[error(transparent)]
     Io(std::io::Error),
     #[error(transparent)]
-    Decompile(#[from] ud_decompile::Error),
+    Decompile(#[from] ud_translate::decompile::Error),
     #[error(transparent)]
-    Decompile6502(#[from] ud_decompile::raw6502::Error),
+    Decompile6502(#[from] ud_translate::decompile::raw6502::Error),
     #[error(transparent)]
     ElfFormat(#[from] ud_format_elf::Error),
     #[error(transparent)]
@@ -122,13 +122,13 @@ pub enum SourceRoundTripError {
     #[error("parse of decompile output failed: {0}")]
     Parse(String),
     #[error(transparent)]
-    ElfLower(#[from] ud_compile::ElfLowerError),
+    ElfLower(#[from] ud_translate::compile::ElfLowerError),
     #[error(transparent)]
-    PeLower(#[from] ud_compile::PeLowerError),
+    PeLower(#[from] ud_translate::compile::PeLowerError),
     #[error(transparent)]
-    MachoLower(#[from] ud_compile::MachoLowerError),
+    MachoLower(#[from] ud_translate::compile::MachoLowerError),
     #[error(transparent)]
-    RawLower(#[from] ud_compile::RawLowerError),
+    RawLower(#[from] ud_translate::compile::RawLowerError),
 }
 
 /// Run `input` through the full source pipeline:
@@ -146,39 +146,39 @@ pub fn roundtrip_through_source(
 
     let (text, warnings, rebuilt) = if ud_format_elf::is_elf64_le(&input_bytes) {
         let elf = ud_format_elf::Elf64File::parse(&input_bytes)?;
-        let ast = ud_decompile::decompile(&elf)?;
+        let ast = ud_translate::decompile::decompile(&elf)?;
         let text = ud_ast::emit(&ast);
         let parsed =
-            ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
-        let warnings = ud_compile::verify_asm(&parsed);
-        let rebuilt = ud_compile::lower_to_elf(&parsed)?;
+            ud_translate::compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_translate::compile::verify_asm(&parsed);
+        let rebuilt = ud_translate::compile::lower_to_elf(&parsed)?;
         (text, warnings, rebuilt)
     } else if ud_format_pe::is_pe(&input_bytes) {
         let pe = ud_format_pe::PeFile::parse(&input_bytes)?;
-        let ast = ud_decompile::decompile_pe(&pe);
+        let ast = ud_translate::decompile::decompile_pe(&pe);
         let text = ud_ast::emit(&ast);
         let parsed =
-            ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
-        let warnings = ud_compile::verify_asm(&parsed);
-        let rebuilt = ud_compile::lower_to_pe(&parsed)?;
+            ud_translate::compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_translate::compile::verify_asm(&parsed);
+        let rebuilt = ud_translate::compile::lower_to_pe(&parsed)?;
         (text, warnings, rebuilt)
     } else if ud_format_macho::is_macho64(&input_bytes) {
         let macho = ud_format_macho::MachoFile::parse(&input_bytes)?;
-        let ast = ud_decompile::decompile_macho(&macho);
+        let ast = ud_translate::decompile::decompile_macho(&macho);
         let text = ud_ast::emit(&ast);
         let parsed =
-            ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
-        let warnings = ud_compile::verify_asm(&parsed);
-        let rebuilt = ud_compile::lower_to_macho(&parsed)?;
+            ud_translate::compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_translate::compile::verify_asm(&parsed);
+        let rebuilt = ud_translate::compile::lower_to_macho(&parsed)?;
         (text, warnings, rebuilt)
     } else if let Some(load_addr) = raw_6502_load_addr(&input_bytes) {
         let image = ud_format_raw::RawImage::new(input_bytes.clone(), load_addr);
-        let ast = ud_decompile::decompile_raw_6502(&image)?;
+        let ast = ud_translate::decompile::decompile_raw_6502(&image)?;
         let text = ud_ast::emit(&ast);
         let parsed =
-            ud_compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
-        let warnings = ud_compile::verify_asm(&parsed);
-        let rebuilt = ud_compile::lower_to_raw(&parsed)?;
+            ud_translate::compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_translate::compile::verify_asm(&parsed);
+        let rebuilt = ud_translate::compile::lower_to_raw(&parsed)?;
         (text, warnings, rebuilt)
     } else {
         return Err(SourceRoundTripError::UnknownFormat);

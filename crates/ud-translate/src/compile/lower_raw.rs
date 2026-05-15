@@ -15,7 +15,7 @@
 
 use ud_ast::{Field, Item, Module, UdFile, Value};
 
-use crate::lower::lower_function_bytes;
+use crate::compile::lower::lower_function_bytes;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RawLowerError {
@@ -47,7 +47,7 @@ pub enum RawLowerError {
     #[error("function `{name}` has no `@addr` — required for raw placement")]
     FunctionWithoutAddr { name: String },
     #[error(transparent)]
-    InnerLower(#[from] crate::lower::LowerError),
+    InnerLower(#[from] crate::compile::lower::LowerError),
 }
 
 /// Lower a `.ud` file describing a raw image to its bytes.

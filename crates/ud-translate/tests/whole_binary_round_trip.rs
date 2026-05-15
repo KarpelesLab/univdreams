@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ud_compile::{lower_to_elf, parse};
+use ud_translate::compile::{lower_to_elf, parse};
 use ud_format_elf::{is_elf64_le, Elf64File, EM_X86_64};
 
 fn workspace_root() -> PathBuf {
@@ -68,7 +68,7 @@ fn whole_binary_byte_identity_through_source() {
             continue;
         }
 
-        let text = match ud_decompile::decompile_to_text(&elf) {
+        let text = match ud_translate::decompile::decompile_to_text(&elf) {
             Ok(t) => t,
             Err(e) => {
                 failures.push(format!("{}: decompile: {e}", fixture.display()));

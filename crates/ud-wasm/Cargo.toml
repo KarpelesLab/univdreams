@@ -24,7 +24,6 @@ ud-format-elf = { version = "0.1.0", path = "../ud-format-elf" }
 ud-format-pe = { version = "0.1.0", path = "../ud-format-pe" }
 ud-format-macho = { version = "0.1.0", path = "../ud-format-macho" }
 ud-format-raw = { version = "0.1.0", path = "../ud-format-raw" }
-ud-decompile = { version = "0.1.0", path = "../ud-decompile" }
-ud-compile = { version = "0.1.0", path = "../ud-compile" }
+ud-translate = { version = "0.1.0", path = "../ud-translate" }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"

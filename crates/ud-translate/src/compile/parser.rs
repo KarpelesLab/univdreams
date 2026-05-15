@@ -5,7 +5,7 @@
 
 use ud_ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
 
-use crate::lexer::{tokenize, LexError, Token, TokenKind};
+use crate::compile::lexer::{tokenize, LexError, Token, TokenKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {

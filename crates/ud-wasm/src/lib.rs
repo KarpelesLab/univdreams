@@ -15,7 +15,7 @@
 use wasm_bindgen::prelude::*;
 
 use ud_ast::{Module, Value};
-use ud_compile::AsmWarning;
+use ud_translate::compile::AsmWarning;
 
 /// Decompile a binary blob to `.ud` source.
 ///
@@ -64,19 +64,19 @@ fn decompile_auto(bytes: &[u8]) -> Result<String, JsError> {
 fn decompile_as_elf(bytes: &[u8]) -> Result<String, JsError> {
     let elf = ud_format_elf::Elf64File::parse(bytes)
         .map_err(|e| JsError::new(&format!("parse ELF: {e}")))?;
-    ud_decompile::decompile_to_text(&elf).map_err(|e| JsError::new(&format!("decompile ELF: {e}")))
+    ud_translate::decompile::decompile_to_text(&elf).map_err(|e| JsError::new(&format!("decompile ELF: {e}")))
 }
 
 fn decompile_as_pe(bytes: &[u8]) -> Result<String, JsError> {
     let pe =
         ud_format_pe::PeFile::parse(bytes).map_err(|e| JsError::new(&format!("parse PE: {e}")))?;
-    Ok(ud_decompile::decompile_pe_to_text(&pe))
+    Ok(ud_translate::decompile::decompile_pe_to_text(&pe))
 }
 
 fn decompile_as_macho(bytes: &[u8]) -> Result<String, JsError> {
     let macho = ud_format_macho::MachoFile::parse(bytes)
         .map_err(|e| JsError::new(&format!("parse Mach-O: {e}")))?;
-    Ok(ud_decompile::decompile_macho_to_text(&macho))
+    Ok(ud_translate::decompile::decompile_macho_to_text(&macho))
 }
 
 fn decompile_as_raw_6502(bytes: &[u8]) -> Result<String, JsError> {
@@ -86,7 +86,7 @@ fn decompile_as_raw_6502(bytes: &[u8]) -> Result<String, JsError> {
         )
     })?;
     let image = ud_format_raw::RawImage::new(bytes.to_vec(), load_addr);
-    ud_decompile::decompile_raw_6502_to_text(&image)
+    ud_translate::decompile::decompile_raw_6502_to_text(&image)
         .map_err(|e| JsError::new(&format!("decompile 6502 raw: {e}")))
 }
 
@@ -100,20 +100,20 @@ fn decompile_as_raw_6502(bytes: &[u8]) -> Result<String, JsError> {
 #[wasm_bindgen]
 pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
     set_panic_hook();
-    let ast = ud_compile::parse(source).map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
+    let ast = ud_translate::compile::parse(source).map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
     let format = read_string(&ast.module, "format").ok_or_else(|| {
         JsError::new("missing `@module.format` (expected \"elf\", \"pe\", \"macho\", or \"raw\")")
     })?;
-    let warnings = ud_compile::verify_asm(&ast);
+    let warnings = ud_translate::compile::verify_asm(&ast);
     let bytes = match format.as_str() {
-        "elf" => ud_compile::lower_to_elf(&ast)
+        "elf" => ud_translate::compile::lower_to_elf(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to ELF: {e}"), &warnings))),
-        "pe" => ud_compile::lower_to_pe(&ast)
+        "pe" => ud_translate::compile::lower_to_pe(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to PE: {e}"), &warnings))),
-        "macho" => ud_compile::lower_to_macho(&ast).map_err(|e| {
+        "macho" => ud_translate::compile::lower_to_macho(&ast).map_err(|e| {
             JsError::new(&with_warnings(&format!("lower to Mach-O: {e}"), &warnings))
         }),
-        "raw" => ud_compile::lower_to_raw(&ast)
+        "raw" => ud_translate::compile::lower_to_raw(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to raw: {e}"), &warnings))),
         other => Err(JsError::new(&format!(
             "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", or \"raw\")"
@@ -128,8 +128,8 @@ pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
 #[wasm_bindgen]
 pub fn verify(source: &str) -> Result<String, JsError> {
     set_panic_hook();
-    let ast = ud_compile::parse(source).map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
-    let warnings = ud_compile::verify_asm(&ast);
+    let ast = ud_translate::compile::parse(source).map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
+    let warnings = ud_translate::compile::verify_asm(&ast);
     Ok(format_warnings(&warnings))
 }
 

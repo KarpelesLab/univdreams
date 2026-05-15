@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use ud_ast::{Item, Stmt};
-use ud_compile::parse;
+use ud_translate::compile::parse;
 use ud_format_elf::{is_elf64_le, Elf64File, EM_X86_64};
 
 fn workspace_root() -> PathBuf {
@@ -60,7 +60,7 @@ fn parser_accepts_every_decompile_output() {
             continue;
         }
 
-        let source = match ud_decompile::decompile_to_text(&elf) {
+        let source = match ud_translate::decompile::decompile_to_text(&elf) {
             Ok(s) => s,
             Err(e) => {
                 failures.push(format!("{} decompile: {e}", fixture.display()));

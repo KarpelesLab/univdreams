@@ -1,5 +1,5 @@
 [package]
-name = "ud-decompile"
+name = "ud-translate"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ categories.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Emit a .ud source file from an analyzed binary."
+description = "The .ud source-language translation engine: binary → .ud source (decompile) and .ud source → binary (compile), in one crate."
 
 [lints]
 workspace = true
@@ -18,16 +18,13 @@ workspace = true
 ud-core = { version = "0.1.0", path = "../ud-core" }
 ud-ir = { version = "0.1.0", path = "../ud-ir" }
 ud-ast = { version = "0.1.0", path = "../ud-ast" }
+ud-analysis = { version = "0.1.0", path = "../ud-analysis" }
+ud-debug = { version = "0.1.0", path = "../ud-debug" }
+ud-arch-x86 = { version = "0.1.0", path = "../ud-arch-x86" }
+ud-arch-aarch64 = { version = "0.1.0", path = "../ud-arch-aarch64" }
+ud-arch-6502 = { version = "0.1.0", path = "../ud-arch-6502" }
 ud-format-elf = { version = "0.1.0", path = "../ud-format-elf" }
 ud-format-pe = { version = "0.1.0", path = "../ud-format-pe" }
 ud-format-macho = { version = "0.1.0", path = "../ud-format-macho" }
 ud-format-raw = { version = "0.1.0", path = "../ud-format-raw" }
-ud-arch-x86 = { version = "0.1.0", path = "../ud-arch-x86" }
-ud-arch-aarch64 = { version = "0.1.0", path = "../ud-arch-aarch64" }
-ud-arch-6502 = { version = "0.1.0", path = "../ud-arch-6502" }
-ud-analysis = { version = "0.1.0", path = "../ud-analysis" }
-ud-debug = { version = "0.1.0", path = "../ud-debug" }
 thiserror = "2"
-
-[dev-dependencies]
-ud-compile = { version = "0.1.0", path = "../ud-compile" }

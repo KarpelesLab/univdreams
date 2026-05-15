@@ -34,7 +34,7 @@
 //! "if I match here, claim these N instructions exclusively"
 //! without coordinating with each other.
 //!
-//! [`build_function`]: crate::build_function
+//! [`build_function`]: crate::decompile::build_function
 
 use std::collections::HashMap;
 

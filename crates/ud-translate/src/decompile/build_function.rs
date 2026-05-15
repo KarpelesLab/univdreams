@@ -13,7 +13,7 @@ use ud_ast::{FnDecl, LocalDecl, LocalKind, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
 use ud_ir::{BasicBlock, Function, Terminator};
 
-use crate::data_lookup::DataLookup;
+use crate::decompile::data_lookup::DataLookup;
 
 /// Convert a lifted [`Function`] into the AST's [`FnDecl`].
 ///
@@ -50,8 +50,8 @@ pub fn build_function(
     // to invalidate only the registers each `@asm` instruction
     // actually wrote, instead of dropping the whole state on any
     // mnemonic we don't have a hand-written carve-out for.
-    let ssa = crate::ssa::build_ssa(f, &sp_delta_at);
-    let liveness = crate::ssa::compute_liveness(f, &sp_delta_at);
+    let ssa = crate::decompile::ssa::build_ssa(f, &sp_delta_at);
+    let liveness = crate::decompile::ssa::compute_liveness(f, &sp_delta_at);
     let bitness = function_bitness(f);
 
     let mut body = Vec::new();
@@ -106,8 +106,8 @@ pub fn build_function(
     // `x ^ x` → `0`, etc. Iterates each expression to a fixpoint;
     // unparseable text is preserved verbatim.
     let bit_width = match bitness {
-        ud_arch_x86::Bitness::Bits64 => crate::expr::BitWidth::Bits64,
-        _ => crate::expr::BitWidth::Bits32,
+        ud_arch_x86::Bitness::Bits64 => crate::decompile::expr::BitWidth::Bits64,
+        _ => crate::decompile::expr::BitWidth::Bits32,
     };
     simplify_body(&mut body, bit_width);
 
@@ -473,7 +473,7 @@ pub fn build_function(
 /// those through different decompile entry points already.
 fn detect_calling_convention_attrs(
     f: &Function<DecodedInsn>,
-    ssa: &crate::ssa::SsaInfo,
+    ssa: &crate::decompile::ssa::SsaInfo,
 ) -> Vec<ud_ast::Attribute> {
     use ud_arch_x86::{CodeSize, Mnemonic};
     let Some(first_insn) = f.blocks.first().and_then(|b| b.insns.first()) else {
@@ -531,11 +531,11 @@ fn detect_calling_convention_attrs(
 /// Walk the entry block and report whether `reg` is read before
 /// it gets written. Treats SSA's per-IP read/write info as
 /// authoritative.
-fn reg_read_before_write(f: &Function<DecodedInsn>, ssa: &crate::ssa::SsaInfo, reg: &str) -> bool {
+fn reg_read_before_write(f: &Function<DecodedInsn>, ssa: &crate::decompile::ssa::SsaInfo, reg: &str) -> bool {
     let Some(entry) = f.blocks.first() else {
         return false;
     };
-    let var = crate::ssa::Var::Reg(reg.to_string());
+    let var = crate::decompile::ssa::Var::Reg(reg.to_string());
     for insn in &entry.insns {
         let ip = insn.iced.ip();
         if ssa.use_at.contains_key(&(ip, var.clone())) {
@@ -547,7 +547,7 @@ fn reg_read_before_write(f: &Function<DecodedInsn>, ssa: &crate::ssa::SsaInfo, r
             if let Some(def) = ssa.use_at.get(&(ip, var.clone())) {
                 if matches!(
                     ssa.defs.get(def.0 as usize).map(|r| &r.site),
-                    Some(crate::ssa::DefSite::Entry)
+                    Some(crate::decompile::ssa::DefSite::Entry)
                 ) {
                     return true;
                 }
@@ -857,7 +857,7 @@ fn is_ident_char(c: char) -> bool {
 /// text changes.
 fn forward_propagate_registers(
     stmts: &mut [Stmt],
-    ssa: &crate::ssa::SsaInfo,
+    ssa: &crate::decompile::ssa::SsaInfo,
     base_ip: u64,
     bitness: ud_arch_x86::Bitness,
 ) {
@@ -871,8 +871,8 @@ fn forward_propagate_registers(
 /// instruction, the list of variables it defines. Used by
 /// `asm_state_effect` to invalidate just those registers rather
 /// than the entire state.
-fn build_writes_at(ssa: &crate::ssa::SsaInfo) -> HashMap<u64, Vec<crate::ssa::Var>> {
-    let mut out: HashMap<u64, Vec<crate::ssa::Var>> = HashMap::new();
+fn build_writes_at(ssa: &crate::decompile::ssa::SsaInfo) -> HashMap<u64, Vec<crate::decompile::ssa::Var>> {
+    let mut out: HashMap<u64, Vec<crate::decompile::ssa::Var>> = HashMap::new();
     for (ip, var) in ssa.def_at.keys() {
         out.entry(*ip).or_default().push(var.clone());
     }
@@ -882,7 +882,7 @@ fn build_writes_at(ssa: &crate::ssa::SsaInfo) -> HashMap<u64, Vec<crate::ssa::Va
 fn forward_propagate_in_seq(
     stmts: &mut [Stmt],
     state: &mut RegState,
-    writes_at: &HashMap<u64, Vec<crate::ssa::Var>>,
+    writes_at: &HashMap<u64, Vec<crate::decompile::ssa::Var>>,
     cursor: &mut u64,
     bitness: ud_arch_x86::Bitness,
 ) {
@@ -895,7 +895,7 @@ fn forward_propagate_in_seq(
 fn propagate_one_stmt(
     stmt: &mut Stmt,
     state: &mut RegState,
-    writes_at: &HashMap<u64, Vec<crate::ssa::Var>>,
+    writes_at: &HashMap<u64, Vec<crate::decompile::ssa::Var>>,
     cursor: &mut u64,
     bitness: ud_arch_x86::Bitness,
 ) {
@@ -1000,7 +1000,7 @@ fn propagate_one_stmt(
                     }
                     if let Some(vars) = writes_at.get(&insn.iced.ip()) {
                         for v in vars {
-                            if let crate::ssa::Var::Reg(name) = v {
+                            if let crate::decompile::ssa::Var::Reg(name) = v {
                                 clobbered.insert(name.clone());
                             }
                         }
@@ -1075,7 +1075,7 @@ fn propagate_one_stmt(
 
 /// Recursively walk `body` and resolve hex literals that point
 /// at string data. Mirrors [`simplify_body`]'s shape but uses
-/// [`crate::expr::resolve_strings_in_text`] for the rewrite.
+/// [`crate::decompile::expr::resolve_strings_in_text`] for the rewrite.
 fn resolve_strings_in_body(stmts: &mut [Stmt], lookup: &dyn Fn(u64) -> Option<String>) {
     for stmt in stmts.iter_mut() {
         resolve_strings_in_stmt(stmt, lookup);
@@ -1085,13 +1085,13 @@ fn resolve_strings_in_body(stmts: &mut [Stmt], lookup: &dyn Fn(u64) -> Option<St
 fn resolve_strings_in_stmt(stmt: &mut Stmt, lookup: &dyn Fn(u64) -> Option<String>) {
     match stmt {
         Stmt::Move { dst, src, .. } => {
-            *dst = crate::expr::resolve_strings_in_text(dst, lookup);
-            *src = crate::expr::resolve_strings_in_text(src, lookup);
+            *dst = crate::decompile::expr::resolve_strings_in_text(dst, lookup);
+            *src = crate::decompile::expr::resolve_strings_in_text(src, lookup);
         }
         Stmt::Call { args, name, .. } => {
-            *name = crate::expr::resolve_strings_in_text(name, lookup);
+            *name = crate::decompile::expr::resolve_strings_in_text(name, lookup);
             for a in args.iter_mut() {
-                *a = crate::expr::resolve_strings_in_text(a, lookup);
+                *a = crate::decompile::expr::resolve_strings_in_text(a, lookup);
             }
         }
         Stmt::IfBranch {
@@ -1101,7 +1101,7 @@ fn resolve_strings_in_stmt(stmt: &mut Stmt, lookup: &dyn Fn(u64) -> Option<Strin
             else_body,
             ..
         } => {
-            *cond_text = crate::expr::resolve_strings_in_text(cond_text, lookup);
+            *cond_text = crate::decompile::expr::resolve_strings_in_text(cond_text, lookup);
             resolve_strings_in_body(pre_body, lookup);
             resolve_strings_in_body(then_body, lookup);
             if let Some(eb) = else_body {
@@ -1111,19 +1111,19 @@ fn resolve_strings_in_stmt(stmt: &mut Stmt, lookup: &dyn Fn(u64) -> Option<Strin
         Stmt::Loop {
             cond_text, body, ..
         } => {
-            *cond_text = crate::expr::resolve_strings_in_text(cond_text, lookup);
+            *cond_text = crate::decompile::expr::resolve_strings_in_text(cond_text, lookup);
             resolve_strings_in_body(body, lookup);
         }
         Stmt::ReturnExpr { text, .. } => {
-            *text = crate::expr::resolve_strings_in_text(text, lookup);
+            *text = crate::decompile::expr::resolve_strings_in_text(text, lookup);
         }
         Stmt::IfReturn {
             cond_text,
             value_text,
             ..
         } => {
-            *cond_text = crate::expr::resolve_strings_in_text(cond_text, lookup);
-            *value_text = crate::expr::resolve_strings_in_text(value_text, lookup);
+            *cond_text = crate::decompile::expr::resolve_strings_in_text(cond_text, lookup);
+            *value_text = crate::decompile::expr::resolve_strings_in_text(value_text, lookup);
         }
         _ => {}
     }
@@ -1183,22 +1183,22 @@ fn lookup_string_at_va(data: &dyn DataLookup, va: u64) -> Option<String> {
 /// Walk every `Stmt` in `body` and run the algebraic simplifier
 /// on its operand-text fields. Recurses into `IfBranch` /
 /// `Loop` arms.
-fn simplify_body(stmts: &mut [Stmt], width: crate::expr::BitWidth) {
+fn simplify_body(stmts: &mut [Stmt], width: crate::decompile::expr::BitWidth) {
     for stmt in stmts.iter_mut() {
         simplify_stmt(stmt, width);
     }
 }
 
-fn simplify_stmt(stmt: &mut Stmt, width: crate::expr::BitWidth) {
+fn simplify_stmt(stmt: &mut Stmt, width: crate::decompile::expr::BitWidth) {
     match stmt {
         Stmt::Move { dst, src, .. } => {
-            *dst = crate::expr::simplify_text(dst, width);
-            *src = crate::expr::simplify_text(src, width);
+            *dst = crate::decompile::expr::simplify_text(dst, width);
+            *src = crate::decompile::expr::simplify_text(src, width);
         }
         Stmt::Call { args, name, .. } => {
-            *name = crate::expr::simplify_text(name, width);
+            *name = crate::decompile::expr::simplify_text(name, width);
             for a in args.iter_mut() {
-                *a = crate::expr::simplify_text(a, width);
+                *a = crate::decompile::expr::simplify_text(a, width);
             }
         }
         Stmt::IfBranch {
@@ -1208,7 +1208,7 @@ fn simplify_stmt(stmt: &mut Stmt, width: crate::expr::BitWidth) {
             else_body,
             ..
         } => {
-            *cond_text = crate::expr::simplify_text(cond_text, width);
+            *cond_text = crate::decompile::expr::simplify_text(cond_text, width);
             simplify_body(pre_body, width);
             simplify_body(then_body, width);
             if let Some(eb) = else_body {
@@ -1218,11 +1218,11 @@ fn simplify_stmt(stmt: &mut Stmt, width: crate::expr::BitWidth) {
         Stmt::Loop {
             cond_text, body, ..
         } => {
-            *cond_text = crate::expr::simplify_text(cond_text, width);
+            *cond_text = crate::decompile::expr::simplify_text(cond_text, width);
             simplify_body(body, width);
         }
         Stmt::ReturnExpr { text, .. } => {
-            *text = crate::expr::simplify_text(text, width);
+            *text = crate::decompile::expr::simplify_text(text, width);
         }
         _ => {}
     }
@@ -2132,7 +2132,7 @@ fn stmts_total_bytes(stmts: &[Stmt]) -> usize {
 }
 
 /// Drop `Move { dst: REG, … }` stmts whose dst register is dead
-/// after the move per [`crate::ssa::Liveness`]. The deleted
+/// after the move per [`crate::decompile::ssa::Liveness`]. The deleted
 /// stmt's bytes are merged into the *following* stmt's `bytes`
 /// field so the function's total byte sequence is unchanged —
 /// round-trip is preserved by construction.
@@ -2140,7 +2140,7 @@ fn stmts_total_bytes(stmts: &[Stmt]) -> usize {
 /// Only fires when the dst is a tracked GPR (registers
 /// participating in liveness analysis). Memory destinations,
 /// register-pair forms, and non-GPR fields are left alone.
-fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::ssa::Liveness, base_ip: u64) {
+fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::decompile::ssa::Liveness, base_ip: u64) {
     let mut cursor = base_ip;
     let mut i = 0;
     while i < stmts.len() {
@@ -2150,7 +2150,7 @@ fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::ssa::Livene
         if let Stmt::Move { dst, bytes, .. } = &stmts[i] {
             if is_gpr_name(dst) && !bytes.is_empty() {
                 let last_insn_ip = stmt_start;
-                let var = crate::ssa::Var::Reg(dst.clone());
+                let var = crate::decompile::ssa::Var::Reg(dst.clone());
                 let dead_after = liveness
                     .live_after_insn
                     .get(&last_insn_ip)
@@ -3469,7 +3469,7 @@ fn try_switch_pair(
     }
     // Selector register is the first cmp operand; MAX is the
     // immediate the cmp compares against.
-    let selector_reg = crate::ssa::canonical_reg_name(cmp_insn.iced.op0_register())?;
+    let selector_reg = crate::decompile::ssa::canonical_reg_name(cmp_insn.iced.op0_register())?;
     let max_val = u64::from(cmp_insn.iced.immediate32());
     let default_addr = ja_insn.iced.near_branch_target();
     if default_addr == 0 {
@@ -5053,7 +5053,7 @@ fn emit_block_stmts(
     // Run the pattern catalog once for this block. Pattern matches
     // claim their instruction ranges first; the inline pattern chain
     // below picks up whatever survives.
-    let pattern_ctx = crate::patterns::PatternCtx {
+    let pattern_ctx = crate::decompile::patterns::PatternCtx {
         fn_addr_start: ctx.fn_addr_start,
         fn_addr_end: ctx.fn_addr_end,
         name_at: ctx.name_at,
@@ -5065,7 +5065,7 @@ fn emit_block_stmts(
     // bytes; letting a pattern scan into that range can produce
     // overlapping byte claims (e.g. `push imm; pop reg` whose
     // `pop` is actually the epilogue's `pop reg` restore).
-    let pattern_matches = crate::patterns::apply_patterns(&pattern_ctx, &block.insns[..asm_count]);
+    let pattern_matches = crate::decompile::patterns::apply_patterns(&pattern_ctx, &block.insns[..asm_count]);
 
     let mut global_idx = prologue_consumed;
     while global_idx < asm_count {

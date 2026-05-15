@@ -397,19 +397,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let source = if ud_format_elf::is_elf64_le(&bytes) {
                 let elf = ud_format_elf::Elf64File::parse(&bytes)
                     .with_context(|| format!("parse {} as ELF", input.display()))?;
-                ud_decompile::decompile_to_text(&elf)
+                ud_translate::decompile::decompile_to_text(&elf)
                     .with_context(|| format!("decompile {}", input.display()))?
             } else if ud_format_pe::is_pe(&bytes) {
                 let pe = ud_format_pe::PeFile::parse(&bytes)
                     .with_context(|| format!("parse {} as PE", input.display()))?;
-                ud_decompile::decompile_pe_to_text(&pe)
+                ud_translate::decompile::decompile_pe_to_text(&pe)
             } else if ud_format_macho::is_macho64(&bytes) {
                 let macho = ud_format_macho::MachoFile::parse(&bytes)
                     .with_context(|| format!("parse {} as Mach-O", input.display()))?;
-                ud_decompile::decompile_macho_to_text(&macho)
+                ud_translate::decompile::decompile_macho_to_text(&macho)
             } else if let Some(load_addr) = ud_cli::raw_6502_load_addr(&bytes) {
                 let image = ud_format_raw::RawImage::new(bytes, load_addr);
-                ud_decompile::decompile_raw_6502_to_text(&image)
+                ud_translate::decompile::decompile_raw_6502_to_text(&image)
                     .with_context(|| format!("decompile {} as 6502 raw", input.display()))?
             } else {
                 anyhow::bail!(
@@ -430,8 +430,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let text = std::fs::read_to_string(&input)
                 .with_context(|| format!("read {}", input.display()))?;
             let ast =
-                ud_compile::parse(&text).with_context(|| format!("parse {}", input.display()))?;
-            let warnings = ud_compile::verify_asm(&ast);
+                ud_translate::compile::parse(&text).with_context(|| format!("parse {}", input.display()))?;
+            let warnings = ud_translate::compile::verify_asm(&ast);
             if warnings.is_empty() {
                 println!(
                     "ok: {} ({} item{})",
@@ -456,7 +456,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let text = std::fs::read_to_string(&input)
                 .with_context(|| format!("read {}", input.display()))?;
             let ast =
-                ud_compile::parse(&text).with_context(|| format!("parse {}", input.display()))?;
+                ud_translate::compile::parse(&text).with_context(|| format!("parse {}", input.display()))?;
             let format = ast
                 .module
                 .fields
@@ -470,13 +470,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     anyhow::anyhow!("`@module.format` is missing — expected \"elf\", \"pe\", \"macho\", or \"raw\"")
                 })?;
             let bytes = match format.as_str() {
-                "elf" => ud_compile::lower_to_elf(&ast)
+                "elf" => ud_translate::compile::lower_to_elf(&ast)
                     .with_context(|| format!("lower {} to ELF", input.display()))?,
-                "pe" => ud_compile::lower_to_pe(&ast)
+                "pe" => ud_translate::compile::lower_to_pe(&ast)
                     .with_context(|| format!("lower {} to PE", input.display()))?,
-                "macho" => ud_compile::lower_to_macho(&ast)
+                "macho" => ud_translate::compile::lower_to_macho(&ast)
                     .with_context(|| format!("lower {} to Mach-O", input.display()))?,
-                "raw" => ud_compile::lower_to_raw(&ast)
+                "raw" => ud_translate::compile::lower_to_raw(&ast)
                     .with_context(|| format!("lower {} to raw", input.display()))?,
                 other => anyhow::bail!(
                     "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", or \"raw\")"
@@ -1336,9 +1336,9 @@ struct CoverageSummary {
     self_modifying_sample: Vec<u32>,
 }
 
-fn format_warning(w: &ud_compile::AsmWarning) -> String {
+fn format_warning(w: &ud_translate::compile::AsmWarning) -> String {
     match w {
-        ud_compile::AsmWarning::Divergence {
+        ud_translate::compile::AsmWarning::Divergence {
             location,
             text,
             canonical,
@@ -1348,12 +1348,12 @@ fn format_warning(w: &ud_compile::AsmWarning) -> String {
             text,
             canonical,
         ),
-        ud_compile::AsmWarning::Undecodable { location, text } => format!(
+        ud_translate::compile::AsmWarning::Undecodable { location, text } => format!(
             "{}: pinned bytes don't decode as a valid x86 instruction (text was {:?})",
             format_location(location),
             text,
         ),
-        ud_compile::AsmWarning::MultipleInsns {
+        ud_translate::compile::AsmWarning::MultipleInsns {
             location,
             text,
             count,
@@ -1366,7 +1366,7 @@ fn format_warning(w: &ud_compile::AsmWarning) -> String {
     }
 }
 
-fn format_location(l: &ud_compile::AsmLocation) -> String {
+fn format_location(l: &ud_translate::compile::AsmLocation) -> String {
     let section = l.section.as_deref().unwrap_or("<top-level>");
     let function = l.function.as_deref().unwrap_or("<no fn>");
     format!("{section}::{function}#{}", l.stmt_index)

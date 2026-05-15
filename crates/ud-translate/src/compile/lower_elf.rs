@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use ud_ast::{Item, Module, UdFile, Value};
 use ud_format_elf::{Ehdr64, Elf64File, ElfClass, Phdr64, Shdr64};
 
-use crate::lower::{lower_section_bytes, LowerError};
+use crate::compile::lower::{lower_section_bytes, LowerError};
 
 /// Errors specific to the ELF lower path.
 #[derive(Debug, thiserror::Error)]

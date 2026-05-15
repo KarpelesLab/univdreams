@@ -26,7 +26,7 @@ use ud_format_pe::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386,
 };
 
-use crate::build_function;
+use crate::decompile::build_function;
 
 /// Build the AST for `pe`. Always succeeds — every byte of the input
 /// is captured either via `@module` structured fields or via

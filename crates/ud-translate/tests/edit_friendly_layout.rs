@@ -4,7 +4,7 @@
 //! auto-shifts those functions and re-resolves every PC-relative
 //! reference inside them.
 //!
-//! This test exercises [`ud_compile::lower_section_bytes`]
+//! This test exercises [`ud_translate::compile::lower_section_bytes`]
 //! directly — the section lay-out primitive — rather than the
 //! full `lower_to_elf` pipeline, because updating an ELF's
 //! section / program / file headers to reflect a grown `.text`
@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use ud_ast::{Item, Stmt};
-use ud_compile::{lower_section_bytes, parse};
+use ud_translate::compile::{lower_section_bytes, parse};
 use ud_format_elf::Elf64File;
 
 fn workspace_root() -> PathBuf {
@@ -87,7 +87,7 @@ fn nop_insertion_auto_shifts_later_functions() {
         return;
     };
     let elf = Elf64File::parse(&bytes).expect("parse fixture");
-    let text = ud_decompile::decompile_to_text(&elf).expect("decompile");
+    let text = ud_translate::decompile::decompile_to_text(&elf).expect("decompile");
     let mut ast = parse(&text).expect("parse .ud");
 
     let Some((sec_idx, fn_idx)) = pick_extendable_function(&ast.items) else {

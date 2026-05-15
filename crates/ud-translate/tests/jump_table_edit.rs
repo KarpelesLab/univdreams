@@ -12,7 +12,7 @@
 //! touches bytes `[table_addr + 4*k, table_addr + 4*(k+1))`.
 
 use ud_ast::{Item, JumpTableEntry};
-use ud_compile::lower_section_bytes;
+use ud_translate::compile::lower_section_bytes;
 
 #[test]
 fn editing_a_case_target_changes_only_that_slot_gcc_pie() {
