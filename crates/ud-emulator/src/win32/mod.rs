@@ -27,6 +27,7 @@ use crate::emulator::{Cpu, Mmu};
 pub mod advapi32;
 pub mod gdi32;
 pub mod kernel32;
+pub mod mfplat;
 pub mod msvcrt;
 pub mod ole32;
 pub mod user32;
@@ -627,6 +628,14 @@ impl Registry {
         self.by_name.len() - before
     }
 
+    /// Register every mfplat (Media Foundation platform) stub.
+    /// Returns the number registered.
+    pub fn register_mfplat(&mut self) -> usize {
+        let before = self.by_name.len();
+        mfplat::register(self);
+        self.by_name.len() - before
+    }
+
     /// Register every Round-1+4+8+20 stub family in one call:
     /// kernel32, gdi32, user32, winmm, advapi32, ole32, msvcrt,
     /// plus the round-27 host-COM thunk family used by
@@ -646,6 +655,7 @@ impl Registry {
             + self.register_msvcrt()
             + self.register_msvcr71()
             + self.register_pncrt()
+            + self.register_mfplat()
             + host_count
     }
 }

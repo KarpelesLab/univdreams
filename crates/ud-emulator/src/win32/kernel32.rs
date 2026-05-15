@@ -787,6 +787,86 @@ pub fn register(registry: &mut Registry) {
         stub_delay_load_failure_hook as StubFn,
         2,
     );
+
+    // ---- Corpus round 2 --------------------------------------------
+    registry.register(
+        "kernel32.dll",
+        "GetVersionExW",
+        stub_get_version_ex_w as StubFn,
+        1,
+    );
+    registry.register(
+        "kernel32.dll",
+        "SignalObjectAndWait",
+        stub_signal_object_and_wait as StubFn,
+        4,
+    );
+    registry.register(
+        "kernel32.dll",
+        "InitializeCriticalSectionAndSpinCount",
+        stub_init_cs_spin as StubFn,
+        2,
+    );
+    registry.register(
+        "kernel32.dll",
+        "IsDebuggerPresent",
+        stub_is_debugger_present as StubFn,
+        0,
+    );
+    registry.register(
+        "kernel32.dll",
+        "VirtualProtect",
+        stub_virtual_protect as StubFn,
+        4,
+    );
+    registry.register(
+        "kernel32.dll",
+        "InterlockedExchangeAdd",
+        stub_interlocked_exchange_add as StubFn,
+        2,
+    );
+    registry.register(
+        "kernel32.dll",
+        "GetComputerNameA",
+        stub_get_computer_name_a as StubFn,
+        2,
+    );
+    registry.register(
+        "kernel32.dll",
+        "GetEnvironmentVariableW",
+        stub_get_environment_variable_w as StubFn,
+        3,
+    );
+    registry.register(
+        "kernel32.dll",
+        "GetProcessAffinityMask",
+        stub_get_process_affinity_mask as StubFn,
+        3,
+    );
+    registry.register(
+        "kernel32.dll",
+        "GetThreadPriority",
+        stub_get_thread_priority as StubFn,
+        1,
+    );
+    registry.register(
+        "kernel32.dll",
+        "SetThreadAffinityMask",
+        stub_set_thread_affinity_mask as StubFn,
+        2,
+    );
+    registry.register(
+        "kernel32.dll",
+        "LoadLibraryW",
+        stub_load_library_w as StubFn,
+        1,
+    );
+    registry.register(
+        "kernel32.dll",
+        "ReadFile",
+        stub_read_file as StubFn,
+        5,
+    );
 }
 
 // ----- Heap ----------------------------------------------------------
@@ -3109,6 +3189,245 @@ fn stub_delay_load_failure_hook(
     let _dll = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("DelayLoadFailureHook", t))?;
     let _proc = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("DelayLoadFailureHook", t))?;
     Ok(0)
+}
+
+// ----- Corpus round 2 -----------------------------------------------
+
+/// `BOOL GetVersionExW(LPOSVERSIONINFOW lpVersionInformation)`.
+/// Fills the OSVERSIONINFO[EX]W struct with values that
+/// announce "Windows 7" (major 6.1, build 7600). Codecs that
+/// gate on minimum-Windows-version checks pass.
+fn stub_get_version_ex_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetVersionExW", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    // First DWORD = dwOSVersionInfoSize. Codecs set this to
+    // either sizeof(OSVERSIONINFOW)=276 or
+    // sizeof(OSVERSIONINFOEXW)=284 before the call; we don't
+    // overwrite it. Then: dwMajorVersion, dwMinorVersion,
+    // dwBuildNumber, dwPlatformId (VER_PLATFORM_WIN32_NT = 2),
+    // then szCSDVersion (128 wide chars). If the caller passed
+    // a too-small struct we still write the first 5 dwords —
+    // it's the caller's responsibility to set dwOSVersionInfoSize
+    // correctly.
+    mmu.store32(p.wrapping_add(4), 6)
+        .map_err(|t| trap_to_win32("GetVersionExW", t))?;
+    mmu.store32(p.wrapping_add(8), 1)
+        .map_err(|t| trap_to_win32("GetVersionExW", t))?;
+    mmu.store32(p.wrapping_add(12), 7600)
+        .map_err(|t| trap_to_win32("GetVersionExW", t))?;
+    mmu.store32(p.wrapping_add(16), 2)
+        .map_err(|t| trap_to_win32("GetVersionExW", t))?;
+    // Zero szCSDVersion[128] = 256 bytes
+    let zeros = [0u8; 256];
+    mmu.write(p.wrapping_add(20), &zeros)
+        .map_err(|t| trap_to_win32("GetVersionExW", t))?;
+    Ok(1)
+}
+
+/// `DWORD SignalObjectAndWait(HANDLE, HANDLE, DWORD, BOOL)`.
+/// Single-threaded sandbox → return `WAIT_OBJECT_0`.
+fn stub_signal_object_and_wait(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION,
+/// DWORD)`. Returns 1; we model critical sections as no-ops.
+fn stub_init_cs_spin(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL IsDebuggerPresent(void)`. We say "no" — codecs that
+/// gate anti-analysis behaviour on this take the non-debugger
+/// branch. https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-isdebuggerpresent
+fn stub_is_debugger_present(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL VirtualProtect(LPVOID lpAddress, SIZE_T dwSize,
+/// DWORD flNewProtect, PDWORD lpflOldProtect)`. We don't
+/// model per-page protection swaps — every page in our MMU
+/// is R+W+X-as-needed once mapped. Just write a plausible old
+/// protection into the out-param and return success.
+fn stub_virtual_protect(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("VirtualProtect", t))?;
+    let _size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("VirtualProtect", t))?;
+    let _new = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("VirtualProtect", t))?;
+    let out = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("VirtualProtect", t))?;
+    if out != 0 {
+        // 0x40 = PAGE_EXECUTE_READWRITE — the most permissive
+        // value, indicates the page was fully accessible.
+        mmu.store32(out, 0x40)
+            .map_err(|t| trap_to_win32("VirtualProtect", t))?;
+    }
+    Ok(1)
+}
+
+/// `LONG InterlockedExchangeAdd(LONG volatile *Addend, LONG Value)`.
+/// Atomically adds `Value` to `*Addend` and returns the
+/// previous value.
+fn stub_interlocked_exchange_add(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let addend =
+        arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
+    let value =
+        arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
+    let prev = mmu
+        .load32(addend)
+        .map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
+    let new = prev.wrapping_add(value);
+    mmu.store32(addend, new)
+        .map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
+    Ok(prev)
+}
+
+/// `BOOL GetComputerNameA(LPSTR lpBuffer, LPDWORD nSize)`.
+/// Writes a canned ASCII name and updates `*nSize`.
+fn stub_get_computer_name_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetComputerNameA", t))?;
+    let n_ptr = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetComputerNameA", t))?;
+    let name = b"UDEMULATOR\0";
+    let mut cap = 0u32;
+    if n_ptr != 0 {
+        cap = mmu
+            .load32(n_ptr)
+            .map_err(|t| trap_to_win32("GetComputerNameA", t))?;
+        mmu.store32(n_ptr, name.len() as u32 - 1)
+            .map_err(|t| trap_to_win32("GetComputerNameA", t))?;
+    }
+    if buf != 0 && cap as usize >= name.len() {
+        mmu.write(buf, name)
+            .map_err(|t| trap_to_win32("GetComputerNameA", t))?;
+    }
+    Ok(1)
+}
+
+/// `DWORD GetEnvironmentVariableW(LPCWSTR lpName, LPWSTR
+/// lpBuffer, DWORD nSize)`. We have no environment — return 0
+/// and let the caller take its default branch.
+fn stub_get_environment_variable_w(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL GetProcessAffinityMask(HANDLE hProcess,
+/// PDWORD_PTR lpProcessAffinityMask,
+/// PDWORD_PTR lpSystemAffinityMask)`. Reports a single-CPU
+/// system (mask 1). Codecs use this to decide how many worker
+/// threads to spawn.
+fn stub_get_process_affinity_mask(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetProcessAffinityMask", t))?;
+    let proc_mask =
+        arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetProcessAffinityMask", t))?;
+    let sys_mask =
+        arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetProcessAffinityMask", t))?;
+    if proc_mask != 0 {
+        mmu.store32(proc_mask, 1)
+            .map_err(|t| trap_to_win32("GetProcessAffinityMask", t))?;
+    }
+    if sys_mask != 0 {
+        mmu.store32(sys_mask, 1)
+            .map_err(|t| trap_to_win32("GetProcessAffinityMask", t))?;
+    }
+    Ok(1)
+}
+
+/// `int GetThreadPriority(HANDLE hThread)`. Returns `THREAD_PRIORITY_NORMAL = 0`.
+fn stub_get_thread_priority(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `DWORD_PTR SetThreadAffinityMask(HANDLE, DWORD_PTR)`.
+/// Returns the previous affinity mask (synthetic 1).
+fn stub_set_thread_affinity_mask(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `HMODULE LoadLibraryW(LPCWSTR lpLibFileName)`. We don't
+/// load arbitrary host DLLs into the guest; return 0 (failure)
+/// so the codec falls through to a backup path. Codecs that
+/// require a successful LoadLibrary tend to be the optional-
+/// codec-pack splitter shapes we don't try to fully drive.
+fn stub_load_library_w(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED)`.
+/// No filesystem mapped — report "read 0 bytes" success.
+fn stub_read_file(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ReadFile", t))?;
+    let _buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("ReadFile", t))?;
+    let _n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("ReadFile", t))?;
+    let out = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("ReadFile", t))?;
+    if out != 0 {
+        mmu.store32(out, 0)
+            .map_err(|t| trap_to_win32("ReadFile", t))?;
+    }
+    Ok(1)
 }
 
 #[cfg(test)]

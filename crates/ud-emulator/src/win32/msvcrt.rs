@@ -354,6 +354,29 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     // `_iob[2]` (stderr) just need a non-NULL FILE* they
     // can pass to fprintf/etc., which we ignore.
     registry.register_data(dll, "_iob", 0);
+
+    // ---- Corpus round 2 -------------------------------------------
+    // Additional CRT entries flagged by the corpus runner after
+    // the first batch of stubs landed.
+    registry.register_data(dll, "_errno", 0);
+    registry.register_data(dll, "__mb_cur_max", 1);
+    registry.register(dll, "_write", stub_returns_arg2 as StubFn, 0);
+    registry.register(dll, "asctime", stub_asctime as StubFn, 0);
+    registry.register(dll, "fflush", stub_purecall as StubFn, 0);
+    registry.register(dll, "fprintf", stub_purecall as StubFn, 0);
+    registry.register(dll, "puts", stub_purecall as StubFn, 0);
+    registry.register(dll, "printf", stub_purecall as StubFn, 0);
+    registry.register(dll, "abort", stub_purecall as StubFn, 0);
+    registry.register(dll, "_snprintf", stub_snprintf as StubFn, 0);
+    registry.register(dll, "_putenv", stub_purecall as StubFn, 0);
+    registry.register(dll, "_stricmp", stub_stricmp as StubFn, 0);
+    registry.register(dll, "strchr", stub_strchr as StubFn, 0);
+    registry.register(dll, "isupper", stub_isupper as StubFn, 0);
+    registry.register(dll, "tolower", stub_tolower as StubFn, 0);
+    registry.register(dll, "ceil", stub_ceil as StubFn, 0);
+    registry.register(dll, "_CIcos", stub_ci_cos as StubFn, 0);
+    registry.register(dll, "_CIsin", stub_ci_sin as StubFn, 0);
+    registry.register(dll, "_CIlog", stub_ci_log as StubFn, 0);
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling
@@ -1259,6 +1282,185 @@ fn stub_localtime(
     mmu.write_initializer(p, &[0u8; 36])
         .map_err(|t| trap("localtime", t))?;
     Ok(p)
+}
+
+// ----- Corpus round 2 ----------------------------------------------
+
+/// Cdecl stub that returns the third argument verbatim. Used
+/// for `_write(fd, buf, n)` — pretending the write succeeded.
+fn stub_returns_arg2(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("_write", t))?;
+    Ok(n)
+}
+
+/// `char *asctime(const struct tm *tp)`. Returns a 26-char
+/// canned string in the const arena. Codecs that include the
+/// build timestamp in a debug log use this; the exact format
+/// doesn't matter for our purposes.
+fn stub_asctime(
+    _cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = state.arena_const_alloc(26)?;
+    let canned = b"Mon Jan  1 00:00:00 2024\n\0";
+    mmu.write_initializer(p, canned)
+        .map_err(|t| trap("asctime", t))?;
+    Ok(p)
+}
+
+/// `int _snprintf(char *buf, size_t n, const char *fmt, ...)`.
+/// Stub: NUL-terminate the buffer and return 0.
+fn stub_snprintf(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap("_snprintf", t))?;
+    let n = arg_dword(cpu, mmu, 1).map_err(|t| trap("_snprintf", t))?;
+    if buf != 0 && n >= 1 {
+        mmu.store8(buf, 0).map_err(|t| trap("_snprintf", t))?;
+    }
+    Ok(0)
+}
+
+/// `int _stricmp(const char *s1, const char *s2)`. Real ASCII
+/// case-insensitive compare so codecs that gate on FOURCC
+/// strings take the right branch.
+fn stub_stricmp(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("_stricmp", t))?;
+    let p2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("_stricmp", t))?;
+    for i in 0..0x1_0000u32 {
+        let a = mmu
+            .load8(p1.wrapping_add(i))
+            .map_err(|t| trap("_stricmp", t))?
+            .to_ascii_lowercase();
+        let b = mmu
+            .load8(p2.wrapping_add(i))
+            .map_err(|t| trap("_stricmp", t))?
+            .to_ascii_lowercase();
+        if a != b {
+            return Ok((a as i32 - b as i32) as u32);
+        }
+        if a == 0 {
+            return Ok(0);
+        }
+    }
+    Ok(0)
+}
+
+/// `char *strchr(const char *s, int c)`. Scans `s` for the
+/// first occurrence of `c`; returns its pointer or NULL.
+fn stub_strchr(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap("strchr", t))?;
+    let needle = arg_dword(cpu, mmu, 1).map_err(|t| trap("strchr", t))? as u8;
+    for i in 0..0x1_0000u32 {
+        let b = mmu
+            .load8(p.wrapping_add(i))
+            .map_err(|t| trap("strchr", t))?;
+        if b == needle {
+            return Ok(p.wrapping_add(i));
+        }
+        if b == 0 {
+            return Ok(0);
+        }
+    }
+    Ok(0)
+}
+
+/// `int isupper(int c)`. Returns non-zero when `c` is an
+/// uppercase ASCII letter. The CRT macro version reads a
+/// per-character classification table; we just do the byte
+/// test.
+fn stub_isupper(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("isupper", t))? as u8;
+    Ok(u32::from(c.is_ascii_uppercase()))
+}
+
+/// `int tolower(int c)`. ASCII-only.
+fn stub_tolower(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("tolower", t))? as u8;
+    Ok(u32::from(c.to_ascii_lowercase()))
+}
+
+/// `double ceil(double x)`. x87-stack — FLD on entry, FSTP
+/// result on exit. Cdecl with no stack args.
+fn stub_ceil(
+    cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let x = cpu.fpu.st(0);
+    let _ = cpu.fpu.pop();
+    cpu.fpu.push(x.ceil());
+    Ok(0)
+}
+
+/// `double _CIcos(double)` — x87-stack cosine.
+fn stub_ci_cos(
+    cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let x = cpu.fpu.st(0);
+    let _ = cpu.fpu.pop();
+    cpu.fpu.push(x.cos());
+    Ok(0)
+}
+
+/// `double _CIsin(double)` — x87-stack sine.
+fn stub_ci_sin(
+    cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let x = cpu.fpu.st(0);
+    let _ = cpu.fpu.pop();
+    cpu.fpu.push(x.sin());
+    Ok(0)
+}
+
+/// `double _CIlog(double)` — x87-stack natural log.
+fn stub_ci_log(
+    cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let x = cpu.fpu.st(0);
+    let _ = cpu.fpu.pop();
+    cpu.fpu.push(x.ln());
+    Ok(0)
 }
 mod tests {
     use super::*;
