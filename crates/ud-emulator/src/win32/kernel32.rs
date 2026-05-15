@@ -671,6 +671,122 @@ pub fn register(registry: &mut Registry) {
         stub_get_profile_int_a as StubFn,
         3,
     );
+
+    // ----- Corpus-driven additions ----------------------------------
+    // Stubs added in response to the codec-corpus test
+    // (`tests/codec_corpus.rs`) showing high-frequency
+    // unresolved-import counts. Each entry below was missing
+    // from ≥6 codecs in the manifest; closing them unblocks
+    // those codecs' `Sandbox::load`.
+
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocessid
+    registry.register(
+        "kernel32.dll",
+        "GetCurrentProcessId",
+        stub_get_current_process_id as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimeasfiletime
+    registry.register(
+        "kernel32.dll",
+        "GetSystemTimeAsFileTime",
+        stub_get_system_time_as_file_time as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentthread
+    registry.register(
+        "kernel32.dll",
+        "GetCurrentThread",
+        stub_get_current_thread as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-interlockedexchange
+    registry.register(
+        "kernel32.dll",
+        "InterlockedExchange",
+        stub_interlocked_exchange as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-interlockedcompareexchange
+    registry.register(
+        "kernel32.dll",
+        "InterlockedCompareExchange",
+        stub_interlocked_compare_exchange as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-unhandledexceptionfilter
+    registry.register(
+        "kernel32.dll",
+        "UnhandledExceptionFilter",
+        stub_unhandled_exception_filter as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-seterrormode
+    registry.register(
+        "kernel32.dll",
+        "SetErrorMode",
+        stub_set_error_mode as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-resetevent
+    registry.register(
+        "kernel32.dll",
+        "ResetEvent",
+        stub_reset_event as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects
+    registry.register(
+        "kernel32.dll",
+        "WaitForMultipleObjects",
+        stub_wait_for_multiple_objects as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createeventw
+    registry.register(
+        "kernel32.dll",
+        "CreateEventW",
+        stub_create_event_w as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createsemaphorew
+    registry.register(
+        "kernel32.dll",
+        "CreateSemaphoreW",
+        stub_create_semaphore_w as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getlocaltime
+    registry.register(
+        "kernel32.dll",
+        "GetLocalTime",
+        stub_get_local_time as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlew
+    registry.register(
+        "kernel32.dll",
+        "GetModuleHandleW",
+        stub_get_module_handle_w as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprivateprofileinta
+    registry.register(
+        "kernel32.dll",
+        "GetPrivateProfileIntA",
+        stub_get_private_profile_int_a as StubFn,
+        4,
+    );
+    // `DelayLoadFailureHook` — DELAYLOAD glue called by the
+    // VC++ delay-load helper when an import resolves at run
+    // time. Synthetic stub returns 0 (loader treats this as
+    // "handled"). https://learn.microsoft.com/en-us/cpp/build/reference/error-handling-and-notification
+    registry.register(
+        "kernel32.dll",
+        "DelayLoadFailureHook",
+        stub_delay_load_failure_hook as StubFn,
+        2,
+    );
 }
 
 // ----- Heap ----------------------------------------------------------
@@ -2726,6 +2842,273 @@ fn stub_get_profile_int_a(
     let _key = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetProfileIntA", t))?;
     let default = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetProfileIntA", t))?;
     Ok(default)
+}
+
+// ----- Corpus-driven additions --------------------------------------
+
+/// `DWORD GetCurrentProcessId(void)`. Synthetic 1 — codecs use
+/// the PID as a poor man's hash seed or as a TLS-store key.
+fn stub_get_current_process_id(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `void GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)`.
+/// Writes a `FILETIME` (two `DWORD`s, little-endian: low then
+/// high) representing 100-ns intervals since 1601-01-01 UTC.
+/// We derive the value from `state.tick` so successive calls
+/// return monotonically increasing timestamps without modelling
+/// real wall-clock time. Most codecs use this for seeding RNGs
+/// or for performance counters that just need monotonicity.
+fn stub_get_system_time_as_file_time(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetSystemTimeAsFileTime", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    // Synthesise a monotonically-increasing FILETIME by
+    // multiplying the tick by 10000 (one tick ≈ 1 ms ≈ 10000
+    // 100-ns units) and adding a base offset roughly equal to
+    // 2024-01-01 in FILETIME units. Codecs that compare two
+    // calls see strictly-increasing values.
+    state.tick = state.tick.wrapping_add(1);
+    let base: u64 = 133_482_240_000_000_000; // 2024-01-01 UTC in 100-ns ticks since 1601
+    let ft = base.wrapping_add(u64::from(state.tick).wrapping_mul(10_000));
+    let low = ft as u32;
+    let high = (ft >> 32) as u32;
+    mmu.store32(p, low)
+        .map_err(|t| trap_to_win32("GetSystemTimeAsFileTime", t))?;
+    mmu.store32(p.wrapping_add(4), high)
+        .map_err(|t| trap_to_win32("GetSystemTimeAsFileTime", t))?;
+    Ok(0)
+}
+
+/// `HANDLE GetCurrentThread(void)`. Pseudo-handle `-2` per the
+/// Win32 ABI (current thread).
+fn stub_get_current_thread(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0xFFFF_FFFE)
+}
+
+/// `LONG InterlockedExchange(LONG volatile *Target, LONG Value)`.
+/// Atomically writes `Value` to `*Target` and returns the
+/// previous value. Single-threaded emulator → no atomicity
+/// dance needed.
+fn stub_interlocked_exchange(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let target = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedExchange", t))?;
+    let value = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("InterlockedExchange", t))?;
+    let prev = mmu
+        .load32(target)
+        .map_err(|t| trap_to_win32("InterlockedExchange", t))?;
+    mmu.store32(target, value)
+        .map_err(|t| trap_to_win32("InterlockedExchange", t))?;
+    Ok(prev)
+}
+
+/// `LONG InterlockedCompareExchange(LONG volatile *Destination,
+/// LONG Exchange, LONG Comparand)`. Returns the original value
+/// at `*Destination`; if it equalled `Comparand`, writes
+/// `Exchange` over it.
+fn stub_interlocked_compare_exchange(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest =
+        arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedCompareExchange", t))?;
+    let exchange =
+        arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("InterlockedCompareExchange", t))?;
+    let comparand =
+        arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("InterlockedCompareExchange", t))?;
+    let prev = mmu
+        .load32(dest)
+        .map_err(|t| trap_to_win32("InterlockedCompareExchange", t))?;
+    if prev == comparand {
+        mmu.store32(dest, exchange)
+            .map_err(|t| trap_to_win32("InterlockedCompareExchange", t))?;
+    }
+    Ok(prev)
+}
+
+/// `LONG UnhandledExceptionFilter(EXCEPTION_POINTERS *)`. Real
+/// behaviour: pops the system "this program has stopped working"
+/// dialog. We return `EXCEPTION_CONTINUE_SEARCH = 0` so the SEH
+/// chain keeps unwinding; codecs that wrap their entire init in
+/// `__try` / `__except(UnhandledExceptionFilter(GetExceptionInformation()))`
+/// won't intercept anything.
+fn stub_unhandled_exception_filter(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `UINT SetErrorMode(UINT uMode)`. We don't model the system
+/// error dialog so any mode is fine. Returns the previous mode
+/// (synthetic 0).
+fn stub_set_error_mode(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _new_mode = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetErrorMode", t))?;
+    Ok(0)
+}
+
+/// `BOOL ResetEvent(HANDLE hEvent)`. Single-threaded emulator
+/// has no real event objects; return 1 (success).
+fn stub_reset_event(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ResetEvent", t))?;
+    Ok(1)
+}
+
+/// `DWORD WaitForMultipleObjects(DWORD nCount, const HANDLE *lpHandles,
+/// BOOL bWaitAll, DWORD dwMilliseconds)`. Always returns
+/// `WAIT_OBJECT_0 = 0` — everything is "ready" in our
+/// single-threaded sandbox.
+fn stub_wait_for_multiple_objects(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _ncount =
+        arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
+    let _phandles =
+        arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
+    let _waitall =
+        arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
+    let _ms = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
+    Ok(0)
+}
+
+/// `HANDLE CreateEventW(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCWSTR)`.
+/// Returns a synthetic non-NULL handle. Codecs use this to
+/// coordinate between threads — we don't model threads, but the
+/// codec just needs a non-zero handle to signal/wait on.
+fn stub_create_event_w(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state.tick = state.tick.wrapping_add(1);
+    Ok(0xE000_0000u32.wrapping_add(state.tick))
+}
+
+/// `HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES, LONG, LONG, LPCWSTR)`.
+/// Synthetic handle like [`stub_create_event_w`]; the codec
+/// gets a non-NULL value, releases/waits are no-ops.
+fn stub_create_semaphore_w(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state.tick = state.tick.wrapping_add(1);
+    Ok(0xE100_0000u32.wrapping_add(state.tick))
+}
+
+/// `void GetLocalTime(LPSYSTEMTIME)`. Writes a 16-byte
+/// `SYSTEMTIME` (wYear, wMonth, wDayOfWeek, wDay, wHour,
+/// wMinute, wSecond, wMilliseconds — each `WORD`). We hand
+/// back a fixed canned value (2024-01-01 00:00:00.000) so
+/// codec-output bitstreams that embed timestamps are
+/// deterministic across runs.
+fn stub_get_local_time(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetLocalTime", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    // wYear=2024, wMonth=1, wDayOfWeek=1 (Mon), wDay=1,
+    // wHour=0, wMinute=0, wSecond=0, wMilliseconds=0
+    let fields: [u16; 8] = [2024, 1, 1, 1, 0, 0, 0, 0];
+    for (i, w) in fields.iter().enumerate() {
+        mmu.store16(p.wrapping_add(i as u32 * 2), *w)
+            .map_err(|t| trap_to_win32("GetLocalTime", t))?;
+    }
+    Ok(0)
+}
+
+/// `HMODULE GetModuleHandleW(LPCWSTR lpModuleName)`. Wide-char
+/// sibling of `GetModuleHandleA`. We don't yet resolve the
+/// name; passing `NULL` returns the primary module base,
+/// anything else returns 0 (codec falls back to a load attempt).
+fn stub_get_module_handle_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetModuleHandleW", t))?;
+    if p == 0 {
+        return Ok(state.primary_module_base);
+    }
+    Ok(0)
+}
+
+/// `UINT GetPrivateProfileIntA(LPCSTR lpAppName, LPCSTR lpKeyName,
+/// INT nDefault, LPCSTR lpFileName)`. We have no INI file to
+/// consult; return the caller's default.
+fn stub_get_private_profile_int_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _app = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
+    let _key = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
+    let default =
+        arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
+    let _file = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
+    Ok(default)
+}
+
+/// `FARPROC WINAPI DelayLoadFailureHook(LPCSTR pszDllName,
+/// LPCSTR pszProcName)`. VC++ delay-load glue. Real handler
+/// returns 0 to signal "let the runtime raise an exception";
+/// the codec sees a NULL pointer and either bails or falls
+/// through to its own backup path. We do the same.
+fn stub_delay_load_failure_hook(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _dll = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("DelayLoadFailureHook", t))?;
+    let _proc = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("DelayLoadFailureHook", t))?;
+    Ok(0)
 }
 
 #[cfg(test)]

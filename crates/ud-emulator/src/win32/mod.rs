@@ -608,6 +608,25 @@ impl Registry {
         self.by_name.len() - before
     }
 
+    /// Register the msvcrt stub set under `msvcr71.dll`. Used by
+    /// codecs from the wmfdist11 era (mp43decd, mp4sdecd,
+    /// wmvdecod, …) that link MSVC 7.1's runtime by its
+    /// per-version name. Returns the number registered.
+    pub fn register_msvcr71(&mut self) -> usize {
+        let before = self.by_name.len();
+        msvcrt::register_alias(self, "msvcr71.dll");
+        self.by_name.len() - before
+    }
+
+    /// Register the msvcrt stub set under `pncrt.dll`. Used by
+    /// RealNetworks codecs that ship their own CRT fork.
+    /// Returns the number registered.
+    pub fn register_pncrt(&mut self) -> usize {
+        let before = self.by_name.len();
+        msvcrt::register_alias(self, "pncrt.dll");
+        self.by_name.len() - before
+    }
+
     /// Register every Round-1+4+8+20 stub family in one call:
     /// kernel32, gdi32, user32, winmm, advapi32, ole32, msvcrt,
     /// plus the round-27 host-COM thunk family used by
@@ -625,6 +644,8 @@ impl Registry {
             + self.register_advapi32()
             + self.register_ole32()
             + self.register_msvcrt()
+            + self.register_msvcr71()
+            + self.register_pncrt()
             + host_count
     }
 }

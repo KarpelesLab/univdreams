@@ -46,15 +46,27 @@ use crate::emulator::{Cpu, Mmu};
 
 /// Register every msvcrt stub.
 pub fn register(registry: &mut Registry) {
+    // Standard `msvcrt.dll`. The same stub set lands under
+    // `msvcr71.dll` and `pncrt.dll` via [`register_alias`] —
+    // codecs from the wmfdist11 era link msvcr71 (MSVC 7.1
+    // runtime); RealNetworks codecs link `pncrt.dll`, their
+    // bundled CRT fork. Both export the same names as
+    // msvcrt for the C-library surface we care about.
+    register_for_dll(registry, "msvcrt.dll");
+}
+
+/// Register the same CRT stub set under an alternate dll
+/// name. Used to cover `msvcr71.dll` (MSVC 7.1, wmfdist11
+/// codecs) and `pncrt.dll` (RealNetworks bundled CRT).
+pub fn register_alias(registry: &mut Registry, dll: &str) {
+    register_for_dll(registry, dll);
+}
+
+fn register_for_dll(registry: &mut Registry, dll: &str) {
     // C++ operator new(size_t) — the Microsoft mangled name.
-    registry.register("msvcrt.dll", "??2@YAPAXI@Z", stub_operator_new as StubFn, 0);
+    registry.register(dll, "??2@YAPAXI@Z", stub_operator_new as StubFn, 0);
     // C++ operator delete(void*) — Microsoft mangled name.
-    registry.register(
-        "msvcrt.dll",
-        "??3@YAXPAX@Z",
-        stub_operator_delete as StubFn,
-        0,
-    );
+    registry.register(dll, "??3@YAXPAX@Z", stub_operator_delete as StubFn, 0);
     // CRT init — fdiv erratum / SEH / static-ctor table /
     // pure-virtual sentinel.
     //
@@ -65,15 +77,15 @@ pub fn register(registry: &mut Registry) {
     // initialised to 0 — meaning "no Pentium-FDIV fix-up
     // needed", which is true for any post-1996 CPU and our
     // synthesised Pentium II.
-    registry.register_data("msvcrt.dll", "_adjust_fdiv", 0);
+    registry.register_data(dll, "_adjust_fdiv", 0);
     registry.register(
-        "msvcrt.dll",
+        dll,
         "_except_handler3",
         stub_except_handler3 as StubFn,
         0,
     );
-    registry.register("msvcrt.dll", "_initterm", stub_initterm as StubFn, 0);
-    registry.register("msvcrt.dll", "_purecall", stub_purecall as StubFn, 0);
+    registry.register(dll, "_initterm", stub_initterm as StubFn, 0);
+    registry.register(dll, "_purecall", stub_purecall as StubFn, 0);
     // CRT exit-handler registry (atexit / DLL-onexit hooks). Real
     // CRTs append the pointer to a per-module list; we let the
     // codec register handlers, then never actually run them
@@ -82,17 +94,17 @@ pub fn register(registry: &mut Registry) {
     // contract: `_onexit` returns the registered pointer on
     // success or NULL on failure. Round 21 — surfaced by the
     // mpg4ds32.ax / wmvds32.ax DirectShow filters.
-    registry.register("msvcrt.dll", "_onexit", stub_onexit as StubFn, 0);
-    registry.register("msvcrt.dll", "__dllonexit", stub_dllonexit as StubFn, 0);
+    registry.register(dll, "_onexit", stub_onexit as StubFn, 0);
+    registry.register(dll, "__dllonexit", stub_dllonexit as StubFn, 0);
     // CRT formatted-string family. We support the headline
     // `sprintf(buf, fmt, ...)` form with `%s`, `%d`, `%u`, `%x`,
     // `%c`, `%p`, `%%`. Codec messages aren't user-visible so
     // the formatter doesn't need to match Microsoft's exact
     // padding / locale behaviour — just a faithful conversion.
-    registry.register("msvcrt.dll", "sprintf", stub_sprintf as StubFn, 0);
+    registry.register(dll, "sprintf", stub_sprintf as StubFn, 0);
     // C heap.
-    registry.register("msvcrt.dll", "malloc", stub_malloc as StubFn, 0);
-    registry.register("msvcrt.dll", "free", stub_free as StubFn, 0);
+    registry.register(dll, "malloc", stub_malloc as StubFn, 0);
+    registry.register(dll, "free", stub_free as StubFn, 0);
 
     // ---- Round-48 addition: msadds32.ax PE-load surface --------
     //
@@ -108,7 +120,7 @@ pub fn register(registry: &mut Registry) {
     // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/endthread-endthreadex
     // void __cdecl _endthreadex(unsigned retval) — caller-cleanup.
     registry.register(
-        "msvcrt.dll",
+        dll,
         "_endthreadex",
         stub_end_thread_ex as StubFn,
         0,
@@ -133,7 +145,7 @@ pub fn register(registry: &mut Registry) {
     // int __cdecl _strnicmp(const char *string1,
     //                       const char *string2,
     //                       size_t count) — caller-cleanup.
-    registry.register("msvcrt.dll", "_strnicmp", stub_strnicmp as StubFn, 0);
+    registry.register(dll, "_strnicmp", stub_strnicmp as StubFn, 0);
 
     // ---- Round-50 addition: msadds32.ax PE-load surface --------
     //
@@ -164,7 +176,7 @@ pub fn register(registry: &mut Registry) {
     //                                  unsigned *thrdaddr)
     //                                                  — caller-cleanup.
     registry.register(
-        "msvcrt.dll",
+        dll,
         "_beginthreadex",
         stub_begin_thread_ex as StubFn,
         0,
@@ -200,7 +212,7 @@ pub fn register(registry: &mut Registry) {
     // `0x8000_0000`).  Rust's `f64 as i32` already saturates per
     // 2018-edition semantics; we still range-check explicitly so
     // the NaN branch returns `i32::MIN` deterministically.
-    registry.register("msvcrt.dll", "_ftol", stub_ftol as StubFn, 0);
+    registry.register(dll, "_ftol", stub_ftol as StubFn, 0);
 
     // ---- Round-55 addition: msadds32.ax PE-load surface --------
     //
@@ -232,8 +244,8 @@ pub fn register(registry: &mut Registry) {
     // via [`crate::Sandbox::rand_seed`].
     //
     // Both stubs are cdecl: caller-cleanup, `arg_dwords = 0`.
-    registry.register("msvcrt.dll", "rand", stub_rand as StubFn, 0);
-    registry.register("msvcrt.dll", "srand", stub_srand as StubFn, 0);
+    registry.register(dll, "rand", stub_rand as StubFn, 0);
+    registry.register(dll, "srand", stub_srand as StubFn, 0);
 
     // ---- Round-56 addition: msadds32.ax PE-load surface --------
     //
@@ -268,7 +280,80 @@ pub fn register(registry: &mut Registry) {
     // r55.  Rust's `f64::powf` follows IEEE 754: `1.0_f64.powf(NaN)
     // = 1.0`, `0.0_f64.powf(0.0) = 1.0`, `(-1.0_f64).powf(0.5) =
     // NaN`, `f64::INFINITY.powf(0.0) = 1.0`.
-    registry.register("msvcrt.dll", "_CIpow", stub_ci_pow as StubFn, 0);
+    registry.register(dll, "_CIpow", stub_ci_pow as StubFn, 0);
+
+    // ---- Corpus-driven additions ----------------------------------
+    // Imports flagged ≥ 6× by `tests/codec_corpus.rs`. All cdecl.
+
+    // void __security_error_handler(int code, void *data) —
+    // MSVC 7.1 buffer-overrun reporter. We return 0; the
+    // codec's CRT never actually invokes it on the happy path.
+    registry.register(
+        dll,
+        "__security_error_handler",
+        stub_purecall as StubFn,
+        0,
+    );
+    // void __CppXcptFilter(unsigned long, _EXCEPTION_POINTERS*)
+    // — MSVC C++ exception filter. `EXCEPTION_CONTINUE_SEARCH = 1`.
+    registry.register(
+        dll,
+        "__CppXcptFilter",
+        stub_except_handler3 as StubFn,
+        0,
+    );
+    // int _XcptFilter(unsigned long xc, EXCEPTION_POINTERS *ptr) —
+    // CRT exception filter used by `__try`/`__except` blocks.
+    // Returns `EXCEPTION_CONTINUE_SEARCH`.
+    registry.register(dll, "_XcptFilter", stub_except_handler3 as StubFn, 0);
+    // void __cdecl _amsg_exit(int rterrnum) — CRT abort path on
+    // runtime errors. We treat it like `_purecall` (no-op,
+    // returns 0) since the codec's CRT only hits it on
+    // unrecoverable conditions (stack overflow, etc.) we don't
+    // synthesise.
+    registry.register(dll, "_amsg_exit", stub_purecall as StubFn, 0);
+    // void _lock(int locknum) / void _unlock(int locknum) —
+    // CRT multi-threaded-mode internal locks. Single-threaded
+    // emulator → no-op.
+    registry.register(dll, "_lock", stub_purecall as StubFn, 0);
+    registry.register(dll, "_unlock", stub_purecall as StubFn, 0);
+    // void *memcpy(void *dest, const void *src, size_t n).
+    registry.register(dll, "memcpy", stub_memcpy as StubFn, 0);
+    // void *memset(void *dest, int c, size_t n).
+    registry.register(dll, "memset", stub_memset as StubFn, 0);
+    // void *memmove(void *dest, const void *src, size_t n).
+    registry.register(dll, "memmove", stub_memmove as StubFn, 0);
+    // char *strncpy(char *dest, const char *src, size_t n).
+    registry.register(dll, "strncpy", stub_strncpy as StubFn, 0);
+    // double _CIsqrt(double x) — x87-stack sqrt (FLD x on
+    // entry, FSTP result on exit). Cdecl with no stack args.
+    registry.register(dll, "_CIsqrt", stub_ci_sqrt as StubFn, 0);
+    // int _vsnwprintf(wchar_t *s, size_t n, const wchar_t *fmt,
+    //                 va_list arg) — wide-char snprintf.
+    // Stub: write a single NUL and return 0.
+    registry.register(dll, "_vsnwprintf", stub_vsnwprintf as StubFn, 0);
+    // FILE *fopen(const char *path, const char *mode) — no
+    // file system mapped, so always NULL.
+    registry.register(dll, "fopen", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "_wfopen", stub_returns_zero as StubFn, 0);
+    // int fclose(FILE *stream) — no-op success (0 == clean
+    // close); codecs that pair fopen→fclose typically
+    // short-circuit on the NULL fopen return anyway.
+    registry.register(dll, "fclose", stub_purecall as StubFn, 0);
+    // time_t time(time_t *t) — synthetic monotonic seconds
+    // since 1970-01-01 derived from `state.tick`.
+    registry.register(dll, "time", stub_time as StubFn, 0);
+    // struct tm *localtime(const time_t *t) — points to a
+    // shared global `tm` struct. We hand back a fixed canned
+    // pointer into the const arena.
+    registry.register(dll, "localtime", stub_localtime as StubFn, 0);
+    // `_iob` is the data symbol for the CRT's array of 32
+    // `FILE` slots (stdin/stdout/stderr/…). Register a
+    // 4-byte data slot whose value is a small region in
+    // the data-import arena — codecs that read
+    // `_iob[2]` (stderr) just need a non-NULL FILE* they
+    // can pass to fprintf/etc., which we ignore.
+    registry.register_data(dll, "_iob", 0);
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling
@@ -1009,7 +1094,172 @@ fn trap(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {
     }
 }
 
-#[cfg(test)]
+// ----- Corpus-driven additions -------------------------------------
+
+/// Trivially returns 0. Used for stubs whose only contract is
+/// "return without exploding" (e.g. unused CRT internals).
+fn stub_returns_zero(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `void *memcpy(void *dest, const void *src, size_t n)`.
+/// Reads `n` bytes from `src` and writes them to `dest`. Returns
+/// `dest`. Cdecl.
+fn stub_memcpy(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("memcpy", t))?;
+    let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("memcpy", t))?;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("memcpy", t))?;
+    let data = mmu.read(src, n as usize).map_err(|t| trap("memcpy", t))?;
+    mmu.write(dest, &data).map_err(|t| trap("memcpy", t))?;
+    Ok(dest)
+}
+
+/// `void *memset(void *dest, int c, size_t n)`. Cdecl.
+fn stub_memset(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("memset", t))?;
+    let c = arg_dword(cpu, mmu, 1).map_err(|t| trap("memset", t))? as u8;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("memset", t))?;
+    let buf = vec![c; n as usize];
+    mmu.write(dest, &buf).map_err(|t| trap("memset", t))?;
+    Ok(dest)
+}
+
+/// `void *memmove(void *dest, const void *src, size_t n)`.
+/// Handles overlapping regions correctly. Cdecl.
+fn stub_memmove(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("memmove", t))?;
+    let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("memmove", t))?;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("memmove", t))?;
+    // Read everything first into a host buffer — that
+    // takes care of the overlap case automatically.
+    let data = mmu.read(src, n as usize).map_err(|t| trap("memmove", t))?;
+    mmu.write(dest, &data).map_err(|t| trap("memmove", t))?;
+    Ok(dest)
+}
+
+/// `char *strncpy(char *dest, const char *src, size_t n)`.
+/// Writes up to `n` bytes from `src` to `dest`, NUL-padding
+/// the remainder if `strlen(src) < n`. Returns `dest`. Cdecl.
+fn stub_strncpy(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("strncpy", t))?;
+    let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("strncpy", t))?;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("strncpy", t))? as usize;
+    let mut buf = vec![0u8; n];
+    let mut hit_nul = false;
+    for i in 0..n {
+        if hit_nul {
+            buf[i] = 0;
+        } else {
+            let b = mmu
+                .load8(src.wrapping_add(i as u32))
+                .map_err(|t| trap("strncpy", t))?;
+            if b == 0 {
+                hit_nul = true;
+                buf[i] = 0;
+            } else {
+                buf[i] = b;
+            }
+        }
+    }
+    mmu.write(dest, &buf).map_err(|t| trap("strncpy", t))?;
+    Ok(dest)
+}
+
+/// `double _CIsqrt(double)` — x87-stack square root. FLD x on
+/// entry, FSTP result on exit. Cdecl, zero stack args.
+fn stub_ci_sqrt(
+    cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let x = cpu.fpu.st(0);
+    let _ = cpu.fpu.pop();
+    cpu.fpu.push(x.sqrt());
+    Ok(0)
+}
+
+/// `int _vsnwprintf(wchar_t *s, size_t n, const wchar_t *fmt,
+/// va_list arg)`. Stub: write a UTF-16 NUL terminator and
+/// return 0. Codec build-info / debug-log strings flow through
+/// this; an empty result is acceptable.
+fn stub_vsnwprintf(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s = arg_dword(cpu, mmu, 0).map_err(|t| trap("_vsnwprintf", t))?;
+    let n = arg_dword(cpu, mmu, 1).map_err(|t| trap("_vsnwprintf", t))?;
+    if s != 0 && n >= 1 {
+        mmu.store16(s, 0).map_err(|t| trap("_vsnwprintf", t))?;
+    }
+    Ok(0)
+}
+
+/// `time_t time(time_t *t)`. Synthetic monotonic seconds-
+/// since-1970 derived from `state.tick`. If `t` is non-NULL,
+/// the value is also stored there.
+fn stub_time(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state.tick = state.tick.wrapping_add(1);
+    // Anchor at 2024-01-01 00:00:00 UTC; bump by tick.
+    let value = 1_704_067_200u32.wrapping_add(state.tick);
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap("time", t))?;
+    if p != 0 {
+        mmu.store32(p, value).map_err(|t| trap("time", t))?;
+    }
+    Ok(value)
+}
+
+/// `struct tm *localtime(const time_t *t)`. The C library
+/// returns a pointer to a thread-local `tm` struct. We
+/// allocate one in the heap arena the first time and reuse
+/// it. Fields are zeroed (1970-01-01 epoch in 9-field tm
+/// shape — `tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year,
+/// tm_wday, tm_yday, tm_isdst`).
+fn stub_localtime(
+    _cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    // Use a fixed offset into the const arena. Reserve 36
+    // bytes = 9 i32 fields.
+    let p = state.arena_const_alloc(36)?;
+    mmu.write_initializer(p, &[0u8; 36])
+        .map_err(|t| trap("localtime", t))?;
+    Ok(p)
+}
 mod tests {
     use super::*;
     use crate::emulator::isa_int::RET_SENTINEL;
