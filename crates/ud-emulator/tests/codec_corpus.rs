@@ -63,6 +63,14 @@ struct Outcome {
     fetched: bool,
     loaded: bool,
     dll_main_ok: bool,
+    /// Codec exports a VfW `DriverProc` entry point.
+    has_driver_proc: bool,
+    /// VfW probe outcome: the codec accepted `ICOpen` in
+    /// decompress mode and handed back a non-zero `HIC`. Only
+    /// attempted when `dll_main_ok` AND there were no
+    /// unresolved imports (otherwise the synthetic zero-stubs
+    /// would corrupt the IC* dispatch).
+    vfw_open_ok: bool,
     /// Non-empty when load or DllMain failed.
     error: Option<String>,
     /// `(dll, function)` pairs the codec imports that the
@@ -148,7 +156,36 @@ fn run_one(codec: &Codec) -> Outcome {
             out.error = Some(format!("dll_main: {e}"));
         }
     }
+
+    // VfW probe — only meaningful when the codec exports a
+    // `DriverProc` AND the real registry fully satisfied its
+    // imports (no synthetic zero-stubs in the way, which would
+    // corrupt the IC* dispatch). Drive `install_codec` +
+    // `ICOpen(VIDC, fourcc, ICMODE_DECOMPRESS)` and record
+    // whether the codec handed back a live `HIC`.
+    out.has_driver_proc = img.export("DriverProc").is_some();
+    if out.dll_main_ok && out.unresolved_imports.is_empty() && out.has_driver_proc {
+        if runner.install_codec(&img).is_ok() {
+            let fcc_type = u32::from_le_bytes(*b"VIDC");
+            let fcc_handler = fourcc_to_u32(&codec.fourcc.clone().unwrap_or_default());
+            const ICMODE_DECOMPRESS: u32 = 1;
+            runner.host.instruction_budget = Some(20_000_000);
+            if let Ok(hic) = runner.ic_open(fcc_type, fcc_handler, ICMODE_DECOMPRESS) {
+                out.vfw_open_ok = hic != 0;
+            }
+        }
+    }
     out
+}
+
+/// Pack a (up to 4-char) FourCC string into a little-endian
+/// `u32`, space-padded — `"MP43"` → `0x3334_504d`.
+fn fourcc_to_u32(s: &str) -> u32 {
+    let mut b = [b' '; 4];
+    for (i, c) in s.bytes().take(4).enumerate() {
+        b[i] = c;
+    }
+    u32::from_le_bytes(b)
 }
 
 /// Synthetic stub that always returns 0. Used by the corpus
@@ -169,27 +206,34 @@ fn codec_corpus_load_and_dll_main() {
     let manifest = load_manifest();
     println!("Codec corpus: {} entries", manifest.codec.len());
 
-    let mut totals = (0usize, 0usize, 0usize, 0usize); // i386_total, loaded, dll_main_ok, skipped
+    // i386_total, loaded, dll_main_ok, skipped, vfw_codecs, vfw_open_ok
+    let mut totals = [0usize; 6];
     let mut unresolved_global: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut report_rows: Vec<String> = Vec::new();
 
     for codec in &manifest.codec {
         if codec.arch != "i386" {
-            totals.3 += 1;
+            totals[3] += 1;
             println!(
                 "  SKIP {} ({} {} arch={})",
                 codec.name, codec.family, codec.kind, codec.arch,
             );
             continue;
         }
-        totals.0 += 1;
+        totals[0] += 1;
 
         let outcome = run_one(codec);
         if outcome.loaded {
-            totals.1 += 1;
+            totals[1] += 1;
         }
         if outcome.dll_main_ok {
-            totals.2 += 1;
+            totals[2] += 1;
+        }
+        if outcome.has_driver_proc {
+            totals[4] += 1;
+        }
+        if outcome.vfw_open_ok {
+            totals[5] += 1;
         }
         for imp in &outcome.unresolved_imports {
             *unresolved_global.entry(imp.clone()).or_default() += 1;
@@ -204,8 +248,15 @@ fn codec_corpus_load_and_dll_main() {
         } else {
             "fetch-fail"
         };
+        let vfw = if outcome.vfw_open_ok {
+            " [VfW ICOpen ok]"
+        } else if outcome.has_driver_proc {
+            " [VfW DriverProc, ICOpen not confirmed]"
+        } else {
+            ""
+        };
         let line = format!(
-            "  {status:10} {} ({} unresolved imports){}",
+            "  {status:10} {} ({} unresolved imports){vfw}{}",
             codec.name,
             outcome.unresolved_imports.len(),
             outcome
@@ -222,15 +273,13 @@ fn codec_corpus_load_and_dll_main() {
     }
     println!();
     println!("Totals (i386 only):");
+    println!("  fetched + loaded:           {} / {}", totals[1], totals[0]);
+    println!("  fetched + DllMain returned: {} / {}", totals[2], totals[0]);
     println!(
-        "  fetched + loaded:           {} / {}",
-        totals.1, totals.0
+        "  VfW codecs (DriverProc):    {} ({} accepted ICOpen)",
+        totals[4], totals[5]
     );
-    println!(
-        "  fetched + DllMain returned: {} / {}",
-        totals.2, totals.0
-    );
-    println!("  skipped (non-i386 / win16): {}", totals.3);
+    println!("  skipped (non-i386 / win16): {}", totals[3]);
 
     if !unresolved_global.is_empty() {
         println!();
