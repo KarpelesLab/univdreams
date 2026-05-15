@@ -952,6 +952,15 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
 
+            // 0x9B — FWAIT / WAIT. On real hardware this checks
+            // for pending unmasked x87 exceptions and raises them.
+            // Our FPU model never has pending exceptions (we don't
+            // emulate the exception-status pipeline), so FWAIT is
+            // a no-op — but it must still be DECODED, since codecs
+            // emit it before/after x87 sequences and would
+            // otherwise trip `UndefinedOpcode`.
+            0x9B => Ok(StepOk::Continued),
+
             // 0x9C — PUSHFD (no prefix) // PUSHF (under 0x66)
             0x9C => {
                 let v = self.regs.flags.pack();

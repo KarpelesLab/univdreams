@@ -66,13 +66,21 @@ pub fn resolve(
                 break;
             }
             let thunk = if (entry & IMAGE_ORDINAL_FLAG32) != 0 {
-                // Import-by-ordinal — round 1 doesn't support it.
+                // Import-by-ordinal. Many system DLLs (notably
+                // `oleaut32.dll`, `ws2_32.dll`) export functions
+                // by ordinal only — no name. We resolve them
+                // against the registry under the synthetic name
+                // `@<ordinal>`; stubs that want to satisfy an
+                // ordinal import register themselves with that
+                // key (see `Registry::register`).
                 let ord = entry & 0xFFFF;
                 let name = format!("@{ord}");
-                return Err(PeError::UnknownImportFunction {
-                    dll: dll_lower.clone(),
-                    name,
-                });
+                registry
+                    .resolve(&dll_lower, &name)
+                    .ok_or(PeError::UnknownImportFunction {
+                        dll: dll_lower.clone(),
+                        name,
+                    })?
             } else {
                 // Import-by-name: low 31 bits are an RVA to an
                 // IMAGE_IMPORT_BY_NAME (Hint:WORD; Name:ASCIIZ).
