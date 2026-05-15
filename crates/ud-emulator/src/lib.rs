@@ -203,6 +203,7 @@ pub mod com;
 pub mod context;
 pub mod coverage;
 pub mod emulator;
+pub mod ffi;
 pub mod pe;
 pub mod runtime;
 #[cfg(feature = "trace")]
@@ -215,6 +216,7 @@ pub use context::{
     HKEY_USERS, HKLM, HKU,
 };
 pub use coverage::CoverageMap;
+pub use ffi::{CallArgs, Dword, FromRet, Guest};
 
 pub use com::{
     Guid, GuidParseError, CLSID_MEMORY_ALLOCATOR, IID_IBASEFILTER, IID_ICLASSFACTORY,
