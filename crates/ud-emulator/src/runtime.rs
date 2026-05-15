@@ -84,6 +84,40 @@ impl Sandbox {
         &mut self.mmu.coverage
     }
 
+    /// Borrow the emulation-context layer (virtual filesystem,
+    /// virtual registry, future surfaces). Always present;
+    /// the per-surface options decide whether the guest
+    /// observes synthetic state or the fail-soft Win32
+    /// default. See [`crate::context::Context`].
+    #[must_use]
+    pub fn context(&self) -> &crate::context::Context {
+        &self.host.context
+    }
+
+    /// Mutable accessor for the context.
+    pub fn context_mut(&mut self) -> &mut crate::context::Context {
+        &mut self.host.context
+    }
+
+    /// Builder: attach a virtual filesystem so guest file-API
+    /// calls land in-memory instead of fail-soft no-ops. See
+    /// [`crate::VirtualFs`] for the stage-some-files / capture-
+    /// what's-written workflow.
+    #[must_use]
+    pub fn with_vfs(mut self, vfs: crate::context::VirtualFs) -> Self {
+        self.host.context.vfs = Some(vfs);
+        self
+    }
+
+    /// Builder: attach a virtual registry so guest `Reg*` calls
+    /// observe analyst-staged keys and writes land in-memory.
+    /// See [`crate::VirtualRegistry`].
+    #[must_use]
+    pub fn with_registry(mut self, reg: crate::context::VirtualRegistry) -> Self {
+        self.host.context.registry = Some(reg);
+        self
+    }
+
     /// Create a fresh sandbox with the heap arena and stack
     /// pre-mapped, the kernel32 stub set registered, and the
     /// CPU's `esp` pointing at a freshly-allocated stack.

@@ -200,6 +200,7 @@
 #![allow(clippy::all)]
 
 pub mod com;
+pub mod context;
 pub mod coverage;
 #[cfg(feature = "discovery")]
 pub mod discovery;
@@ -210,6 +211,11 @@ pub mod runtime;
 pub mod trace;
 pub mod win32;
 
+pub use context::{
+    Context, FileAccess, FileHandle, OpenKey, RegistryKey, RegistryValue, VirtualFs,
+    VirtualRegistry, HKCR, HKCU, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+    HKEY_USERS, HKLM, HKU,
+};
 pub use coverage::CoverageMap;
 
 pub use com::{

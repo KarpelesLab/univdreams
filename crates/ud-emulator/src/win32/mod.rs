@@ -215,6 +215,12 @@ pub struct HostState {
     /// front-ends to report "ran for N instructions, budget
     /// was M". Reset to zero on each top-level run entry.
     pub instructions_executed: u64,
+    /// Optional emulation-context layer (virtual filesystem,
+    /// virtual registry, future surfaces). When `None`, the
+    /// Win32 stubs that would consult it fall through to
+    /// their fail-soft default. See [`crate::context::Context`]
+    /// for the contract.
+    pub context: crate::context::Context,
     /// Read-only constant-data arena. Used by stubs like
     /// `GetCommandLineA` / `GetEnvironmentStrings` that need to
     /// hand out stable guest pointers to canned strings. The
@@ -330,6 +336,7 @@ impl HostState {
             exit_requested: None,
             instruction_budget: None,
             instructions_executed: 0,
+            context: crate::context::Context::default(),
             const_arena_cursor: 0,
             const_arena_end: 0,
             command_line_ptr: 0,
