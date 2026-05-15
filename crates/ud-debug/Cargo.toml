@@ -1,18 +1,21 @@
 [package]
 name = "ud-debug"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "DWARF / PDB / Mach-O dSYM reader; produces typed function signatures and other source-level metadata."
-publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-ud-ast = { path = "../ud-ast" }
-ud-format-elf = { path = "../ud-format-elf" }
+ud-ast = { version = "0.1.0", path = "../ud-ast" }
+ud-format-elf = { version = "0.1.0", path = "../ud-format-elf" }
 gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
 thiserror = "2"

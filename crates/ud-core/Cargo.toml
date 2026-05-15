@@ -1,12 +1,15 @@
 [package]
 name = "ud-core"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Core types shared by the univdreams compiler/decompiler suite."
-publish = false
 
 [lints]
 workspace = true

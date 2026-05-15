@@ -1,17 +1,20 @@
 [package]
 name = "ud-arch-6502"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "MOS 6502 instruction decoder for univdreams (Apple I / WozMon scope)."
-publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-ud-core = { path = "../ud-core" }
-ud-ir = { path = "../ud-ir" }
+ud-core = { version = "0.1.0", path = "../ud-core" }
+ud-ir = { version = "0.1.0", path = "../ud-ir" }
 thiserror = "2"

@@ -1,30 +1,33 @@
 [package]
 name = "ud-decompile"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Emit a .ud source file from an analyzed binary."
-publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-ud-core = { path = "../ud-core" }
-ud-ir = { path = "../ud-ir" }
-ud-ast = { path = "../ud-ast" }
-ud-format-elf = { path = "../ud-format-elf" }
-ud-format-pe = { path = "../ud-format-pe" }
-ud-format-macho = { path = "../ud-format-macho" }
-ud-format-raw = { path = "../ud-format-raw" }
-ud-arch-x86 = { path = "../ud-arch-x86" }
-ud-arch-aarch64 = { path = "../ud-arch-aarch64" }
-ud-arch-6502 = { path = "../ud-arch-6502" }
-ud-analysis = { path = "../ud-analysis" }
-ud-debug = { path = "../ud-debug" }
+ud-core = { version = "0.1.0", path = "../ud-core" }
+ud-ir = { version = "0.1.0", path = "../ud-ir" }
+ud-ast = { version = "0.1.0", path = "../ud-ast" }
+ud-format-elf = { version = "0.1.0", path = "../ud-format-elf" }
+ud-format-pe = { version = "0.1.0", path = "../ud-format-pe" }
+ud-format-macho = { version = "0.1.0", path = "../ud-format-macho" }
+ud-format-raw = { version = "0.1.0", path = "../ud-format-raw" }
+ud-arch-x86 = { version = "0.1.0", path = "../ud-arch-x86" }
+ud-arch-aarch64 = { version = "0.1.0", path = "../ud-arch-aarch64" }
+ud-arch-6502 = { version = "0.1.0", path = "../ud-arch-6502" }
+ud-analysis = { version = "0.1.0", path = "../ud-analysis" }
+ud-debug = { version = "0.1.0", path = "../ud-debug" }
 thiserror = "2"
 
 [dev-dependencies]
-ud-compile = { path = "../ud-compile" }
+ud-compile = { version = "0.1.0", path = "../ud-compile" }

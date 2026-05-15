@@ -1,12 +1,15 @@
 [package]
 name = "ud-emulator"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Pure-Rust 32-bit x86 emulator + PE runtime loader + Win32 host shims. Mirrors oxideav-vfw; intended to grow into the dynamic-analysis backend that informs decompilation (indirect-target recovery, constant-data discovery)."
-publish = false
 
 [lints]
 workspace = true

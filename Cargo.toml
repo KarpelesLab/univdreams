@@ -34,10 +34,15 @@ members = [
 # the order they come online.
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
 repository = "https://github.com/KarpelesLab/univdreams"
+homepage = "https://github.com/KarpelesLab/univdreams"
+authors = ["Mark Karpeles"]
+keywords = ["decompiler", "compiler", "binary-analysis", "reverse-engineering", "emulator"]
+categories = ["development-tools", "command-line-utilities", "emulators"]
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

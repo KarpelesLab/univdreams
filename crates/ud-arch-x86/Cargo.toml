@@ -1,20 +1,23 @@
 [package]
 name = "ud-arch-x86"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "x86 (16/32/64-bit) decode + encode backend with byte-identical round-trip."
-publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
 thiserror = "2"
-ud-core = { path = "../ud-core" }
-ud-ir = { path = "../ud-ir" }
+ud-core = { version = "0.1.0", path = "../ud-core" }
+ud-ir = { version = "0.1.0", path = "../ud-ir" }
 iced-x86 = { version = "1", default-features = false, features = [
     "decoder",
     "encoder",
@@ -25,5 +28,5 @@ iced-x86 = { version = "1", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-ud-format-elf = { path = "../ud-format-elf" }
-ud-analysis = { path = "../ud-analysis" }
+ud-format-elf = { version = "0.1.0", path = "../ud-format-elf" }
+ud-analysis = { version = "0.1.0", path = "../ud-analysis" }

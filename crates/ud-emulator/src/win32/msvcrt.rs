@@ -1468,6 +1468,7 @@ mod tests {
     use crate::emulator::mmu::Perm;
     use crate::emulator::regs::Reg32;
 
+    #[allow(dead_code)]
     fn make_env() -> (Cpu, Mmu, Registry, HostState) {
         let mut mmu = Mmu::new();
         mmu.map(0x4000, 0x4000, Perm::R | Perm::W);
@@ -1480,6 +1481,7 @@ mod tests {
         (cpu, mmu, registry, state)
     }
 
+    #[allow(dead_code)]
     fn call_cdecl(
         cpu: &mut Cpu,
         mmu: &mut Mmu,

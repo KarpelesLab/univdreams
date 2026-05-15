@@ -1,15 +1,18 @@
 [package]
 name = "ud-ast"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Abstract syntax tree for the .ud source language, with canonical pretty-printer."
-publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-ud-arch-x86 = { path = "../ud-arch-x86" }
+ud-arch-x86 = { version = "0.1.0", path = "../ud-arch-x86" }
