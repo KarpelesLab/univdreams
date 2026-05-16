@@ -64,7 +64,8 @@ fn decompile_auto(bytes: &[u8]) -> Result<String, JsError> {
 fn decompile_as_elf(bytes: &[u8]) -> Result<String, JsError> {
     let elf = ud_format::elf::Elf64File::parse(bytes)
         .map_err(|e| JsError::new(&format!("parse ELF: {e}")))?;
-    ud_translate::decompile::decompile_to_text(&elf).map_err(|e| JsError::new(&format!("decompile ELF: {e}")))
+    ud_translate::decompile::decompile_to_text(&elf)
+        .map_err(|e| JsError::new(&format!("decompile ELF: {e}")))
 }
 
 fn decompile_as_pe(bytes: &[u8]) -> Result<String, JsError> {
@@ -100,7 +101,8 @@ fn decompile_as_raw_6502(bytes: &[u8]) -> Result<String, JsError> {
 #[wasm_bindgen]
 pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
     set_panic_hook();
-    let ast = ud_translate::compile::parse(source).map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
+    let ast = ud_translate::compile::parse(source)
+        .map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
     let format = read_string(&ast.module, "format").ok_or_else(|| {
         JsError::new("missing `@module.format` (expected \"elf\", \"pe\", \"macho\", or \"raw\")")
     })?;
@@ -128,7 +130,8 @@ pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
 #[wasm_bindgen]
 pub fn verify(source: &str) -> Result<String, JsError> {
     set_panic_hook();
-    let ast = ud_translate::compile::parse(source).map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
+    let ast = ud_translate::compile::parse(source)
+        .map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
     let warnings = ud_translate::compile::verify_asm(&ast);
     Ok(format_warnings(&warnings))
 }

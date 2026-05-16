@@ -429,8 +429,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Verify { input } => {
             let text = std::fs::read_to_string(&input)
                 .with_context(|| format!("read {}", input.display()))?;
-            let ast =
-                ud_translate::compile::parse(&text).with_context(|| format!("parse {}", input.display()))?;
+            let ast = ud_translate::compile::parse(&text)
+                .with_context(|| format!("parse {}", input.display()))?;
             let warnings = ud_translate::compile::verify_asm(&ast);
             if warnings.is_empty() {
                 println!(
@@ -455,8 +455,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             });
             let text = std::fs::read_to_string(&input)
                 .with_context(|| format!("read {}", input.display()))?;
-            let ast =
-                ud_translate::compile::parse(&text).with_context(|| format!("parse {}", input.display()))?;
+            let ast = ud_translate::compile::parse(&text)
+                .with_context(|| format!("parse {}", input.display()))?;
             let format = ast
                 .module
                 .fields
@@ -600,8 +600,8 @@ fn vfw_probe(
     height: u32,
     max_instructions: u64,
 ) -> anyhow::Result<()> {
-    let dll_bytes = std::fs::read(dll_path)
-        .with_context(|| format!("reading {}", dll_path.display()))?;
+    let dll_bytes =
+        std::fs::read(dll_path).with_context(|| format!("reading {}", dll_path.display()))?;
     let dll_name = dll_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -633,7 +633,11 @@ fn vfw_probe(
     if hic == 0 {
         anyhow::bail!("codec refused DRV_OPEN");
     }
-    println!("[probe] loaded {} (image_base 0x{:x})", dll_path.display(), img.image_base);
+    println!(
+        "[probe] loaded {} (image_base 0x{:x})",
+        dll_path.display(),
+        img.image_base
+    );
     println!("[probe] HIC = {hic}; fcc_handler = {fcc:?}");
 
     // ICGetInfo: codec metadata.
@@ -674,8 +678,14 @@ fn vfw_probe(
             let name = read_utf16(24, 16);
             let desc = read_utf16(24 + 32, 128);
             println!("[probe] ICINFO:");
-            println!("  fccType      = {:?}", std::str::from_utf8(&fcc_type_bytes).unwrap_or("?"));
-            println!("  fccHandler   = {:?}", std::str::from_utf8(&fcc_handler_bytes).unwrap_or("?"));
+            println!(
+                "  fccType      = {:?}",
+                std::str::from_utf8(&fcc_type_bytes).unwrap_or("?")
+            );
+            println!(
+                "  fccHandler   = {:?}",
+                std::str::from_utf8(&fcc_handler_bytes).unwrap_or("?")
+            );
             println!("  dwFlags      = 0x{:08x}", flags);
             println!("  dwVersion    = 0x{:08x}", version);
             println!("  dwVersionICM = 0x{:08x}", version_icm);
@@ -737,14 +747,14 @@ fn decode_cmd(
     output: Option<&Path>,
     max_instructions: u64,
 ) -> anyhow::Result<()> {
-    let dll_bytes = std::fs::read(dll_path)
-        .with_context(|| format!("reading {}", dll_path.display()))?;
+    let dll_bytes =
+        std::fs::read(dll_path).with_context(|| format!("reading {}", dll_path.display()))?;
     let dll_name = dll_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "codec.dll".into());
-    let frame = std::fs::read(input)
-        .with_context(|| format!("reading frame {}", input.display()))?;
+    let frame =
+        std::fs::read(input).with_context(|| format!("reading frame {}", input.display()))?;
 
     let mut sandbox = ud_emulator::Sandbox::new();
     sandbox.host.instruction_budget = Some(max_instructions);
@@ -797,10 +807,7 @@ fn decode_cmd(
     let q = sandbox
         .ic_decompress_query(hic, &in_bih, Some(&out_bih))
         .context("ICDecompressQuery")?;
-    eprintln!(
-        "[decode] ICDecompressQuery = {} (0 = ICERR_OK)",
-        q as i32
-    );
+    eprintln!("[decode] ICDecompressQuery = {} (0 = ICERR_OK)", q as i32);
 
     if (q as i32) != 0 {
         anyhow::bail!("codec rejected the in/out BIH pair");
@@ -820,7 +827,11 @@ fn decode_cmd(
     if let Some(path) = output {
         std::fs::write(path, &decoded)
             .with_context(|| format!("writing output {}", path.display()))?;
-        eprintln!("[decode] wrote {} bytes to {}", decoded.len(), path.display());
+        eprintln!(
+            "[decode] wrote {} bytes to {}",
+            decoded.len(),
+            path.display()
+        );
     } else {
         use std::io::Write as _;
         std::io::stdout().write_all(&decoded)?;
@@ -844,15 +855,15 @@ fn encode_cmd(
     output: Option<&Path>,
     max_instructions: u64,
 ) -> anyhow::Result<()> {
-    let dll_bytes = std::fs::read(dll_path)
-        .with_context(|| format!("reading {}", dll_path.display()))?;
+    let dll_bytes =
+        std::fs::read(dll_path).with_context(|| format!("reading {}", dll_path.display()))?;
     let dll_name = dll_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "codec.dll".into());
 
-    let frame = std::fs::read(input)
-        .with_context(|| format!("reading input frame {}", input.display()))?;
+    let frame =
+        std::fs::read(input).with_context(|| format!("reading input frame {}", input.display()))?;
     let expected_frame_bytes = input_format.frame_bytes(width, height) as usize;
     if frame.len() < expected_frame_bytes {
         anyhow::bail!(
@@ -914,10 +925,7 @@ fn encode_cmd(
     let q = sandbox
         .ic_compress_query(hic, &in_bih, Some(&out_bih))
         .context("ICCompressQuery")?;
-    eprintln!(
-        "[encode] ICCompressQuery = {} (0 = ICERR_OK)",
-        q as i32
-    );
+    eprintln!("[encode] ICCompressQuery = {} (0 = ICERR_OK)", q as i32);
     if (q as i32) != 0 {
         anyhow::bail!("codec rejected the input/output BIH pair");
     }
@@ -938,12 +946,12 @@ fn encode_cmd(
             frame_slice,
             &out_bih,
             cap,
-            0,     // ckid
-            0,     // frame_num
-            0,     // frame_size_limit
+            0, // ckid
+            0, // frame_num
+            0, // frame_size_limit
             quality,
-            None,  // prev_bih
-            None,  // prev_bytes
+            None, // prev_bih
+            None, // prev_bytes
         )
         .context("ICCompress")?;
     eprintln!(
@@ -956,7 +964,11 @@ fn encode_cmd(
     if let Some(path) = output {
         std::fs::write(path, &result.bytes)
             .with_context(|| format!("writing output {}", path.display()))?;
-        eprintln!("[encode] wrote {} bytes to {}", result.bytes.len(), path.display());
+        eprintln!(
+            "[encode] wrote {} bytes to {}",
+            result.bytes.len(),
+            path.display()
+        );
     } else {
         use std::io::Write as _;
         std::io::stdout().write_all(&result.bytes)?;
@@ -993,10 +1005,7 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
             // whether the load even got off the ground.
             if as_json {
                 let pe = ud_format::pe::PeFile::parse(&bytes).ok();
-                let indicators = pe
-                    .as_ref()
-                    .map(extract_indicators)
-                    .unwrap_or_default();
+                let indicators = pe.as_ref().map(extract_indicators).unwrap_or_default();
                 let report = AnalyzeReport {
                     input: input.display().to_string(),
                     image_base: 0,
@@ -1035,8 +1044,7 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
         })
         .collect();
 
-    let mut by_func: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
+    let mut by_func: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for c in &win32_calls {
         *by_func.entry(format!("{}!{}", c.dll, c.name)).or_default() += 1;
     }
@@ -1071,10 +1079,7 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
     // the run completing, so even codecs that trap mid-DllMain
     // surface their string indicators.
     let pe = ud_format::pe::PeFile::parse(&bytes).ok();
-    let indicators = pe
-        .as_ref()
-        .map(extract_indicators)
-        .unwrap_or_default();
+    let indicators = pe.as_ref().map(extract_indicators).unwrap_or_default();
 
     let report = AnalyzeReport {
         input: input.display().to_string(),
@@ -1267,7 +1272,10 @@ impl AnalyzeReport {
         );
         println!();
         println!("Indicators:");
-        println!("  {} ASCII strings extracted from data sections", self.indicators.ascii_strings.len());
+        println!(
+            "  {} ASCII strings extracted from data sections",
+            self.indicators.ascii_strings.len()
+        );
         if !self.indicators.urls.is_empty() {
             println!("  URLs ({}):", self.indicators.urls.len());
             for u in &self.indicators.urls {

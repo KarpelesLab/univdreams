@@ -531,7 +531,11 @@ fn detect_calling_convention_attrs(
 /// Walk the entry block and report whether `reg` is read before
 /// it gets written. Treats SSA's per-IP read/write info as
 /// authoritative.
-fn reg_read_before_write(f: &Function<DecodedInsn>, ssa: &crate::decompile::ssa::SsaInfo, reg: &str) -> bool {
+fn reg_read_before_write(
+    f: &Function<DecodedInsn>,
+    ssa: &crate::decompile::ssa::SsaInfo,
+    reg: &str,
+) -> bool {
     let Some(entry) = f.blocks.first() else {
         return false;
     };
@@ -871,7 +875,9 @@ fn forward_propagate_registers(
 /// instruction, the list of variables it defines. Used by
 /// `asm_state_effect` to invalidate just those registers rather
 /// than the entire state.
-fn build_writes_at(ssa: &crate::decompile::ssa::SsaInfo) -> HashMap<u64, Vec<crate::decompile::ssa::Var>> {
+fn build_writes_at(
+    ssa: &crate::decompile::ssa::SsaInfo,
+) -> HashMap<u64, Vec<crate::decompile::ssa::Var>> {
     let mut out: HashMap<u64, Vec<crate::decompile::ssa::Var>> = HashMap::new();
     for (ip, var) in ssa.def_at.keys() {
         out.entry(*ip).or_default().push(var.clone());
@@ -2140,7 +2146,11 @@ fn stmts_total_bytes(stmts: &[Stmt]) -> usize {
 /// Only fires when the dst is a tracked GPR (registers
 /// participating in liveness analysis). Memory destinations,
 /// register-pair forms, and non-GPR fields are left alone.
-fn fold_dead_register_moves(stmts: &mut Vec<Stmt>, liveness: &crate::decompile::ssa::Liveness, base_ip: u64) {
+fn fold_dead_register_moves(
+    stmts: &mut Vec<Stmt>,
+    liveness: &crate::decompile::ssa::Liveness,
+    base_ip: u64,
+) {
     let mut cursor = base_ip;
     let mut i = 0;
     while i < stmts.len() {
@@ -5065,7 +5075,8 @@ fn emit_block_stmts(
     // bytes; letting a pattern scan into that range can produce
     // overlapping byte claims (e.g. `push imm; pop reg` whose
     // `pop` is actually the epilogue's `pop reg` restore).
-    let pattern_matches = crate::decompile::patterns::apply_patterns(&pattern_ctx, &block.insns[..asm_count]);
+    let pattern_matches =
+        crate::decompile::patterns::apply_patterns(&pattern_ctx, &block.insns[..asm_count]);
 
     let mut global_idx = prologue_consumed;
     while global_idx < asm_count {

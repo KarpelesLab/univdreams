@@ -196,11 +196,7 @@ fn drop_regenerable_asm_bytes(items: &mut [Item], bitness: ud_arch_x86::Bitness)
         0
     }
 
-    fn visit_stmts(
-        stmts: &mut [ud_ast::Stmt],
-        bitness: ud_arch_x86::Bitness,
-        ip: &mut u64,
-    ) {
+    fn visit_stmts(stmts: &mut [ud_ast::Stmt], bitness: ud_arch_x86::Bitness, ip: &mut u64) {
         for stmt in stmts.iter_mut() {
             let here = *ip;
             match stmt {
@@ -360,8 +356,8 @@ fn drop_regenerable_asm_bytes(items: &mut [Item], bitness: ud_arch_x86::Bitness)
                     cursor = (*addr).saturating_add(bytes.len() as u64);
                 }
                 Item::Strings { addr, strings } => {
-                    cursor = (*addr)
-                        .saturating_add(strings.iter().map(|s| (s.len() + 1) as u64).sum());
+                    cursor =
+                        (*addr).saturating_add(strings.iter().map(|s| (s.len() + 1) as u64).sum());
                 }
                 Item::Notes { addr, .. } => {
                     cursor = *addr;
@@ -830,7 +826,8 @@ mod tests {
         // of suffix.
         let raw_bytes = vec![
             // prefix (0x2000..0x2008)
-            0x01, 0x00, 0x02, 0x00, 0x53, 0x75, 0x6e, 0x00, // table (0x2008..0x2014) — bytes don't matter, will be replaced
+            0x01, 0x00, 0x02, 0x00, 0x53, 0x75, 0x6e,
+            0x00, // table (0x2008..0x2014) — bytes don't matter, will be replaced
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             // suffix (0x2014..0x2018)
             0xde, 0xad, 0xbe, 0xef,
@@ -859,7 +856,10 @@ mod tests {
         assert_eq!(tables.len(), 1);
         replace_raw_with_jump_tables(&mut items, &tables);
 
-        let Item::Section { items: ro_items, .. } = &items[1] else {
+        let Item::Section {
+            items: ro_items, ..
+        } = &items[1]
+        else {
             panic!("expected .rodata section");
         };
         // Expect: [Raw(prefix 0x2000..0x2008), JumpTable(0x2008), Raw(suffix 0x2014..)]
@@ -928,7 +928,10 @@ mod tests {
         let tables = collect_switch_tables(&items);
         replace_raw_with_jump_tables(&mut items, &tables);
         // Unknown dispatch → no replacement → raw stays intact.
-        let Item::Section { items: ro_items, .. } = &items[1] else {
+        let Item::Section {
+            items: ro_items, ..
+        } = &items[1]
+        else {
             panic!()
         };
         assert!(matches!(&ro_items[0], Item::Raw { .. }));

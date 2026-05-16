@@ -6,8 +6,8 @@
 
 use std::path::Path;
 
-use ud_translate::compile::AsmWarning;
 use ud_core::{assert_bytes_equal, Error, Result};
+use ud_translate::compile::AsmWarning;
 
 /// Run the round-trip pipeline on `input`, write the result to `output`,
 /// and verify byte-equality with the input.
@@ -148,8 +148,8 @@ pub fn roundtrip_through_source(
         let elf = ud_format::elf::Elf64File::parse(&input_bytes)?;
         let ast = ud_translate::decompile::decompile(&elf)?;
         let text = ud_ast::emit(&ast);
-        let parsed =
-            ud_translate::compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let parsed = ud_translate::compile::parse(&text)
+            .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
         let warnings = ud_translate::compile::verify_asm(&parsed);
         let rebuilt = ud_translate::compile::lower_to_elf(&parsed)?;
         (text, warnings, rebuilt)
@@ -157,8 +157,8 @@ pub fn roundtrip_through_source(
         let pe = ud_format::pe::PeFile::parse(&input_bytes)?;
         let ast = ud_translate::decompile::decompile_pe(&pe);
         let text = ud_ast::emit(&ast);
-        let parsed =
-            ud_translate::compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let parsed = ud_translate::compile::parse(&text)
+            .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
         let warnings = ud_translate::compile::verify_asm(&parsed);
         let rebuilt = ud_translate::compile::lower_to_pe(&parsed)?;
         (text, warnings, rebuilt)
@@ -166,8 +166,8 @@ pub fn roundtrip_through_source(
         let macho = ud_format::macho::MachoFile::parse(&input_bytes)?;
         let ast = ud_translate::decompile::decompile_macho(&macho);
         let text = ud_ast::emit(&ast);
-        let parsed =
-            ud_translate::compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let parsed = ud_translate::compile::parse(&text)
+            .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
         let warnings = ud_translate::compile::verify_asm(&parsed);
         let rebuilt = ud_translate::compile::lower_to_macho(&parsed)?;
         (text, warnings, rebuilt)
@@ -175,8 +175,8 @@ pub fn roundtrip_through_source(
         let image = ud_format::raw::RawImage::new(input_bytes.clone(), load_addr);
         let ast = ud_translate::decompile::decompile_raw_6502(&image)?;
         let text = ud_ast::emit(&ast);
-        let parsed =
-            ud_translate::compile::parse(&text).map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let parsed = ud_translate::compile::parse(&text)
+            .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
         let warnings = ud_translate::compile::verify_asm(&parsed);
         let rebuilt = ud_translate::compile::lower_to_raw(&parsed)?;
         (text, warnings, rebuilt)

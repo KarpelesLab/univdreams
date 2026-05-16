@@ -215,12 +215,7 @@ fn pe_header_region_end_from_ast(build: &[Field]) -> u64 {
     e_lfanew + 4 + 20 + opt_size + nsec * 40
 }
 
-fn place(
-    out: &mut [u8],
-    addr: u64,
-    bytes: &[u8],
-    file_size: u64,
-) -> Result<(), PeLowerError> {
+fn place(out: &mut [u8], addr: u64, bytes: &[u8], file_size: u64) -> Result<(), PeLowerError> {
     let len = bytes.len() as u64;
     let end = addr.checked_add(len).ok_or(PeLowerError::RawOverflows {
         addr,
@@ -368,8 +363,7 @@ fn read_optional_header(build: &[Field]) -> Option<OptionalHeader> {
         major_linker_version: read_int_block(o, "major_linker_version").unwrap_or(0) as u8,
         minor_linker_version: read_int_block(o, "minor_linker_version").unwrap_or(0) as u8,
         size_of_code: read_int_block(o, "size_of_code").unwrap_or(0) as u32,
-        size_of_initialized_data: read_int_block(o, "size_of_initialized_data").unwrap_or(0)
-            as u32,
+        size_of_initialized_data: read_int_block(o, "size_of_initialized_data").unwrap_or(0) as u32,
         size_of_uninitialized_data: read_int_block(o, "size_of_uninitialized_data").unwrap_or(0)
             as u32,
         address_of_entry_point: read_int_block(o, "address_of_entry_point").unwrap_or(0) as u32,

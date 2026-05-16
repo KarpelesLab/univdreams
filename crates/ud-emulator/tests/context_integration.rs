@@ -7,9 +7,7 @@
 //! this test pins the API shape so consumers can build
 //! against it today.
 
-use ud_emulator::{
-    FileAccess, RegistryValue, Sandbox, VirtualFs, VirtualRegistry, HKLM,
-};
+use ud_emulator::{FileAccess, RegistryValue, Sandbox, VirtualFs, VirtualRegistry, HKLM};
 
 #[test]
 fn default_sandbox_has_empty_context() {
@@ -40,7 +38,11 @@ fn attached_registry_round_trips_through_sandbox() {
         RegistryValue::Sz("3.11".into()),
     );
     let sandbox = Sandbox::new().with_registry(reg);
-    let reg = sandbox.context().registry.as_ref().expect("registry attached");
+    let reg = sandbox
+        .context()
+        .registry
+        .as_ref()
+        .expect("registry attached");
     assert_eq!(
         reg.get_value("hkey_local_machine/software/codec", "version"),
         Some(&RegistryValue::Sz("3.11".into()))

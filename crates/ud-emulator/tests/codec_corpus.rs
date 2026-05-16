@@ -52,10 +52,9 @@ fn workspace_root() -> PathBuf {
 
 fn load_manifest() -> CodecManifest {
     let path = workspace_root().join("testdata/external/codec-corpus.toml");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    toml::from_str(&text)
-        .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    toml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
 #[derive(Debug, Default)]
@@ -273,8 +272,14 @@ fn codec_corpus_load_and_dll_main() {
     }
     println!();
     println!("Totals (i386 only):");
-    println!("  fetched + loaded:           {} / {}", totals[1], totals[0]);
-    println!("  fetched + DllMain returned: {} / {}", totals[2], totals[0]);
+    println!(
+        "  fetched + loaded:           {} / {}",
+        totals[1], totals[0]
+    );
+    println!(
+        "  fetched + DllMain returned: {} / {}",
+        totals[2], totals[0]
+    );
     println!(
         "  VfW codecs (DriverProc):    {} ({} accepted ICOpen)",
         totals[4], totals[5]

@@ -12,18 +12,8 @@ use crate::emulator::{Cpu, Mmu};
 
 /// Register every mfplat stub.
 pub fn register(registry: &mut Registry) {
-    registry.register(
-        "mfplat.dll",
-        "MFHeapAlloc",
-        stub_mf_heap_alloc as StubFn,
-        4,
-    );
-    registry.register(
-        "mfplat.dll",
-        "MFHeapFree",
-        stub_mf_heap_free as StubFn,
-        1,
-    );
+    registry.register("mfplat.dll", "MFHeapAlloc", stub_mf_heap_alloc as StubFn, 4);
+    registry.register("mfplat.dll", "MFHeapFree", stub_mf_heap_free as StubFn, 1);
 }
 
 /// `void *MFHeapAlloc(SIZE_T nSize, ULONG dwFlags, char *pszFile,

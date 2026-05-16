@@ -485,33 +485,94 @@ fn parse_register(name: &str) -> Option<Register> {
     use Register::*;
     Some(match name {
         // 64-bit
-        "rax" => RAX, "rcx" => RCX, "rdx" => RDX, "rbx" => RBX,
-        "rsp" => RSP, "rbp" => RBP, "rsi" => RSI, "rdi" => RDI,
-        "r8" => R8, "r9" => R9, "r10" => R10, "r11" => R11,
-        "r12" => R12, "r13" => R13, "r14" => R14, "r15" => R15,
+        "rax" => RAX,
+        "rcx" => RCX,
+        "rdx" => RDX,
+        "rbx" => RBX,
+        "rsp" => RSP,
+        "rbp" => RBP,
+        "rsi" => RSI,
+        "rdi" => RDI,
+        "r8" => R8,
+        "r9" => R9,
+        "r10" => R10,
+        "r11" => R11,
+        "r12" => R12,
+        "r13" => R13,
+        "r14" => R14,
+        "r15" => R15,
         // 32-bit
-        "eax" => EAX, "ecx" => ECX, "edx" => EDX, "ebx" => EBX,
-        "esp" => ESP, "ebp" => EBP, "esi" => ESI, "edi" => EDI,
-        "r8d" => R8D, "r9d" => R9D, "r10d" => R10D, "r11d" => R11D,
-        "r12d" => R12D, "r13d" => R13D, "r14d" => R14D, "r15d" => R15D,
+        "eax" => EAX,
+        "ecx" => ECX,
+        "edx" => EDX,
+        "ebx" => EBX,
+        "esp" => ESP,
+        "ebp" => EBP,
+        "esi" => ESI,
+        "edi" => EDI,
+        "r8d" => R8D,
+        "r9d" => R9D,
+        "r10d" => R10D,
+        "r11d" => R11D,
+        "r12d" => R12D,
+        "r13d" => R13D,
+        "r14d" => R14D,
+        "r15d" => R15D,
         // 16-bit
-        "ax" => AX, "cx" => CX, "dx" => DX, "bx" => BX,
-        "sp" => SP, "bp" => BP, "si" => SI, "di" => DI,
-        "r8w" => R8W, "r9w" => R9W, "r10w" => R10W, "r11w" => R11W,
-        "r12w" => R12W, "r13w" => R13W, "r14w" => R14W, "r15w" => R15W,
+        "ax" => AX,
+        "cx" => CX,
+        "dx" => DX,
+        "bx" => BX,
+        "sp" => SP,
+        "bp" => BP,
+        "si" => SI,
+        "di" => DI,
+        "r8w" => R8W,
+        "r9w" => R9W,
+        "r10w" => R10W,
+        "r11w" => R11W,
+        "r12w" => R12W,
+        "r13w" => R13W,
+        "r14w" => R14W,
+        "r15w" => R15W,
         // 8-bit
-        "al" => AL, "cl" => CL, "dl" => DL, "bl" => BL,
-        "ah" => AH, "ch" => CH, "dh" => DH, "bh" => BH,
-        "spl" => SPL, "bpl" => BPL, "sil" => SIL, "dil" => DIL,
-        "r8b" | "r8l" => R8L, "r9b" | "r9l" => R9L,
-        "r10b" | "r10l" => R10L, "r11b" | "r11l" => R11L,
-        "r12b" | "r12l" => R12L, "r13b" | "r13l" => R13L,
-        "r14b" | "r14l" => R14L, "r15b" | "r15l" => R15L,
+        "al" => AL,
+        "cl" => CL,
+        "dl" => DL,
+        "bl" => BL,
+        "ah" => AH,
+        "ch" => CH,
+        "dh" => DH,
+        "bh" => BH,
+        "spl" => SPL,
+        "bpl" => BPL,
+        "sil" => SIL,
+        "dil" => DIL,
+        "r8b" | "r8l" => R8L,
+        "r9b" | "r9l" => R9L,
+        "r10b" | "r10l" => R10L,
+        "r11b" | "r11l" => R11L,
+        "r12b" | "r12l" => R12L,
+        "r13b" | "r13l" => R13L,
+        "r14b" | "r14l" => R14L,
+        "r15b" | "r15l" => R15L,
         // XMM
-        "xmm0" => XMM0, "xmm1" => XMM1, "xmm2" => XMM2, "xmm3" => XMM3,
-        "xmm4" => XMM4, "xmm5" => XMM5, "xmm6" => XMM6, "xmm7" => XMM7,
-        "xmm8" => XMM8, "xmm9" => XMM9, "xmm10" => XMM10, "xmm11" => XMM11,
-        "xmm12" => XMM12, "xmm13" => XMM13, "xmm14" => XMM14, "xmm15" => XMM15,
+        "xmm0" => XMM0,
+        "xmm1" => XMM1,
+        "xmm2" => XMM2,
+        "xmm3" => XMM3,
+        "xmm4" => XMM4,
+        "xmm5" => XMM5,
+        "xmm6" => XMM6,
+        "xmm7" => XMM7,
+        "xmm8" => XMM8,
+        "xmm9" => XMM9,
+        "xmm10" => XMM10,
+        "xmm11" => XMM11,
+        "xmm12" => XMM12,
+        "xmm13" => XMM13,
+        "xmm14" => XMM14,
+        "xmm15" => XMM15,
         _ => return Option::None, // ::None to avoid Register::None from the glob.
     })
 }
@@ -578,8 +639,8 @@ mod tests {
 
     #[track_caller]
     fn round_trip(bitness: Bitness, text: &str, expected: &[u8]) {
-        let bytes =
-            assemble_intel(bitness, text, 0x1000).unwrap_or_else(|e| panic!("assemble {text:?}: {e}"));
+        let bytes = assemble_intel(bitness, text, 0x1000)
+            .unwrap_or_else(|e| panic!("assemble {text:?}: {e}"));
         assert_eq!(
             bytes, expected,
             "bytes mismatch for {text:?}: got {bytes:02x?}, want {expected:02x?}"
@@ -672,11 +733,7 @@ mod tests {
     #[test]
     fn nop_with_memory_operand_x86_64() {
         round_trip(Bitness::Bits64, "nop [rax]", &[0x0f, 0x1f, 0x00]);
-        round_trip(
-            Bitness::Bits64,
-            "nop [rax+rax]",
-            &[0x0f, 0x1f, 0x04, 0x00],
-        );
+        round_trip(Bitness::Bits64, "nop [rax+rax]", &[0x0f, 0x1f, 0x04, 0x00]);
     }
 
     #[test]

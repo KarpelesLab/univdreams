@@ -781,10 +781,7 @@ fn build_optional_block(opt: &ud_format::pe::OptionalHeader) -> Value {
             Value::Int(opt.size_of_stack_reserve),
         ),
         field("size_of_stack_commit", Value::Int(opt.size_of_stack_commit)),
-        field(
-            "size_of_heap_reserve",
-            Value::Int(opt.size_of_heap_reserve),
-        ),
+        field("size_of_heap_reserve", Value::Int(opt.size_of_heap_reserve)),
         field("size_of_heap_commit", Value::Int(opt.size_of_heap_commit)),
         field("loader_flags", Value::Int(u64::from(opt.loader_flags))),
         field(

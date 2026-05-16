@@ -15,8 +15,8 @@
 use std::path::{Path, PathBuf};
 
 use ud_ast::{Item, Stmt};
-use ud_translate::compile::{lower_to_elf, parse};
 use ud_format::elf::Elf64File;
+use ud_translate::compile::{lower_to_elf, parse};
 
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -371,17 +371,14 @@ fn lower_stmts_into(
                     let ip = base_addr
                         .map(|a| a.saturating_add(out.len() as u64))
                         .unwrap_or(0);
-                    let encoded = ud_arch_x86::assemble_intel(
-                        ud_arch_x86::Bitness::Bits64,
-                        text,
-                        ip,
-                    )
-                    .map_err(|e| LowerError::AsmAssembleFailed {
-                        fn_name: fn_name.to_string(),
-                        stmt_index: i,
-                        text: text.clone(),
-                        message: e.to_string(),
-                    })?;
+                    let encoded =
+                        ud_arch_x86::assemble_intel(ud_arch_x86::Bitness::Bits64, text, ip)
+                            .map_err(|e| LowerError::AsmAssembleFailed {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                                text: text.clone(),
+                                message: e.to_string(),
+                            })?;
                     out.extend_from_slice(&encoded);
                 } else {
                     out.extend_from_slice(bytes);
@@ -1071,10 +1068,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(
-            bytes,
-            vec![0x5a, 0xf1, 0xff, 0xff, 0x63, 0xf1, 0xff, 0xff]
-        );
+        assert_eq!(bytes, vec![0x5a, 0xf1, 0xff, 0xff, 0x63, 0xf1, 0xff, 0xff]);
     }
 
     #[test]
@@ -1094,10 +1088,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(
-            bytes,
-            vec![0x7a, 0x11, 0x40, 0x00, 0x83, 0x11, 0x40, 0x00]
-        );
+        assert_eq!(bytes, vec![0x7a, 0x11, 0x40, 0x00, 0x83, 0x11, 0x40, 0x00]);
     }
 
     #[test]

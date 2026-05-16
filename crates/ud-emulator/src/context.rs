@@ -539,9 +539,7 @@ mod tests {
             "x",
             RegistryValue::Dword(1),
         );
-        let h = reg
-            .open_key(HKLM, "Software\\Foo")
-            .expect("opens");
+        let h = reg.open_key(HKLM, "Software\\Foo").expect("opens");
         assert!(reg.owns(h));
         assert_eq!(reg.path_of(h), Some("hkey_local_machine/software/foo"));
         assert!(reg.close_key(h));
