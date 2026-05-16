@@ -58,6 +58,7 @@ fn load_manifest() -> CodecManifest {
 }
 
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct Outcome {
     fetched: bool,
     loaded: bool,
@@ -163,15 +164,17 @@ fn run_one(codec: &Codec) -> Outcome {
     // `ICOpen(VIDC, fourcc, ICMODE_DECOMPRESS)` and record
     // whether the codec handed back a live `HIC`.
     out.has_driver_proc = img.export("DriverProc").is_some();
-    if out.dll_main_ok && out.unresolved_imports.is_empty() && out.has_driver_proc {
-        if runner.install_codec(&img).is_ok() {
-            let fcc_type = u32::from_le_bytes(*b"VIDC");
-            let fcc_handler = fourcc_to_u32(&codec.fourcc.clone().unwrap_or_default());
-            const ICMODE_DECOMPRESS: u32 = 1;
-            runner.host.instruction_budget = Some(20_000_000);
-            if let Ok(hic) = runner.ic_open(fcc_type, fcc_handler, ICMODE_DECOMPRESS) {
-                out.vfw_open_ok = hic != 0;
-            }
+    if out.dll_main_ok
+        && out.unresolved_imports.is_empty()
+        && out.has_driver_proc
+        && runner.install_codec(&img).is_ok()
+    {
+        const ICMODE_DECOMPRESS: u32 = 1;
+        let fcc_type = u32::from_le_bytes(*b"VIDC");
+        let fcc_handler = fourcc_to_u32(&codec.fourcc.clone().unwrap_or_default());
+        runner.host.instruction_budget = Some(20_000_000);
+        if let Ok(hic) = runner.ic_open(fcc_type, fcc_handler, ICMODE_DECOMPRESS) {
+            out.vfw_open_ok = hic != 0;
         }
     }
     out
@@ -189,7 +192,9 @@ fn fourcc_to_u32(s: &str) -> u32 {
 
 /// Synthetic stub that always returns 0. Used by the corpus
 /// runner to probe the full set of unresolved imports without
-/// patching the production stub registry.
+/// patching the production stub registry. The `Result` wrap
+/// is dictated by the `StubFn` signature.
+#[allow(clippy::unnecessary_wraps)]
 fn stub_zero(
     _cpu: &mut ud_emulator::emulator::Cpu,
     _mmu: &mut ud_emulator::emulator::Mmu,
@@ -200,7 +205,7 @@ fn stub_zero(
 }
 
 #[test]
-#[ignore]
+#[ignore = "fetches the 60+ codec DLLs from samples.oxideav.org; opt-in via --ignored"]
 fn codec_corpus_load_and_dll_main() {
     let manifest = load_manifest();
     println!("Codec corpus: {} entries", manifest.codec.len());
@@ -213,8 +218,13 @@ fn codec_corpus_load_and_dll_main() {
     for codec in &manifest.codec {
         if codec.arch != "i386" {
             totals[3] += 1;
+            let note = codec
+                .notes
+                .as_deref()
+                .map(|n| format!(" — {n}"))
+                .unwrap_or_default();
             println!(
-                "  SKIP {} ({} {} arch={})",
+                "  SKIP {} ({} {} arch={}){note}",
                 codec.name, codec.family, codec.kind, codec.arch,
             );
             continue;

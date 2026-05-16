@@ -368,9 +368,7 @@ fn lower_stmts_into(
                     // x86 assembler. The IP we feed it is the
                     // statement's cursor position so RIP-relative
                     // forms resolve correctly once we cover them.
-                    let ip = base_addr
-                        .map(|a| a.saturating_add(out.len() as u64))
-                        .unwrap_or(0);
+                    let ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
                     let encoded =
                         ud_arch_x86::assemble_intel(ud_arch_x86::Bitness::Bits64, text, ip)
                             .map_err(|e| LowerError::AsmAssembleFailed {
@@ -721,6 +719,7 @@ fn lower_notes_bytes(entries: &[ud_ast::NoteEntry]) -> Vec<u8> {
 /// tables (cases that aren't 0..N) are not supported at lower
 /// time — the source must spell out gaps with `default:` arms
 /// or an `@raw` fallback.
+#[allow(clippy::cast_possible_wrap)]
 fn lower_jump_table_bytes(
     addr: u64,
     dispatch: &str,

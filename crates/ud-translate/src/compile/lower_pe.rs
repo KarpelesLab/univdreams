@@ -101,8 +101,7 @@ pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
         read_pe_skeleton(build, file_size)?;
     let kind = match optional.as_ref().map(|o| o.magic) {
         Some(OPTIONAL_HEADER_MAGIC_PE32) => PeKind::Pe32,
-        Some(OPTIONAL_HEADER_MAGIC_PE32_PLUS) | None => PeKind::Pe32Plus,
-        Some(_) => PeKind::Pe32Plus,
+        _ => PeKind::Pe32Plus,
     };
     let image_base = optional.as_ref().map_or(0, |o| o.image_base);
     let address_of_entry_point = optional.as_ref().map_or(0, |o| o.address_of_entry_point);
@@ -359,7 +358,8 @@ fn read_optional_header(build: &[Field]) -> Option<OptionalHeader> {
         return Option::None;
     }
     Some(OptionalHeader {
-        magic: read_int_block(o, "magic").unwrap_or(OPTIONAL_HEADER_MAGIC_PE32_PLUS as u64) as u16,
+        magic: read_int_block(o, "magic").unwrap_or(u64::from(OPTIONAL_HEADER_MAGIC_PE32_PLUS))
+            as u16,
         major_linker_version: read_int_block(o, "major_linker_version").unwrap_or(0) as u8,
         minor_linker_version: read_int_block(o, "minor_linker_version").unwrap_or(0) as u8,
         size_of_code: read_int_block(o, "size_of_code").unwrap_or(0) as u32,

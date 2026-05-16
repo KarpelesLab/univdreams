@@ -362,7 +362,9 @@ impl OptionalHeader {
                 out.extend_from_slice(&self.base_of_data.to_le_bytes());
                 out.extend_from_slice(&(self.image_base as u32).to_le_bytes());
             }
-            OPTIONAL_HEADER_MAGIC_PE32_PLUS | _ => {
+            _ => {
+                // OPTIONAL_HEADER_MAGIC_PE32_PLUS (and any other
+                // future magic) — 64-bit `image_base`.
                 out.extend_from_slice(&self.image_base.to_le_bytes());
             }
         }
@@ -380,19 +382,16 @@ impl OptionalHeader {
         out.extend_from_slice(&self.check_sum.to_le_bytes());
         out.extend_from_slice(&self.subsystem.to_le_bytes());
         out.extend_from_slice(&self.dll_characteristics.to_le_bytes());
-        match self.magic {
-            OPTIONAL_HEADER_MAGIC_PE32 => {
-                out.extend_from_slice(&(self.size_of_stack_reserve as u32).to_le_bytes());
-                out.extend_from_slice(&(self.size_of_stack_commit as u32).to_le_bytes());
-                out.extend_from_slice(&(self.size_of_heap_reserve as u32).to_le_bytes());
-                out.extend_from_slice(&(self.size_of_heap_commit as u32).to_le_bytes());
-            }
-            _ => {
-                out.extend_from_slice(&self.size_of_stack_reserve.to_le_bytes());
-                out.extend_from_slice(&self.size_of_stack_commit.to_le_bytes());
-                out.extend_from_slice(&self.size_of_heap_reserve.to_le_bytes());
-                out.extend_from_slice(&self.size_of_heap_commit.to_le_bytes());
-            }
+        if self.magic == OPTIONAL_HEADER_MAGIC_PE32 {
+            out.extend_from_slice(&(self.size_of_stack_reserve as u32).to_le_bytes());
+            out.extend_from_slice(&(self.size_of_stack_commit as u32).to_le_bytes());
+            out.extend_from_slice(&(self.size_of_heap_reserve as u32).to_le_bytes());
+            out.extend_from_slice(&(self.size_of_heap_commit as u32).to_le_bytes());
+        } else {
+            out.extend_from_slice(&self.size_of_stack_reserve.to_le_bytes());
+            out.extend_from_slice(&self.size_of_stack_commit.to_le_bytes());
+            out.extend_from_slice(&self.size_of_heap_reserve.to_le_bytes());
+            out.extend_from_slice(&self.size_of_heap_commit.to_le_bytes());
         }
         out.extend_from_slice(&self.loader_flags.to_le_bytes());
         out.extend_from_slice(&self.number_of_rva_and_sizes.to_le_bytes());
@@ -535,6 +534,7 @@ impl PeFile {
     /// Parse a PE file. Validates the structural skeleton (DOS
     /// header, PE signature, COFF + optional + section headers) but
     /// leaves the rest as opaque bytes.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < DOS_HEADER_SIZE {
             return Err(Error::Truncated {
@@ -978,6 +978,7 @@ impl PeFile {
     /// the buffer at its offset, after the structured headers
     /// are written.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         kind: PeKind,
         dos: DosHeader,

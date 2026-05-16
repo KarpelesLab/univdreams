@@ -154,6 +154,7 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
 /// reproduces the original bytes exactly. Edited input lays out
 /// a new ELF that loads and runs at the cost of file/VA
 /// offsets that no longer match the pristine binary.
+#[allow(clippy::cast_possible_wrap)]
 fn apply_size_changes(
     ehdr: &mut Ehdr64,
     phdrs: &mut [Phdr64],

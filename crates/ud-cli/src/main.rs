@@ -1,3 +1,9 @@
+// `LRESULT` / `HRESULT` / Win32 IC* return codes inhabit the u32
+// ↔ i32 boundary by design (the negative half encodes errors).
+// Allow the cast at module level rather than peppering 14 inline
+// attrs across the VfW handlers.
+#![allow(clippy::cast_possible_wrap)]
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -592,6 +598,7 @@ const ICMODE_DECOMPRESS: u32 = 1;
 const ICMODE_COMPRESS: u32 = 2;
 const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
 
+#[allow(clippy::too_many_lines)]
 fn vfw_probe(
     dll_path: &Path,
     fcc_handler: Option<&str>,
@@ -604,8 +611,7 @@ fn vfw_probe(
         std::fs::read(dll_path).with_context(|| format!("reading {}", dll_path.display()))?;
     let dll_name = dll_path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "codec.dll".into());
+        .map_or_else(|| "codec.dll".into(), |n| n.to_string_lossy().into_owned());
 
     let mut sandbox = ud_emulator::Sandbox::new();
     sandbox.host.instruction_budget = Some(max_instructions);
@@ -621,9 +627,7 @@ fn vfw_probe(
         .install_codec(&img)
         .with_context(|| "install_codec")?;
 
-    let fcc = fcc_handler
-        .map(str::to_owned)
-        .unwrap_or_else(|| derive_default_fcc(dll_path));
+    let fcc = fcc_handler.map_or_else(|| derive_default_fcc(dll_path), str::to_owned);
     let fcc_type = u32::from_le_bytes(*b"VIDC");
     let fcc_handler_u32 = fourcc_to_u32(&fcc);
 
@@ -686,9 +690,9 @@ fn vfw_probe(
                 "  fccHandler   = {:?}",
                 std::str::from_utf8(&fcc_handler_bytes).unwrap_or("?")
             );
-            println!("  dwFlags      = 0x{:08x}", flags);
-            println!("  dwVersion    = 0x{:08x}", version);
-            println!("  dwVersionICM = 0x{:08x}", version_icm);
+            println!("  dwFlags      = 0x{flags:08x}");
+            println!("  dwVersion    = 0x{version:08x}");
+            println!("  dwVersionICM = 0x{version_icm:08x}");
             println!("  szName       = {name:?}");
             println!("  szDescription= {desc:?}");
         }
@@ -737,6 +741,7 @@ fn vfw_probe(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn decode_cmd(
     dll_path: &Path,
     input: &Path,
@@ -751,8 +756,7 @@ fn decode_cmd(
         std::fs::read(dll_path).with_context(|| format!("reading {}", dll_path.display()))?;
     let dll_name = dll_path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "codec.dll".into());
+        .map_or_else(|| "codec.dll".into(), |n| n.to_string_lossy().into_owned());
     let frame =
         std::fs::read(input).with_context(|| format!("reading frame {}", input.display()))?;
 
@@ -769,9 +773,7 @@ fn decode_cmd(
         .install_codec(&img)
         .with_context(|| "install_codec")?;
 
-    let fcc = fcc_handler
-        .map(str::to_owned)
-        .unwrap_or_else(|| derive_default_fcc(dll_path));
+    let fcc = fcc_handler.map_or_else(|| derive_default_fcc(dll_path), str::to_owned);
     let fcc_type = u32::from_le_bytes(*b"VIDC");
     let fcc_handler_u32 = fourcc_to_u32(&fcc);
 
@@ -782,7 +784,7 @@ fn decode_cmd(
         planes: 1,
         bit_count: 24,
         compression: fcc_handler_u32.to_le_bytes(),
-        size_image: frame.len() as u32,
+        size_image: u32::try_from(frame.len()).unwrap_or(u32::MAX),
         ..ud_emulator::Bih::default()
     };
     let out_bih = ud_emulator::Bih {
@@ -843,6 +845,7 @@ fn decode_cmd(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn encode_cmd(
     dll_path: &Path,
     input: &Path,
@@ -859,8 +862,7 @@ fn encode_cmd(
         std::fs::read(dll_path).with_context(|| format!("reading {}", dll_path.display()))?;
     let dll_name = dll_path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "codec.dll".into());
+        .map_or_else(|| "codec.dll".into(), |n| n.to_string_lossy().into_owned());
 
     let frame =
         std::fs::read(input).with_context(|| format!("reading input frame {}", input.display()))?;
@@ -889,9 +891,7 @@ fn encode_cmd(
         .install_codec(&img)
         .with_context(|| "install_codec")?;
 
-    let fcc = fcc_handler
-        .map(str::to_owned)
-        .unwrap_or_else(|| derive_default_fcc(dll_path));
+    let fcc = fcc_handler.map_or_else(|| derive_default_fcc(dll_path), str::to_owned);
     let fcc_type = u32::from_le_bytes(*b"VIDC");
     let fcc_handler_u32 = fourcc_to_u32(&fcc);
 
@@ -979,6 +979,7 @@ fn encode_cmd(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     if !ud_format::pe::is_pe(&bytes) {
@@ -1208,12 +1209,10 @@ fn scan_ascii_strings(buf: &[u8], out: &mut Vec<String>) {
         let printable = matches!(b, 0x20..=0x7e);
         if printable {
             start.get_or_insert(i);
-        } else {
-            if let Some(s) = start.take() {
-                if i - s >= STRING_MIN_LEN {
-                    if let Ok(text) = std::str::from_utf8(&buf[s..i]) {
-                        out.push(text.to_string());
-                    }
+        } else if let Some(s) = start.take() {
+            if i - s >= STRING_MIN_LEN {
+                if let Ok(text) = std::str::from_utf8(&buf[s..i]) {
+                    out.push(text.to_string());
                 }
             }
         }

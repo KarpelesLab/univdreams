@@ -32,13 +32,11 @@ pub fn fetch_or_load(base_url: &str, name: &str) -> Result<Vec<u8>, FetchError> 
         }
     }
 
-    let ci = env::var("CI")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    let ci = env::var("CI").is_ok_and(|v| v == "true" || v == "1");
 
     let cache_path = cache_dir().join(name);
     if !ci && cache_path.is_file() {
-        return Ok(fs::read(&cache_path).map_err(FetchError::Io)?);
+        return fs::read(&cache_path).map_err(FetchError::Io);
     }
 
     let url = format!("{base_url}/{name}");
@@ -119,9 +117,8 @@ fn cache_dir() -> PathBuf {
     if let Some(target) = env::var_os("CARGO_TARGET_DIR") {
         return PathBuf::from(target).join("test-fixture-cache");
     }
-    let manifest = env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let manifest =
+        env::var_os("CARGO_MANIFEST_DIR").map_or_else(|| PathBuf::from("."), PathBuf::from);
     // Walk up to the workspace root so all crates share a cache.
     let mut p = manifest;
     while !p.join("Cargo.toml").is_file() || !p.join("crates").is_dir() {

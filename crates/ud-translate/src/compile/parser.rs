@@ -466,6 +466,7 @@ impl Parser {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_at_directive(&mut self) -> Result<Item, ParseError> {
         self.expect(&TokenKind::At, "`@`")?;
         let dir_tok = self.peek().clone();

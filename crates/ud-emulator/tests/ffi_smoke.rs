@@ -64,6 +64,10 @@ fn guest_alloc_round_trips_through_guest_memory() {
 
 #[test]
 fn guest_call_drives_driver_proc() {
+    // DRV_LOAD = 1 — the codec's one-time load hook. The
+    // typed `call` reads like an FFI call; the result comes
+    // back as a typed `i32` LRESULT.
+    const DRV_LOAD: u32 = 1;
     let Some(bytes) = fixture() else {
         eprintln!("note: msmpeg fixture missing; skipping");
         return;
@@ -71,10 +75,6 @@ fn guest_call_drives_driver_proc() {
     let mut guest = Guest::load("wmpcdcs8-mpg4c32.dll", &bytes).expect("load");
 
     // DriverProc(dwDriverId, hdrvr, msg, lParam1, lParam2).
-    // DRV_LOAD = 1 — the codec's one-time load hook. The
-    // typed `call` reads like an FFI call; the result comes
-    // back as a typed `i32` LRESULT.
-    const DRV_LOAD: u32 = 1;
     let rc: i32 = guest
         .call("DriverProc", (0u32, 0u32, DRV_LOAD, 0u32, 0u32))
         .expect("DriverProc(DRV_LOAD)");

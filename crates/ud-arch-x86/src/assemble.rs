@@ -244,7 +244,7 @@ fn parse_single_operand(
         {
             build_rip_relative_operand(mem.displacement)
         } else {
-            build_memory_operand(&mem)?
+            build_memory_operand(&mem)
         };
         return Instruction::with1::<iced_x86::MemoryOperand>(code, mem_op).map_err(|e| {
             AssembleError::EncodeFailed {
@@ -447,9 +447,9 @@ fn tokenize_addr(s: &str) -> Vec<(bool, &str)> {
     out
 }
 
-fn build_memory_operand(mem: &ParsedMemory) -> Result<iced_x86::MemoryOperand, AssembleError> {
+fn build_memory_operand(mem: &ParsedMemory) -> iced_x86::MemoryOperand {
     use iced_x86::MemoryOperand;
-    Ok(MemoryOperand::with_base_index_scale_displ_size(
+    MemoryOperand::with_base_index_scale_displ_size(
         mem.base,
         mem.index,
         mem.scale,
@@ -458,7 +458,7 @@ fn build_memory_operand(mem: &ParsedMemory) -> Result<iced_x86::MemoryOperand, A
         // operand shape (Mod=00 / disp8 / disp32 for ModR/M
         // forms; always disp32 for RIP-relative).
         0,
-    ))
+    )
 }
 
 /// Build a 64-bit RIP-relative memory operand from an absolute
@@ -481,6 +481,7 @@ fn build_rip_relative_operand(target: i64) -> iced_x86::MemoryOperand {
 /// Lower-case input (`rax`, `eax`, `ax`, `al`, `ah`, `r8`, `r8d`,
 /// `r8w`, `r8b`, `xmm0` …); anything we don't recognise returns
 /// `None` so the caller can surface `Unsupported`.
+#[allow(clippy::enum_glob_use)]
 fn parse_register(name: &str) -> Option<Register> {
     use Register::*;
     Some(match name {
@@ -580,6 +581,7 @@ fn parse_register(name: &str) -> Option<Register> {
 /// Operand bit width for a general-purpose register. XMM and
 /// segment registers return `None` because they use different
 /// encoders.
+#[allow(clippy::enum_glob_use)]
 fn register_width(reg: Register) -> Option<u32> {
     use Register::*;
     match reg {
@@ -606,8 +608,7 @@ fn zero_operand_code(mnemonic: &str) -> Option<Code> {
         "hlt" => Code::Hlt,
         "nop" => Code::Nopd,
         "int3" => Code::Int3,
-        "ret" => Code::Retnq,
-        "retq" => Code::Retnq,
+        "ret" | "retq" => Code::Retnq,
         "retn" => Code::Retnd,
         "cdqe" => Code::Cdqe,
         "cwde" => Code::Cwde,

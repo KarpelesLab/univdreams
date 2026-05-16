@@ -44,6 +44,7 @@ pub fn decompile_pe_to_text(pe: &PeFile) -> String {
     ud_ast::emit(&decompile_pe(pe))
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_pe_module(pe: &PeFile) -> Module {
     let arch = match pe.coff.machine {
         IMAGE_FILE_MACHINE_I386 => "x86",

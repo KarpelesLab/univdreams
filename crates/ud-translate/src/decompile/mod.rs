@@ -155,9 +155,10 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
     // This shrinks the .ud source toward "minimal bytes": only
     // forms the assembler doesn't yet cover keep their pinned
     // bytes.
-    let bitness = match arch {
-        Arch::X86 { bitness } => Some(bitness),
-        _ => None,
+    let bitness = if let Arch::X86 { bitness } = arch {
+        Some(bitness)
+    } else {
+        None
     };
     if let Some(bitness) = bitness {
         drop_regenerable_asm_bytes(&mut items, bitness);
@@ -179,6 +180,7 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
 /// the original bytes at the real IP. Threading the cursor
 /// through gives us both the regen path and the drop test
 /// against the same fixed reference point.
+#[allow(clippy::too_many_lines)]
 fn drop_regenerable_asm_bytes(items: &mut [Item], bitness: ud_arch_x86::Bitness) {
     /// Return the encoded byte size of `stmt` so the cursor can
     /// step past it. For `Stmt::Asm`, the pinned bytes' length
@@ -286,6 +288,7 @@ fn drop_regenerable_asm_bytes(items: &mut [Item], bitness: ud_arch_x86::Bitness)
         ud_arch_x86::encode_epilogue(&epi, cb).len() as u64
     }
 
+    #[allow(clippy::enum_glob_use)]
     fn stmt_min_size(stmt: &ud_ast::Stmt) -> u64 {
         use ud_ast::Stmt::*;
         match stmt {
@@ -400,14 +403,12 @@ fn collect_switch_tables(items: &[Item]) -> Vec<SwitchTable> {
                     dispatch,
                     table_va,
                     ..
-                } => {
-                    if *table_va != 0 && !cases.is_empty() {
-                        out.push(SwitchTable {
-                            table_va: *table_va,
-                            dispatch: dispatch.clone(),
-                            cases: cases.clone(),
-                        });
-                    }
+                } if *table_va != 0 && !cases.is_empty() => {
+                    out.push(SwitchTable {
+                        table_va: *table_va,
+                        dispatch: dispatch.clone(),
+                        cases: cases.clone(),
+                    });
                 }
                 ud_ast::Stmt::IfBranch {
                     pre_body,
@@ -445,7 +446,7 @@ fn collect_switch_tables(items: &[Item]) -> Vec<SwitchTable> {
 /// use 4-byte entries, so each table covers `4 * cases.len()`
 /// bytes starting at `table_va`. Unknown dispatch kinds are
 /// skipped (no replacement, no error).
-fn replace_raw_with_jump_tables(items: &mut Vec<Item>, tables: &[SwitchTable]) {
+fn replace_raw_with_jump_tables(items: &mut [Item], tables: &[SwitchTable]) {
     fn entry_size(dispatch: &str) -> Option<u64> {
         match dispatch {
             "gcc_pie_rel32" | "msvc_va32" => Some(4),
