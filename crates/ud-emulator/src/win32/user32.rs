@@ -150,6 +150,26 @@ pub fn register(registry: &mut Registry) {
     // of being variadic. cdecl. We bottom-out at zero.
     registry.register("user32.dll", "wvsprintfA", stub_zero0 as StubFn, 0);
 
+    // ---- Codec-corpus probe additions -----------------------------
+    //
+    // Config-dialog imports pulled in by Cinepak, HuffYUV,
+    // Lagarith and MagicYUV. None is on the decode path; each
+    // returns its canonical success / zero-state reply.
+    //
+    // ScreenToClient(HWND, LPPOINT) — BOOL; report success.
+    registry.register("user32.dll", "ScreenToClient", stub_one2 as StubFn, 2);
+    // SendDlgItemMessageA(HWND, int, UINT, WPARAM, LPARAM) — the
+    // dialog never exists; reply 0.
+    registry.register("user32.dll", "SendDlgItemMessageA", stub_zero5 as StubFn, 5);
+    // LoadIconA(HINSTANCE, LPCSTR) — hand back a non-NULL HICON
+    // sentinel (1) so the caller's "icon != NULL" check passes.
+    registry.register("user32.dll", "LoadIconA", stub_one2 as StubFn, 2);
+    // PostThreadMessageA(DWORD, UINT, WPARAM, LPARAM) — BOOL;
+    // report the message was posted.
+    registry.register("user32.dll", "PostThreadMessageA", stub_one4 as StubFn, 4);
+    // wsprintfW — cdecl variadic; see stub_wsprintf_w.
+    registry.register("user32.dll", "wsprintfW", stub_wsprintf_w as StubFn, 0);
+
     // ---- Round-20 additions (mpg4c32.dll PE-load surface) ---------
     //
     // The MSMPEG4 v3 codec carries a property-page UI vestige
@@ -494,8 +514,34 @@ fn stub_zero7(
 fn stub_one1(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
     Ok(1)
 }
+fn stub_one2(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+fn stub_one4(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
+    Ok(1)
+}
 fn stub_one6(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
     Ok(1)
+}
+
+/// `int wsprintfW(LPWSTR lpOut, LPCWSTR lpFmt, ...)`. **cdecl**,
+/// variadic. The sandbox never surfaces formatted UI text, so
+/// this writes an empty wide string into `lpOut` and reports a
+/// length of 0 — enough for the config-dialog code path to
+/// proceed.
+fn stub_wsprintf_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let out =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("wsprintfW", t))?;
+    if out != 0 {
+        mmu.store16(out, 0)
+            .map_err(|t| crate::win32::trap_to_win32_local("wsprintfW", t))?;
+    }
+    Ok(0)
 }
 
 // ---- Round-26 CreateWindowExA cascade --------------------------------

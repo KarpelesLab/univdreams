@@ -92,6 +92,24 @@ pub fn register(registry: &mut Registry) {
         stub_stretch_dibits as StubFn,
         13,
     );
+
+    // ---- Codec-corpus probe addition ----------------------------
+    //
+    // Cinepak (`iccvid`) frees a GDI object in its config-dialog
+    // teardown. The sandbox hands out no real GDI handles, so
+    // `DeleteObject` is a no-op that reports success.
+    // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deleteobject
+    registry.register("gdi32.dll", "DeleteObject", stub_delete_object as StubFn, 1);
+}
+
+/// `BOOL DeleteObject(HGDIOBJ ho)`. No-op returning TRUE.
+fn stub_delete_object(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
 }
 
 /// `BOOL BitBlt(HDC, int, int, int, int, HDC, int, int, DWORD)`.

@@ -25,12 +25,16 @@ use std::collections::BTreeMap;
 use crate::emulator::{Cpu, Mmu};
 
 pub mod advapi32;
+pub mod comctl32;
 pub mod gdi32;
 pub mod kernel32;
 pub mod mfplat;
 pub mod msvcrt;
 pub mod ole32;
+pub mod shell32;
+pub mod shlwapi;
 pub mod user32;
+pub mod version;
 pub mod vfw32;
 pub mod winmm;
 
@@ -643,6 +647,19 @@ impl Registry {
         self.by_name.len() - before
     }
 
+    /// Register the version.dll / comctl32.dll / shell32.dll /
+    /// shlwapi.dll stub families — the config-dialog and
+    /// settings-file surface VfW codecs pull in alongside their
+    /// decode core. Returns the number registered.
+    pub fn register_shell_support(&mut self) -> usize {
+        let before = self.by_name.len();
+        version::register(self);
+        comctl32::register(self);
+        shell32::register(self);
+        shlwapi::register(self);
+        self.by_name.len() - before
+    }
+
     /// Register every Round-1+4+8+20 stub family in one call:
     /// kernel32, gdi32, user32, winmm, advapi32, ole32, msvcrt,
     /// plus the round-27 host-COM thunk family used by
@@ -663,6 +680,7 @@ impl Registry {
             + self.register_msvcr71()
             + self.register_pncrt()
             + self.register_mfplat()
+            + self.register_shell_support()
             + host_count
     }
 }
@@ -811,9 +829,10 @@ pub fn dispatch_stub(
             .map(|a| format!("{a:#010x}"))
             .collect::<Vec<_>>()
             .join(", ");
-        state
-            .stub_trace
-            .push(format!("{}!{}({args_str}) → {:#010x}", entry.dll, entry.name, ret));
+        state.stub_trace.push(format!(
+            "{}!{}({args_str}) → {:#010x}",
+            entry.dll, entry.name, ret
+        ));
         state.stub_calls.push(StubCall {
             dll: entry.dll.clone(),
             name: entry.name.clone(),

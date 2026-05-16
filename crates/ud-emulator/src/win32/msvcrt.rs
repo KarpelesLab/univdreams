@@ -78,12 +78,7 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     // needed", which is true for any post-1996 CPU and our
     // synthesised Pentium II.
     registry.register_data(dll, "_adjust_fdiv", 0);
-    registry.register(
-        dll,
-        "_except_handler3",
-        stub_except_handler3 as StubFn,
-        0,
-    );
+    registry.register(dll, "_except_handler3", stub_except_handler3 as StubFn, 0);
     registry.register(dll, "_initterm", stub_initterm as StubFn, 0);
     registry.register(dll, "_purecall", stub_purecall as StubFn, 0);
     // CRT exit-handler registry (atexit / DLL-onexit hooks). Real
@@ -119,12 +114,7 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     //
     // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/endthread-endthreadex
     // void __cdecl _endthreadex(unsigned retval) — caller-cleanup.
-    registry.register(
-        dll,
-        "_endthreadex",
-        stub_end_thread_ex as StubFn,
-        0,
-    );
+    registry.register(dll, "_endthreadex", stub_end_thread_ex as StubFn, 0);
 
     // ---- Round-49 addition: msadds32.ax PE-load surface --------
     //
@@ -175,12 +165,7 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     //                                  unsigned initflag,
     //                                  unsigned *thrdaddr)
     //                                                  — caller-cleanup.
-    registry.register(
-        dll,
-        "_beginthreadex",
-        stub_begin_thread_ex as StubFn,
-        0,
-    );
+    registry.register(dll, "_beginthreadex", stub_begin_thread_ex as StubFn, 0);
 
     // ---- Round-52 addition: msadds32.ax PE-load surface --------
     //
@@ -288,20 +273,10 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     // void __security_error_handler(int code, void *data) —
     // MSVC 7.1 buffer-overrun reporter. We return 0; the
     // codec's CRT never actually invokes it on the happy path.
-    registry.register(
-        dll,
-        "__security_error_handler",
-        stub_purecall as StubFn,
-        0,
-    );
+    registry.register(dll, "__security_error_handler", stub_purecall as StubFn, 0);
     // void __CppXcptFilter(unsigned long, _EXCEPTION_POINTERS*)
     // — MSVC C++ exception filter. `EXCEPTION_CONTINUE_SEARCH = 1`.
-    registry.register(
-        dll,
-        "__CppXcptFilter",
-        stub_except_handler3 as StubFn,
-        0,
-    );
+    registry.register(dll, "__CppXcptFilter", stub_except_handler3 as StubFn, 0);
     // int _XcptFilter(unsigned long xc, EXCEPTION_POINTERS *ptr) —
     // CRT exception filter used by `__try`/`__except` blocks.
     // Returns `EXCEPTION_CONTINUE_SEARCH`.
@@ -377,6 +352,51 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     registry.register(dll, "_CIcos", stub_ci_cos as StubFn, 0);
     registry.register(dll, "_CIsin", stub_ci_sin as StubFn, 0);
     registry.register(dll, "_CIlog", stub_ci_log as StubFn, 0);
+
+    // ---- Corpus round 3 -------------------------------------------
+    // CRT surface flagged by the HuffYUV / Lagarith / MagicYUV
+    // probe. All cdecl (arg_dwords = 0 — the caller cleans up).
+    // ctype — real ASCII classification.
+    registry.register(dll, "isalnum", stub_isalnum as StubFn, 0);
+    registry.register(dll, "isspace", stub_isspace as StubFn, 0);
+    registry.register(dll, "iswctype", stub_iswctype as StubFn, 0);
+    registry.register(dll, "toupper", stub_toupper as StubFn, 0);
+    registry.register(dll, "towlower", stub_towlower as StubFn, 0);
+    registry.register(dll, "towupper", stub_towupper as StubFn, 0);
+    // memory.
+    registry.register(dll, "memchr", stub_memchr as StubFn, 0);
+    registry.register(dll, "memcmp", stub_memcmp as StubFn, 0);
+    // narrow strings.
+    registry.register(dll, "strcat", stub_strcat as StubFn, 0);
+    registry.register(dll, "strcmp", stub_strcmp as StubFn, 0);
+    registry.register(dll, "strcoll", stub_strcmp as StubFn, 0);
+    registry.register(dll, "strlen", stub_strlen as StubFn, 0);
+    registry.register(dll, "strncmp", stub_strncmp as StubFn, 0);
+    registry.register(dll, "strrchr", stub_strrchr as StubFn, 0);
+    registry.register(dll, "strxfrm", stub_strxfrm as StubFn, 0);
+    registry.register(dll, "strerror", stub_strerror as StubFn, 0);
+    registry.register(dll, "strftime", stub_strftime as StubFn, 0);
+    registry.register(dll, "strtoul", stub_strtoul as StubFn, 0);
+    registry.register(dll, "atoi", stub_atoi as StubFn, 0);
+    // wide strings.
+    registry.register(dll, "wcslen", stub_wcslen as StubFn, 0);
+    registry.register(dll, "wcscoll", stub_wcscoll as StubFn, 0);
+    registry.register(dll, "wcsxfrm", stub_wcsxfrm as StubFn, 0);
+    registry.register(dll, "wcsftime", stub_wcsftime as StubFn, 0);
+    // buffered I/O — discarded; report success.
+    registry.register(dll, "fputc", stub_fputc as StubFn, 0);
+    registry.register(dll, "fputs", stub_purecall as StubFn, 0);
+    registry.register(dll, "fwrite", stub_fwrite as StubFn, 0);
+    registry.register(dll, "vfprintf", stub_purecall as StubFn, 0);
+    registry.register(dll, "setvbuf", stub_purecall as StubFn, 0);
+    // heap.
+    registry.register(dll, "calloc", stub_calloc as StubFn, 0);
+    registry.register(dll, "realloc", stub_realloc as StubFn, 0);
+    // environment / locale / filesystem.
+    registry.register(dll, "getenv", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "localeconv", stub_localeconv as StubFn, 0);
+    registry.register(dll, "setlocale", stub_setlocale as StubFn, 0);
+    registry.register(dll, "_wmkdir", stub_purecall as StubFn, 0);
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling
@@ -1462,6 +1482,625 @@ fn stub_ci_log(
     cpu.fpu.push(x.ln());
     Ok(0)
 }
+
+// ============================================================
+// Corpus round 3 — CRT surface for HuffYUV / Lagarith / MagicYUV
+// ============================================================
+
+/// Scan bound for the in-stub C-string loops below.
+const STR_SCAN_CAP: u32 = 0x1_0000;
+
+/// `int isalnum(int c)` — ASCII alphanumeric test.
+fn stub_isalnum(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("isalnum", t))? as u8;
+    Ok(u32::from(c.is_ascii_alphanumeric()))
+}
+
+/// `int isspace(int c)` — ASCII whitespace test.
+fn stub_isspace(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("isspace", t))? as u8;
+    Ok(u32::from(c.is_ascii_whitespace()))
+}
+
+/// `int iswctype(wint_t c, wctype_t desc)`. The classification
+/// mask is locale-specific; we report "not of that class" (0).
+/// Codecs only reach this through CRT locale plumbing the
+/// sandbox never exercises on the decode path.
+fn stub_iswctype(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `int toupper(int c)` — ASCII upper-case.
+fn stub_toupper(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("toupper", t))?;
+    Ok(u32::from((c as u8).to_ascii_uppercase()))
+}
+
+/// `wint_t towlower(wint_t c)` — ASCII-range lower-case; other
+/// code points pass through unchanged.
+fn stub_towlower(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("towlower", t))?;
+    Ok(if (b'A' as u32..=b'Z' as u32).contains(&c) {
+        c + 32
+    } else {
+        c
+    })
+}
+
+/// `wint_t towupper(wint_t c)` — ASCII-range upper-case.
+fn stub_towupper(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("towupper", t))?;
+    Ok(if (b'a' as u32..=b'z' as u32).contains(&c) {
+        c - 32
+    } else {
+        c
+    })
+}
+
+/// `void *memchr(const void *buf, int c, size_t count)`.
+fn stub_memchr(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap("memchr", t))?;
+    let c = arg_dword(cpu, mmu, 1).map_err(|t| trap("memchr", t))? as u8;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("memchr", t))?;
+    for i in 0..n {
+        if mmu
+            .load8(buf.wrapping_add(i))
+            .map_err(|t| trap("memchr", t))?
+            == c
+        {
+            return Ok(buf.wrapping_add(i));
+        }
+    }
+    Ok(0)
+}
+
+/// `int memcmp(const void *p1, const void *p2, size_t count)`.
+fn stub_memcmp(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("memcmp", t))?;
+    let p2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("memcmp", t))?;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("memcmp", t))?;
+    for i in 0..n {
+        let a = mmu
+            .load8(p1.wrapping_add(i))
+            .map_err(|t| trap("memcmp", t))?;
+        let b = mmu
+            .load8(p2.wrapping_add(i))
+            .map_err(|t| trap("memcmp", t))?;
+        if a != b {
+            return Ok(if a < b { (-1i32) as u32 } else { 1 });
+        }
+    }
+    Ok(0)
+}
+
+/// Read a NUL-terminated string from guest memory (bounded).
+fn read_c(mmu: &Mmu, base: u32, stub: &'static str) -> Result<Vec<u8>, Win32Error> {
+    let mut out = Vec::new();
+    if base == 0 {
+        return Ok(out);
+    }
+    for i in 0..STR_SCAN_CAP {
+        let b = mmu.load8(base.wrapping_add(i)).map_err(|t| trap(stub, t))?;
+        if b == 0 {
+            break;
+        }
+        out.push(b);
+    }
+    Ok(out)
+}
+
+/// `char *strcat(char *dest, const char *src)`.
+fn stub_strcat(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("strcat", t))?;
+    let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("strcat", t))?;
+    let mut end = dest;
+    let mut scanned = 0u32;
+    while scanned < STR_SCAN_CAP && mmu.load8(end).map_err(|t| trap("strcat", t))? != 0 {
+        end = end.wrapping_add(1);
+        scanned += 1;
+    }
+    let mut bytes = read_c(mmu, src, "strcat")?;
+    bytes.push(0);
+    mmu.write(end, &bytes).map_err(|t| trap("strcat", t))?;
+    Ok(dest)
+}
+
+/// `int strcmp(const char *s1, const char *s2)` — also wired as
+/// `strcoll` (ordinal collation in the sandbox's "C" locale).
+fn stub_strcmp(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("strcmp", t))?;
+    let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("strcmp", t))?;
+    let a = read_c(mmu, s1, "strcmp")?;
+    let b = read_c(mmu, s2, "strcmp")?;
+    Ok(match a.cmp(&b) {
+        std::cmp::Ordering::Less => (-1i32) as u32,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    })
+}
+
+/// `size_t strlen(const char *s)`.
+fn stub_strlen(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s = arg_dword(cpu, mmu, 0).map_err(|t| trap("strlen", t))?;
+    Ok(read_c(mmu, s, "strlen")?.len() as u32)
+}
+
+/// `int strncmp(const char *s1, const char *s2, size_t n)`.
+fn stub_strncmp(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("strncmp", t))?;
+    let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("strncmp", t))?;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("strncmp", t))?;
+    for i in 0..n {
+        let a = mmu
+            .load8(s1.wrapping_add(i))
+            .map_err(|t| trap("strncmp", t))?;
+        let b = mmu
+            .load8(s2.wrapping_add(i))
+            .map_err(|t| trap("strncmp", t))?;
+        if a != b {
+            return Ok(if a < b { (-1i32) as u32 } else { 1 });
+        }
+        if a == 0 {
+            break;
+        }
+    }
+    Ok(0)
+}
+
+/// `char *strrchr(const char *s, int c)` — last occurrence.
+fn stub_strrchr(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s = arg_dword(cpu, mmu, 0).map_err(|t| trap("strrchr", t))?;
+    let c = arg_dword(cpu, mmu, 1).map_err(|t| trap("strrchr", t))? as u8;
+    let mut hit = 0u32;
+    for i in 0..STR_SCAN_CAP {
+        let b = mmu
+            .load8(s.wrapping_add(i))
+            .map_err(|t| trap("strrchr", t))?;
+        if b == c {
+            hit = s.wrapping_add(i);
+        }
+        if b == 0 {
+            break;
+        }
+    }
+    Ok(hit)
+}
+
+/// `size_t strxfrm(char *dest, const char *src, size_t n)`. In
+/// the "C" locale the collation transform is the identity, so
+/// this is a length-bounded copy. Returns `strlen(src)`.
+fn stub_strxfrm(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("strxfrm", t))?;
+    let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("strxfrm", t))?;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("strxfrm", t))?;
+    let bytes = read_c(mmu, src, "strxfrm")?;
+    let src_len = bytes.len() as u32;
+    if dest != 0 && n > 0 {
+        let take = (n as usize - 1).min(bytes.len());
+        let mut buf = bytes[..take].to_vec();
+        buf.push(0);
+        mmu.write(dest, &buf).map_err(|t| trap("strxfrm", t))?;
+    }
+    Ok(src_len)
+}
+
+/// `char *strerror(int errnum)`. Allocates a small guest buffer
+/// holding a generic message and returns a pointer to it — a
+/// non-NULL result is the contract a caller relies on.
+fn stub_strerror(
+    _cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let msg = b"Error\0";
+    let addr = state.arena_alloc(msg.len() as u32)?;
+    mmu.write_initializer(addr, msg)
+        .map_err(|t| trap("strerror", t))?;
+    Ok(addr)
+}
+
+/// `size_t strftime(char *dest, size_t maxsize, const char *fmt,
+/// const struct tm *tm)`. Writes an empty string and reports a
+/// length of 0 — codecs reach this only through diagnostic
+/// paths the sandbox never surfaces.
+fn stub_strftime(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("strftime", t))?;
+    if dest != 0 {
+        mmu.store8(dest, 0).map_err(|t| trap("strftime", t))?;
+    }
+    Ok(0)
+}
+
+/// Skip leading ASCII whitespace, returning the new offset.
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// `unsigned long strtoul(const char *nptr, char **endptr,
+/// int base)`. Supports base 0 (auto-detect `0x` / `0`) and any
+/// explicit base 2..=36. Writes the parse-end pointer through
+/// `endptr` when non-NULL.
+fn stub_strtoul(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let nptr = arg_dword(cpu, mmu, 0).map_err(|t| trap("strtoul", t))?;
+    let endptr = arg_dword(cpu, mmu, 1).map_err(|t| trap("strtoul", t))?;
+    let mut base = arg_dword(cpu, mmu, 2).map_err(|t| trap("strtoul", t))?;
+    let bytes = read_c(mmu, nptr, "strtoul")?;
+    let mut i = skip_ws(&bytes, 0);
+    let mut negate = false;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        negate = bytes[i] == b'-';
+        i += 1;
+    }
+    // Base 0 / 16 prefix handling.
+    if (base == 0 || base == 16)
+        && i + 1 < bytes.len()
+        && bytes[i] == b'0'
+        && (bytes[i + 1] | 0x20) == b'x'
+    {
+        i += 2;
+        base = 16;
+    } else if base == 0 && i < bytes.len() && bytes[i] == b'0' {
+        base = 8;
+    } else if base == 0 {
+        base = 10;
+    }
+    let mut value: u32 = 0;
+    while i < bytes.len() {
+        let d = match bytes[i] {
+            c @ b'0'..=b'9' => u32::from(c - b'0'),
+            c @ b'a'..=b'z' => u32::from(c - b'a') + 10,
+            c @ b'A'..=b'Z' => u32::from(c - b'A') + 10,
+            _ => break,
+        };
+        if d >= base {
+            break;
+        }
+        value = value.wrapping_mul(base).wrapping_add(d);
+        i += 1;
+    }
+    if endptr != 0 {
+        mmu.store32(endptr, nptr.wrapping_add(i as u32))
+            .map_err(|t| trap("strtoul", t))?;
+    }
+    Ok(if negate { value.wrapping_neg() } else { value })
+}
+
+/// `int atoi(const char *nptr)`.
+fn stub_atoi(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let nptr = arg_dword(cpu, mmu, 0).map_err(|t| trap("atoi", t))?;
+    let bytes = read_c(mmu, nptr, "atoi")?;
+    let mut i = skip_ws(&bytes, 0);
+    let mut negate = false;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        negate = bytes[i] == b'-';
+        i += 1;
+    }
+    let mut value: i32 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        value = value
+            .wrapping_mul(10)
+            .wrapping_add(i32::from(bytes[i] - b'0'));
+        i += 1;
+    }
+    Ok((if negate { -value } else { value }) as u32)
+}
+
+/// Read a NUL-terminated wide (UTF-16) string from guest memory.
+fn read_w(mmu: &Mmu, base: u32, stub: &'static str) -> Result<Vec<u16>, Win32Error> {
+    let mut out = Vec::new();
+    if base == 0 {
+        return Ok(out);
+    }
+    for i in 0..STR_SCAN_CAP {
+        let c = mmu
+            .load16(base.wrapping_add(i * 2))
+            .map_err(|t| trap(stub, t))?;
+        if c == 0 {
+            break;
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
+/// `size_t wcslen(const wchar_t *s)`.
+fn stub_wcslen(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s = arg_dword(cpu, mmu, 0).map_err(|t| trap("wcslen", t))?;
+    Ok(read_w(mmu, s, "wcslen")?.len() as u32)
+}
+
+/// `int wcscoll(const wchar_t *s1, const wchar_t *s2)` — ordinal
+/// wide compare.
+fn stub_wcscoll(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("wcscoll", t))?;
+    let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("wcscoll", t))?;
+    let a = read_w(mmu, s1, "wcscoll")?;
+    let b = read_w(mmu, s2, "wcscoll")?;
+    Ok(match a.cmp(&b) {
+        std::cmp::Ordering::Less => (-1i32) as u32,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    })
+}
+
+/// `size_t wcsxfrm(wchar_t *dest, const wchar_t *src, size_t n)`.
+/// Identity transform in the "C" locale — a length-bounded wide
+/// copy returning `wcslen(src)`.
+fn stub_wcsxfrm(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("wcsxfrm", t))?;
+    let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("wcsxfrm", t))?;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("wcsxfrm", t))?;
+    let chars = read_w(mmu, src, "wcsxfrm")?;
+    let src_len = chars.len() as u32;
+    if dest != 0 && n > 0 {
+        let take = (n as usize - 1).min(chars.len());
+        for (i, c) in chars[..take].iter().enumerate() {
+            mmu.store16(dest.wrapping_add(i as u32 * 2), *c)
+                .map_err(|t| trap("wcsxfrm", t))?;
+        }
+        mmu.store16(dest.wrapping_add(take as u32 * 2), 0)
+            .map_err(|t| trap("wcsxfrm", t))?;
+    }
+    Ok(src_len)
+}
+
+/// `size_t wcsftime(wchar_t *dest, size_t maxsize,
+/// const wchar_t *fmt, const struct tm *tm)`. Writes an empty
+/// wide string, reports length 0.
+fn stub_wcsftime(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("wcsftime", t))?;
+    if dest != 0 {
+        mmu.store16(dest, 0).map_err(|t| trap("wcsftime", t))?;
+    }
+    Ok(0)
+}
+
+/// `int fputc(int c, FILE *stream)`. Output discarded; returns
+/// `c` (the success contract).
+fn stub_fputc(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    arg_dword(cpu, mmu, 0).map_err(|t| trap("fputc", t))
+}
+
+/// `size_t fwrite(const void *ptr, size_t size, size_t count,
+/// FILE *stream)`. Output discarded; reports all `count`
+/// elements written.
+fn stub_fwrite(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    arg_dword(cpu, mmu, 2).map_err(|t| trap("fwrite", t))
+}
+
+/// `void *calloc(size_t num, size_t size)`. Zero-initialised
+/// heap allocation.
+fn stub_calloc(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let num = arg_dword(cpu, mmu, 0).map_err(|t| trap("calloc", t))?;
+    let size = arg_dword(cpu, mmu, 1).map_err(|t| trap("calloc", t))?;
+    let total = match num.checked_mul(size) {
+        Some(0) | None => return Ok(0),
+        Some(t) => t,
+    };
+    let addr = state.arena_alloc(total)?;
+    mmu.write_initializer(addr, &vec![0u8; total as usize])
+        .map_err(|t| trap("calloc", t))?;
+    Ok(addr)
+}
+
+/// `void *realloc(void *ptr, size_t size)`. Allocates a fresh
+/// block and copies the old contents across. The bump arena
+/// never reclaims `ptr`, so the old block simply leaks — fine
+/// for a bounded analysis run.
+fn stub_realloc(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let ptr = arg_dword(cpu, mmu, 0).map_err(|t| trap("realloc", t))?;
+    let size = arg_dword(cpu, mmu, 1).map_err(|t| trap("realloc", t))?;
+    if size == 0 {
+        let _ = state.heap.remove(&ptr);
+        return Ok(0);
+    }
+    let addr = state.arena_alloc(size)?;
+    mmu.write_initializer(addr, &vec![0u8; size as usize])
+        .map_err(|t| trap("realloc", t))?;
+    // Copy the old contents byte-by-byte, stopping at the first
+    // unreadable address — the old block's true size is not
+    // tracked, so this naturally bounds the copy to whatever is
+    // mapped.
+    if ptr != 0 {
+        for i in 0..size {
+            match mmu.load8(ptr.wrapping_add(i)) {
+                Ok(b) => mmu
+                    .store8(addr.wrapping_add(i), b)
+                    .map_err(|t| trap("realloc", t))?,
+                Err(_) => break,
+            }
+        }
+    }
+    Ok(addr)
+}
+
+/// `struct lconv *localeconv(void)`. Builds a minimal `lconv`
+/// in guest memory: `decimal_point` points at `"."`, every
+/// other string field at `""`, and the numeric `char` fields
+/// are `CHAR_MAX` ("value not available", per the C standard).
+/// The real CRT never returns NULL here, so neither do we.
+fn stub_localeconv(
+    _cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    // Layout (32-bit msvcrt): 10 char* (offsets 0..40) followed
+    // by 8 signed-char fields (offsets 40..48). We append the
+    // backing strings after the struct in the same block.
+    const STRUCT_LEN: u32 = 48;
+    const DOT_OFF: u32 = 48; // "." NUL
+    const EMPTY_OFF: u32 = 50; // "" (a lone NUL)
+    let block = state.arena_alloc(STRUCT_LEN + 3)?;
+    let mut buf = vec![0u8; (STRUCT_LEN + 3) as usize];
+    // decimal_point -> ".", the other nine pointers -> "".
+    let dot = block + DOT_OFF;
+    let empty = block + EMPTY_OFF;
+    buf[0..4].copy_from_slice(&dot.to_le_bytes());
+    for slot in 1..10 {
+        let off = slot * 4;
+        buf[off..off + 4].copy_from_slice(&empty.to_le_bytes());
+    }
+    // The eight numeric fields: CHAR_MAX = 0x7F.
+    for b in buf.iter_mut().take(STRUCT_LEN as usize).skip(40) {
+        *b = 0x7F;
+    }
+    buf[DOT_OFF as usize] = b'.';
+    // DOT_OFF+1 and EMPTY_OFF already zero.
+    mmu.write_initializer(block, &buf)
+        .map_err(|t| trap("localeconv", t))?;
+    Ok(block)
+}
+
+/// `char *setlocale(int category, const char *locale)`. Echoes
+/// the requested locale back (a non-NULL "success" result); a
+/// NULL query returns a pointer to the canonical `"C"` locale.
+fn stub_setlocale(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _category = arg_dword(cpu, mmu, 0).map_err(|t| trap("setlocale", t))?;
+    let locale = arg_dword(cpu, mmu, 1).map_err(|t| trap("setlocale", t))?;
+    if locale != 0 {
+        return Ok(locale);
+    }
+    let addr = state.arena_alloc(2)?;
+    mmu.write_initializer(addr, b"C\0")
+        .map_err(|t| trap("setlocale", t))?;
+    Ok(addr)
+}
+
 mod tests {
     use super::*;
     #[allow(unused_imports)]

@@ -729,12 +729,7 @@ pub fn register(registry: &mut Registry) {
         1,
     );
     // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-resetevent
-    registry.register(
-        "kernel32.dll",
-        "ResetEvent",
-        stub_reset_event as StubFn,
-        1,
-    );
+    registry.register("kernel32.dll", "ResetEvent", stub_reset_event as StubFn, 1);
     // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects
     registry.register(
         "kernel32.dll",
@@ -861,11 +856,214 @@ pub fn register(registry: &mut Registry) {
         stub_load_library_w as StubFn,
         1,
     );
+    registry.register("kernel32.dll", "ReadFile", stub_read_file as StubFn, 5);
+
+    // ---- Codec-corpus probe additions --------------------------
+    //
+    // The 30 stubs below close the kernel32 import gap for the
+    // VfW codecs whose `ICOpen` probe was previously blocked by
+    // unresolved imports: Cinepak (`iccvid`), Indeo Audio
+    // (`IAC25`), HuffYUV, Lagarith, MagicYUV. Most are pulled in
+    // by CRT startup or the codec's config-dialog path — not the
+    // decode core — so they are fail-soft by design.
+
+    // lstrcat / lstrcpy / lstrcmpi — kernel32's string helpers.
+    registry.register("kernel32.dll", "lstrcatA", stub_lstrcat_a as StubFn, 2);
+    registry.register("kernel32.dll", "lstrcpyA", stub_lstrcpy_a as StubFn, 2);
+    registry.register("kernel32.dll", "lstrcmpiA", stub_lstrcmpi_a as StubFn, 2);
+    // CompareString — locale-aware string compare (CRT collate).
     registry.register(
         "kernel32.dll",
-        "ReadFile",
-        stub_read_file as StubFn,
+        "CompareStringA",
+        stub_compare_string_a as StubFn,
+        6,
+    );
+    registry.register(
+        "kernel32.dll",
+        "CompareStringW",
+        stub_compare_string_w as StubFn,
+        6,
+    );
+    // FatalAppExitA — CRT abort path; no-op (never hit on the
+    // happy path, just needs to resolve).
+    registry.register(
+        "kernel32.dll",
+        "FatalAppExitA",
+        stub_fatal_app_exit_a as StubFn,
+        2,
+    );
+    // GetSystemTime / GetTimeZoneInformation — wall-clock surface.
+    registry.register(
+        "kernel32.dll",
+        "GetSystemTime",
+        stub_get_system_time as StubFn,
+        1,
+    );
+    registry.register(
+        "kernel32.dll",
+        "GetTimeZoneInformation",
+        stub_get_time_zone_information as StubFn,
+        1,
+    );
+    // LoadLibraryExA — like LoadLibraryA, ignores the flags.
+    registry.register(
+        "kernel32.dll",
+        "LoadLibraryExA",
+        stub_load_library_ex_a as StubFn,
+        3,
+    );
+    // SetEnvironmentVariableA — no-op success.
+    registry.register(
+        "kernel32.dll",
+        "SetEnvironmentVariableA",
+        stub_returns_true as StubFn,
+        2,
+    );
+    // Console surface — codecs that link a console-subsystem
+    // config tool. All no-op success.
+    registry.register(
+        "kernel32.dll",
+        "AllocConsole",
+        stub_returns_true as StubFn,
+        0,
+    );
+    registry.register(
+        "kernel32.dll",
+        "SetConsoleScreenBufferSize",
+        stub_returns_true as StubFn,
+        2,
+    );
+    registry.register(
+        "kernel32.dll",
+        "SetConsoleCtrlHandler",
+        stub_returns_true as StubFn,
+        2,
+    );
+    registry.register(
+        "kernel32.dll",
+        "WriteConsoleA",
+        stub_write_console_a as StubFn,
         5,
+    );
+    // EncodePointer / DecodePointer — pointer obfuscation. We
+    // model them as the identity transform, which is a valid
+    // (no-op) implementation: encode then decode round-trips.
+    registry.register(
+        "kernel32.dll",
+        "EncodePointer",
+        stub_identity_pointer as StubFn,
+        1,
+    );
+    registry.register(
+        "kernel32.dll",
+        "DecodePointer",
+        stub_identity_pointer as StubFn,
+        1,
+    );
+    // EnumSystemLocalesA — report success without invoking the
+    // callback (the CRT only needs the call to not fail).
+    registry.register(
+        "kernel32.dll",
+        "EnumSystemLocalesA",
+        stub_returns_true as StubFn,
+        2,
+    );
+    // GetModuleFileNameW / GetStartupInfoW — wide twins of the
+    // existing ANSI stubs.
+    registry.register(
+        "kernel32.dll",
+        "GetModuleFileNameW",
+        stub_get_module_file_name_w as StubFn,
+        3,
+    );
+    registry.register(
+        "kernel32.dll",
+        "GetStartupInfoW",
+        stub_get_startup_info_w as StubFn,
+        1,
+    );
+    // GetUserDefaultLCID — en-US.
+    registry.register(
+        "kernel32.dll",
+        "GetUserDefaultLCID",
+        stub_get_user_default_lcid as StubFn,
+        0,
+    );
+    // HeapQueryInformation — report "not supported" (return 0);
+    // the caller treats the heap as a plain heap.
+    registry.register(
+        "kernel32.dll",
+        "HeapQueryInformation",
+        stub_returns_zero as StubFn,
+        5,
+    );
+    // IsProcessorFeaturePresent — report every feature ABSENT
+    // (return 0). That steers SIMD-dispatching codecs onto their
+    // scalar fallback, which the emulator decodes reliably.
+    registry.register(
+        "kernel32.dll",
+        "IsProcessorFeaturePresent",
+        stub_returns_zero as StubFn,
+        1,
+    );
+    // IsValidCodePage / IsValidLocale — accept anything.
+    registry.register(
+        "kernel32.dll",
+        "IsValidCodePage",
+        stub_returns_true as StubFn,
+        1,
+    );
+    registry.register(
+        "kernel32.dll",
+        "IsValidLocale",
+        stub_returns_true as StubFn,
+        2,
+    );
+    // WaitForMultipleObjectsEx — like WaitForMultipleObjects,
+    // ignoring the extra `bAlertable` arg.
+    registry.register(
+        "kernel32.dll",
+        "WaitForMultipleObjectsEx",
+        stub_wait_for_multiple_objects as StubFn,
+        5,
+    );
+    // FreeLibraryAndExitThread — thread-teardown path; no-op.
+    registry.register(
+        "kernel32.dll",
+        "FreeLibraryAndExitThread",
+        stub_returns_zero as StubFn,
+        2,
+    );
+    // GetLongPathNameA — no long/short distinction in the
+    // sandbox: echo the input path back.
+    registry.register(
+        "kernel32.dll",
+        "GetLongPathNameA",
+        stub_get_long_path_name_a as StubFn,
+        3,
+    );
+    // GetModuleHandleExA — resolve like GetModuleHandleA and
+    // write the handle through the out-pointer.
+    registry.register(
+        "kernel32.dll",
+        "GetModuleHandleExA",
+        stub_get_module_handle_ex_a as StubFn,
+        3,
+    );
+    // IsDBCSLeadByteEx — single-byte code page: no lead bytes.
+    registry.register(
+        "kernel32.dll",
+        "IsDBCSLeadByteEx",
+        stub_returns_zero as StubFn,
+        2,
+    );
+    // VirtualQuery — report "query failed" (return 0); codecs
+    // use it for an optional guard-page probe.
+    registry.register(
+        "kernel32.dll",
+        "VirtualQuery",
+        stub_returns_zero as StubFn,
+        3,
     );
 }
 
@@ -3078,8 +3276,7 @@ fn stub_wait_for_multiple_objects(
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _ncount =
-        arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
+    let _ncount = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
     let _phandles =
         arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
     let _waitall =
@@ -3169,8 +3366,7 @@ fn stub_get_private_profile_int_a(
 ) -> Result<u32, Win32Error> {
     let _app = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
     let _key = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
-    let default =
-        arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
+    let default = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
     let _file = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
     Ok(default)
 }
@@ -3298,10 +3494,8 @@ fn stub_interlocked_exchange_add(
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let addend =
-        arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
-    let value =
-        arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
+    let addend = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
+    let value = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
     let prev = mmu
         .load32(addend)
         .map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
@@ -3426,6 +3620,409 @@ fn stub_read_file(
     if out != 0 {
         mmu.store32(out, 0)
             .map_err(|t| trap_to_win32("ReadFile", t))?;
+    }
+    Ok(1)
+}
+
+// ============================================================
+// Codec-corpus probe stubs
+// ============================================================
+
+/// Generic fail-soft stub: returns 0 (FALSE / NULL / "no").
+fn stub_returns_zero(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// Generic success stub: returns 1 (TRUE).
+fn stub_returns_true(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// Bound for the in-stub C-string scan loops below.
+const CSTR_SCAN_CAP: u32 = 0x1_0000;
+
+/// `LPSTR lstrcatA(LPSTR lpString1, LPCSTR lpString2)`. Appends
+/// `lpString2` onto the NUL-terminated `lpString1`. Returns
+/// `lpString1`.
+fn stub_lstrcat_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dst = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("lstrcatA", t))?;
+    let src = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("lstrcatA", t))?;
+    if dst == 0 {
+        return Ok(0);
+    }
+    let mut end = dst;
+    let mut scanned = 0u32;
+    while scanned < CSTR_SCAN_CAP && mmu.load8(end).map_err(|t| trap_to_win32("lstrcatA", t))? != 0
+    {
+        end = end.wrapping_add(1);
+        scanned += 1;
+    }
+    if src != 0 {
+        let mut i = 0u32;
+        loop {
+            let b = mmu
+                .load8(src.wrapping_add(i))
+                .map_err(|t| trap_to_win32("lstrcatA", t))?;
+            mmu.store8(end.wrapping_add(i), b)
+                .map_err(|t| trap_to_win32("lstrcatA", t))?;
+            if b == 0 || i >= CSTR_SCAN_CAP {
+                break;
+            }
+            i += 1;
+        }
+    } else {
+        mmu.store8(end, 0)
+            .map_err(|t| trap_to_win32("lstrcatA", t))?;
+    }
+    Ok(dst)
+}
+
+/// `LPSTR lstrcpyA(LPSTR lpString1, LPCSTR lpString2)`. Copies
+/// `lpString2` (incl. NUL) into `lpString1`. Returns
+/// `lpString1`.
+fn stub_lstrcpy_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let dst = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("lstrcpyA", t))?;
+    let src = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("lstrcpyA", t))?;
+    if dst == 0 {
+        return Ok(0);
+    }
+    if src == 0 {
+        mmu.store8(dst, 0)
+            .map_err(|t| trap_to_win32("lstrcpyA", t))?;
+        return Ok(dst);
+    }
+    let mut i = 0u32;
+    loop {
+        let b = mmu
+            .load8(src.wrapping_add(i))
+            .map_err(|t| trap_to_win32("lstrcpyA", t))?;
+        mmu.store8(dst.wrapping_add(i), b)
+            .map_err(|t| trap_to_win32("lstrcpyA", t))?;
+        if b == 0 || i >= CSTR_SCAN_CAP {
+            break;
+        }
+        i += 1;
+    }
+    Ok(dst)
+}
+
+/// Read a NUL-terminated ASCII string, lower-cased, for the
+/// case-insensitive comparisons below.
+fn read_cstr_lower(mmu: &Mmu, base: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    if base == 0 {
+        return out;
+    }
+    for i in 0..CSTR_SCAN_CAP {
+        match mmu.load8(base.wrapping_add(i)) {
+            Ok(0) | Err(_) => break,
+            Ok(b) => out.push(b.to_ascii_lowercase()),
+        }
+    }
+    out
+}
+
+/// `int lstrcmpiA(LPCSTR lpString1, LPCSTR lpString2)`. Case-
+/// insensitive ordinal compare; returns a negative / zero /
+/// positive value like the C `strcmp` family.
+fn stub_lstrcmpi_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("lstrcmpiA", t))?;
+    let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("lstrcmpiA", t))?;
+    let a = read_cstr_lower(mmu, s1);
+    let b = read_cstr_lower(mmu, s2);
+    Ok(match a.cmp(&b) {
+        std::cmp::Ordering::Less => (-1i32) as u32,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    })
+}
+
+// CompareString return values — `winnls.h`.
+const CSTR_LESS_THAN: u32 = 1;
+const CSTR_EQUAL: u32 = 2;
+const CSTR_GREATER_THAN: u32 = 3;
+
+fn cmp_to_cstr(ord: std::cmp::Ordering) -> u32 {
+    match ord {
+        std::cmp::Ordering::Less => CSTR_LESS_THAN,
+        std::cmp::Ordering::Equal => CSTR_EQUAL,
+        std::cmp::Ordering::Greater => CSTR_GREATER_THAN,
+    }
+}
+
+/// `int CompareStringA(LCID, DWORD dwCmpFlags, LPCSTR lpString1,
+/// int cchCount1, LPCSTR lpString2, int cchCount2)`. Ordinal
+/// compare of the two NUL-terminated strings (explicit lengths
+/// ignored — the CRT collate path passes `-1`). Returns
+/// `CSTR_LESS_THAN` / `CSTR_EQUAL` / `CSTR_GREATER_THAN`.
+fn stub_compare_string_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s1 = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CompareStringA", t))?;
+    let s2 = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CompareStringA", t))?;
+    let a = read_cstr_lower(mmu, s1);
+    let b = read_cstr_lower(mmu, s2);
+    Ok(cmp_to_cstr(a.cmp(&b)))
+}
+
+/// `int CompareStringW(...)`. Wide twin of [`stub_compare_string_a`].
+fn stub_compare_string_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s1 = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CompareStringW", t))?;
+    let s2 = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CompareStringW", t))?;
+    let read_w = |base: u32| -> Vec<u16> {
+        let mut out = Vec::new();
+        if base == 0 {
+            return out;
+        }
+        for i in 0..CSTR_SCAN_CAP {
+            match mmu.load16(base.wrapping_add(i * 2)) {
+                Ok(0) | Err(_) => break,
+                Ok(c) => out.push(c),
+            }
+        }
+        out
+    };
+    let a = read_w(s1);
+    let b = read_w(s2);
+    Ok(cmp_to_cstr(a.cmp(&b)))
+}
+
+/// `void FatalAppExitA(UINT uAction, LPCSTR lpMessageText)`.
+/// The CRT links this for its abort path; the sandbox never
+/// reaches it on a healthy decode. No-op.
+fn stub_fatal_app_exit_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `void GetSystemTime(LPSYSTEMTIME lpSystemTime)`. Fills the
+/// 16-byte `SYSTEMTIME` with a fixed 2024-01-01T00:00:00 stamp.
+fn stub_get_system_time(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetSystemTime", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    // wYear, wMonth, wDayOfWeek, wDay, wHour, wMinute, wSecond,
+    // wMilliseconds — 2024-01-01 was a Monday (wDayOfWeek = 1).
+    let fields: [u16; 8] = [2024, 1, 1, 1, 0, 0, 0, 0];
+    for (i, v) in fields.iter().enumerate() {
+        mmu.store16(p.wrapping_add(i as u32 * 2), *v)
+            .map_err(|t| trap_to_win32("GetSystemTime", t))?;
+    }
+    Ok(0)
+}
+
+/// `DWORD GetTimeZoneInformation(LPTIME_ZONE_INFORMATION lpTzi)`.
+/// Zeroes the 172-byte struct and reports `TIME_ZONE_ID_UNKNOWN`
+/// (0) — the sandbox runs in a fixed, DST-free UTC.
+fn stub_get_time_zone_information(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetTimeZoneInformation", t))?;
+    if p != 0 {
+        mmu.write(p, &[0u8; 172])
+            .map_err(|t| trap_to_win32("GetTimeZoneInformation", t))?;
+    }
+    Ok(0)
+}
+
+/// `HMODULE LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile,
+/// DWORD dwFlags)`. Resolves like `LoadLibraryA`, ignoring the
+/// flags — a loaded module returns its image base, otherwise 0.
+fn stub_load_library_ex_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadLibraryExA", t))?;
+    let name = read_cstr(mmu, p, 260)?.to_ascii_lowercase();
+    Ok(state.modules.get(&name).copied().unwrap_or(0))
+}
+
+/// `BOOL WriteConsoleA(HANDLE, const VOID*, DWORD nNumberOfChars,
+/// LPDWORD lpNumberOfCharsWritten, LPVOID lpReserved)`. Discards
+/// the output, reports all characters written.
+fn stub_write_console_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WriteConsoleA", t))?;
+    let written = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WriteConsoleA", t))?;
+    if written != 0 {
+        mmu.store32(written, n)
+            .map_err(|t| trap_to_win32("WriteConsoleA", t))?;
+    }
+    Ok(1)
+}
+
+/// `PVOID EncodePointer/DecodePointer(PVOID Ptr)`. Modelled as
+/// the identity transform — a valid no-op implementation, since
+/// `Decode(Encode(p)) == p` holds trivially.
+fn stub_identity_pointer(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("EncodePointer/DecodePointer", t))
+}
+
+/// `DWORD GetModuleFileNameW(HMODULE, LPWSTR lpFilename,
+/// DWORD nSize)`. Wide twin of `GetModuleFileNameA` — writes
+/// `"oxideav-vfw"` as UTF-16, returns the character count.
+fn stub_get_module_file_name_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetModuleFileNameW", t))?;
+    let dst = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetModuleFileNameW", t))?;
+    let n_size = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetModuleFileNameW", t))?;
+    if dst == 0 || n_size == 0 {
+        return Ok(0);
+    }
+    let s = "oxideav-vfw";
+    let mut written = 0u32;
+    for (i, c) in s.chars().enumerate() {
+        if (i as u32) >= n_size.saturating_sub(1) {
+            break;
+        }
+        mmu.store16(dst + i as u32 * 2, c as u16)
+            .map_err(|t| trap_to_win32("GetModuleFileNameW", t))?;
+        written += 1;
+    }
+    let nul_off = written.min(n_size - 1);
+    mmu.store16(dst + nul_off * 2, 0)
+        .map_err(|t| trap_to_win32("GetModuleFileNameW", t))?;
+    Ok(written)
+}
+
+/// `void GetStartupInfoW(LPSTARTUPINFOW lpStartupInfo)`. Wide
+/// twin of `GetStartupInfoA` — `STARTUPINFOW` is also 68 bytes
+/// on 32-bit; zero it and stamp `cb`.
+fn stub_get_startup_info_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetStartupInfoW", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    mmu.write(p, &[0u8; 68])
+        .map_err(|t| trap_to_win32("GetStartupInfoW", t))?;
+    mmu.store32(p, 68)
+        .map_err(|t| trap_to_win32("GetStartupInfoW", t))?;
+    Ok(0)
+}
+
+/// `LCID GetUserDefaultLCID(void)`. Reports `en-US` (0x0409).
+fn stub_get_user_default_lcid(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0x0409)
+}
+
+/// `DWORD GetLongPathNameA(LPCSTR lpszShortPath,
+/// LPSTR lpszLongPath, DWORD cchBuffer)`. The sandbox draws no
+/// short/long distinction — echo the input path back and report
+/// its length.
+fn stub_get_long_path_name_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let short = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetLongPathNameA", t))?;
+    let long = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetLongPathNameA", t))?;
+    let cch = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetLongPathNameA", t))?;
+    let path = read_cstr(mmu, short, CSTR_SCAN_CAP)?;
+    let len = path.len() as u32;
+    // MSDN: when the buffer is too small (or NULL) the return
+    // value is the required size, including the terminating NUL.
+    if long == 0 || cch < len + 1 {
+        return Ok(len + 1);
+    }
+    let mut bytes = path.into_bytes();
+    bytes.push(0);
+    mmu.write(long, &bytes)
+        .map_err(|t| trap_to_win32("GetLongPathNameA", t))?;
+    Ok(len)
+}
+
+/// `BOOL GetModuleHandleExA(DWORD dwFlags, LPCSTR lpModuleName,
+/// HMODULE *phModule)`. Resolves like `GetModuleHandleA` and
+/// writes the handle through `phModule`. Returns TRUE.
+fn stub_get_module_handle_ex_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let name_p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetModuleHandleExA", t))?;
+    let out = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetModuleHandleExA", t))?;
+    let handle = if name_p == 0 {
+        state.primary_module_base
+    } else {
+        let name = read_cstr(mmu, name_p, 260)?.to_ascii_lowercase();
+        state.modules.get(&name).copied().unwrap_or(0)
+    };
+    if out != 0 {
+        mmu.store32(out, handle)
+            .map_err(|t| trap_to_win32("GetModuleHandleExA", t))?;
     }
     Ok(1)
 }
