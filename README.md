@@ -180,11 +180,8 @@ Rust. Reasoning, briefly:
 │   └── round-trip-contract.md  # what "identical bytes" means precisely
 └── crates/
     ├── ud-core/                # shared types: VAddr, Result, byte helpers
-    ├── ud-format-elf/          # ELF64 reader + writer (byte-identical)
-    ├── ud-format-pe/           # PE/COFF reader + writer (byte-identical)
-    ├── ud-format-macho/        # thin 64-bit Mach-O reader + writer
-    ├── ud-format-raw/          # raw / flat-image fixtures (6502)
-    ├── ud-arch-x86/            # x86 decode + lift + Intel formatter + call-site analyzer
+    ├── ud-format/              # ELF64 + PE/COFF + thin Mach-O + raw readers + writers (byte-identical)
+    ├── ud-arch-x86/            # x86 decode + lift + Intel formatter + assembler
     ├── ud-arch-aarch64/        # AArch64 decode + lift
     ├── ud-arch-6502/           # 6502 decode + lift + assembler
     ├── ud-ir/                  # Function, BasicBlock, Terminator (generic over arch)
@@ -192,8 +189,8 @@ Rust. Reasoning, briefly:
     ├── ud-signatures/          # byte-pattern DB (CRT helpers)
     ├── ud-debug/               # DWARF reader → typed signatures
     ├── ud-ast/                 # .ud AST + canonical pretty-printer
-    ├── ud-compile/             # .ud parser + lower_to_{elf,pe,macho,raw}
-    ├── ud-decompile/           # binary → AST pipeline (all formats)
+    ├── ud-translate/           # .ud → binary lowering + binary → .ud decompile (all formats)
+    ├── ud-emulator/            # 32-bit i386 sandbox: MMU, CPU, PE loader, Win32 stubs, VfW IC*
     ├── ud-cli/                 # the `ud` binary
     └── ud-wasm/                # wasm-bindgen bindings for the browser playground
 ```
@@ -216,6 +213,42 @@ cargo run --bin ud -- roundtrip --through-source path/to/binary
 # Verify an .ud file's @asm lines decode to canonical Intel-syntax form
 cargo run --bin ud -- verify path/to/file.ud
 ```
+
+## Library use: drive a guest like a foreign library
+
+`ud-emulator` ships an FFI-shaped front end over the underlying sandbox. A Rust consumer can drive a Windows DLL the same way they would `dlopen` a shared library — useful for codec analysis, malware triage, and any "load this 32-bit Win32 binary safely and tell me what it does" workflow. All in safe Rust; no `unsafe`, no host filesystem, network, or registry access from the guest unless an emulation [`Context`] explicitly attaches a virtual one.
+
+```rust
+use ud_emulator::Guest;
+
+let bytes = std::fs::read("codec.dll")?;
+let mut guest = Guest::load("codec.dll", &bytes)?;       // dlopen-shaped: also runs DllMain
+
+// Call an exported function like an extern fn — typed in, typed out.
+let version: u32 = guest.call("GetCodecVersion", ())?;
+
+// Marshal a buffer into guest memory, pass the pointer, read it back.
+let payload = vec![0u8; 4096];
+let ptr = guest.alloc(&payload)?;
+let rc: i32 = guest.call("Decompress", (ptr, payload.len() as u32))?;
+let decoded = guest.read(ptr, payload.len())?;
+```
+
+| FFI concept | `Guest` API |
+|---|---|
+| `dlopen` / `LoadLibrary` | `Guest::load(name, bytes)` |
+| calling an `extern fn` | `guest.call("Export", (a, b, c))` |
+| typed arguments | tuples (`()`–8-arity) of `u32` / `i32` / `u16` / `u8` / `bool` |
+| typed return | `R: FromRet` — `u32` / `i32` / `bool` / `()`, inferred |
+| `*const T` | `guest.alloc(&bytes)` → guest pointer |
+| `*const c_char` | `guest.alloc_cstr("…")` |
+| reading an out-param | `guest.read(ptr, len)` after the call |
+
+The default call convention is **stdcall** (the Win32 norm — args pushed right-to-left, callee cleans the stack). cdecl exports work too: the run-loop unwinds to a synthetic return sentinel, so who-cleans-the-stack doesn't change the observed return. The underlying `Sandbox` stays reachable via `guest.sandbox()` / `sandbox_mut()` for coverage maps, the `Context` VFS/registry, and the VfW `IC*` helpers (`ic_open`, `ic_decompress_*`, `ic_compress_*`).
+
+Pre-built variants for less-common cases: `Guest::load_raw` skips `DllMain` (useful when you want to instrument the module before any guest code runs); `Guest::load_into` / `load_raw_into` accept a caller-provided `Sandbox` so you can attach a `Context`, set an instruction budget, or seed coverage tracking before loading.
+
+See `cargo doc -p ud-emulator --open` for the full API.
 
 ## How to read this repo
 
