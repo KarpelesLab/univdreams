@@ -1932,7 +1932,27 @@ fn page_protect_to_perm(flprot: u32) -> Perm {
         PAGE_READWRITE => Perm::R | Perm::W,
         PAGE_EXECUTE_READ => Perm::R | Perm::X,
         PAGE_EXECUTE_READWRITE => Perm::R | Perm::W | Perm::X,
+        PAGE_EXECUTE => Perm::R | Perm::X,
         _ => Perm::R | Perm::W,
+    }
+}
+
+/// Inverse of [`page_protect_to_perm`] for the `lpflOldProtect`
+/// out-parameter of `VirtualProtect`.
+fn perm_to_page_protect(perm: Perm) -> u32 {
+    let r = perm.contains(Perm::R);
+    let w = perm.contains(Perm::W);
+    let x = perm.contains(Perm::X);
+    match (r, w, x) {
+        (false, false, false) => PAGE_NOACCESS,
+        (true, false, false) => PAGE_READONLY,
+        (true, true, false) => PAGE_READWRITE,
+        (true, false, true) => PAGE_EXECUTE_READ,
+        (true, true, true) => PAGE_EXECUTE_READWRITE,
+        // No-read combos are rare under Win32 protection
+        // taxonomy; report the closest match.
+        (false, _, true) => PAGE_EXECUTE,
+        (false, true, false) => PAGE_READWRITE,
     }
 }
 
@@ -3462,26 +3482,38 @@ fn stub_is_debugger_present(
 }
 
 /// `BOOL VirtualProtect(LPVOID lpAddress, SIZE_T dwSize,
-/// DWORD flNewProtect, PDWORD lpflOldProtect)`. We don't
-/// model per-page protection swaps — every page in our MMU
-/// is R+W+X-as-needed once mapped. Just write a plausible old
-/// protection into the out-param and return success.
+/// DWORD flNewProtect, PDWORD lpflOldProtect)`. Actually
+/// updates the MMU permissions for every page in
+/// `[lpAddress, lpAddress + dwSize)`. The bytes are preserved
+/// — `Mmu::map` rewrites the perm slot without touching page
+/// contents. Required by codecs (e.g. `wmvdecod.dll`) that
+/// self-patch a thunk inside their own `.text` section during
+/// `DllMain` by flipping it RW, writing, then flipping it
+/// back. `lpflOldProtect` receives the prior protection of the
+/// first page in the range — sufficient for the
+/// flip-write-flip pattern.
 fn stub_virtual_protect(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("VirtualProtect", t))?;
-    let _size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("VirtualProtect", t))?;
-    let _new = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("VirtualProtect", t))?;
+    let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("VirtualProtect", t))?;
+    let size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("VirtualProtect", t))?;
+    let new = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("VirtualProtect", t))?;
     let out = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("VirtualProtect", t))?;
+    // MSDN: all pages in the range must already be committed;
+    // return FALSE if any unmapped page is hit.
+    if size == 0 || !mmu.is_mapped(addr) {
+        return Ok(0);
+    }
+    let old_perm = mmu.perm_at(addr).unwrap_or(Perm::from_bits(0));
     if out != 0 {
-        // 0x40 = PAGE_EXECUTE_READWRITE — the most permissive
-        // value, indicates the page was fully accessible.
-        mmu.store32(out, 0x40)
+        mmu.store32(out, perm_to_page_protect(old_perm))
             .map_err(|t| trap_to_win32("VirtualProtect", t))?;
     }
+    let new_perm = page_protect_to_perm(new);
+    mmu.map(addr, size, new_perm);
     Ok(1)
 }
 
@@ -4396,5 +4428,86 @@ mod tests {
         .unwrap();
         // Should land on the data-entry VA.
         assert_eq!(cpu.regs.get32(Reg32::Eax), rsrc_base + 0x60);
+    }
+
+    /// `VirtualProtect` must actually update the MMU page
+    /// permissions. The previous version only returned success
+    /// + a canned old-protection value, which caused
+    /// `wmvdecod.dll` / `wmvsdecd.dll` / CamStudio's DllMain to
+    /// fault on a self-patch into `.text` — they call
+    /// `VirtualProtect(.text, _, PAGE_READWRITE)`, write a
+    /// thunk, then flip back.
+    #[test]
+    fn virtual_protect_flips_text_page_to_writable_and_back() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        // Mark a fake "code" page as R+X (mirrors how the PE
+        // loader stamps a real .text section).
+        let code = 0x20000u32;
+        mmu.map(code, 0x1000, Perm::R | Perm::X);
+        assert_eq!(mmu.perm_at(code), Some(Perm::R | Perm::X));
+
+        // Out-param for old-protection.
+        mmu.map(0x30000, 0x1000, Perm::R | Perm::W);
+        let old_out = 0x30000u32;
+
+        // Flip code → PAGE_READWRITE (0x04).
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "VirtualProtect",
+            &[code, 0x100, 0x04, old_out],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 1, "should return TRUE");
+        assert_eq!(mmu.perm_at(code), Some(Perm::R | Perm::W));
+        // Old protection should encode the prior R+X state =
+        // PAGE_EXECUTE_READ (0x20).
+        assert_eq!(mmu.load32(old_out).unwrap(), 0x20);
+
+        // Now the codec writes through the page — must not trap.
+        mmu.store32(code, 0xDEAD_BEEF).expect("writable after flip");
+
+        // Flip back to PAGE_EXECUTE_READ (0x20).
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "VirtualProtect",
+            &[code, 0x100, 0x20, old_out],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 1);
+        assert_eq!(mmu.perm_at(code), Some(Perm::R | Perm::X));
+        // Old protection now reports PAGE_READWRITE (0x04).
+        assert_eq!(mmu.load32(old_out).unwrap(), 0x04);
+
+        // Bytes survive the flip-write-flip round-trip.
+        assert_eq!(mmu.load32(code).unwrap(), 0xDEAD_BEEF);
+    }
+
+    /// `VirtualProtect` on an unmapped address must fail
+    /// (`MSDN`: returns FALSE if any page in the range isn't
+    /// committed).
+    #[test]
+    fn virtual_protect_rejects_unmapped_address() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        // Out-param scratch.
+        mmu.map(0x30000, 0x1000, Perm::R | Perm::W);
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "VirtualProtect",
+            &[0x5000_0000, 0x100, 0x04, 0x30000],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0, "should return FALSE");
     }
 }

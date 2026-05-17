@@ -144,6 +144,15 @@ impl Sandbox {
         mmu.map(DATA_IMPORT_BASE, DATA_IMPORT_REGION_SIZE, Perm::R | Perm::W);
         // Stack (R+W)
         mmu.map(STACK_BOTTOM, STACK_SIZE, Perm::R | Perm::W);
+        // Stub-thunk region (R-only, zeroed). The run loop
+        // detects `eip == thunk_addr` via `Registry::is_thunk`
+        // *before* hitting the MMU, so execution still routes
+        // to the stub regardless of the X bit — but codecs that
+        // *read* a function pointer's bytes (a hot-patch /
+        // forwarder probe; CamStudio does this in DllMain) need
+        // a mapped region behind the address. Zeros pass every
+        // standard "is this byte E9/EB/CC/C3?" introspection.
+        mmu.map(crate::win32::THUNK_BASE, 0x1_0000, Perm::R);
         // TEB / FS-segment data (R+W). Initialise FS:[0] = -1
         // (no SEH handler installed) and FS:[0x18] = TEB self
         // pointer per the Windows TEB ABI used by Win32 CRTs.

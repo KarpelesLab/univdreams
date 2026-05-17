@@ -146,8 +146,11 @@ fn run_one(codec: &Codec) -> Outcome {
     out.loaded = true;
     out.unresolved_imports = missing;
 
-    // Cap the run to keep adversarial loops bounded.
-    runner.host.instruction_budget = Some(2_000_000);
+    // Cap the run to keep adversarial loops bounded. Some
+    // codecs (wmvdecod.dll, ~6M steps) do heavy CRT init and
+    // table generation in DllMain; 10M covers them with margin
+    // and still bounds malicious infinite loops.
+    runner.host.instruction_budget = Some(10_000_000);
     match runner.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH) {
         Ok(_) => {
             out.dll_main_ok = true;

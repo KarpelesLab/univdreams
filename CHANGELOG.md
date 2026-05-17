@@ -8,6 +8,37 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+### Fixed
+- `kernel32!VirtualProtect` now actually updates MMU page
+  permissions for the requested range, and writes the prior
+  protection (translated from the page's `Perm` bits back to a
+  Win32 `PAGE_*` constant) into `lpflOldProtect`. The previous
+  implementation was a no-op that just returned success, which
+  caused four corpus codecs (`wmvdecod.dll`, `wmvsdecd.dll`,
+  CamStudio 1.4 + 1.5) to fault during `DllMain` when they
+  flipped `.text` writable to self-patch a thunk, wrote, then
+  flipped it back. `VirtualProtect` on an unmapped address
+  correctly returns FALSE.
+- Stub-thunk region `[0xFFFE_0000, 0xFFFF_0000)` is now mapped
+  R-only (zeroed) at `Sandbox::new`. The run loop already
+  intercepts execution at `eip == thunk_addr` before the MMU
+  permission check, so execution still routes through
+  `dispatch_stub` — but codecs that *read* a function
+  pointer's bytes (e.g. CamStudio's hot-patch / forwarder probe
+  in DllMain) no longer fault on the unmapped region.
+
+### Changed
+- Codec-corpus DllMain coverage: **61 → 65 of 66 i386 entries**.
+  The four wmv-decoder + CamStudio failures from 0.1.3 are
+  resolved by the `VirtualProtect` fix and the thunk-region
+  mapping. The lone remaining failure is `wmvcore.dll`
+  (145 unresolved imports — fundamentally a missing-stubs
+  problem, not an emulator bug).
+- Codec-corpus `DllMain` instruction budget raised from 2 M to
+  10 M to cover codecs (`wmvdecod.dll`, ~6 M steps) that do
+  heavy CRT init and table generation. Still bounded enough to
+  stop adversarial infinite loops in tractable time.
+
 ## [0.1.3] — 2026-05-17
 
 ### Added
