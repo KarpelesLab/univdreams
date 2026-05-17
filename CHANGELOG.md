@@ -33,6 +33,14 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
   Phase 2 A/B falsifies round 63's `helper_addref_patch`
   (proves it's retirable but kept for prior-round test
   backwards compat). Ported from oxideav-vfw round 70.
+- Integration test `tests/round70_ic_get_set_state.rs` — 3-test
+  harness driving `Sandbox::ic_get_state` / `ic_set_state`
+  end-to-end against `mpg4c32.dll`: the MSDN size-discovery probe
+  pattern (a zero-length-buffer call returns the byte count or
+  `ICERR_UNSUPPORTED`), `get → set → get` idempotency, and a
+  smoke against a canned in-test driver. Confirms the empirical
+  `ICERR_UNSUPPORTED` outcome at the integration layer. Ported
+  from oxideav-vfw round 70.
 - 5 in-module unit tests in `src/win32/vfw32.rs` covering
   `ICM_GETSTATE`/`ICM_SETSTATE` constant values, dispatch
   surface, success path, failure path, and probe call.
