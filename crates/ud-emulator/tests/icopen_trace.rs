@@ -53,6 +53,9 @@ fn fourcc(s: &str) -> u32 {
     u32::from_le_bytes(b)
 }
 
+/// VfW `ICMODE_DECOMPRESS` from `vfw.h`.
+const ICMODE_DECOMPRESS: u32 = 1;
+
 fn trace_codec(name: &str, base_url: &str, fcc: &str) {
     let bytes = match common::fetch_or_load(base_url, name) {
         Ok(b) => b,
@@ -90,7 +93,6 @@ fn trace_codec(name: &str, base_url: &str, fcc: &str) {
 
     let fcc_type = fourcc("VIDC");
     let fcc_handler = fourcc(fcc);
-    const ICMODE_DECOMPRESS: u32 = 1;
     let result = sb.ic_open(fcc_type, fcc_handler, ICMODE_DECOMPRESS);
 
     println!(
