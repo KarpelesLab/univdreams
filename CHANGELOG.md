@@ -8,6 +8,8 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-05-17
+
 ### Added
 - `Sandbox::ic_get_state` / `Sandbox::ic_set_state` — host-side
   wrappers around the VfW `ICM_GETSTATE` (`0x5009`) and
