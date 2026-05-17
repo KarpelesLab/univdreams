@@ -8,6 +8,35 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+### Added
+- `Sandbox::ic_get_state` / `Sandbox::ic_set_state` — host-side
+  wrappers around the VfW `ICM_GETSTATE` (`0x5009`) and
+  `ICM_SETSTATE` (`0x500A`) messages, mirroring the existing
+  `ic_compress_*` family. Required by oxideav-tracevfw to drive
+  the codec encoder's per-quality-knob round-trip via the public
+  state-serialisation surface. Empirical finding: `mpg4c32.dll`
+  returns `ICERR_UNSUPPORTED` for both messages (stateless codec)
+  — the wrapper surfaces the raw LRESULT so callers can detect
+  this cleanly. Ported from oxideav-vfw round 70.
+- Forensic test `tests/round69_msadds32_inner_decode_watch.rs` —
+  5-test harness that arms `Cpu::add_register_watchpoint`
+  snapshots at the four NULL-arg guards inside `msadds32.ax`'s
+  inner-decode body at RVA `0xc887..0xc973` and proves all four
+  PASS (the bail target `0xc969` is never reached). Pins the
+  actual `E_FAIL` (`0x80004005`) source to RVA `0xe2bb` inside
+  function `0xe0f4`. Ported from oxideav-vfw round 69.
+- Forensic test `tests/round70_msadds32_ea3a_forensic.rs` —
+  4-test harness that traces into `0xea3a` (called from RVA
+  `0xe13c` inside `0xe0f4`) and pins the loop-overflow bail JCC
+  at `0xe282` (`jge +0x37` after `cmp edi, [ebp+0x10]`) with
+  concrete register state (`EDI = 0x748`, `[ebp+0x10] = 0x748`).
+  Phase 2 A/B falsifies round 63's `helper_addref_patch`
+  (proves it's retirable but kept for prior-round test
+  backwards compat). Ported from oxideav-vfw round 70.
+- 5 in-module unit tests in `src/win32/vfw32.rs` covering
+  `ICM_GETSTATE`/`ICM_SETSTATE` constant values, dispatch
+  surface, success path, failure path, and probe call.
+
 ## [0.1.2] — 2026-05-16
 
 ### Added

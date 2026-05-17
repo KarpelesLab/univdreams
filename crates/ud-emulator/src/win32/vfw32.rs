@@ -90,6 +90,21 @@ pub const ICM_RESERVED: u32 = 0x5000;
 
 /// `vfw.h`: `ICM_GETINFO` (request the codec's identity card).
 pub const ICM_GETINFO: u32 = ICM_RESERVED + 2;
+/// `vfw.h`: `ICM_GETSTATE = ICM_RESERVED + 9` (`0x5009`) — codec
+/// serialises its private per-instance state into the caller-supplied
+/// buffer.  When `lParam1 == 0` the codec returns the byte count it
+/// would have written; non-zero `lParam1` is a destination buffer of
+/// `lParam2` bytes.  Returns the byte count actually written (or
+/// the required size when probing with NULL).
+///
+/// Round 70 — added alongside [`ic_get_state`] / [`ic_set_state`] for
+/// the encoder per-quality-knob round-trip required by oxideav-tracevfw.
+pub const ICM_GETSTATE: u32 = ICM_RESERVED + 9;
+/// `vfw.h`: `ICM_SETSTATE = ICM_RESERVED + 10` (`0x500A`) — codec
+/// deserialises the caller-supplied buffer into its private
+/// per-instance state.  `lParam1` is the source buffer of `lParam2`
+/// bytes.  Returns `ICERR_OK` (0) on success.
+pub const ICM_SETSTATE: u32 = ICM_RESERVED + 10;
 /// `vfw.h`: `ICM_DECOMPRESS_GET_FORMAT`.
 pub const ICM_DECOMPRESS_GET_FORMAT: u32 = ICM_USER + 10;
 /// `vfw.h`: `ICM_DECOMPRESS_QUERY` — can we decompress this format?
@@ -1235,6 +1250,123 @@ pub fn ic_compress_end(
     )
 }
 
+// --- ICM_GETSTATE / ICM_SETSTATE host-side wrappers (round 70) -------
+//
+// Mirror the per-message dispatch shape used by the
+// `ic_compress_*` family.  Both messages take `(buf_va,
+// buf_len)` in `(lParam1, lParam2)`, exactly like the trivial
+// shape `ic_compress_query` uses for its (input_bih, output_bih)
+// pair.
+//
+// Round 70 — task #829 (oxideav-tracevfw needs to drive the
+// codec encoder's per-quality knob round-trip via these two
+// messages).  See MSDN `ICGetState` / `ICSetState` topic pages
+// for the public contract.
+
+/// `ICGetState` — ask the codec to serialise its private
+/// per-instance state into the caller-supplied buffer.  Returns
+/// the byte count the codec actually wrote.
+///
+/// Per MSDN: when `lParam1 == 0` the codec returns the byte count
+/// it would have written; we always supply a real buffer (never
+/// NULL) so this wrapper returns the written-byte count rather
+/// than a probe size.  Callers that want to size the buffer
+/// should pass an over-large slice and read the return value.
+///
+/// MSDN: `LRESULT ICGetState(HIC hic, LPVOID pv, LONG cb)`.
+pub fn ic_get_state(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    hic: u32,
+    dst_buf: &mut [u8],
+) -> Result<u32, crate::Error> {
+    let entry = state
+        .hics
+        .get(&hic)
+        .cloned()
+        .ok_or_else(|| Win32Error::InvalidArgument {
+            stub: "ICGetState",
+            reason: format!("unknown HIC {hic}"),
+        })?;
+    // Allocate a guest-side staging slot of dst_buf.len() bytes,
+    // pre-zero it so a partial codec write produces deterministic
+    // bytes (mirrors `ic_compress_get_format`'s pre-zero).
+    let len = dst_buf.len() as u32;
+    let buf_va = state.arena_alloc(len.max(1))?;
+    let trap = |t: crate::emulator::Trap| Win32Error::InvalidArgument {
+        stub: "ICGetState",
+        reason: format!("{t}"),
+    };
+    if len > 0 {
+        let zeros = vec![0u8; len as usize];
+        mmu.write_initializer(buf_va, &zeros).map_err(trap)?;
+    }
+    let lresult = call_guest(
+        cpu,
+        mmu,
+        registry,
+        state,
+        entry.driver_proc_va,
+        &[entry.driver_id, hic, ICM_GETSTATE, buf_va, len],
+    )?;
+    // Copy back the codec-written bytes.
+    for (i, b) in dst_buf.iter_mut().enumerate() {
+        *b = mmu.load8(buf_va + i as u32).map_err(trap)?;
+    }
+    Ok(lresult)
+}
+
+/// `ICSetState` — ask the codec to deserialise the supplied
+/// buffer into its private per-instance state.  Returns `Ok(())`
+/// on `ICERR_OK`, or [`Win32Error::InvalidArgument`] wrapping the
+/// codec's raw `LRESULT` otherwise.
+///
+/// MSDN: `LRESULT ICSetState(HIC hic, LPVOID pv, LONG cb)`.
+pub fn ic_set_state(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    hic: u32,
+    src_buf: &[u8],
+) -> Result<(), crate::Error> {
+    let entry = state
+        .hics
+        .get(&hic)
+        .cloned()
+        .ok_or_else(|| Win32Error::InvalidArgument {
+            stub: "ICSetState",
+            reason: format!("unknown HIC {hic}"),
+        })?;
+    let len = src_buf.len() as u32;
+    let buf_va = state.arena_alloc(len.max(1))?;
+    let trap = |t: crate::emulator::Trap| Win32Error::InvalidArgument {
+        stub: "ICSetState",
+        reason: format!("{t}"),
+    };
+    if len > 0 {
+        mmu.write_initializer(buf_va, src_buf).map_err(trap)?;
+    }
+    let lresult = call_guest(
+        cpu,
+        mmu,
+        registry,
+        state,
+        entry.driver_proc_va,
+        &[entry.driver_id, hic, ICM_SETSTATE, buf_va, len],
+    )?;
+    if lresult as i32 == ICERR_OK {
+        Ok(())
+    } else {
+        Err(crate::Error::Win32(Win32Error::InvalidArgument {
+            stub: "ICSetState",
+            reason: format!("codec returned LRESULT {lresult:#010x} (not ICERR_OK)"),
+        }))
+    }
+}
+
 /// Returned-by-reference companion to [`ic_compress`].
 #[derive(Debug, Clone, Default)]
 pub struct CompressOutcome {
@@ -1799,5 +1931,94 @@ mod tests {
         // The returned-flags slot was seeded with dwFlags +
         // canned proc didn't update it, so we see the seed.
         assert_eq!(outcome.returned_flags, ICCOMPRESS_KEYFRAME);
+    }
+
+    // -- Round-70 unit tests for ic_get_state / ic_set_state ---------
+
+    #[test]
+    fn icm_state_constants_match_vfw_h_offsets() {
+        // ICM_RESERVED = DRV_USER + 0x1000 = 0x5000.  Per Vfw.h:
+        //   ICM_GETSTATE = ICM_RESERVED + 9   = 0x5009
+        //   ICM_SETSTATE = ICM_RESERVED + 10  = 0x500A
+        assert_eq!(ICM_GETSTATE, 0x5009);
+        assert_eq!(ICM_SETSTATE, 0x500A);
+    }
+
+    #[test]
+    fn ic_get_state_dispatches_to_driver_proc_and_returns_lresult() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let dpv = 0x0040_0000;
+        // First DRV_OPEN: canned driver must return non-zero
+        // driver-id so `ic_open` installs the HIC.
+        install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
+        state.default_driver_proc = dpv;
+        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        assert_ne!(hic, 0);
+        // Re-install the canned driver to return 24 — the byte
+        // count we pretend the codec would write into the buffer.
+        install_canned_driver_proc(&mut mmu, dpv, 24);
+        let mut buf = vec![0u8; 64];
+        let written = ic_get_state(&mut cpu, &mut mmu, &registry, &mut state, hic, &mut buf)
+            .expect("ic_get_state should succeed");
+        assert_eq!(written, 24);
+        // Eax was set to the canned LRESULT.
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 24);
+    }
+
+    #[test]
+    fn ic_set_state_dispatches_to_driver_proc_and_returns_ok() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let dpv = 0x0040_0000;
+        install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
+        state.default_driver_proc = dpv;
+        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        assert_ne!(hic, 0);
+        // Re-install the canned driver to return ICERR_OK (0) —
+        // codec accepts the state.
+        install_canned_driver_proc(&mut mmu, dpv, 0);
+        let payload = vec![0xAAu8; 32];
+        ic_set_state(&mut cpu, &mut mmu, &registry, &mut state, hic, &payload)
+            .expect("ic_set_state should succeed when codec returns ICERR_OK");
+    }
+
+    #[test]
+    fn ic_set_state_surfaces_codec_failure_lresult() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let dpv = 0x0040_0000;
+        install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
+        state.default_driver_proc = dpv;
+        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        assert_ne!(hic, 0);
+        // Re-install the canned driver to return ICERR_BADFORMAT
+        // (-2 = 0xFFFFFFFE) — codec rejects the state blob.
+        install_canned_driver_proc(&mut mmu, dpv, 0xFFFF_FFFE);
+        let payload = vec![0u8; 4];
+        let r = ic_set_state(&mut cpu, &mut mmu, &registry, &mut state, hic, &payload);
+        match r {
+            Err(crate::Error::Win32(Win32Error::InvalidArgument { stub, .. })) => {
+                assert_eq!(stub, "ICSetState");
+            }
+            other => panic!("expected Win32Error::InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ic_get_state_zero_length_buffer_is_legal_probe_call() {
+        // A zero-length buffer is the canonical probe call (asking
+        // the codec how big its state blob is).  The wrapper still
+        // dispatches and surfaces the LRESULT (the codec would
+        // return its required size).
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let dpv = 0x0040_0000;
+        install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
+        state.default_driver_proc = dpv;
+        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        // Re-install: probe-time the codec returns 128 (the size
+        // it would write into a real buffer).
+        install_canned_driver_proc(&mut mmu, dpv, 128);
+        let mut empty: Vec<u8> = Vec::new();
+        let r = ic_get_state(&mut cpu, &mut mmu, &registry, &mut state, hic, &mut empty)
+            .expect("zero-length probe should succeed");
+        assert_eq!(r, 128);
     }
 }

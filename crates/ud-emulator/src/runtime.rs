@@ -1062,6 +1062,43 @@ impl Sandbox {
         )
     }
 
+    /// `ICGetState` — ask the codec to serialise its private
+    /// per-instance state into `dst_buf`.  Returns the byte count
+    /// the codec actually wrote.
+    ///
+    /// Round 70 — wraps `ICM_GETSTATE` (`0x5009`) per MSDN; required
+    /// by oxideav-tracevfw to drive the encoder's per-quality knob
+    /// round-trip alongside [`Self::ic_set_state`].  See MSDN
+    /// `ICGetState` topic page for the public contract.
+    pub fn ic_get_state(&mut self, hic: u32, dst_buf: &mut [u8]) -> Result<u32, crate::Error> {
+        vfw32::ic_get_state(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            dst_buf,
+        )
+    }
+
+    /// `ICSetState` — ask the codec to deserialise `src_buf` into
+    /// its private per-instance state.  Returns `Ok(())` on
+    /// `ICERR_OK`, or [`crate::Error`] wrapping the codec's raw
+    /// `LRESULT` otherwise.
+    ///
+    /// Round 70 — wraps `ICM_SETSTATE` (`0x500A`) per MSDN.  See
+    /// MSDN `ICSetState` topic page for the public contract.
+    pub fn ic_set_state(&mut self, hic: u32, src_buf: &[u8]) -> Result<(), crate::Error> {
+        vfw32::ic_set_state(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            src_buf,
+        )
+    }
+
     /// Round 63 — patch `msadds32.ax`'s `helper_addref` thunk (at
     /// RVA `0x5cea`) to unconditionally return `value` (32-bit
     /// integer).
