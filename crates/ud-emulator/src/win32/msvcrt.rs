@@ -397,6 +397,74 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     registry.register(dll, "localeconv", stub_localeconv as StubFn, 0);
     registry.register(dll, "setlocale", stub_setlocale as StubFn, 0);
     registry.register(dll, "_wmkdir", stub_purecall as StubFn, 0);
+
+    // ---- Corpus round 4 -------------------------------------------
+    // MSVC 8 / MSVC 9 CRT additions (camstudio-1.4 links msvcr80,
+    // camstudio-1.5 links msvcr90). All cdecl (arg_dwords = 0).
+    //
+    // RTTI cleanup hook + debugger hook + encoded-null sentinel —
+    // no observable behaviour required, returning 0 is fine.
+    registry.register(
+        dll,
+        "__clean_type_info_names_internal",
+        stub_returns_zero as StubFn,
+        0,
+    );
+    registry.register(dll, "_crt_debugger_hook", stub_returns_zero as StubFn, 0);
+    registry.register_data(dll, "_encoded_null", 0);
+    // CRT-internal pointer obfuscation. The encode/decode pair
+    // is required to be inverse, so the identity transform is a
+    // valid implementation.
+    registry.register(dll, "_encode_pointer", stub_returns_arg0 as StubFn, 0);
+    registry.register(dll, "_decode_pointer", stub_returns_arg0 as StubFn, 0);
+    // SEH handler — chain past us, same as `_except_handler3`.
+    registry.register(
+        dll,
+        "_except_handler4_common",
+        stub_except_handler3 as StubFn,
+        0,
+    );
+    // `_initterm_e` is the error-reporting variant of `_initterm`.
+    // Each entry returns `int`; if any returns non-zero, the
+    // walker stops and reports that code. For the probe path we
+    // walk like `_initterm` and report success.
+    registry.register(dll, "_initterm_e", stub_initterm as StubFn, 0);
+    // `_malloc_crt` is the CRT-private allocator alias.
+    registry.register(dll, "_malloc_crt", stub_malloc as StubFn, 0);
+    // Secure printf / scanf variants. The probe path doesn't
+    // need real formatting — write an empty string + return 0.
+    registry.register(dll, "sprintf_s", stub_sprintf_s as StubFn, 0);
+    registry.register(dll, "sscanf", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "sscanf_s", stub_returns_zero as StubFn, 0);
+}
+
+/// Generic stub that returns the caller's first dword argument
+/// unchanged — the identity transform for CRT helpers like
+/// `_encode_pointer` / `_decode_pointer`.
+fn stub_returns_arg0(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    arg_dword(cpu, mmu, 0).map_err(|t| trap("_encode_pointer/_decode_pointer", t))
+}
+
+/// `int sprintf_s(char *buf, size_t size, const char *fmt, ...)`.
+/// cdecl. Writes an empty NUL-terminated string and reports 0
+/// chars written — good enough for codec diagnostic paths the
+/// probe never reaches.
+fn stub_sprintf_s(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap("sprintf_s", t))?;
+    if buf != 0 {
+        mmu.store8(buf, 0).map_err(|t| trap("sprintf_s", t))?;
+    }
+    Ok(0)
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling

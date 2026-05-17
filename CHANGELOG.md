@@ -27,6 +27,16 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
   pointer's bytes (e.g. CamStudio's hot-patch / forwarder probe
   in DllMain) no longer fault on the unmapped region.
 
+### Added
+- `msvcr80.dll` / `msvcr90.dll` are now aliased to the
+  `msvcrt` stub set (Visual Studio 2005 / 2008 CRTs — CamStudio
+  1.4 links msvcr80, CamStudio 1.5 links msvcr90). Adds the
+  MSVC 8 / 9 specific helpers: `__clean_type_info_names_internal`,
+  `_crt_debugger_hook`, `_decode_pointer` / `_encode_pointer`
+  (identity transform), `_encoded_null`, `_except_handler4_common`,
+  `_initterm_e`, `_malloc_crt`, `sprintf_s` / `sscanf` / `sscanf_s`.
+- `user32!GetWindowTextA` — config-probe stub returning 0.
+
 ### Changed
 - Codec-corpus DllMain coverage: **61 → 65 of 66 i386 entries**.
   The four wmv-decoder + CamStudio failures from 0.1.3 are
@@ -34,6 +44,13 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
   mapping. The lone remaining failure is `wmvcore.dll`
   (145 unresolved imports — fundamentally a missing-stubs
   problem, not an emulator bug).
+- Codec-corpus ICOpen-confirmed: **9 → 11 of 17 DriverProc
+  exporters** (both CamStudio codecs now probe cleanly).
+  Of the 6 remaining: 4 are audio codecs (3 `.acm` + Indeo
+  Audio `IAC25_32.AX`) where the `VIDC` probe is N/A by
+  design; 2 are video codecs (`lagarith-i386`, `magicyuv-i386`)
+  whose `ICOpen` handler returns 0 — a codec-internal matter,
+  not a missing-stub one.
 - Codec-corpus `DllMain` instruction budget raised from 2 M to
   10 M to cover codecs (`wmvdecod.dll`, ~6 M steps) that do
   heavy CRT init and table generation. Still bounded enough to

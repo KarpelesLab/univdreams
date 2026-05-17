@@ -639,6 +639,22 @@ impl Registry {
         self.by_name.len() - before
     }
 
+    /// Register the msvcrt stub set under `msvcr80.dll` (Visual
+    /// Studio 2005 CRT). Used by `camstudio-1.4-camcodec.dll`.
+    pub fn register_msvcr80(&mut self) -> usize {
+        let before = self.by_name.len();
+        msvcrt::register_alias(self, "msvcr80.dll");
+        self.by_name.len() - before
+    }
+
+    /// Register the msvcrt stub set under `msvcr90.dll` (Visual
+    /// Studio 2008 CRT). Used by `camstudio-1.5-camcodec.dll`.
+    pub fn register_msvcr90(&mut self) -> usize {
+        let before = self.by_name.len();
+        msvcrt::register_alias(self, "msvcr90.dll");
+        self.by_name.len() - before
+    }
+
     /// Register every mfplat (Media Foundation platform) stub.
     /// Returns the number registered.
     pub fn register_mfplat(&mut self) -> usize {
@@ -679,6 +695,8 @@ impl Registry {
             + self.register_msvcrt()
             + self.register_msvcr71()
             + self.register_pncrt()
+            + self.register_msvcr80()
+            + self.register_msvcr90()
             + self.register_mfplat()
             + self.register_shell_support()
             + host_count

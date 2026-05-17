@@ -120,6 +120,9 @@ pub fn register(registry: &mut Registry) {
     // decode path never enters this code, but the import must
     // resolve at load time. Return 0 (no chars copied).
     registry.register("user32.dll", "GetDlgItemTextA", stub_zero4 as StubFn, 4);
+    // GetWindowTextA(HWND, LPSTR, int) — return 0 chars copied.
+    // Pulled in by CamStudio's `DllMain` config probe path.
+    registry.register("user32.dll", "GetWindowTextA", stub_zero3 as StubFn, 3);
     registry.register("user32.dll", "GetFocus", stub_zero0 as StubFn, 0);
     registry.register("user32.dll", "InvalidateRect", stub_zero3 as StubFn, 3);
     registry.register("user32.dll", "IsDlgButtonChecked", stub_zero2 as StubFn, 2);
