@@ -26,12 +26,21 @@
 //! the function calling `ExitProcess` at RVA `0x4998` to find its
 //! triggering condition.
 //!
-//! **MagicYUV (`magicyuv-i386.dll`, fourcc `MYUV`)** — `DRV_OPEN`
-//! traps on `UndefinedOpcode { opcode: 0xF12 }`, i.e. `0F 12`
-//! (`MOVLPS` / `MOVHLPS`) — an SSE1 instruction the emulator's
-//! `dispatch_0f` doesn't yet decode. The codec uses SIMD heavily,
-//! so closing this likely needs a substantial SSE/SSE2 surface
-//! expansion rather than a single opcode add.
+//! **MagicYUV (`magicyuv-i386.dll`, fourcc `M8RG`)** — past the
+//! initial SSE1 traps now that `0F 12 / 13 / 16 / 17`
+//! (MOV{L,H}PS load/store, MOVHLPS / MOVLHPS) are implemented
+//! in `super::isa_sse`. The next blocker is the single-byte
+//! opcode `0xC5` — either MagicYUV is using `LDS` (unlikely in
+//! 32-bit modern code) or, more probably, the **AVX 2-byte VEX
+//! prefix**. MagicYUV is a 2015+ codec; it almost certainly
+//! requires AVX for its actual decode path. Closing this needs
+//! VEX decoding + 256-bit YMM registers + a fresh AVX opcode
+//! table — substantially larger than the SSE1 surface.
+//!
+//! The manifest fourcc was previously `MYUV` (wrong — not in
+//! MagicYUV's supported set); changed to `M8RG`, which the
+//! codec accepts past its fourcc-lookup and into its AVX
+//! decode body.
 
 mod common;
 
@@ -134,6 +143,6 @@ fn magicyuv_icopen_trace() {
     trace_codec(
         "magicyuv-i386.dll",
         "https://samples.oxideav.org/codecs/windows/magicyuv",
-        "MYUV",
+        "M8RG",
     );
 }

@@ -109,6 +109,17 @@ pub struct Cpu {
     /// (`super::isa_mmx::dispatch`) so reads / writes to
     /// `mm0..mm7` no longer trap for the implemented subset.
     pub mmx: [u64; 8],
+    /// XMM register file `xmm0..xmm7`, eight 128-bit registers
+    /// (Intel SDM Vol. 1 §10.2). SSE/SSE2 opcodes read and write
+    /// these via [`super::isa_sse::dispatch`]. Stored as `u128`
+    /// in host endianness; the helpers in `isa_sse` deal in
+    /// 64-bit halves so we can avoid `u128` arithmetic where
+    /// the architectural definition is per-lane.
+    pub xmm: [u128; 8],
+    /// Count of SSE-family instructions executed — mirrors
+    /// `mmx_dispatch_count`. Lets a test confirm the SSE path
+    /// actually ran.
+    pub sse_dispatch_count: u64,
     /// Count of MMX (`0F 60..6F | 70..7F | D0..FF`) instructions
     /// successfully dispatched. Round-13 sentinel — lets a test
     /// confirm MMX semantics actually ran rather than the codec
@@ -217,6 +228,8 @@ impl Cpu {
             fpu: super::isa_fpu::FpuState::new(),
             mmx: [0u64; 8],
             mmx_dispatch_count: 0,
+            xmm: [0u128; 8],
+            sse_dispatch_count: 0,
             cpuid_dispatch_count: 0,
             trace_ring: Vec::new(),
             trace_ring_cap: 0,
@@ -1622,6 +1635,17 @@ impl Cpu {
             0x60..=0x6F | 0x70..=0x7F | 0xD0..=0xFF => {
                 super::isa_mmx::dispatch(self, mmu, op2, entry_eip)
             }
+            // ---- SSE / SSE2 opcode space (Intel SDM Vol. 2,
+            // App. A). Routed to a dedicated executor so the
+            // integer table stays a flat dispatch.
+            //
+            //   0F 10..1F : MOV{UPS,SS,LPS,HLPS,APS,SD,DDUP,…}
+            //   0F 28..2F : MOVAPS / CVT* / UCOMISS / COMISS
+            //   0F 50..5F : MOVMSKPS + packed-FP math.
+            //   0F C2/C4..C6 : CMPPS / PINSRW / PEXTRW / SHUFPS.
+            0x10..=0x1F | 0x28..=0x2F | 0x50..=0x5F | 0xC2 | 0xC4..=0xC6 => {
+                super::isa_sse::dispatch(self, mmu, op2, entry_eip)
+            }
             other => Err(Trap::UndefinedOpcode {
                 eip: entry_eip,
                 opcode: 0x0F00 | u32::from(other),
@@ -1708,6 +1732,31 @@ impl Cpu {
         let b3 = mmu.fetch_x8(self.regs.eip.wrapping_add(3))?;
         self.regs.eip = self.regs.eip.wrapping_add(4);
         Ok(u32::from_le_bytes([b0, b1, b2, b3]))
+    }
+
+    /// Operand-size override (`0x66` prefix) for the current
+    /// instruction. Exposed for the SSE executor — `0x66` selects
+    /// packed-double semantics on SSE2 opcodes.
+    pub(super) fn op_size_16(&self) -> bool {
+        self.op_size_16
+    }
+
+    /// REP / REPNE prefix byte for the current instruction, if any
+    /// (`0xF3` for REP/REPE, `0xF2` for REPNE). On SSE opcodes the
+    /// same prefixes select scalar-single / scalar-double semantics.
+    pub(super) fn rep_prefix_byte(&self) -> Option<u8> {
+        match self.rep_prefix {
+            Some(RepPrefix::Rep) => Some(0xF3),
+            Some(RepPrefix::Repne) => Some(0xF2),
+            None => None,
+        }
+    }
+
+    /// Advance `EIP` by `n` bytes — used by ISA executors to step
+    /// past consumed SIB / displacement / immediate bytes after a
+    /// ModR/M resolution.
+    pub(super) fn advance_eip(&mut self, n: u32) {
+        self.regs.eip = self.regs.eip.wrapping_add(n);
     }
 
     pub(super) fn fetch_modrm(&mut self, mmu: &Mmu) -> Result<ModRm, Trap> {

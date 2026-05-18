@@ -9,6 +9,35 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- `crates/ud-emulator/src/emulator/isa_sse.rs` — SSE1 instruction
+  executor, routed from `dispatch_0f` for the opcode ranges
+  `0F 10..1F`, `0F 28..2F`, `0F 50..5F`, `0F C2/C4..C6`. Four
+  opcodes implemented (trace-driven from MagicYUV's `DRV_OPEN`):
+  `0F 12` MOVLPS / MOVHLPS, `0F 13` MOVLPS m64-store, `0F 16`
+  MOVHPS / MOVLHPS, `0F 17` MOVHPS m64-store. Plus eight 128-bit
+  `xmm` registers on `Cpu` and an `sse_dispatch_count` for
+  observability. The mandatory-prefix discriminator
+  (`0x66`/`0xF2`/`0xF3`) is in place — new opcodes can be added
+  mechanically as future codecs surface them.
+- Three new `pub(super)` accessors on `Cpu` so ISA executors
+  outside `isa_int` can read the prefix state: `op_size_16()`,
+  `rep_prefix_byte()`, and `advance_eip(n)`.
+- MagicYUV's manifest fourcc corrected from `MYUV` (not in
+  MagicYUV's supported set) to `M8RG`, an actual MagicYUV
+  fourcc. With the corrected fourcc the codec passes its
+  fourcc-lookup and enters its decode body — surfacing the
+  *next* gap.
+
+### Changed
+- MagicYUV's `DRV_OPEN` no longer traps on `0F 12`; it now
+  progresses past the SSE1 surface and hits opcode `0xC5`,
+  which is the **AVX 2-byte VEX prefix** (MagicYUV is a 2015+
+  codec that requires AVX, not just SSE). Closing it needs
+  VEX decoding + 256-bit YMM registers + the AVX opcode table
+  — substantially larger than the SSE1 surface and out of
+  scope for this round.
+
+### Added
 - `Sandbox::new` pre-registers the canonical system DLL names
   (`kernel32` / `user32` / `gdi32` / `advapi32` / `ole32` /
   `shell32` / `shlwapi` / `comctl32` / `winmm` / `msvcrt` /
