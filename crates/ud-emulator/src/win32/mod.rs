@@ -173,6 +173,12 @@ pub struct HostState {
     pub process_heap_handle: u32,
     /// Last error code (`SetLastError` / `GetLastError`).
     pub last_error: u32,
+    /// Lazily-allocated guest address of the C-CRT `errno` cell.
+    /// `None` until the first call to `msvcrt::_errno`, then
+    /// stable for the lifetime of the sandbox so repeated calls
+    /// return the same pointer (the contract `int * _errno(void)`
+    /// requires).
+    pub errno_cell: Option<u32>,
     /// Pseudo-tick counter incremented on every `GetTickCount`.
     pub tick: u32,
     /// Loaded-module registry: name → ImageBase.
@@ -328,6 +334,7 @@ impl HostState {
             heap_arena_end: heap_end,
             process_heap_handle: 0xDEAD_BEEF,
             last_error: 0,
+            errno_cell: None,
             tick: 0,
             heap: BTreeMap::new(),
             modules: BTreeMap::new(),

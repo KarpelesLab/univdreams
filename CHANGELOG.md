@@ -9,6 +9,58 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- `crates/ud-emulator/src/emulator/isa_avx.rs` — VEX-encoded AVX
+  instruction executor. Handles both VEX prefix forms (2-byte
+  `0xC5` and 3-byte `0xC4`), discriminated from legacy LES/LDS
+  by the high-bit-set rule on the byte after the prefix. The
+  decoded VEX carries `(map, pp, L, vvvv, W)` and the trap on
+  any unimplemented combination packs all five plus the opcode
+  byte into a single u32 id so the next handler to write is
+  obvious. Adds 8 × 128-bit `ymm_high` registers to `Cpu`
+  (YMM = `(ymm_high << 128) | xmm`) and `avx_dispatch_count`.
+  Three opcodes implemented trace-driven from MagicYUV:
+  * `VPXOR xmm1, xmm2, xmm3/m128` (`66 0F EF`)
+  * `VMOVUPS xmm2/m128, xmm1` store (`NP 0F 11`)
+  * BMI2 `SHLX` / `SHRX` / `SARX` on GP regs
+    (`{66,F2,F3} 0F 38 F7`)
+- `HostState.errno_cell: Option<u32>` — lazy-allocated CRT
+  errno cell address. `msvcrt!_errno` was previously registered
+  as a *data* import, which made the PE loader stuff the data
+  slot's address (in the `0x70100000` band) into the IAT and
+  the codec's `call [iat]` then fetched from a R+W-no-X page.
+  Reregistered as a function stub that returns a stable pointer
+  to a heap-arena-allocated `u32`. The MSVC contract
+  (`int *_errno(void)`) is satisfied because successive calls
+  return the same address.
+- `kernel32!GetProcAddress` now reverse-resolves `hModule`
+  through `state.modules` (the system-DLL pre-registration plus
+  the codec's own `Sandbox::load` entry) and looks the name up
+  in the stub registry under the matched DLL. Returns the thunk
+  address on hit, NULL otherwise. Previously always returned
+  NULL.
+
+### Changed
+- System-DLL synthetic handle band moved from
+  `0x7000_0000..0x7100_0000` to `0x7800_0000..0x7900_0000` —
+  the previous band collided exactly with `CONST_ARENA_START`
+  (`0x7000_0000`, the host's canned-string region, R+W
+  mapped). Codecs that walked `kernel32`'s "PE image" starting
+  at its handle were reading const-arena bytes and computing
+  function pointers landing inside the arena (R+W, no X) →
+  exec-protect fault. The new band sits clear of every other
+  mapped region (heap arena, const arena, data-import region,
+  TEB, stack, VirtualAlloc range, thunk space) so an
+  inadvertent PE-walk produces a clean `MemoryFault` instead.
+- Codec-corpus ICOpen-confirmed: **12 → 13 of 17 DriverProc
+  exporters** (MagicYUV newly confirmed). The 4 remaining are
+  all audio codecs (3 `.acm` + IAC25 Indeo Audio in a
+  DS-filter wrapper) where the `VIDC` probe is N/A by design —
+  **every genuine video codec in the corpus that exports
+  `DriverProc` now probes `ICOpen` successfully**.
+- MagicYUV manifest fourcc corrected `MYUV` -> `M8RG` (the
+  former is not in the codec's supported set; the latter is).
+
+### Added
 - `crates/ud-emulator/src/emulator/isa_sse.rs` — SSE1 instruction
   executor, routed from `dispatch_0f` for the opcode ranges
   `0F 10..1F`, `0F 28..2F`, `0F 50..5F`, `0F C2/C4..C6`. Four

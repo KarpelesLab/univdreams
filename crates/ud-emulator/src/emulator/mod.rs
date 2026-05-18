@@ -15,6 +15,7 @@
 //! §"The emulator" for the design rationale.
 
 pub mod decode;
+pub mod isa_avx;
 pub mod isa_fpu;
 pub mod isa_int;
 pub mod isa_mmx;

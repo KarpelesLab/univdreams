@@ -1364,26 +1364,35 @@ fn stub_load_library_a(
 
 /// `FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)`.
 ///
-/// Round-1 returns a registered thunk for the (module, name)
-/// pair if one exists; otherwise NULL. Lookup-by-ordinal is not
-/// supported in round 1 (low-bit-set address) — a target codec
-/// that needs it will surface as a clean trap.
+/// Reverse-resolves `hModule` through `state.modules` (the
+/// system-DLL pre-registration in `Sandbox::new` plus the
+/// codec's own load entry from `Sandbox::load`) and looks the
+/// name up in the stub registry under that DLL. Returns the
+/// thunk address on hit, NULL otherwise. Lookup-by-ordinal
+/// (low-bit-set name pointer) is not supported.
 fn stub_get_proc_address(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    _state: &mut HostState,
-    _registry: &Registry,
+    state: &mut HostState,
+    registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetProcAddress", t))?;
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetProcAddress", t))?;
     let name_p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetProcAddress", t))?;
     if name_p < 0x10000 {
         // Pointer is an ordinal (HIWORD == 0) — unsupported.
         return Ok(0);
     }
-    // We don't know which DLL was identified, so always return
-    // NULL for round-1; callers fall back to import-table
-    // resolution.
-    Ok(0)
+    let name = read_cstr(mmu, name_p, 260)?;
+    // Reverse-map handle -> dll name.
+    let dll = state
+        .modules
+        .iter()
+        .find(|(_, &base)| base == h)
+        .map(|(n, _)| n.clone());
+    let Some(dll) = dll else {
+        return Ok(0);
+    };
+    Ok(registry.resolve(&dll, &name).unwrap_or(0))
 }
 
 // ----- Round-4 stubs -------------------------------------------------

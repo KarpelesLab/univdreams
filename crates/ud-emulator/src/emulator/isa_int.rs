@@ -116,10 +116,17 @@ pub struct Cpu {
     /// 64-bit halves so we can avoid `u128` arithmetic where
     /// the architectural definition is per-lane.
     pub xmm: [u128; 8],
+    /// Upper 128 bits of the YMM register file `ymm0..ymm7`.
+    /// `ymm[i]` is the 256-bit value `(ymm_high[i] << 128) |
+    /// xmm[i]`; legacy SSE writes leave `ymm_high` untouched
+    /// while VEX.128 writes zero it (Intel SDM Vol. 1 §15.5).
+    pub ymm_high: [u128; 8],
     /// Count of SSE-family instructions executed — mirrors
     /// `mmx_dispatch_count`. Lets a test confirm the SSE path
     /// actually ran.
     pub sse_dispatch_count: u64,
+    /// Count of AVX (VEX-encoded) instructions executed.
+    pub avx_dispatch_count: u64,
     /// Count of MMX (`0F 60..6F | 70..7F | D0..FF`) instructions
     /// successfully dispatched. Round-13 sentinel — lets a test
     /// confirm MMX semantics actually ran rather than the codec
@@ -229,7 +236,9 @@ impl Cpu {
             mmx: [0u64; 8],
             mmx_dispatch_count: 0,
             xmm: [0u128; 8],
+            ymm_high: [0u128; 8],
             sse_dispatch_count: 0,
+            avx_dispatch_count: 0,
             cpuid_dispatch_count: 0,
             trace_ring: Vec::new(),
             trace_ring_cap: 0,
@@ -1377,6 +1386,26 @@ impl Cpu {
             // ----------- 0x0F two-byte escape ------
             0x0F => self.dispatch_0f(entry_eip, mmu),
 
+            // 0xC4 / 0xC5 — in legacy decoding these are LES / LDS
+            // (load far pointer), but on an AVX-capable CPU they
+            // double as the 3-byte / 2-byte VEX prefixes. The
+            // discriminator: the byte after 0xC4/0xC5 has its top
+            // bit set for VEX (in 32-bit mode the inverted REX.R
+            // bit is always 1). LES/LDS are effectively dead in
+            // 32-bit codec code, so we treat a VEX-shaped second
+            // byte as VEX and anything else as undefined.
+            0xC4 | 0xC5 => {
+                let probe = mmu.fetch_x8(self.regs.eip)?;
+                if probe & 0x80 != 0 {
+                    super::isa_avx::dispatch(self, mmu, op, entry_eip)
+                } else {
+                    Err(Trap::UndefinedOpcode {
+                        eip: entry_eip,
+                        opcode: u32::from(op),
+                    })
+                }
+            }
+
             // Far-call / far-jmp / segment loads and other
             // non-supported single-byte opcodes trap.
             0x9A | 0xEA => Err(Trap::PrivilegedOpcode {
@@ -1757,6 +1786,21 @@ impl Cpu {
     /// ModR/M resolution.
     pub(super) fn advance_eip(&mut self, n: u32) {
         self.regs.eip = self.regs.eip.wrapping_add(n);
+    }
+
+    /// Increment the AVX dispatch counter — exposed so the AVX
+    /// executor in a sibling module can do its own bookkeeping
+    /// without owning the `Cpu` field directly.
+    pub(super) fn bump_avx_count(&mut self) {
+        self.avx_dispatch_count = self.avx_dispatch_count.wrapping_add(1);
+    }
+
+    /// Fetch one byte at `EIP` and advance. Public-to-`super`
+    /// flavour of [`Self::fetch_imm8`] so ISA executors in
+    /// sibling modules (`isa_avx`) can consume prefix / opcode
+    /// bytes uniformly.
+    pub(super) fn fetch_imm8_pub(&mut self, mmu: &Mmu) -> Result<u8, Trap> {
+        self.fetch_imm8(mmu)
     }
 
     pub(super) fn fetch_modrm(&mut self, mmu: &Mmu) -> Result<ModRm, Trap> {

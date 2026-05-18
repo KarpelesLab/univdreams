@@ -333,7 +333,16 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     // ---- Corpus round 2 -------------------------------------------
     // Additional CRT entries flagged by the corpus runner after
     // the first batch of stubs landed.
-    registry.register_data(dll, "_errno", 0);
+    // `_errno()` in the MSVC CRT is a *function* returning a
+    // pointer to the (thread-local) errno cell. Pre-AVX-codec
+    // versions of this stub registered it as a data import,
+    // which made the PE loader stuff the data-slot address into
+    // the IAT — and the codec's `call [iat]` then fetched from
+    // the data region (R+W, no X) and tripped an execute-protect
+    // fault. Register as a function instead; the stub lazily
+    // allocates a single u32 cell in the heap arena and returns
+    // its address on every call.
+    registry.register(dll, "_errno", stub_errno as StubFn, 0);
     registry.register_data(dll, "__mb_cur_max", 1);
     registry.register(dll, "_write", stub_returns_arg2 as StubFn, 0);
     registry.register(dll, "asctime", stub_asctime as StubFn, 0);
@@ -1206,6 +1215,26 @@ fn trap(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {
 }
 
 // ----- Corpus-driven additions -------------------------------------
+
+/// `int *_errno(void)` — returns a pointer to the C-CRT errno
+/// cell. Real MSVC keeps this in TLS; we keep a single
+/// process-global u32 lazily allocated in the heap arena.
+/// Subsequent calls return the same pointer (the MSVC contract).
+fn stub_errno(
+    _cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    if let Some(addr) = state.errno_cell {
+        return Ok(addr);
+    }
+    let addr = state.arena_alloc(4)?;
+    mmu.write_initializer(addr, &0u32.to_le_bytes())
+        .map_err(|t| trap("_errno", t))?;
+    state.errno_cell = Some(addr);
+    Ok(addr)
+}
 
 /// Trivially returns 0. Used for stubs whose only contract is
 /// "return without exploding" (e.g. unused CRT internals).

@@ -186,10 +186,14 @@ impl Sandbox {
         // exports (e.g. lagarith's `_CRT_INIT` rolls back its heap
         // and bails if `KERNEL32.DLL`'s handle comes back NULL).
         // The handles are synthetic, distinct, non-zero values in
-        // the otherwise-unmapped `0x7000_0000..0x7800_0000` band —
-        // codecs use them for identity comparisons and as opaque
-        // arguments to `GetProcAddress` (which dispatches through
-        // the stub registry by function name, not module handle).
+        // the otherwise-unmapped `0x7800_0000..0x7900_0000` band.
+        // Codecs use these handles for identity comparisons and
+        // as opaque arguments to `GetProcAddress`; the band is
+        // clear of every other mapped region (heap, const arena,
+        // TEB, stack, VirtualAlloc range, thunk space) so a
+        // codec that tries to *walk* the handle as if it were a
+        // PE image gets a clean `MemoryFault` rather than
+        // accidentally hitting some other arena.
         for (i, dll) in [
             "kernel32.dll",
             "user32.dll",
@@ -212,7 +216,7 @@ impl Sandbox {
         .iter()
         .enumerate()
         {
-            let handle = 0x7000_0000u32.wrapping_add((i as u32) * 0x10_0000);
+            let handle = 0x7800_0000u32.wrapping_add((i as u32) * 0x10_0000);
             host.modules.insert((*dll).to_string(), handle);
         }
 

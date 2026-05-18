@@ -78,6 +78,7 @@ fn trace_codec(name: &str, base_url: &str, fcc: &str) {
     let mut sb = Sandbox::new();
     sb.host.trace_stubs = true;
     sb.host.instruction_budget = Some(50_000_000);
+    sb.cpu.trace_ring_cap = 32;
 
     let img = sb.load(name, &bytes).expect("load");
     sb.call_dll_main(&img, DLL_PROCESS_ATTACH).expect("DllMain");
@@ -109,6 +110,12 @@ fn trace_codec(name: &str, base_url: &str, fcc: &str) {
         "ICOpen(VIDC, {fcc}, DECOMPRESS) -> {:?}",
         result.as_ref().map(|h| format!("HIC {h}")),
     );
+    if result.is_err() {
+        println!("Last 32 instruction EIPs before trap:");
+        for eip in &sb.cpu.trace_ring {
+            println!("  {eip:#010x}");
+        }
+    }
     println!("DRV_OPEN-phase calls (DllMain pre-cleared, was {dllmain_calls}):");
     for (i, c) in sb.host.stub_calls.iter().enumerate() {
         let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
