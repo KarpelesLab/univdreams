@@ -197,17 +197,67 @@ fn make_input_rgb24() -> Vec<u8> {
     frame
 }
 
-fn input_bih(_fcc_handler_u32: u32) -> Bih {
-    Bih {
-        bi_size: 40,
-        width: WIDTH as i32,
-        height: HEIGHT as i32,
-        planes: 1,
-        bit_count: 24,
-        compression: [0; 4], // BI_RGB
-        size_image: RGB24_SIZE,
-        ..Bih::default()
-    }
+/// Candidate input formats tried in order; the first that
+/// passes `ICCompressQuery` is the one the encode path uses.
+/// Most codecs accept RGB24 — only HuffYUV / MagicYUV need
+/// the alternatives.
+fn candidate_input_formats() -> Vec<(&'static str, Bih, Vec<u8>)> {
+    let rgb32_payload = {
+        let mut v = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                v.push((x * 8) as u8); // B
+                v.push((y * 8) as u8); // G
+                v.push(((x + y) * 4) as u8); // R
+                v.push(0xFF); // A / reserved
+            }
+        }
+        v
+    };
+    vec![
+        (
+            "RGB24",
+            Bih {
+                bi_size: 40,
+                width: WIDTH as i32,
+                height: HEIGHT as i32,
+                planes: 1,
+                bit_count: 24,
+                compression: [0; 4],
+                size_image: RGB24_SIZE,
+                ..Bih::default()
+            },
+            make_input_rgb24(),
+        ),
+        (
+            "RGB32",
+            Bih {
+                bi_size: 40,
+                width: WIDTH as i32,
+                height: HEIGHT as i32,
+                planes: 1,
+                bit_count: 32,
+                compression: [0; 4],
+                size_image: WIDTH * HEIGHT * 4,
+                ..Bih::default()
+            },
+            rgb32_payload,
+        ),
+        (
+            "YUY2",
+            Bih {
+                bi_size: 40,
+                width: WIDTH as i32,
+                height: HEIGHT as i32,
+                planes: 1,
+                bit_count: 16,
+                compression: *b"YUY2",
+                size_image: WIDTH * HEIGHT * 2,
+                ..Bih::default()
+            },
+            vec![0x80; (WIDTH * HEIGHT * 2) as usize],
+        ),
+    ]
 }
 
 fn run_one(entry: &Entry) -> Outcome {
@@ -241,8 +291,6 @@ fn run_one(entry: &Entry) -> Outcome {
 
     let fcc_type = fourcc("VIDC");
     let fcc_handler_u32 = fourcc(entry.fcc);
-    let input = make_input_rgb24();
-    let in_bih = input_bih(fcc_handler_u32);
 
     // ---- encode path ----------------------------------------
     let enc_hic = match sb.ic_open(fcc_type, fcc_handler_u32, ICMODE_COMPRESS) {
@@ -258,24 +306,41 @@ fn run_one(entry: &Entry) -> Outcome {
     };
     out.compress_open_ok = true;
 
-    let (_, out_bih) = match sb.ic_compress_get_format(enc_hic, &in_bih) {
-        Ok(p) => p,
-        Err(e) => {
-            out.error = Some(format!("ICCompressGetFormat: {e}"));
-            return out;
+    // Try each candidate input format; pick the first whose
+    // (in_bih, codec-chosen out_bih) pair passes ICCompressQuery.
+    // Most codecs accept RGB24, but HuffYUV / MagicYUV need
+    // one of the alternatives.
+    let mut chosen: Option<(Bih, Bih, Vec<u8>)> = None;
+    let mut last_reject = String::new();
+    for (label, in_bih, payload) in candidate_input_formats() {
+        let out_bih = match sb.ic_compress_get_format(enc_hic, &in_bih) {
+            Ok((_, o)) => o,
+            Err(e) => {
+                last_reject = format!("ICCompressGetFormat({label}): {e}");
+                continue;
+            }
+        };
+        match sb.ic_compress_query(enc_hic, &in_bih, Some(&out_bih)) {
+            Ok(0) => {
+                chosen = Some((in_bih, out_bih, payload));
+                break;
+            }
+            Ok(rc) => {
+                last_reject = format!(
+                    "ICCompressQuery({label}) rejected pair (LRESULT {rc:#x}); \
+                     out_bih bit_count={} compression={:?}",
+                    out_bih.bit_count, out_bih.compression,
+                );
+            }
+            Err(e) => {
+                last_reject = format!("ICCompressQuery({label}): {e}");
+            }
         }
-    };
-    let q = match sb.ic_compress_query(enc_hic, &in_bih, Some(&out_bih)) {
-        Ok(rc) => rc,
-        Err(e) => {
-            out.error = Some(format!("ICCompressQuery: {e}"));
-            return out;
-        }
-    };
-    if (q as i32) != 0 {
-        out.error = Some(format!("ICCompressQuery rejected pair (LRESULT {q:#x})"));
-        return out;
     }
+    let Some((in_bih, out_bih, input)) = chosen else {
+        out.error = Some(last_reject);
+        return out;
+    };
     let cap = match sb.ic_compress_get_size(enc_hic, &in_bih, &out_bih) {
         Ok(c) => c,
         Err(e) => {

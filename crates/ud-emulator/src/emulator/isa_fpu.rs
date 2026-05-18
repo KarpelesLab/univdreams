@@ -284,6 +284,19 @@ fn dispatch_reg_form(
                     cpu.fpu.push(0.0);
                     Ok(StepOk::Continued)
                 }
+                (6, 1) => {
+                    // FYL2X (D9 F1) — ST(1) := ST(1) * log2(ST(0)),
+                    // then pop. After pop the new ST(0) holds the
+                    // result. Indeo 4's ICCompress encode-init
+                    // path uses this for rate-control parameter
+                    // setup.
+                    let st0 = cpu.fpu.st(0);
+                    let st1 = cpu.fpu.st(1);
+                    let result = st1 * st0.log2();
+                    cpu.fpu.pop();
+                    cpu.fpu.set_st(0, result);
+                    Ok(StepOk::Continued)
+                }
                 (7, 0) => {
                     // FPREM (D9 F8) — partial remainder. Real
                     // x87 is iterative (handles huge magnitudes
@@ -338,9 +351,12 @@ fn dispatch_reg_form(
                     cpu.fpu.set_st(0, v.cos());
                     Ok(StepOk::Continued)
                 }
-                _ => Err(Trap::PrivilegedOpcode {
+                _ => Err(Trap::UndefinedOpcode {
                     eip: entry_eip,
-                    mnemonic: "x87 D9 reg-form (unimplemented sub-form)",
+                    // Pack (reg, rm) into the opcode id so the
+                    // trap log identifies the exact D9 sub-form
+                    // (`D9 C0..C7` = FLD, `D9 C8..CF` = FXCH, …).
+                    opcode: 0xD900 | (u32::from(reg) << 4) | u32::from(rm),
                 }),
             }
         }
