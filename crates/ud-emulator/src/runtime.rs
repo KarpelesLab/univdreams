@@ -123,11 +123,18 @@ impl Sandbox {
     /// CPU's `esp` pointing at a freshly-allocated stack.
     pub fn new() -> Self {
         let mut mmu = Mmu::new();
-        // Heap arena (R+W)
+        // Heap arena (R+W+X). Old codecs (e.g. Cinepak) ship
+        // architecture-specific inner-loop assembly that they
+        // copy into `malloc`'d memory at init time and then call.
+        // On real Windows, `HeapAlloc(GetProcessHeap, ...)` returns
+        // executable memory by default; modelling the same is
+        // simpler than chasing per-codec `VirtualProtect(PAGE_EXEC)`
+        // calls. Bytes still respect `mmu.write_initializer`'s
+        // perm rules; only the X bit is broader.
         mmu.map(
             HEAP_ARENA_START,
             HEAP_ARENA_END - HEAP_ARENA_START,
-            Perm::R | Perm::W,
+            Perm::R | Perm::W | Perm::X,
         );
         // Const-arena for canned strings (R+W mapped; the caller
         // ABI treats it as R-only — we use write_initializer for

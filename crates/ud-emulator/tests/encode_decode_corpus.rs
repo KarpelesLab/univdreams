@@ -57,6 +57,13 @@ struct Entry {
     /// (HuffYUV, Lagarith, MagicYUV, CamStudio). Lossy codecs
     /// just need to encode + decode without trapping.
     lossless: bool,
+    /// `true` for codecs that ship without an encoder by design
+    /// — e.g. Intel's `IR32_32.DLL` shipped as a decoder-only
+    /// build; the encoder lived in a separate `ENCODE.DLL` that
+    /// isn't in the corpus. `ICOpen(ICMODE_COMPRESS)` legitimately
+    /// returns 0 here; the harness records this as "decode-only
+    /// by design" rather than a failure.
+    decode_only: bool,
 }
 
 const CODECS: &[Entry] = &[
@@ -66,6 +73,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/divx-3.11",
         fcc: "DIV3",
         lossless: false,
+        decode_only: false,
     },
     Entry {
         label: "DivX 3.11 fast",
@@ -73,6 +81,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/divx-3.11",
         fcc: "DIV4",
         lossless: false,
+        decode_only: false,
     },
     Entry {
         label: "Cinepak",
@@ -80,6 +89,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/cinepak",
         fcc: "cvid",
         lossless: false,
+        decode_only: false,
     },
     Entry {
         label: "Indeo 3",
@@ -87,6 +97,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/indeo3",
         fcc: "IV31",
         lossless: false,
+        decode_only: true,
     },
     Entry {
         label: "Indeo 4",
@@ -94,6 +105,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/indeo4",
         fcc: "IV41",
         lossless: false,
+        decode_only: false,
     },
     Entry {
         label: "Indeo 5",
@@ -101,6 +113,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/indeo5",
         fcc: "IV50",
         lossless: false,
+        decode_only: false,
     },
     Entry {
         label: "MS-MPEG-4 v3 (wmpcdcs8)",
@@ -108,6 +121,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/msmpeg4v3",
         fcc: "MP43",
         lossless: false,
+        decode_only: false,
     },
     Entry {
         label: "MS-MPEG-4 v3 (winxp)",
@@ -115,6 +129,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/msmpeg4v3",
         fcc: "MP43",
         lossless: false,
+        decode_only: false,
     },
     Entry {
         label: "HuffYUV",
@@ -122,6 +137,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/huffyuv",
         fcc: "HFYU",
         lossless: true,
+        decode_only: false,
     },
     Entry {
         label: "CamStudio 1.4",
@@ -129,6 +145,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/camstudio",
         fcc: "CSCD",
         lossless: true,
+        decode_only: false,
     },
     Entry {
         label: "CamStudio 1.5",
@@ -136,6 +153,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/camstudio",
         fcc: "CSCD",
         lossless: true,
+        decode_only: false,
     },
     Entry {
         label: "Lagarith",
@@ -143,6 +161,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/lagarith",
         fcc: "LAGS",
         lossless: true,
+        decode_only: false,
     },
     Entry {
         label: "MagicYUV",
@@ -150,6 +169,7 @@ const CODECS: &[Entry] = &[
         base_url: "https://samples.oxideav.org/codecs/windows/magicyuv",
         fcc: "M8RG",
         lossless: true,
+        decode_only: false,
     },
 ];
 
@@ -272,6 +292,8 @@ fn run_one(entry: &Entry) -> Outcome {
 
     let mut sb = Sandbox::new();
     sb.host.instruction_budget = Some(100_000_000);
+    sb.host.trace_stubs = true;
+    sb.cpu.trace_ring_cap = 8;
 
     let img = match sb.load(entry.name, &bytes) {
         Ok(i) => i,
@@ -292,10 +314,31 @@ fn run_one(entry: &Entry) -> Outcome {
     let fcc_type = fourcc("VIDC");
     let fcc_handler_u32 = fourcc(entry.fcc);
 
+    if entry.decode_only {
+        // Decode-only by design — record the marker and skip the
+        // encode + same-bitstream-round-trip path entirely.
+        // Independent decode would need an external bitstream
+        // fixture; not in this harness yet.
+        out.error = Some("decode-only by design (no encoder in DLL)".into());
+        return out;
+    }
+
     // ---- encode path ----------------------------------------
     let enc_hic = match sb.ic_open(fcc_type, fcc_handler_u32, ICMODE_COMPRESS) {
         Ok(0) => {
-            out.error = Some("ICOpen(COMPRESS) returned 0".into());
+            let last_stubs: Vec<String> = sb
+                .host
+                .stub_calls
+                .iter()
+                .rev()
+                .take(8)
+                .rev()
+                .map(|c| format!("{}!{}", c.dll, c.name))
+                .collect();
+            out.error = Some(format!(
+                "ICOpen(COMPRESS) returned 0; last stubs=[{}]",
+                last_stubs.join(",")
+            ));
             return out;
         }
         Ok(h) => h,
@@ -320,19 +363,29 @@ fn run_one(entry: &Entry) -> Outcome {
                 continue;
             }
         };
-        match sb.ic_compress_query(enc_hic, &in_bih, Some(&out_bih)) {
-            Ok(0) => {
+        // Try with the codec-chosen out_bih first; if it rejects,
+        // try with `None` ("any output") — some codecs (HuffYUV)
+        // accept the latter even when they reject their own
+        // chosen output BIH echoed back.
+        let q_pair = sb.ic_compress_query(enc_hic, &in_bih, Some(&out_bih));
+        let q_any = if matches!(q_pair, Ok(0)) {
+            Ok(0xFFFF_FFFF) // unused — pair already passed
+        } else {
+            sb.ic_compress_query(enc_hic, &in_bih, None)
+        };
+        match (q_pair, q_any) {
+            (Ok(0), _) | (_, Ok(0)) => {
                 chosen = Some((in_bih, out_bih, payload));
                 break;
             }
-            Ok(rc) => {
+            (Ok(rc), _) => {
                 last_reject = format!(
                     "ICCompressQuery({label}) rejected pair (LRESULT {rc:#x}); \
                      out_bih bit_count={} compression={:?}",
                     out_bih.bit_count, out_bih.compression,
                 );
             }
-            Err(e) => {
+            (Err(e), _) => {
                 last_reject = format!("ICCompressQuery({label}): {e}");
             }
         }
@@ -365,7 +418,26 @@ fn run_one(entry: &Entry) -> Outcome {
     ) {
         Ok(outcome) => outcome.bytes,
         Err(e) => {
-            out.error = Some(format!("ICCompress: {e}"));
+            let last_eips: Vec<String> = sb
+                .cpu
+                .trace_ring
+                .iter()
+                .map(|e| format!("{e:#x}"))
+                .collect();
+            let last_stubs: Vec<String> = sb
+                .host
+                .stub_calls
+                .iter()
+                .rev()
+                .take(8)
+                .rev()
+                .map(|c| format!("{}!{}", c.dll, c.name))
+                .collect();
+            out.error = Some(format!(
+                "ICCompress: {e}; last_eips=[{}]; last_stubs=[{}]",
+                last_eips.join(","),
+                last_stubs.join(","),
+            ));
             return out;
         }
     };
@@ -426,7 +498,11 @@ fn run_one(entry: &Entry) -> Outcome {
 #[ignore = "fetches 13 codec DLLs from samples.oxideav.org; run on demand"]
 fn encode_decode_corpus() {
     let mut totals = (0usize, 0usize, 0usize); // (encode_ok, decode_ok, round_trip)
-    let total = CODECS.len();
+    let testable = CODECS.iter().filter(|c| !c.decode_only).count();
+    let lossless_testable = CODECS
+        .iter()
+        .filter(|c| c.lossless && !c.decode_only)
+        .count();
     for entry in CODECS {
         let r = run_one(entry);
         if r.compress_ok {
@@ -438,29 +514,36 @@ fn encode_decode_corpus() {
         if r.round_trip_pixel_exact {
             totals.2 += 1;
         }
-        let enc = if r.compress_ok {
-            format!("enc=ok({} B)", r.encoded_size)
+        let (enc, dec, rt);
+        if entry.decode_only {
+            enc = "enc=N/A".into();
+            dec = "dec=N/A".into();
+            rt = "";
         } else {
-            "enc=FAIL".into()
-        };
-        let dec = if r.decompress_ok {
-            format!("dec=ok({} B)", r.decoded_size)
-        } else if r.compress_ok {
-            "dec=FAIL".into()
-        } else {
-            "dec=skip".into()
-        };
-        let rt = if entry.lossless {
-            if r.round_trip_pixel_exact {
-                " rt=EXACT"
-            } else if r.decompress_ok {
-                " rt=lossy"
+            enc = if r.compress_ok {
+                format!("enc=ok({} B)", r.encoded_size)
+            } else {
+                "enc=FAIL".into()
+            };
+            dec = if r.decompress_ok {
+                format!("dec=ok({} B)", r.decoded_size)
+            } else if r.compress_ok {
+                "dec=FAIL".into()
+            } else {
+                "dec=skip".into()
+            };
+            rt = if entry.lossless {
+                if r.round_trip_pixel_exact {
+                    " rt=EXACT"
+                } else if r.decompress_ok {
+                    " rt=lossy"
+                } else {
+                    ""
+                }
             } else {
                 ""
-            }
-        } else {
-            ""
-        };
+            };
+        }
         let err = r
             .error
             .as_deref()
@@ -469,12 +552,11 @@ fn encode_decode_corpus() {
         println!("  {:<28}  {enc:<14}  {dec:<14}{rt}{err}", entry.label);
     }
     println!();
-    println!("Totals:");
-    println!("  encode ok:     {} / {}", totals.0, total);
-    println!("  decode ok:     {} / {}", totals.1, total);
+    println!("Totals (excluding decode-only by design):");
+    println!("  encode ok:     {} / {}", totals.0, testable);
+    println!("  decode ok:     {} / {}", totals.1, testable);
     println!(
-        "  lossless round-trip exact: {} / {} (of lossless codecs)",
-        totals.2,
-        CODECS.iter().filter(|c| c.lossless).count(),
+        "  lossless round-trip exact: {} / {}",
+        totals.2, lossless_testable,
     );
 }
