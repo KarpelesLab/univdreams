@@ -41,16 +41,20 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
   `DllMain` and `DRV_OPEN`-phase Win32 call sequence. Records
   the current findings for the two remaining unconfirmed video
   codecs:
-  * **Lagarith** — `DRV_OPEN` ends in `__report_gsfailure`
-    (MSVC /GS stack-cookie detected as corrupted in a
-    codec-internal function). Fault chain:
+  * **Lagarith** — `DRV_OPEN` ends in `ExitProcess(0xff)` after
+    a call chain that looks like MSVC's `__report_gsfailure`:
     `GetModuleFileNameW → EncodePointer(0) →
      LoadLibraryW(L"USER32.DLL") →
      GetModuleHandleW(L"mscoree.dll") → ExitProcess(0xff)`.
-    `__security_init_cookie` ran cleanly in DllMain, so the
-    cookie was set — something a DRV_OPEN-invoked function does
-    trips the epilogue check. Pinning the offender needs a
-    watchpoint on `__security_check_cookie`.
+    Watchpoint-based forensics (see
+    `tests/lagarith_gs_forensics.rs`) **falsifies** the /GS
+    hypothesis: `__security_check_cookie` fires twice during
+    `DRV_OPEN` and both cookie checks pass, and
+    `__report_gsfailure` (`0x1000_7c00`) is never entered. The
+    `ExitProcess` path is a *different* fatal-exit helper baked
+    into the codec's CRT — closing it needs static disassembly
+    of the function at `RVA 0x4998` to find its triggering
+    condition.
   * **MagicYUV** — traps on `UndefinedOpcode 0xF12` (`0F 12` =
     `MOVLPS` / `MOVHLPS`). The codec is SIMD-heavy; closing
     this likely needs an SSE/SSE2 surface expansion, not a

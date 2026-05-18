@@ -12,18 +12,19 @@
 //! ## Current findings (as of 2026-05-18)
 //!
 //! **Lagarith (`lagarith-i386.dll`, fourcc `LAGS`)** — `DRV_OPEN`
-//! ends in `__report_gsfailure`: the MSVC /GS stack cookie was
-//! detected as corrupted inside one of the codec's own functions
-//! during the DRV_OPEN handler. The fault-chain calls are
-//! `GetModuleFileNameW` → `EncodePointer(0)` →
+//! ends in `ExitProcess(0xff)` after a fault-handler-looking call
+//! chain (`GetModuleFileNameW` → `EncodePointer(0)` →
 //! `LoadLibraryW(L"USER32.DLL")` → `GetModuleHandleW(L"mscoree.dll")`
-//! → `ExitProcess(0xff)`. `__security_init_cookie` ran cleanly in
-//! `DllMain` (the five entropy-source calls are present in order
-//! in the DllMain trace), so the codec installed a fresh cookie;
-//! something inside one of its DRV_OPEN-invoked functions
-//! tripped the epilogue check. Reproducing this needs a
-//! watchpoint on `__security_check_cookie` (à la round-69 forensics)
-//! to identify the offending callee.
+//! → `ExitProcess(0xff)`). The shape looks like MSVC's
+//! `__report_gsfailure`, but the forensic harness
+//! `tests/lagarith_gs_forensics.rs` falsifies that hypothesis:
+//! `__security_check_cookie` fires twice during `DRV_OPEN`,
+//! both times the cookie matches the global at `0x10033298`,
+//! and `__report_gsfailure` (`0x10007c00`) is never entered.
+//! The ExitProcess path is a *different* fatal-exit helper baked
+//! into Lagarith's CRT — closing this needs static disassembly of
+//! the function calling `ExitProcess` at RVA `0x4998` to find its
+//! triggering condition.
 //!
 //! **MagicYUV (`magicyuv-i386.dll`, fourcc `MYUV`)** — `DRV_OPEN`
 //! traps on `UndefinedOpcode { opcode: 0xF12 }`, i.e. `0F 12`
