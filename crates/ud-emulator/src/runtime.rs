@@ -179,6 +179,43 @@ impl Sandbox {
         let mut host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
             .with_const_arena(CONST_ARENA_START, CONST_ARENA_END);
 
+        // Pre-register the system DLLs whose stub registries we
+        // ship as "loaded modules". Real Windows always has these
+        // available, and codec CRTs commonly probe them via
+        // `GetModuleHandleW(L"KERNEL32.DLL")` before walking their
+        // exports (e.g. lagarith's `_CRT_INIT` rolls back its heap
+        // and bails if `KERNEL32.DLL`'s handle comes back NULL).
+        // The handles are synthetic, distinct, non-zero values in
+        // the otherwise-unmapped `0x7000_0000..0x7800_0000` band —
+        // codecs use them for identity comparisons and as opaque
+        // arguments to `GetProcAddress` (which dispatches through
+        // the stub registry by function name, not module handle).
+        for (i, dll) in [
+            "kernel32.dll",
+            "user32.dll",
+            "gdi32.dll",
+            "advapi32.dll",
+            "ole32.dll",
+            "shell32.dll",
+            "shlwapi.dll",
+            "comctl32.dll",
+            "winmm.dll",
+            "msvcrt.dll",
+            "msvcr71.dll",
+            "msvcr80.dll",
+            "msvcr90.dll",
+            "pncrt.dll",
+            "mfplat.dll",
+            "version.dll",
+            "vfw32.dll",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let handle = 0x7000_0000u32.wrapping_add((i as u32) * 0x10_0000);
+            host.modules.insert((*dll).to_string(), handle);
+        }
+
         // Round 35 — pre-register the canonical DirectShow memory
         // allocator class factory in the in-process class-factory
         // cache.  Codecs that internally call
@@ -261,6 +298,13 @@ impl Sandbox {
         // Record primary module base so `GetModuleHandleA(NULL)`
         // returns the right value.
         self.host.primary_module_base = img.image_base;
+        // Also record the loaded module under its filename so
+        // `GetModuleHandleA("name.dll")` finds it. Lower-cased,
+        // matching the lookup in `stub_get_module_handle_a` /
+        // `_w`.
+        self.host
+            .modules
+            .insert(name.to_ascii_lowercase(), img.image_base);
         Ok(img)
     }
 

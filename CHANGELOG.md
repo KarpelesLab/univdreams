@@ -8,6 +8,24 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+### Added
+- `Sandbox::new` pre-registers the canonical system DLL names
+  (`kernel32` / `user32` / `gdi32` / `advapi32` / `ole32` /
+  `shell32` / `shlwapi` / `comctl32` / `winmm` / `msvcrt` /
+  `msvcr71` / `msvcr80` / `msvcr90` / `pncrt` / `mfplat` /
+  `version` / `vfw32`) in `state.modules` with synthetic
+  distinct non-zero handles. Codec CRTs commonly probe
+  `GetModuleHandleW(L"KERNEL32.DLL")` during init and roll back
+  if the handle comes back NULL — Lagarith's CRT was destroying
+  its newly-created heap on the NULL return path, then bailing
+  in `malloc` once `DRV_OPEN` ran. Closes that bug.
+- `GetModuleHandleW` and `LoadLibraryW` now read the wide
+  string and resolve through `state.modules` (matching the
+  ANSI variants). The W-stubs previously returned 0 for any
+  non-NULL pointer regardless of name. Closes Lagarith's
+  `ICOpen` rejection path (corpus probe: **11 → 12 of 17
+  DriverProc exporters**).
+
 ### Fixed
 - `kernel32!VirtualProtect` now actually updates MMU page
   permissions for the requested range, and writes the prior
@@ -41,20 +59,16 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
   `DllMain` and `DRV_OPEN`-phase Win32 call sequence. Records
   the current findings for the two remaining unconfirmed video
   codecs:
-  * **Lagarith** — `DRV_OPEN` ends in `ExitProcess(0xff)` after
-    a call chain that looks like MSVC's `__report_gsfailure`:
-    `GetModuleFileNameW → EncodePointer(0) →
-     LoadLibraryW(L"USER32.DLL") →
-     GetModuleHandleW(L"mscoree.dll") → ExitProcess(0xff)`.
-    Watchpoint-based forensics (see
-    `tests/lagarith_gs_forensics.rs`) **falsifies** the /GS
-    hypothesis: `__security_check_cookie` fires twice during
-    `DRV_OPEN` and both cookie checks pass, and
-    `__report_gsfailure` (`0x1000_7c00`) is never entered. The
-    `ExitProcess` path is a *different* fatal-exit helper baked
-    into the codec's CRT — closing it needs static disassembly
-    of the function at `RVA 0x4998` to find its triggering
-    condition.
+  * **Lagarith** — fixed (see new "Added" entries above).
+    The fault chain was a CRT allocator wrapper that called
+    `sub_4981(0xff) → ExitProcess(0xff)` whenever `_crtheap`
+    was NULL; the heap was being destroyed inside `_CRT_INIT`
+    because that function checks `GetModuleHandleW(L"KERNEL32.DLL")`
+    and our wide stub was returning 0 for every non-NULL name.
+    Diagnosed by running `ud decompile` on the codec and
+    reading the function tree — `sub_27ff` (`_CRT_INIT`),
+    `sub_466f` (the KERNEL32 probe), `sub_5379` / `sub_5397`
+    (heap create / destroy).
   * **MagicYUV** — traps on `UndefinedOpcode 0xF12` (`0F 12` =
     `MOVLPS` / `MOVHLPS`). The codec is SIMD-heavy; closing
     this likely needs an SSE/SSE2 surface expansion, not a

@@ -3359,9 +3359,11 @@ fn stub_get_local_time(
 }
 
 /// `HMODULE GetModuleHandleW(LPCWSTR lpModuleName)`. Wide-char
-/// sibling of `GetModuleHandleA`. We don't yet resolve the
-/// name; passing `NULL` returns the primary module base,
-/// anything else returns 0 (codec falls back to a load attempt).
+/// sibling of `GetModuleHandleA`. `NULL` returns the primary
+/// module base; otherwise resolve via `state.modules` (lower-cased
+/// — `Sandbox::new` pre-registers the canonical system DLLs there
+/// so codec CRTs that probe `GetModuleHandleW(L"KERNEL32.DLL")`
+/// during init get a non-NULL handle back).
 fn stub_get_module_handle_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -3372,7 +3374,26 @@ fn stub_get_module_handle_w(
     if p == 0 {
         return Ok(state.primary_module_base);
     }
-    Ok(0)
+    let name = read_wcstr(mmu, p, 260)?.to_ascii_lowercase();
+    Ok(state.modules.get(&name).copied().unwrap_or(0))
+}
+
+/// Read a NUL-terminated wide (UTF-16LE) string from guest
+/// memory and return it as a host `String` (lossily, ASCII-bias
+/// — codec module names and CRT probes are all ASCII-clean).
+fn read_wcstr(mmu: &Mmu, mut addr: u32, max: u32) -> Result<String, Win32Error> {
+    let mut bytes = Vec::with_capacity(64);
+    for _ in 0..max {
+        let c = mmu
+            .load16(addr)
+            .map_err(|t| trap_to_win32("read_wcstr", t))?;
+        if c == 0 {
+            break;
+        }
+        bytes.push(c);
+        addr = addr.wrapping_add(2);
+    }
+    Ok(String::from_utf16_lossy(&bytes))
 }
 
 /// `UINT GetPrivateProfileIntA(LPCSTR lpAppName, LPCSTR lpKeyName,
@@ -3629,12 +3650,17 @@ fn stub_set_thread_affinity_mask(
 /// require a successful LoadLibrary tend to be the optional-
 /// codec-pack splitter shapes we don't try to fully drive.
 fn stub_load_library_w(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(0)
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadLibraryW", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    let name = read_wcstr(mmu, p, 260)?.to_ascii_lowercase();
+    Ok(state.modules.get(&name).copied().unwrap_or(0))
 }
 
 /// `BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED)`.
