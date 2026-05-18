@@ -394,13 +394,19 @@ fn run_one(entry: &Entry) -> Outcome {
         out.error = Some(last_reject);
         return out;
     };
-    let cap = match sb.ic_compress_get_size(enc_hic, &in_bih, &out_bih) {
+    let mut cap = match sb.ic_compress_get_size(enc_hic, &in_bih, &out_bih) {
         Ok(c) => c,
         Err(e) => {
             out.error = Some(format!("ICCompressGetSize: {e}"));
             return out;
         }
     };
+    // Some codecs (notably MagicYUV) return a 0 or otherwise
+    // unusable size here; fall back to a generous default so
+    // we can still try to drive the compress path.
+    if cap == 0 || cap > 0x0100_0000 {
+        cap = (input.len() as u32).saturating_mul(4).max(0x10000);
+    }
     let _ = sb.ic_compress_begin(enc_hic, &in_bih, &out_bih);
     let encoded = match sb.ic_compress(
         enc_hic,

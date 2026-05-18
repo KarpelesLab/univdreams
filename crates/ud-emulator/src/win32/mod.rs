@@ -383,13 +383,13 @@ impl HostState {
     /// guest address of the new slab. The caller is responsible
     /// for [`Mmu::write_initializer`]'ing the contents.
     pub fn arena_const_alloc(&mut self, n: u32) -> Result<u32, Win32Error> {
-        let aligned = n
-            .checked_add(15)
-            .map(|v| v & !15u32)
-            .ok_or(Win32Error::InvalidArgument {
-                stub: "arena_const_alloc",
-                reason: "size overflow".into(),
-            })?;
+        let aligned =
+            n.checked_add(15)
+                .map(|v| v & !15u32)
+                .ok_or_else(|| Win32Error::InvalidArgument {
+                    stub: "arena_const_alloc",
+                    reason: format!("size overflow: requested {n} (≈ {n:#x})"),
+                })?;
         let addr = self.const_arena_cursor;
         let next = addr
             .checked_add(aligned)
@@ -415,13 +415,13 @@ impl HostState {
     /// stage `ICDECOMPRESS` / `BITMAPINFOHEADER` / raw-frame
     /// buffers in guest memory before calling `DriverProc`.
     pub fn arena_alloc(&mut self, n: u32) -> Result<u32, Win32Error> {
-        let aligned = n
-            .checked_add(15)
-            .map(|v| v & !15u32)
-            .ok_or(Win32Error::InvalidArgument {
-                stub: "arena_alloc",
-                reason: "size overflow".into(),
-            })?;
+        let aligned =
+            n.checked_add(15)
+                .map(|v| v & !15u32)
+                .ok_or_else(|| Win32Error::InvalidArgument {
+                    stub: "arena_alloc",
+                    reason: format!("size overflow: requested {n} (≈ {n:#x})"),
+                })?;
         let addr = self.heap_cursor;
         let next = addr
             .checked_add(aligned)

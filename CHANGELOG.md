@@ -8,6 +8,96 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-05-19
+
+### Added
+- `crates/ud-emulator/tests/encode_decode_corpus.rs` — single
+  integration test that drives the VfW IC* compress + decompress
+  pipeline end-to-end on each of the 13 ICOpen-confirmed video
+  codecs (32×32 RGB24 synthetic input). Reports per-codec pass /
+  fail; tracks pixel-exact round-trip for the lossless set.
+  Final state of this release:
+  ```
+    DivX 3.11               enc=ok(105 B)   dec=ok(3072 B)
+    DivX 3.11 fast          enc=ok(94 B)    dec=ok(3072 B)
+    Cinepak                 enc=ok(706 B)   dec=ok(3072 B)
+    Indeo 3                 enc=N/A         dec=N/A   (decode-only by design)
+    Indeo 4                 enc=ok(150 B)   dec=ok(3072 B)
+    Indeo 5                 enc=ok(128 B)   dec=ok(3072 B)
+    MS-MPEG-4 v3 (wmpcdcs8) enc=ok(105 B)   dec=ok(3072 B)
+    MS-MPEG-4 v3 (winxp)    enc=ok(162 B)   dec=ok(3072 B)
+    HuffYUV                 enc=FAIL  (infinite config-parse loop)
+    CamStudio 1.4           enc=ok(3091 B)  dec=ok(3072 B)  rt=EXACT
+    CamStudio 1.5           enc=ok(3091 B)  dec=ok(3072 B)  rt=EXACT
+    Lagarith                enc=ok(159 B)   dec=ok(3072 B)  rt=EXACT
+    MagicYUV                enc=ok(65536 B) dec=ok(3072 B)  rt=lossy
+    ─────────────────────────────────────────────────────────
+    encode + decode:                       11 / 12
+    lossless round-trip pixel-exact:        3 /  5
+  ```
+- `Cpu::xmm[8]` (128-bit XMM register file), `ymm_high[8]`
+  (upper 128 of YMM), `sse_dispatch_count`, `avx_dispatch_count`.
+- SSE1 instruction executor with `MOVLPS` / `MOVHLPS` /
+  `MOVHPS` / `MOVLHPS` plus store-variants (4 opcodes); AVX VEX
+  decoder with `VPXOR`, `VMOVUPS-store`, BMI2 `SHLX` / `SHRX` /
+  `SARX` (3 opcodes); x87 `FYL2X` (`D9 F1`).
+- `kernel32!VirtualProtect` actually updates MMU page
+  permissions and round-trips `lpflOldProtect`.
+- Stub-thunk region mapped R-only zeroed at `Sandbox::new` so
+  codecs that read a function pointer's bytes (CamStudio's
+  hot-patch probe) don't fault on the previously-unmapped
+  region.
+- `Sandbox::new` pre-registers the canonical system DLL names
+  in `state.modules` with synthetic non-zero handles (in the
+  `0x7800_0000..0x7900_0000` band, clear of every other mapped
+  region); `GetModuleHandleW` / `LoadLibraryW` now actually
+  read the wide string and resolve through `state.modules`.
+- `kernel32!GetProcAddress` reverse-resolves `hModule` via
+  `state.modules` and looks up the function name through the
+  stub registry (previously always returned NULL).
+- `Sandbox::load` records the loaded codec under its filename
+  so `GetModuleHandleA("codec.dll")` finds it.
+- `msvcrt!_errno` is now a function returning a stable pointer
+  to a lazily-allocated heap cell (was incorrectly registered
+  as a data import).
+- `msvcr80.dll` / `msvcr90.dll` aliased to the `msvcrt` stub
+  set; ~12 new MSVC 8 / 9 CRT additions
+  (`_decode_pointer` / `_encode_pointer` identity, `_initterm_e`,
+  `sprintf_s` / `sscanf` / `sscanf_s`, `_malloc_crt`, …).
+- ~70 Win32 stubs to unblock probe (round 2): new modules
+  `version.dll` / `comctl32.dll` / `shell32.dll` / `shlwapi.dll`;
+  extensions to `kernel32` / `user32` / `gdi32` / `msvcrt`.
+- `Sandbox::ic_get_state` / `ic_set_state` — VfW `ICM_GETSTATE`
+  / `ICM_SETSTATE` wrappers, mirroring `ic_compress_*`.
+- `ud_emulator::Guest` — FFI-shaped front end over `Sandbox`
+  (`dlopen` / typed `call` / `alloc` / `read` / `write`).
+- README §"Library use" introduces the `Guest` API.
+
+### Changed
+- Heap arena now maps R+W+X (was R+W). Cinepak's encoder ships
+  inner-loop assembly that it copies into `malloc`'d memory and
+  calls; modelling Windows' default executable heap is simpler
+  than chasing per-codec `VirtualProtect(PAGE_EXEC*)`.
+- Codec-corpus ICOpen-confirmed: **9 → 13 of 17 DriverProc
+  exporters**. The 4 remaining are all audio codecs (3 `.acm` +
+  IAC25 Indeo Audio in a DS-filter wrapper) where the `VIDC`
+  probe is N/A by design — **every genuine video codec in the
+  corpus that exports `DriverProc` now probes `ICOpen`
+  successfully**.
+- Codec-corpus DllMain: **61 → 64 of 66 i386 entries**.
+  Remaining failures: `wmvcore.dll` (145 unresolved imports —
+  out of scope), `RealMediaSplitter.ax` (now bails on a
+  different fault than before; more honest accounting now that
+  the previous "ok" was actually an early bail).
+- MagicYUV manifest fourcc corrected `MYUV` → `M8RG`.
+- Stale TSD.DLL manifest fix: relabelled `i386` → `win16`
+  (it's a 16-bit NE executable).
+
+### Fixed
+- `cargo clippy --all-targets -- -D warnings` is clean on
+  master; previously several pre-existing lints were tripping
+  CI.
+
 ### Added
 - `crates/ud-emulator/src/emulator/isa_avx.rs` — VEX-encoded AVX
   instruction executor. Handles both VEX prefix forms (2-byte
