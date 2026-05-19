@@ -8,6 +8,37 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+### Changed
+- `encode_decode_corpus` failure diagnostics now show
+  *unique* trace-ring EIPs (skeleton of any spinning loop) plus
+  a stub-call tail condensed to `dll!name×N` runs, instead of
+  the previous raw last-8-EIPs and last-8-stubs. Much easier
+  to spot whether a failing codec is in API-call rage or pure
+  guest loop.
+
+### Investigated
+- HuffYUV's `ICCompress` infinite loop pinned to RVA
+  `0x1ed8..0x1f50` — a Kraft-inequality check on Huffman
+  code lengths:
+  ```
+    movzx esi, [ecx]    ; read 1 byte (code length)
+    ...
+    add ebp, esi        ; accumulate
+    cmp ebp, 0x100      ; loop until 256
+    jl loop_start
+  ```
+  Only ~37 Win32 stub calls happen across 100 M instructions,
+  so the loop is in pure guest code reading from HuffYUV's
+  internal state (allocated during `DRV_OPEN` and populated
+  from `GetPrivateProfileIntA`-driven config). Our stub
+  returns the caller's default for every config key, so the
+  Huffman code-length table stays zero-filled and `esi` is
+  always 0 → loop never terminates. Closing this needs a
+  pre-populated virtual `HKCU\Software\Ben Rudiak-Gould\Huffyuv`
+  in `Context.registry` (and possibly seed Huffman tables in
+  the INI surface) so the codec's open-mode init actually
+  fills its tables. Future work.
+
 ## [0.1.4] — 2026-05-19
 
 ### Added

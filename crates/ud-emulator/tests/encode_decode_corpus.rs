@@ -293,7 +293,7 @@ fn run_one(entry: &Entry) -> Outcome {
     let mut sb = Sandbox::new();
     sb.host.instruction_budget = Some(100_000_000);
     sb.host.trace_stubs = true;
-    sb.cpu.trace_ring_cap = 8;
+    sb.cpu.trace_ring_cap = 256;
 
     let img = match sb.load(entry.name, &bytes) {
         Ok(i) => i,
@@ -424,25 +424,43 @@ fn run_one(entry: &Entry) -> Outcome {
     ) {
         Ok(outcome) => outcome.bytes,
         Err(e) => {
-            let last_eips: Vec<String> = sb
-                .cpu
-                .trace_ring
-                .iter()
-                .map(|e| format!("{e:#x}"))
-                .collect();
-            let last_stubs: Vec<String> = sb
-                .host
-                .stub_calls
+            // Distinct EIPs in the trace ring — when a tight
+            // loop spins it gets re-recorded many times; the
+            // unique set is the skeleton of the loop body.
+            let mut unique_eips: Vec<u32> = sb.cpu.trace_ring.clone();
+            unique_eips.sort_unstable();
+            unique_eips.dedup();
+            let eips_str: Vec<String> = unique_eips.iter().map(|e| format!("{e:#x}")).collect();
+            // Condensed stub-call trace: "dll!name ×N" runs.
+            let mut condensed: Vec<(String, u32)> = Vec::new();
+            for c in &sb.host.stub_calls {
+                let key = format!("{}!{}", c.dll, c.name);
+                if let Some((last, n)) = condensed.last_mut() {
+                    if *last == key {
+                        *n += 1;
+                        continue;
+                    }
+                }
+                condensed.push((key, 1));
+            }
+            let tail: Vec<String> = condensed
                 .iter()
                 .rev()
-                .take(8)
+                .take(12)
                 .rev()
-                .map(|c| format!("{}!{}", c.dll, c.name))
+                .map(|(k, n)| {
+                    if *n == 1 {
+                        k.clone()
+                    } else {
+                        format!("{k}×{n}")
+                    }
+                })
                 .collect();
             out.error = Some(format!(
-                "ICCompress: {e}; last_eips=[{}]; last_stubs=[{}]",
-                last_eips.join(","),
-                last_stubs.join(","),
+                "ICCompress: {e}; unique_loop_eips=[{}]; total_stub_calls={}; tail=[{}]",
+                eips_str.join(","),
+                sb.host.stub_calls.len(),
+                tail.join(", "),
             ));
             return out;
         }
