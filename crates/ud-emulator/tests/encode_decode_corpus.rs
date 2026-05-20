@@ -470,13 +470,28 @@ fn run_one(entry: &Entry) -> Outcome {
                     format!("{}!{}({})->{:#x}", c.dll, c.name, args.join(","), c.ret)
                 })
                 .collect();
+            // Last few distinct EIPs (deduped) — these are the
+            // skeleton of the loop / path leading up to the
+            // trap, restricted to the codec's image so the
+            // trace stays readable.
+            let codec_eips: Vec<String> = eips_str
+                .iter()
+                .filter(|s| {
+                    let v = u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0);
+                    // Codec image is loaded in the 0x60000000..0x70000000
+                    // range; skip Win32-stub thunks which land
+                    // in the 0x70000000..0x78000000 import band.
+                    (0x4000_0000..0x7000_0000).contains(&v)
+                })
+                .cloned()
+                .collect();
             out.error = Some(format!(
-                "ICCompress: {e}; total_stub_calls={}; tail=[{}]; final=[{}]",
+                "ICCompress: {e}; total_stub_calls={}; tail=[{}]; final=[{}]; codec_eips=[{}]",
                 sb.host.stub_calls.len(),
                 tail.join(", "),
                 with_args.join(" / "),
+                codec_eips.join(","),
             ));
-            let _ = eips_str; // (kept for reference but not in error msg)
             return out;
         }
     };

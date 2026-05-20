@@ -198,6 +198,107 @@ fn movhps_or_movlhps(cpu: &mut Cpu, mmu: &mut Mmu) -> Result<StepOk, Trap> {
 }
 
 // ============================================================
+// SSE2 integer space (`0x66 0F xx`) — the MMX-shaped opcode
+// space repurposed for 128-bit XMM operations when the `0x66`
+// mandatory prefix is present. Routed here from `isa_int`'s
+// 0F-dispatcher so MMX-only instructions don't accidentally
+// service their XMM counterparts.
+// ============================================================
+
+/// Dispatch a `0x66 0F xx` instruction whose `xx` lives in the
+/// MMX opcode space (`60..6F | 70..7F | D0..FF`). Only the
+/// opcodes corpus codecs actually use are wired up; everything
+/// else traps with a structured opcode id so the next gap is
+/// obvious at trap-time.
+pub fn dispatch_xmm_int(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    op2: u8,
+    entry_eip: u32,
+) -> Result<StepOk, Trap> {
+    cpu.sse_dispatch_count = cpu.sse_dispatch_count.wrapping_add(1);
+    match op2 {
+        // 0x66 0F 6F /r — MOVDQA xmm, xmm/m128.
+        0x6F => movdqa_load_xmm(cpu, mmu),
+        // 0x66 0F 7F /r — MOVDQA xmm/m128, xmm.
+        0x7F => movdqa_store_xmm(cpu, mmu),
+        // 0x66 0F EF /r — PXOR xmm, xmm/m128.
+        0xEF => pxor_xmm(cpu, mmu),
+        _ => Err(Trap::UndefinedOpcode {
+            eip: entry_eip,
+            // Distinguish the XMM (66-prefixed) form from the
+            // MMX form sharing the same op2 byte by setting
+            // a high bit. `0x0166_XX` reads as "0x66-prefixed
+            // 0F XX".
+            opcode: 0x0166_0000 | u32::from(op2),
+        }),
+    }
+}
+
+/// `0x66 0F 6F /r` — MOVDQA xmm1, xmm2/m128. Unaligned access
+/// is treated as accepted here; real silicon faults on
+/// misaligned operands but corpus codecs don't rely on that.
+fn movdqa_load_xmm(cpu: &mut Cpu, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+    let mr = cpu.fetch_modrm(mmu)?;
+    let bytes = cpu.peek_after_modrm(mmu, 16)?;
+    let (op, consumed) = resolve_modrm32(mr, &bytes, &cpu.regs)?;
+    cpu.advance_eip(consumed as u32);
+    let dst_idx = (mr.reg & 0x7) as usize;
+    let value: u128 = match op {
+        Operand::Reg32(_) => cpu.xmm[(mr.rm & 0x7) as usize],
+        Operand::Mem32(addr) => {
+            let addr = cpu.seg_translate(addr);
+            let low = mmu.load64(addr)?;
+            let high = mmu.load64(addr.wrapping_add(8))?;
+            pack_lh(low, high)
+        }
+    };
+    cpu.xmm[dst_idx] = value;
+    Ok(StepOk::Continued)
+}
+
+/// `0x66 0F 7F /r` — MOVDQA xmm2/m128, xmm1. The 16-byte store
+/// MagicYUV uses to clear its stack-resident buffer descriptor.
+fn movdqa_store_xmm(cpu: &mut Cpu, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+    let mr = cpu.fetch_modrm(mmu)?;
+    let bytes = cpu.peek_after_modrm(mmu, 16)?;
+    let (op, consumed) = resolve_modrm32(mr, &bytes, &cpu.regs)?;
+    cpu.advance_eip(consumed as u32);
+    let value = cpu.xmm[(mr.reg & 0x7) as usize];
+    let low = value as u64;
+    let high = (value >> 64) as u64;
+    match op {
+        Operand::Reg32(_) => cpu.xmm[(mr.rm & 0x7) as usize] = value,
+        Operand::Mem32(addr) => {
+            let addr = cpu.seg_translate(addr);
+            mmu.write(addr, &low.to_le_bytes())?;
+            mmu.write(addr.wrapping_add(8), &high.to_le_bytes())?;
+        }
+    }
+    Ok(StepOk::Continued)
+}
+
+/// `0x66 0F EF /r` — PXOR xmm1, xmm2/m128.
+fn pxor_xmm(cpu: &mut Cpu, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+    let mr = cpu.fetch_modrm(mmu)?;
+    let bytes = cpu.peek_after_modrm(mmu, 16)?;
+    let (op, consumed) = resolve_modrm32(mr, &bytes, &cpu.regs)?;
+    cpu.advance_eip(consumed as u32);
+    let dst_idx = (mr.reg & 0x7) as usize;
+    let src: u128 = match op {
+        Operand::Reg32(_) => cpu.xmm[(mr.rm & 0x7) as usize],
+        Operand::Mem32(addr) => {
+            let addr = cpu.seg_translate(addr);
+            let low = mmu.load64(addr)?;
+            let high = mmu.load64(addr.wrapping_add(8))?;
+            pack_lh(low, high)
+        }
+    };
+    cpu.xmm[dst_idx] ^= src;
+    Ok(StepOk::Continued)
+}
+
+// ============================================================
 // Helpers
 // ============================================================
 

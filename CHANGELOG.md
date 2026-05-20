@@ -22,6 +22,30 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
   no longer get their tail silently truncated.
 - `0F B3 /r` — `BTR r/m32, r32` (Bit Test and Reset). Used by
   HuffYUV's `ICDecompress` Huffman-table walk.
+- SSE2 XMM dispatch (`isa_sse::dispatch_xmm_int`) — handles
+  `0x66 0F 6F/7F/EF` (MOVDQA load/store, PXOR xmm). The
+  MMX-shaped opcode space `0F 60..6F | 70..7F | D0..FF`
+  becomes XMM 128-bit when the `0x66` mandatory prefix is set;
+  routing those through the MMX dispatcher silently zeroed
+  only the low 64 bits of XMM stores and left the high 64
+  garbage. MagicYUV's stack-resident buffer descriptor relied
+  on a full `movdqa [stack], xmm0` zeroing all 16 bytes — the
+  missing high 8 made `sub_30410` think there was capacity and
+  hand `memcpy` a NULL `current` pointer.
+- AVX/AVX2 opcodes used by MagicYUV's encode path:
+  `VPCMPEQD ymm` (`VEX.256.66.0F.WIG 76`), `VMOVDQA xmm`
+  load/store (`VEX.128.66.0F 6F/7F`), `VMOVDQA ymm` load/store
+  (`VEX.256.66.0F 6F/7F`), `VZEROUPPER`
+  (`VEX.128.NP.0F 77`).
+- `stub_memcpy` trap now reports the caller's return address
+  and the top 14 stack dwords. Sub-30410-style helpers that
+  forward args without a frame leak their caller's frame into
+  the same stack window, so the 2nd-level return address is
+  visible without writing a separate stack-walk pass.
+- `encode_decode_corpus` failure diagnostics now include
+  `codec_eips=[…]` — the distinct EIPs in the codec's image
+  preceding the trap. Reveals the path through the codec for
+  trace-driven opcode triage.
 
 ### Changed
 - HuffYUV's ICCompress + ICDecompress now work end-to-end with

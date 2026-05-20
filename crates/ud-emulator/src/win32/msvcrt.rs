@@ -1259,8 +1259,43 @@ fn stub_memcpy(
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("memcpy", t))?;
     let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("memcpy", t))?;
     let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("memcpy", t))?;
-    let data = mmu.read(src, n as usize).map_err(|t| trap("memcpy", t))?;
-    mmu.write(dest, &data).map_err(|t| trap("memcpy", t))?;
+    // Real Windows just dereferences and crashes; codecs that
+    // pass NULL almost always have an earlier check that we
+    // didn't trip the right branch on. Trap with the offending
+    // args + the caller's return address so the call site is
+    // obvious — the previous behaviour propagated only the bare
+    // page-fault address, which loses all the context.
+    if n == 0 {
+        return Ok(dest);
+    }
+    // Capture the caller's return address before we hand the
+    // borrow to read/write, so we can include it in the trap
+    // message if either fails. Also walk a few stack dwords up
+    // so the call chain into us is visible (sub_30410 in MagicYUV
+    // has 4 distinct call sites).
+    let esp = cpu.regs.esp();
+    let mut stack_chain = String::new();
+    for i in 0..14u32 {
+        let v = mmu.load32(esp.wrapping_add(i * 4)).unwrap_or(0);
+        if i > 0 {
+            stack_chain.push(' ');
+        }
+        stack_chain.push_str(&format!("{v:#010x}"));
+    }
+    let ret_addr = mmu.load32(esp).unwrap_or(0);
+    let make_trap = |what: &str, t: crate::emulator::Trap| -> Win32Error {
+        Win32Error::InvalidArgument {
+            stub: "memcpy",
+            reason: format!(
+                "{what}: {t} (dst={dest:#x} src={src:#x} n={n:#x} caller_ret={ret_addr:#x} stack=[{stack_chain}])"
+            ),
+        }
+    };
+    let data = mmu
+        .read(src, n as usize)
+        .map_err(|t| make_trap("read src", t))?;
+    mmu.write(dest, &data)
+        .map_err(|t| make_trap("write dst", t))?;
     Ok(dest)
 }
 

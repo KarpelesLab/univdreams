@@ -136,6 +136,24 @@ pub fn dispatch(
         //   dst = src1 ^ src2; VEX.128 zeroes the upper 128 of
         //   the destination YMM (Intel SDM §15.5).
         (1, 1, 0, 0xEF) => vpxor_128(cpu, mmu, &vex),
+        // VEX.128.66.0F.WIG 6F /r — VMOVDQA xmm1, xmm2/m128.
+        (1, 1, 0, 0x6F) => vmovdqa_load_128(cpu, mmu),
+        // VEX.128.66.0F.WIG 7F /r — VMOVDQA xmm2/m128, xmm1.
+        (1, 1, 0, 0x7F) => vmovdqa_store_128(cpu, mmu),
+        // VEX.256.66.0F.WIG 76 /r — VPCMPEQD ymm1, ymm2, ymm3/m256.
+        //   Per-32-bit-lane: dst = (src1 == src2) ? all-ones : 0.
+        //   MagicYUV uses `vpcmpeqd ymm0,ymm0,ymm0` as a one-cycle
+        //   way to materialize an all-ones YMM constant.
+        (1, 1, 1, 0x76) => vpcmpeqd_256(cpu, mmu, &vex),
+        // VEX.256.66.0F.WIG 6F /r — VMOVDQA ymm1, ymm2/m256.
+        (1, 1, 1, 0x6F) => vmovdqa_load_256(cpu, mmu),
+        // VEX.256.66.0F.WIG 7F /r — VMOVDQA ymm2/m256, ymm1.
+        (1, 1, 1, 0x7F) => vmovdqa_store_256(cpu, mmu),
+        // VEX.128.NP.0F.WIG 77 — VZEROUPPER. Zeroes the upper
+        // 128 bits of every YMM register. No ModR/M follows.
+        // Codecs sprinkle this after AVX work to avoid the
+        // "AVX/SSE state transition" penalty on real silicon.
+        (1, 0, 0, 0x77) => vzeroupper(cpu),
         // NP 0F 11 /r — VMOVUPS xmm2/m128, xmm1 (store).
         //   src = xmm[ModR/M.reg]; r/m is the destination.
         //   When r/m is a register, the upper 128 of that YMM
@@ -250,6 +268,132 @@ fn vmovups_store_128(cpu: &mut Cpu, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         }
         Operand::Mem32(addr) => {
             mmu.write(cpu.seg_translate(addr), &src.to_le_bytes())?;
+        }
+    }
+    Ok(StepOk::Continued)
+}
+
+/// `VEX.128.66.0F.WIG 6F /r` — VMOVDQA xmm1, xmm2/m128 (load).
+/// VEX.128 zeroes the upper 128 of the destination YMM.
+fn vmovdqa_load_128(cpu: &mut Cpu, mmu: &Mmu) -> Result<StepOk, Trap> {
+    let (dst, src2) = read_xmm_dst_and_src2(cpu, mmu)?;
+    cpu.xmm[dst] = src2;
+    cpu.ymm_high[dst] = 0;
+    Ok(StepOk::Continued)
+}
+
+/// `VEX.128.66.0F.WIG 7F /r` — VMOVDQA xmm2/m128, xmm1 (store).
+/// `ModR/M.reg` is the *source*. Register form zeroes the
+/// destination's upper YMM-128.
+fn vmovdqa_store_128(cpu: &mut Cpu, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+    let mr = cpu.fetch_modrm(mmu)?;
+    let bytes = cpu.peek_after_modrm(mmu, 16)?;
+    let (op, consumed) = resolve_modrm32(mr, &bytes, &cpu.regs)?;
+    cpu.advance_eip(consumed as u32);
+    let src = cpu.xmm[(mr.reg & 0x7) as usize];
+    match op {
+        Operand::Reg32(_) => {
+            let dst = (mr.rm & 0x7) as usize;
+            cpu.xmm[dst] = src;
+            cpu.ymm_high[dst] = 0;
+        }
+        Operand::Mem32(addr) => {
+            mmu.write(cpu.seg_translate(addr), &src.to_le_bytes())?;
+        }
+    }
+    Ok(StepOk::Continued)
+}
+
+/// `VEX.128.NP.0F.WIG 77` — VZEROUPPER. No operands; just
+/// clear the upper 128 of every YMM register.
+fn vzeroupper(cpu: &mut Cpu) -> Result<StepOk, Trap> {
+    cpu.ymm_high = [0u128; 8];
+    Ok(StepOk::Continued)
+}
+
+/// Resolve `(dst_idx, src2_value_low, src2_value_high)` for a
+/// 256-bit YMM "VEX 3-op SSE-shape" instruction.
+fn read_ymm_dst_and_src2(cpu: &mut Cpu, mmu: &Mmu) -> Result<(usize, u128, u128), Trap> {
+    let mr = cpu.fetch_modrm(mmu)?;
+    let bytes = cpu.peek_after_modrm(mmu, 16)?;
+    let (op, consumed) = resolve_modrm32(mr, &bytes, &cpu.regs)?;
+    cpu.advance_eip(consumed as u32);
+    let dst = (mr.reg & 0x7) as usize;
+    let (low, high) = match op {
+        Operand::Reg32(_) => {
+            let idx = (mr.rm & 0x7) as usize;
+            (cpu.xmm[idx], cpu.ymm_high[idx])
+        }
+        Operand::Mem32(addr) => {
+            let addr = cpu.seg_translate(addr);
+            let bs_low = mmu.read(addr, 16)?;
+            let bs_high = mmu.read(addr.wrapping_add(16), 16)?;
+            let mut low = [0u8; 16];
+            let mut high = [0u8; 16];
+            low.copy_from_slice(&bs_low);
+            high.copy_from_slice(&bs_high);
+            (u128::from_le_bytes(low), u128::from_le_bytes(high))
+        }
+    };
+    Ok((dst, low, high))
+}
+
+/// `VEX.256.66.0F.WIG 76 /r` — VPCMPEQD ymm1, ymm2, ymm3/m256.
+/// Compares each 32-bit lane of `src1` and `src2`; equal lanes
+/// in `dst` become all-ones, others zero.
+fn vpcmpeqd_256(cpu: &mut Cpu, mmu: &Mmu, vex: &Vex) -> Result<StepOk, Trap> {
+    let (dst, src2_low, src2_high) = read_ymm_dst_and_src2(cpu, mmu)?;
+    let src1_idx = (vex.vvvv & 0x7) as usize;
+    let src1_low = cpu.xmm[src1_idx];
+    let src1_high = cpu.ymm_high[src1_idx];
+    cpu.xmm[dst] = pcmpeqd_lanes_128(src1_low, src2_low);
+    cpu.ymm_high[dst] = pcmpeqd_lanes_128(src1_high, src2_high);
+    Ok(StepOk::Continued)
+}
+
+/// Per-32-bit-lane PCMPEQD on two 128-bit halves.
+fn pcmpeqd_lanes_128(a: u128, b: u128) -> u128 {
+    let mut out: u128 = 0;
+    for lane in 0..4 {
+        let shift = lane * 32;
+        let aa = ((a >> shift) & 0xFFFF_FFFF) as u32;
+        let bb = ((b >> shift) & 0xFFFF_FFFF) as u32;
+        let mask: u128 = if aa == bb { 0xFFFF_FFFF } else { 0 };
+        out |= mask << shift;
+    }
+    out
+}
+
+/// `VEX.256.66.0F.WIG 6F /r` — VMOVDQA ymm1, ymm2/m256 (load).
+fn vmovdqa_load_256(cpu: &mut Cpu, mmu: &Mmu) -> Result<StepOk, Trap> {
+    let (dst, low, high) = read_ymm_dst_and_src2(cpu, mmu)?;
+    cpu.xmm[dst] = low;
+    cpu.ymm_high[dst] = high;
+    Ok(StepOk::Continued)
+}
+
+/// `VEX.256.66.0F.WIG 7F /r` — VMOVDQA ymm2/m256, ymm1 (store).
+/// `ModR/M.reg` is the *source* ymm. MagicYUV uses
+/// `vmovdqa [mem], ymm0` (with ymm0 freshly all-ones or
+/// all-zero) to seed 32-byte runs in its working buffers.
+fn vmovdqa_store_256(cpu: &mut Cpu, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+    let mr = cpu.fetch_modrm(mmu)?;
+    let bytes = cpu.peek_after_modrm(mmu, 16)?;
+    let (op, consumed) = resolve_modrm32(mr, &bytes, &cpu.regs)?;
+    cpu.advance_eip(consumed as u32);
+    let src = (mr.reg & 0x7) as usize;
+    let low = cpu.xmm[src];
+    let high = cpu.ymm_high[src];
+    match op {
+        Operand::Reg32(_) => {
+            let dst = (mr.rm & 0x7) as usize;
+            cpu.xmm[dst] = low;
+            cpu.ymm_high[dst] = high;
+        }
+        Operand::Mem32(addr) => {
+            let addr = cpu.seg_translate(addr);
+            mmu.write(addr, &low.to_le_bytes())?;
+            mmu.write(addr.wrapping_add(16), &high.to_le_bytes())?;
         }
     }
     Ok(StepOk::Continued)

@@ -1677,7 +1677,22 @@ impl Cpu {
             //   0F D0..FF : PADD*/PSUB*/PMUL*/PMADD/PCMPEQ/PSL*/
             //               PSR*/PAND/POR/PXOR/PADDS*/PSUBS*.
             0x60..=0x6F | 0x70..=0x7F | 0xD0..=0xFF => {
-                super::isa_mmx::dispatch(self, mmu, op2, entry_eip)
+                // SSE2 reuses the MMX opcode space with a `0x66`
+                // mandatory prefix to mean "XMM 128-bit" instead of
+                // "MMX 64-bit". The MMX dispatcher only knows how
+                // to drive 64-bit MMX registers, so routing a
+                // 128-bit `pxor xmm0,xmm0` / `movdqa [mem],xmm0`
+                // there silently zeroes only the low 64 bits and
+                // leaves the high 64 bits of the destination
+                // untouched — which is exactly the corruption
+                // MagicYUV's stack-buffer descriptor relied on
+                // *not* happening. Route to the SSE2 executor when
+                // the `0x66` prefix is set.
+                if self.op_size_16 {
+                    super::isa_sse::dispatch_xmm_int(self, mmu, op2, entry_eip)
+                } else {
+                    super::isa_mmx::dispatch(self, mmu, op2, entry_eip)
+                }
             }
             // ---- SSE / SSE2 opcode space (Intel SDM Vol. 2,
             // App. A). Routed to a dedicated executor so the
