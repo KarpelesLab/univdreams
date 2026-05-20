@@ -456,12 +456,27 @@ fn run_one(entry: &Entry) -> Outcome {
                     }
                 })
                 .collect();
+            // Final 3 stub calls with args — the actual NULL or
+            // sentinel that tripped a fault usually shows up here.
+            let with_args: Vec<String> = sb
+                .host
+                .stub_calls
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .map(|c| {
+                    let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+                    format!("{}!{}({})->{:#x}", c.dll, c.name, args.join(","), c.ret)
+                })
+                .collect();
             out.error = Some(format!(
-                "ICCompress: {e}; unique_loop_eips=[{}]; total_stub_calls={}; tail=[{}]",
-                eips_str.join(","),
+                "ICCompress: {e}; total_stub_calls={}; tail=[{}]; final=[{}]",
                 sb.host.stub_calls.len(),
                 tail.join(", "),
+                with_args.join(" / "),
             ));
+            let _ = eips_str; // (kept for reference but not in error msg)
             return out;
         }
     };

@@ -217,6 +217,16 @@ pub struct Bih {
     pub y_pels_per_meter: i32,
     pub clr_used: u32,
     pub clr_important: u32,
+    /// Bytes that follow the canonical 40-byte header when the
+    /// codec advertises `bi_size > 40`. Several codecs store
+    /// per-instance config in this extension area — HuffYUV,
+    /// for instance, keeps its Huffman code-length tables here
+    /// and reads them back at compress time via `bih + 0x2c`.
+    /// `host_bih_to_guest` writes this tail verbatim after the
+    /// header; `guest_bih_to_host` reads
+    /// `bi_size.saturating_sub(40)` bytes (capped) into it.
+    /// Default empty.
+    pub tail: Vec<u8>,
 }
 
 impl Default for Bih {
@@ -233,6 +243,7 @@ impl Default for Bih {
             y_pels_per_meter: 0,
             clr_used: 0,
             clr_important: 0,
+            tail: Vec::new(),
         }
     }
 }
@@ -261,8 +272,18 @@ pub fn host_bih_to_guest(mmu: &mut Mmu, bih: &Bih, addr: u32) -> Result<(), Win3
         .map_err(trap)?;
     mmu.store32(addr + 32, bih.clr_used).map_err(trap)?;
     mmu.store32(addr + 36, bih.clr_important).map_err(trap)?;
+    if !bih.tail.is_empty() {
+        mmu.write(addr + BIH_SIZE, &bih.tail).map_err(trap)?;
+    }
     Ok(())
 }
+
+/// Cap on how many extension bytes [`guest_bih_to_host`] will
+/// read after the standard 40-byte header. Codec config blobs
+/// observed in the corpus top out at a few hundred bytes; 1024
+/// is the soft ceiling — anything beyond is almost certainly a
+/// codec writing garbage into `bi_size`.
+pub const BIH_TAIL_CAP: u32 = 1024;
 
 /// Read a guest [`Bih`] back into a host struct.
 pub fn guest_bih_to_host(mmu: &Mmu, addr: u32) -> Result<Bih, Win32Error> {
@@ -284,6 +305,16 @@ pub fn guest_bih_to_host(mmu: &Mmu, addr: u32) -> Result<Bih, Win32Error> {
     let y_pels_per_meter = mmu.load32(addr + 28).map_err(trap)? as i32;
     let clr_used = mmu.load32(addr + 32).map_err(trap)?;
     let clr_important = mmu.load32(addr + 36).map_err(trap)?;
+    // Codec wrote `bi_size` advertising the total header
+    // length. When `bi_size > 40`, the extra bytes are a
+    // codec-private extension (Huffman tables, quality bits,
+    // ...); preserve them verbatim so downstream IC* calls
+    // can echo the same buffer back to the codec.
+    let tail_len = bi_size.saturating_sub(BIH_SIZE).min(BIH_TAIL_CAP);
+    let mut tail = Vec::with_capacity(tail_len as usize);
+    for i in 0..tail_len {
+        tail.push(mmu.load8(addr + BIH_SIZE + i).map_err(trap)?);
+    }
     Ok(Bih {
         bi_size,
         width,
@@ -296,6 +327,7 @@ pub fn guest_bih_to_host(mmu: &Mmu, addr: u32) -> Result<Bih, Win32Error> {
         y_pels_per_meter,
         clr_used,
         clr_important,
+        tail,
     })
 }
 
@@ -706,10 +738,10 @@ pub fn ic_decompress_query(
             stub: "ICDecompressQuery",
             reason: format!("unknown HIC {hic}"),
         })?;
-    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    let in_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, input, in_addr)?;
     let out_addr = if let Some(out_bih) = output {
-        let a = state.arena_alloc(BIH_SIZE)?;
+        let a = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
         host_bih_to_guest(mmu, out_bih, a)?;
         a
     } else {
@@ -761,13 +793,13 @@ pub fn ic_decompress_get_format(
             stub: "ICDecompressGetFormat",
             reason: format!("unknown HIC {hic}"),
         })?;
-    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    let in_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, input, in_addr)?;
-    let out_addr = state.arena_alloc(BIH_SIZE)?;
+    let out_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     // Pre-zero the output BIH so a codec that returns S_OK but
     // doesn't populate every field still produces deterministic
     // bytes.
-    for i in 0..BIH_SIZE {
+    for i in 0..(BIH_SIZE + BIH_TAIL_CAP) {
         mmu.store8(out_addr + i, 0)
             .map_err(|t| Win32Error::InvalidArgument {
                 stub: "ICDecompressGetFormat",
@@ -827,9 +859,9 @@ pub fn ic_decompress_begin(
     // record. Indeo / Cinepak codecs do not gate this way, so
     // the round-12 / round-15 paths remain a no-op.
     msmpeg4_v3_preinit(mmu, state, &entry)?;
-    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    let in_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, input, in_addr)?;
-    let out_addr = state.arena_alloc(BIH_SIZE)?;
+    let out_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, output, out_addr)?;
     call_guest(
         cpu,
@@ -962,9 +994,9 @@ pub fn ic_decompress(
 
     // Lay out the four pieces of guest scratch:
     //   bi-input, bi-output, in-bytes, out-bytes
-    let bi_in = state.arena_alloc(BIH_SIZE)?;
+    let bi_in = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, input_bih, bi_in)?;
-    let bi_out = state.arena_alloc(BIH_SIZE)?;
+    let bi_out = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, output_bih, bi_out)?;
 
     let in_buf = state.arena_alloc(input_bytes.len() as u32)?;
@@ -1052,10 +1084,10 @@ pub fn ic_compress_query(
             stub: "ICCompressQuery",
             reason: format!("unknown HIC {hic}"),
         })?;
-    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    let in_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, input, in_addr)?;
     let out_addr = if let Some(out_bih) = output {
-        let a = state.arena_alloc(BIH_SIZE)?;
+        let a = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
         host_bih_to_guest(mmu, out_bih, a)?;
         a
     } else {
@@ -1097,12 +1129,12 @@ pub fn ic_compress_get_format(
             stub: "ICCompressGetFormat",
             reason: format!("unknown HIC {hic}"),
         })?;
-    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    let in_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, input, in_addr)?;
-    let out_addr = state.arena_alloc(BIH_SIZE)?;
+    let out_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     // Pre-zero the output BIH so a partial codec write still
     // produces deterministic bytes for the caller to compare.
-    for i in 0..BIH_SIZE {
+    for i in 0..(BIH_SIZE + BIH_TAIL_CAP) {
         mmu.store8(out_addr + i, 0)
             .map_err(|t| Win32Error::InvalidArgument {
                 stub: "ICCompressGetFormat",
@@ -1154,9 +1186,9 @@ pub fn ic_compress_get_size(
             stub: "ICCompressGetSize",
             reason: format!("unknown HIC {hic}"),
         })?;
-    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    let in_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, input, in_addr)?;
-    let out_addr = state.arena_alloc(BIH_SIZE)?;
+    let out_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, output, out_addr)?;
     call_guest(
         cpu,
@@ -1207,9 +1239,9 @@ pub fn ic_compress_begin(
             reason: format!("unknown HIC {hic}"),
         })?;
     msmpeg4_v3_preinit(mmu, state, &entry)?;
-    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    let in_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, input, in_addr)?;
-    let out_addr = state.arena_alloc(BIH_SIZE)?;
+    let out_addr = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, output, out_addr)?;
     call_guest(
         cpu,
@@ -1446,9 +1478,9 @@ pub fn ic_compress(
     // Lay out the per-call guest scratch:
     //   bi-input, bi-output, in-bytes, out-bytes, ckid-slot,
     //   flags-slot, optional bi-prev + prev-bytes.
-    let bi_in = state.arena_alloc(BIH_SIZE)?;
+    let bi_in = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, input_bih, bi_in)?;
-    let bi_out = state.arena_alloc(BIH_SIZE)?;
+    let bi_out = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
     host_bih_to_guest(mmu, output_bih, bi_out)?;
 
     let in_buf = state.arena_alloc(input_bytes.len().max(1) as u32)?;
@@ -1483,7 +1515,7 @@ pub fn ic_compress(
     // Optional previous-frame slots for P-frame encoders.
     let (bi_prev, prev_buf) = match (prev_bih_opt, prev_bytes_opt) {
         (Some(bih), Some(bytes)) => {
-            let bp = state.arena_alloc(BIH_SIZE)?;
+            let bp = state.arena_alloc(BIH_SIZE + BIH_TAIL_CAP)?;
             host_bih_to_guest(mmu, bih, bp)?;
             let pb = state.arena_alloc(bytes.len().max(1) as u32)?;
             if !bytes.is_empty() {
@@ -1613,6 +1645,7 @@ mod tests {
             y_pels_per_meter: 0,
             clr_used: 0,
             clr_important: 0,
+            tail: Vec::new(),
         };
         host_bih_to_guest(&mut mmu, &bih, 0x6000_0000).unwrap();
         let back = guest_bih_to_host(&mmu, 0x6000_0000).unwrap();

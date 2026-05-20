@@ -8,13 +8,53 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+### Added
+- `Bih.tail: Vec<u8>` — the bytes past the canonical 40-byte
+  header when the codec advertises `bi_size > 40`. Several
+  codecs store per-instance config in the BIH extension area;
+  HuffYUV in particular keeps its Huffman code-length tables
+  here and reads them back at compress time via `bih + 0x2c`.
+  `host_bih_to_guest` writes the tail verbatim after the
+  header; `guest_bih_to_host` reads
+  `bi_size.saturating_sub(40)` bytes (capped at `BIH_TAIL_CAP`
+  = 1024) into it. Every IC* allocator now reserves room for
+  the extension up-front, so codecs writing more than 40 bytes
+  no longer get their tail silently truncated.
+- `0F B3 /r` — `BTR r/m32, r32` (Bit Test and Reset). Used by
+  HuffYUV's `ICDecompress` Huffman-table walk.
+
 ### Changed
+- HuffYUV's ICCompress + ICDecompress now work end-to-end with
+  pixel-exact lossless round-trip on a 32×32 RGB24 gradient
+  (was the lone remaining encode failure in the corpus
+  harness). The previous infinite Kraft-inequality loop was
+  caused by `ic_compress_get_format` truncating the codec's
+  output BIH at 40 bytes — HuffYUV's Huffman code lengths live
+  past that boundary, so the validation loop accumulated zeros
+  forever. The decompiler walk via `ud decompile huffyuv-i386.dll`
+  + tracing `sub_2820` / `sub_2030` / `sub_1e10` pinned the
+  exact `bih + 0x2c` dereference; the fix is structural rather
+  than per-codec.
 - `encode_decode_corpus` failure diagnostics now show
   *unique* trace-ring EIPs (skeleton of any spinning loop) plus
-  a stub-call tail condensed to `dll!name×N` runs, instead of
-  the previous raw last-8-EIPs and last-8-stubs. Much easier
-  to spot whether a failing codec is in API-call rage or pure
-  guest loop.
+  a stub-call tail condensed to `dll!name×N` runs plus the
+  final three calls with their args. Much easier to spot
+  whether a failing codec is in API-call rage, pure guest
+  loop, or a single bad pointer.
+
+### State
+- `encode + decode` end-to-end: **11 / 12** (excluding Indeo 3,
+  decode-only by design).
+- Lossless round-trip pixel-exact: **4 / 5** — CamStudio 1.4,
+  CamStudio 1.5, Lagarith, HuffYUV. Only MagicYUV remains lossy
+  (decode succeeds without trap, but pixels differ — its native
+  format is YUV not RGB, so chroma round-tripping isn't bit-
+  exact on an RGB input).
+- Lone remaining encode failure: MagicYUV traps on a `memcpy`
+  with `src = NULL`. The BIH-tail preservation unblocked
+  enough of MagicYUV's encode path that it now reaches a NULL
+  pointer deeper in — previously masked by the
+  `ICCompressGetSize` fallback. Next iteration.
 
 ### Investigated
 - HuffYUV's `ICCompress` infinite loop pinned to RVA

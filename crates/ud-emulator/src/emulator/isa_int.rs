@@ -1515,6 +1515,21 @@ impl Cpu {
                 write_operand32(op, new, &mut self.regs, mmu)?;
                 Ok(StepOk::Continued)
             }
+            // 0x0F 0xB3 — BTR r/m32, r32 (bit test and reset: copy
+            // bit to CF, then clear it in the operand).
+            0xB3 => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let op = self.seg_apply(op);
+                let v = read_operand32(op, &self.regs, mmu)?;
+                let bit = self.regs.get32(Reg32::from_bits(mr.reg)) & 31;
+                self.regs.flags.cf = ((v >> bit) & 1) != 0;
+                let new = v & !(1u32 << bit);
+                write_operand32(op, new, &mut self.regs, mmu)?;
+                Ok(StepOk::Continued)
+            }
             // 0x0F 0xB1 — CMPXCHG r/m32, r32
             0xB1 => {
                 let mr = self.fetch_modrm(mmu)?;
