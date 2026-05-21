@@ -59,6 +59,11 @@ pub const SHT_DYNSYM: u32 = 11;
 /// `sh_type` for a relocation table with explicit addends (`Elf64_Rela`).
 pub const SHT_RELA: u32 = 4;
 
+/// `sh_type` for an ELF relocation table (no addend) — `Elf64_Rel`
+/// entries, 16 bytes each: `r_offset:8 ; r_info:8`. Used by BPF
+/// (LLVM emits `SHT_REL`, not `SHT_RELA`, for BPF objects).
+pub const SHT_REL: u32 = 9;
+
 /// `sh_flags` bit indicating the section contains executable instructions.
 pub const SHF_EXECINSTR: u64 = 0x4;
 
@@ -78,6 +83,22 @@ pub const EM_BPF: u16 = 247;
 /// Not assigned in the GABI registry but used by the Solana
 /// toolchain and Agave loader for on-chain programs.
 pub const EM_SBF: u16 = 263;
+
+/// BPF relocation types (LLVM `lib/Target/BPF/MCTargetDesc/BPFELFObjectWriter.cpp`).
+/// `R_BPF_64_32` is the one we care about for syscall name
+/// resolution — the `call <imm>` form. Other types apply to
+/// data references and `lddw r, imm64` slots; we recognise
+/// the names but don't need to act on them for layer 1.
+pub const R_BPF_NONE: u32 = 0;
+pub const R_BPF_64_64: u32 = 1;
+pub const R_BPF_64_ABS64: u32 = 2;
+pub const R_BPF_64_ABS32: u32 = 3;
+pub const R_BPF_64_NODYLD32: u32 = 4;
+pub const R_BPF_64_32: u32 = 10;
+/// Solana-specific dynamic relocation: an absolute 64-bit
+/// pointer adjusted at load time by the program's load
+/// address. Used by BPFLoaderUpgradeable for data refs.
+pub const R_BPF_64_RELATIVE: u32 = 8;
 
 /// On-disk size of an ELF64 ELF header.
 const EHDR64_SIZE: u16 = 64;

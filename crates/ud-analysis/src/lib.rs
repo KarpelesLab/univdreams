@@ -20,6 +20,7 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+pub mod bpf_relocs;
 mod eh_frame;
 mod function_map;
 mod plt;

@@ -86,6 +86,9 @@ pub enum Error {
 
     #[error(transparent)]
     BpfDecode(ud_arch_bpf::Error),
+
+    #[error(transparent)]
+    BpfReloc(ud_analysis::bpf_relocs::BpfRelocError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -127,6 +130,19 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
     // call sites can be annotated with target names.
     let name_at: HashMap<u64, String> = map.iter().map(|f| (f.addr.0, f.name.clone())).collect();
 
+    // BPF / SBF only: build a `call <imm> → symbol name` map
+    // from `.rel.dyn`. This is layer 1 of the BPF
+    // decompile-quality push — `call 0xeca` becomes
+    // `call sol_log_` for every relocation-resolved import.
+    // Non-BPF arches don't carry these relocations; the map
+    // stays empty and the rewrite path is a no-op.
+    let call_site_names: HashMap<u64, String> = match arch {
+        Arch::Bpf { .. } => {
+            ud_analysis::bpf_relocs::build_call_site_names(elf).map_err(Error::BpfReloc)?
+        }
+        _ => HashMap::new(),
+    };
+
     let mut items = Vec::new();
 
     // Top-level notes for functions we know about but can't body.
@@ -152,8 +168,16 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
         let name = elf
             .section_name(idx)
             .map_or_else(|| format!("section{idx}"), str::to_string);
-        let mut section_items =
-            build_section_items(elf, sh, data, &map, &debug_by_addr, &name_at, arch)?;
+        let mut section_items = build_section_items(
+            elf,
+            sh,
+            data,
+            &map,
+            &debug_by_addr,
+            &name_at,
+            &call_site_names,
+            arch,
+        )?;
         drop_redundant_function_addrs(sh.sh_addr, &mut section_items);
         items.push(Item::Section {
             name,
@@ -722,6 +746,7 @@ fn decode_notes(data: &[u8]) -> Option<Vec<ud_ast::NoteEntry>> {
 /// Build the items inside one `@section` block: any functions whose
 /// address range falls inside the section, plus `@raw` blocks for
 /// every byte not covered by a function.
+#[allow(clippy::too_many_arguments)]
 fn build_section_items(
     elf: &Elf64File,
     sh: &Shdr64,
@@ -729,6 +754,7 @@ fn build_section_items(
     map: &FunctionMap,
     debug_by_addr: &HashMap<u64, DebugFunction>,
     name_at: &HashMap<u64, String>,
+    call_site_names: &HashMap<u64, String>,
     arch: Arch,
 ) -> Result<Vec<Item>> {
     // Structured-form sections short-circuit before the
@@ -802,7 +828,15 @@ fn build_section_items(
         if cursor < f.addr.0 {
             let lo = (cursor - section_start) as usize;
             let hi = (f.addr.0 - section_start) as usize;
-            emit_gap(&mut out, arch, is_exec, cursor, &data[lo..hi], name_at)?;
+            emit_gap(
+                &mut out,
+                arch,
+                is_exec,
+                cursor,
+                &data[lo..hi],
+                name_at,
+                call_site_names,
+            )?;
         }
         // The function itself.
         let lo = (f.addr.0 - section_start) as usize;
@@ -825,7 +859,7 @@ fn build_section_items(
                 let insns =
                     ud_arch_bpf::decode(slice, f.addr.0, variant).map_err(Error::BpfDecode)?;
                 let lifted = ud_arch_bpf::lift_function(f.name.clone(), &insns);
-                bpf::build_function(&lifted, name_at, variant)
+                bpf::build_function(&lifted, name_at, call_site_names, variant)
             }
         };
         out.push(Item::Function(fn_decl));
@@ -835,7 +869,15 @@ fn build_section_items(
     // Trailing gap to the section's end.
     if cursor < section_end {
         let lo = (cursor - section_start) as usize;
-        emit_gap(&mut out, arch, is_exec, cursor, &data[lo..], name_at)?;
+        emit_gap(
+            &mut out,
+            arch,
+            is_exec,
+            cursor,
+            &data[lo..],
+            name_at,
+            call_site_names,
+        )?;
     }
 
     Ok(out)
@@ -863,6 +905,7 @@ fn emit_gap(
     addr: u64,
     bytes: &[u8],
     name_at: &HashMap<u64, String>,
+    call_site_names: &HashMap<u64, String>,
 ) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
@@ -887,10 +930,12 @@ fn emit_gap(
             if !code.is_empty() {
                 let insns =
                     ud_arch_bpf::decode(code, code_addr, variant).map_err(Error::BpfDecode)?;
-                let lifted =
-                    ud_arch_bpf::lift_function(format!("fragment_{code_addr:x}"), &insns);
+                let lifted = ud_arch_bpf::lift_function(format!("fragment_{code_addr:x}"), &insns);
                 out.push(Item::Function(bpf::build_function(
-                    &lifted, name_at, variant,
+                    &lifted,
+                    name_at,
+                    call_site_names,
+                    variant,
                 )));
             }
             return Ok(());

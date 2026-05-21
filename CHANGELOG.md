@@ -9,6 +9,25 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF call-site name resolution (decompile layer 1 of 6). New
+  `ud-analysis::bpf_relocs::build_call_site_names` walks
+  `SHT_REL` (`.rel.dyn`) entries of type `R_BPF_64_32`,
+  resolves the symbol via `.dynsym` + `.dynstr`, and produces
+  a `HashMap<u64, String>` from call-instruction address to
+  imported symbol name. The BPF decompile renderer consults
+  the map for every `InsnKind::Call`, so `call 0xeca`
+  becomes `call sol_log_` whenever a relocation covers the
+  site. For the example Solana program
+  `3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr` this swaps
+  268 of the 1661 raw-hex calls to their syscall names
+  (205 `abort`, 62 `sol_*`, 1 `custom_panic`); round-trip
+  stays byte-identical because the pinned `@asm` bytes are
+  untouched.
+- ELF format constants for the BPF relocation family
+  (`SHT_REL`, `R_BPF_NONE`/`64_64`/`ABS64`/`ABS32`/
+  `NODYLD32`/`64_32`/`64_RELATIVE`).
+
+### Added (previous in this Unreleased block)
 - `ud solana <program-id>` — fetch a Solana on-chain program
   directly from a JSON-RPC endpoint and decompile it. Recognises
   the three current SBF loaders (`BPFLoader2`,
