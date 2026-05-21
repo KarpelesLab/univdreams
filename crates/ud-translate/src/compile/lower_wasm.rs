@@ -13,7 +13,7 @@
 //! complains loudly rather than silently emitting truncated
 //! bytes.
 
-use ud_ast::{Field, Item, Module, UdFile, Value};
+use ud_ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WasmLowerError {
@@ -35,8 +35,12 @@ pub enum WasmLowerError {
         "coverage mismatch: walked 0x{covered:x} bytes but file_size declares 0x{file_size:x}"
     )]
     SizeMismatch { covered: u64, file_size: u64 },
-    #[error("WASM lower only knows how to handle `@raw` items; got {kind}")]
+    #[error("WASM lower only knows how to handle `@raw` and `fn` items; got {kind}")]
     UnsupportedItem { kind: &'static str },
+    #[error("`fn {name}` is missing an `@addr(0x…)` directive")]
+    FnMissingAddr { name: String },
+    #[error("`fn {name}` body contains a statement that lower-to-wasm can't handle: {kind}")]
+    UnsupportedStmt { name: String, kind: &'static str },
 }
 
 /// Lower a `.ud` file describing a WASM module to its bytes.
@@ -48,13 +52,20 @@ pub fn lower_to_wasm(file: &UdFile) -> Result<Vec<u8>, WasmLowerError> {
     let build = build_block(&file.module)?;
     let file_size = read_int(build, "file_size")?;
 
-    // Collect `@raw` blocks in addr order; reject anything else.
+    // Collect `@raw` blocks and `fn { … }` bodies in addr order;
+    // reject anything else.
     let mut blocks: Vec<(u64, Vec<u8>)> = Vec::new();
     for item in &file.items {
         match item {
             Item::Raw { addr, bytes } => blocks.push((*addr, bytes.clone())),
+            Item::Function(fd) => {
+                let addr = fd.addr.ok_or_else(|| WasmLowerError::FnMissingAddr {
+                    name: fd.name.clone(),
+                })?;
+                let bytes = collect_fn_bytes(fd)?;
+                blocks.push((addr, bytes));
+            }
             Item::Comment(_) => {}
-            Item::Function(_) => return Err(WasmLowerError::UnsupportedItem { kind: "function" }),
             Item::Section { .. } => {
                 return Err(WasmLowerError::UnsupportedItem { kind: "section" })
             }
@@ -93,6 +104,29 @@ pub fn lower_to_wasm(file: &UdFile) -> Result<Vec<u8>, WasmLowerError> {
             covered: cursor,
             file_size,
         });
+    }
+    Ok(out)
+}
+
+/// Concatenate the byte payload of every `Stmt::Asm` in a
+/// function body, in declaration order. Comments are
+/// ignored; anything else is rejected so we don't silently
+/// drop bytes (the function's `@addr` declares a
+/// contiguous byte range — any unhandled statement type
+/// would create a gap or overlap on round-trip).
+fn collect_fn_bytes(fd: &FnDecl) -> Result<Vec<u8>, WasmLowerError> {
+    let mut out: Vec<u8> = Vec::new();
+    for stmt in &fd.body {
+        match stmt {
+            Stmt::Asm { bytes, .. } => out.extend_from_slice(bytes),
+            Stmt::Comment(_) | Stmt::Label { .. } => {}
+            _ => {
+                return Err(WasmLowerError::UnsupportedStmt {
+                    name: fd.name.clone(),
+                    kind: "non-asm statement",
+                })
+            }
+        }
     }
     Ok(out)
 }

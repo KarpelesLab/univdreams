@@ -168,3 +168,41 @@ fn wasm_whole_binary_byte_identity_through_source() {
     eprintln!("WASM whole-binary round-trip: {total} fixtures, {total_bytes} bytes");
     assert!(total > 0, "expected at least one WASM fixture to test");
 }
+
+/// Assert the Code section actually decoded into per-function
+/// blocks with `@asm` ops — i.e. we didn't silently fall back
+/// to the opaque-`@raw` path on the bundled fixture. Locks in
+/// the readability win delivered by the disassembler.
+#[test]
+fn wasm_code_section_decodes_into_functions() {
+    let path = workspace_root()
+        .join("testdata")
+        .join("hello-clang-wasm.wasm");
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!("note: {} missing; skipping", path.display());
+        return;
+    };
+    let wasm = WasmFile::parse(&bytes).expect("parse fixture");
+    let text = decompile_wasm_to_text(&wasm);
+
+    // Per-function `fn func_<idx>` blocks must appear.
+    let fn_blocks = text.matches("\nfn func_").count();
+    assert!(
+        fn_blocks >= 3,
+        "expected ≥3 decoded WASM function blocks, got {fn_blocks} in:\n{text}"
+    );
+
+    // At least one decoded op the fixture is known to use.
+    for needle in [
+        "@asm(\"global.get 0\"",
+        "@asm(\"i32.const 16\"",
+        "@asm(\"i32.add\"",
+        "@asm(\"return\"",
+        "@asm(\"end\"",
+    ] {
+        assert!(
+            text.contains(needle),
+            "decoded WASM text should contain `{needle}` but didn't:\n{text}"
+        );
+    }
+}

@@ -43,6 +43,7 @@ pub mod raw6502;
 mod ssa;
 mod stack_slots;
 pub mod wasm;
+mod wasm_disasm;
 
 pub use data_lookup::DataLookup;
 pub use macho::{decompile_macho, decompile_macho_to_text};
