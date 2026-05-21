@@ -9,6 +9,20 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF function discovery from call sites (decompile layer 2
+  of 6). New `ud-analysis::call_sites::discover_from_bpf_call_sites`
+  walks executable sections, decodes every BPF slot, and
+  treats every `InsnKind::Call` target (excluding the syscall
+  sites already named by layer 1) as a function entry. Synthesizes
+  `sub_<addr>` `Function` entries with `FunctionSource::CallSite`;
+  the existing `fill_in_sizes_from_neighbors` pass closes
+  their sizes off neighbour-function-start. New
+  `ud-arch-bpf::call_target` helper exposes the `imm`-based
+  target computation for non-syscall calls.
+  For `3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr`: 215
+  newly-discovered functions split the 39 K-line `fragment_120`
+  blob into 217 named blocks total, with round-trip
+  byte-identical preserved.
 - BPF call-site name resolution (decompile layer 1 of 6). New
   `ud-analysis::bpf_relocs::build_call_site_names` walks
   `SHT_REL` (`.rel.dyn`) entries of type `R_BPF_64_32`,

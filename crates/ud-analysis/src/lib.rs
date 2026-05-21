@@ -21,12 +21,14 @@
 #![allow(clippy::cast_possible_truncation)]
 
 pub mod bpf_relocs;
+pub mod call_sites;
 mod eh_frame;
 mod function_map;
 mod plt;
 mod signatures;
 mod symbols;
 
+pub use call_sites::{discover_from_bpf_call_sites, CallSiteError};
 pub use eh_frame::{discover_from_eh_frame, EhFrameError};
 pub use function_map::{Function, FunctionMap, FunctionSource};
 pub use plt::{discover_plt_thunks, PltError};
@@ -45,6 +47,10 @@ pub enum Error {
     EhFrame(#[from] EhFrameError),
     #[error(transparent)]
     Plt(#[from] PltError),
+    #[error(transparent)]
+    BpfReloc(#[from] bpf_relocs::BpfRelocError),
+    #[error(transparent)]
+    CallSite(#[from] CallSiteError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -63,6 +69,17 @@ pub fn discover_functions(elf: &Elf64File) -> Result<FunctionMap> {
     let mut map = FunctionMap::new();
 
     for f in discover_from_eh_frame(elf)? {
+        map.insert(f);
+    }
+    // BPF / SBF: harvest function entries from local `call`
+    // targets. Stripped Solana programs only expose
+    // entrypoint + custom_panic in `.dynsym`; every other
+    // function lives behind a `call` somewhere. We need the
+    // syscall relocation map to exclude syscall call sites
+    // (whose `imm` is a helper id or Murmur3 hash, not a code
+    // offset).
+    let bpf_syscalls = bpf_relocs::build_call_site_names(elf)?;
+    for f in discover_from_bpf_call_sites(elf, &bpf_syscalls)? {
         map.insert(f);
     }
     for f in discover_from_signatures(elf) {

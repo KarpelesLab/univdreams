@@ -16,22 +16,28 @@ use ud_core::VAddr;
 pub enum FunctionSource {
     /// Inferred from a prologue-pattern match. Lowest confidence.
     Prologue = 0,
+    /// Harvested as the target of a direct `call` instruction
+    /// somewhere in executable code. Placeholder name
+    /// (`sub_<addr>`); slightly higher confidence than a
+    /// prologue match because *something* explicitly references
+    /// the address as a function entry.
+    CallSite = 1,
     /// Recovered from a `.eh_frame` FDE. Yields a real address range
     /// but no name (placeholder `sub_<addr>`).
-    EhFrame = 1,
+    EhFrame = 2,
     /// Matched a known byte-pattern signature (CRT helpers, libc
     /// primitives, …). Yields a meaningful name; placed above
     /// `EhFrame` so the name overrides eh_frame's placeholder.
-    Signature = 2,
+    Signature = 3,
     /// Resolved as a `.plt` thunk via `.rela.plt` → `.dynsym`. Yields
     /// the imported symbol's name (e.g. `printf`).
-    Plt = 3,
+    Plt = 4,
     /// Read from `.dynsym` (dynamic linker's symbol table).
-    DynSym = 4,
+    DynSym = 5,
     /// Read from `.symtab` (full symbol table; absent in stripped binaries).
-    SymTab = 5,
+    SymTab = 6,
     /// Provided by the user via an override file.
-    UserOverride = 6,
+    UserOverride = 7,
 }
 
 /// A discovered function.

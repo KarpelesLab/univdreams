@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use ud_arch_bpf::{format_insn, jump_target, BpfVariant, DecodedInsn, InsnKind};
+use ud_arch_bpf::{call_target, format_insn, jump_target, BpfVariant, DecodedInsn, InsnKind};
 use ud_ast::{FnDecl, Stmt};
 use ud_ir::Function;
 
@@ -47,9 +47,9 @@ pub fn build_function(
     let mut body = Vec::new();
     for block in &f.blocks {
         for insn in &block.insns {
-            let text = render_text(insn, variant, call_site_names);
+            let text = render_text(insn, variant, name_at, call_site_names);
             body.push(Stmt::asm(text, insn.bytes.to_vec()));
-            if let Some(annotation) = call_or_branch_annotation(insn, name_at, call_site_names) {
+            if let Some(annotation) = call_or_branch_annotation(insn, name_at) {
                 body.push(Stmt::Comment(annotation));
             }
         }
@@ -64,52 +64,42 @@ pub fn build_function(
     }
 }
 
-/// Format an instruction with name-aware substitution: a
-/// `call <hex>` whose address has an entry in `call_site_names`
-/// renders as `call <symbol>` instead.
+/// Format an instruction with name-aware substitution.
+///
+/// Two cases for `call`:
+///   1. Relocation map names the *call site* (syscall import).
+///      Render as `call <symbol>`.
+///   2. Otherwise, compute the local call target. If it lands
+///      on a known function (layer-2 `sub_<addr>` or anything
+///      else), render as `call <fn_name>`.
+///
+/// The pinned bytes never change; only the text does.
 fn render_text(
     insn: &DecodedInsn,
     variant: BpfVariant,
+    name_at: &HashMap<u64, String>,
     call_site_names: &HashMap<u64, String>,
 ) -> String {
-    let base = format_insn(insn, variant);
     if matches!(insn.kind, InsnKind::Call) {
         if let Some(name) = call_site_names.get(&insn.addr.0) {
             return format!("call {name}");
         }
+        let target = call_target(insn);
+        if let Some(name) = name_at.get(&target) {
+            return format!("call {name}");
+        }
     }
-    base
+    format_insn(insn, variant)
 }
 
-/// Annotate direct calls (with relocation-resolved names) and
-/// unconditional jumps whose target is a known function.
-fn call_or_branch_annotation(
-    insn: &DecodedInsn,
-    name_at: &HashMap<u64, String>,
-    call_site_names: &HashMap<u64, String>,
-) -> Option<String> {
+/// Annotate jumps whose target is a known function (cross-
+/// function tail-calls are rare in BPF but possible). Calls
+/// are already named by `render_text` so they need no
+/// extra annotation.
+fn call_or_branch_annotation(insn: &DecodedInsn, name_at: &HashMap<u64, String>) -> Option<String> {
     match insn.kind {
         InsnKind::Jmp | InsnKind::JmpCond | InsnKind::JmpCond32 => {
             name_at.get(&jump_target(insn)).map(|n| format!("-> {n}"))
-        }
-        // For calls we already substituted the operand in the
-        // `@asm` text; no need to add a `// -> name` comment
-        // since the name is right there. Without a reloc hit,
-        // a numeric `call 0xeca` stays in the text and we have
-        // nothing to add.
-        InsnKind::Call => {
-            // Stay silent when the reloc map covered this site —
-            // the text already names it. If the call wasn't in
-            // the reloc map but lands on a known local function
-            // (layer 2 will fill `name_at` for sub_<addr>),
-            // we'll annotate; until layer 2 lands, this branch
-            // is effectively unreachable for syscalls.
-            if call_site_names.contains_key(&insn.addr.0) {
-                None
-            } else {
-                let target = jump_target(insn);
-                name_at.get(&target).map(|n| format!("-> {n}"))
-            }
         }
         _ => None,
     }

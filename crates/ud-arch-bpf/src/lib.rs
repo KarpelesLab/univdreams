@@ -333,6 +333,24 @@ pub fn jump_target(insn: &DecodedInsn) -> u64 {
     next_slot.wrapping_add(off_bytes as u64)
 }
 
+/// Compute the absolute byte-address target of a `call <imm>`
+/// instruction *for a local call*. The `imm` field on a BPF
+/// `call` is a signed slot offset relative to the next slot.
+///
+/// Callers should first verify the call isn't a syscall — for
+/// the Linux kernel the `imm` is a helper-id and is *not* a
+/// code offset; for SBF the `imm` is a Murmur3 hash (or `-1`
+/// before relocation) and again is not a code offset. The
+/// usual discriminator is "is this call site in the
+/// relocation-resolved syscall map?" — see
+/// `ud_analysis::bpf_relocs::build_call_site_names`.
+#[must_use]
+pub fn call_target(insn: &DecodedInsn) -> u64 {
+    let next_slot = insn.addr.0.wrapping_add(INSN_SIZE as u64);
+    let off_bytes = i64::from(insn.imm).wrapping_mul(INSN_SIZE as i64);
+    next_slot.wrapping_add(off_bytes as u64)
+}
+
 /// Lift a decoded instruction stream into a CFG.
 ///
 /// v1: one basic block per function, terminator driven by the
