@@ -839,6 +839,7 @@ fn build_section_items(
                 &data[lo..hi],
                 name_at,
                 call_site_names,
+                elf,
             )?;
         }
         // The function itself.
@@ -862,7 +863,7 @@ fn build_section_items(
                 let insns =
                     ud_arch_bpf::decode(slice, f.addr.0, variant).map_err(Error::BpfDecode)?;
                 let lifted = ud_arch_bpf::lift_function(f.name.clone(), &insns);
-                bpf::build_function(&lifted, name_at, call_site_names, variant)
+                bpf::build_function(&lifted, name_at, call_site_names, variant, Some(elf))
             }
         };
         out.push(Item::Function(fn_decl));
@@ -880,6 +881,7 @@ fn build_section_items(
             &data[lo..],
             name_at,
             call_site_names,
+            elf,
         )?;
     }
 
@@ -901,6 +903,7 @@ fn build_section_items(
 /// `discover_functions` for x86 / aarch64 is call-site /
 /// landing-pad-style function discovery, which is its own
 /// project.
+#[allow(clippy::too_many_arguments)]
 fn emit_gap(
     out: &mut Vec<Item>,
     arch: Arch,
@@ -909,6 +912,7 @@ fn emit_gap(
     bytes: &[u8],
     name_at: &HashMap<u64, String>,
     call_site_names: &HashMap<u64, String>,
+    elf: &Elf64File,
 ) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
@@ -939,6 +943,7 @@ fn emit_gap(
                     name_at,
                     call_site_names,
                     variant,
+                    Some(elf),
                 )));
             }
             return Ok(());

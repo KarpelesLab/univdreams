@@ -9,6 +9,31 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF call-site argument tracking + `.rodata` string
+  resolution (decompile L6c+). New per-basic-block
+  `RegTracker` walks the BPF slot stream tracking each
+  register's symbolic value (immediates, register copies,
+  pointer-to-r10 → `&local_N` / `&arg_N`, lddw imm64).
+  At every `call` site it snapshots r1..r5 and emits a
+  `// args: r1=…, r2=…, …` comment listing the resolved
+  arguments. The tracker is seeded at function entry with
+  `r10 = "r10"` (frame pointer) and `r1..rN = "arg_0".."arg_(N-1)"`
+  per the inferred signature, and resets at labels (CFG join
+  points). For 3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr:
+  1,350 call-arg annotations.
+
+  At lddw decode time, the imm64 is run through a string
+  resolver: direct .rodata lookup first, then a `.data.rel.ro`
+  slice-descriptor walk (Solana SBF stores R_BPF_64_RELATIVE
+  pointers with the static vaddr in the upper 32 bits of an
+  8-byte slot — `{ ptr, len }` slice descriptors). When the
+  pointed-to bytes form a printable UTF-8 string up to ~1 KB,
+  the lddw operand is replaced: `lddw r3, "src/extension/mod.rs"`
+  instead of `lddw r3, 0x52b20`. 545 lddws resolved on the
+  example program — every `sol_log_` message is now legible.
+
+  Round-trip stays byte-identical: the rendered text is
+  cosmetic, the pinned `@asm` bytes drive the rebuild.
 - BPF Solana-syscall signature annotations (decompile L6c).
   New `decompile/idioms.rs::solana_syscall_signature` is a
   fixed lookup table for the ~30 most common Anza / Solana

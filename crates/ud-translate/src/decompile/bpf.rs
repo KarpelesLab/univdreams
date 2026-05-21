@@ -32,6 +32,7 @@ use ud_ast::{FnDecl, Stmt};
 use ud_ir::Function;
 
 use super::args::infer_bpf_signature;
+use super::data_lookup::DataLookup;
 use super::idioms::solana_syscall_signature;
 use super::stack_slots::rewrite_slots;
 
@@ -51,6 +52,7 @@ pub fn build_function(
     name_at: &HashMap<u64, String>,
     call_site_names: &HashMap<u64, String>,
     variant: BpfVariant,
+    data: Option<&dyn DataLookup>,
 ) -> FnDecl {
     // Layer-4 pre-pass: collect every jump target *inside*
     // this function. A target outside the function's address
@@ -74,6 +76,18 @@ pub fn build_function(
         }
     }
 
+    // Pre-compute the signature once so the value tracker
+    // can seed r1..r5 with `arg_0..` at function entry.
+    let signature = infer_bpf_signature(f);
+    let arity = signature.as_ref().map_or(0, |s| s.params.len() as u8);
+
+    // Layer-6c+ pre-pass: track per-register values across
+    // each linear instruction sequence so we can annotate
+    // call sites with their actual argument values (r1..r5)
+    // resolved to immediates, copies, or pointer-to-local
+    // forms. The state is invalidated at labels (basic-block
+    // boundaries) and after every call.
+    let mut tracker = RegTracker::new_at_entry(arity);
     let mut body = Vec::new();
     for block in &f.blocks {
         for insn in &block.insns {
@@ -81,8 +95,28 @@ pub fn build_function(
             // instruction that's a known jump target.
             if intra_targets.contains(&insn.addr.0) {
                 body.push(Stmt::Label { addr: insn.addr.0 });
+                // A label marks a join point — values flowing
+                // in may come from either the fall-through or
+                // the jump, so we can't trust the tracked
+                // state. Reset to "unknown".
+                tracker.reset();
             }
-            let text = render_text(insn, variant, name_at, call_site_names, &intra_targets);
+            // Snapshot the call args BEFORE the instruction
+            // applies its own state effects, so a `call`'s
+            // args are the *incoming* values of r1..r5.
+            let call_args = if matches!(insn.kind, InsnKind::Call) {
+                Some(tracker.snapshot_call_args())
+            } else {
+                None
+            };
+            let text = render_text(
+                insn,
+                variant,
+                name_at,
+                call_site_names,
+                &intra_targets,
+                data,
+            );
             body.push(Stmt::asm(text, insn.bytes.to_vec()));
             if let Some(annotation) = call_or_branch_annotation(insn, name_at, &intra_targets) {
                 body.push(Stmt::Comment(annotation));
@@ -97,7 +131,16 @@ pub fn build_function(
                         body.push(Stmt::Comment(sig.to_string()));
                     }
                 }
+                if let Some(args) = call_args {
+                    if let Some(line) = render_call_args(&args) {
+                        body.push(Stmt::Comment(line));
+                    }
+                }
             }
+            // Apply this instruction's effect on the tracker
+            // *after* snapshotting (so the next insn sees the
+            // new state).
+            tracker.apply(insn);
         }
     }
     // Layer-5a: detect forward `jcc -> body -> label` patterns
@@ -105,12 +148,8 @@ pub fn build_function(
     // because the jcc bytes ride in `cond_bytes` and the body
     // statements keep their own pinned `@asm` bytes.
     let body = wrap_if_blocks(body, f, &intra_targets);
-    // Layer-6b: infer arity + return type from per-register
-    // read-before-write analysis. Renders as a Rust-shaped
-    // signature on the FnDecl; the AST emit / parse path
-    // already round-trips signatures, so this is pure addition
-    // with no round-trip impact.
-    let signature = infer_bpf_signature(f);
+    // (signature was computed up-front so the L6c+ tracker
+    // could seed r1..r5; reuse it here.)
     FnDecl {
         addr: Some(f.addr.0),
         name: f.name.clone(),
@@ -322,6 +361,7 @@ fn render_text(
     name_at: &HashMap<u64, String>,
     call_site_names: &HashMap<u64, String>,
     intra_targets: &std::collections::BTreeSet<u64>,
+    data: Option<&dyn DataLookup>,
 ) -> String {
     if matches!(insn.kind, InsnKind::Call) {
         if let Some(name) = call_site_names.get(&insn.addr.0) {
@@ -330,6 +370,17 @@ fn render_text(
         let target = call_target(insn);
         if let Some(name) = name_at.get(&target) {
             return format!("call {name}");
+        }
+    }
+    // Layer 6c+: for `lddw r, imm64` whose imm64 lands in a
+    // readable section with printable string content (typical
+    // pattern for sol_log_ message pointers), surface the
+    // string as the operand.
+    if matches!(insn.kind, InsnKind::Lddw) {
+        if let (Some(imm), Some(lookup)) = (insn.imm64, data) {
+            if let Some(s) = read_inline_string(lookup, imm) {
+                return format!("lddw r{}, {s}", insn.dst);
+            }
         }
     }
     // Layer-4: rewrite the relative-offset operand of intra-
@@ -392,5 +443,283 @@ fn call_or_branch_annotation(
             name_at.get(&target).map(|n| format!("-> {n}"))
         }
         _ => None,
+    }
+}
+
+// ============================================================
+// Register-value tracker (layer 6c+).
+// ============================================================
+
+/// Linear-flow register-value tracker. Updates a per-register
+/// `Option<String>` map as instructions execute; resets on
+/// labels (basic-block boundaries) and clobbers r1..r5 + sets
+/// r0 to `<return>` on calls.
+///
+/// Values are rendered as human-readable strings (`"0x10"`,
+/// `"r10"`, `"&local_8"`, `"[local_38]"`). The tracker
+/// understands the patterns BPF emits at call setup —
+/// immediates, register copies, frame-pointer arithmetic, and
+/// loads from stack — which covers most argument-prep
+/// sequences without needing a full value-flow analysis.
+struct RegTracker {
+    /// One entry per r0..r10 (index 0..10). `None` means
+    /// "unknown / clobbered".
+    state: [Option<String>; 11],
+}
+
+impl RegTracker {
+    /// Construct with the entry state: r10 always holds the
+    /// frame pointer, and r1..r(arity) hold the function's
+    /// arguments (named `arg_0`..`arg_<arity-1>` to match the
+    /// signature `infer_bpf_signature` produces).
+    fn new_at_entry(arity: u8) -> Self {
+        let mut state: [Option<String>; 11] = Default::default();
+        state[10] = Some("r10".into());
+        for i in 0..arity.min(5) {
+            state[(i + 1) as usize] = Some(format!("arg_{i}"));
+        }
+        Self { state }
+    }
+
+    /// Clear all register values — used at labels (CFG join
+    /// points) where the incoming value could come from any
+    /// predecessor. r10 stays set since the frame pointer is
+    /// invariant across the function body.
+    fn reset(&mut self) {
+        for (i, s) in self.state.iter_mut().enumerate() {
+            if i == 10 {
+                continue;
+            }
+            *s = None;
+        }
+    }
+
+    /// Snapshot the current values of r1..r5 (the BPF arg
+    /// registers). Returned as a fixed-size array of optional
+    /// strings — none for "unknown".
+    fn snapshot_call_args(&self) -> [Option<String>; 5] {
+        [
+            self.state[1].clone(),
+            self.state[2].clone(),
+            self.state[3].clone(),
+            self.state[4].clone(),
+            self.state[5].clone(),
+        ]
+    }
+
+    /// Update the tracker by interpreting `insn`'s effect.
+    #[allow(clippy::match_same_arms)]
+    fn apply(&mut self, insn: &DecodedInsn) {
+        let class = insn.opcode & 0x07;
+        let op_nibble = insn.opcode >> 4;
+        let is_reg_src = (insn.opcode & 0x08) != 0;
+        let dst = insn.dst as usize;
+        let src = insn.src as usize;
+        if dst > 10 {
+            return;
+        }
+        match class {
+            // BPF_LD (LDDW + legacy packet loads).
+            0x00 => {
+                if insn.opcode == 0x18 {
+                    // `lddw r, imm64` — value known.
+                    self.state[dst] = Some(format!("0x{:x}", insn.imm64.unwrap_or(0)));
+                } else {
+                    self.state[dst] = None;
+                }
+            }
+            // BPF_LDX (register-indexed loads): track loads
+            // from `[r10 ± offset]` as `[local_N]` / `[arg_N]`.
+            0x01 => {
+                if src == 10 {
+                    self.state[dst] = Some(render_stack_ref(insn.offset, false));
+                } else {
+                    self.state[dst] = None;
+                }
+            }
+            // Stores don't change register values. (Two
+            // opcode classes; same effect.)
+            0x02 | 0x03 => { /* no-op */ }
+            // ALU32 / ALU64 — the interesting cases are MOV
+            // (immediate or register copy) and ADD on a known
+            // base.
+            0x04 | 0x07 => {
+                #[allow(clippy::cast_sign_loss)]
+                match op_nibble {
+                    // MOV
+                    0xb => {
+                        self.state[dst] = if is_reg_src {
+                            self.state[src].clone()
+                        } else {
+                            Some(format!("0x{:x}", insn.imm as u32))
+                        };
+                    }
+                    // ADD
+                    0x0 => {
+                        if is_reg_src {
+                            self.state[dst] = None;
+                        } else {
+                            // Add immediate. If dst is a known
+                            // pointer-to-r10, fold the offset
+                            // into the stack-slot name.
+                            let folded = self.state[dst]
+                                .as_deref()
+                                .and_then(|s| fold_stack_add(s, insn.imm));
+                            self.state[dst] = folded;
+                        }
+                    }
+                    // Everything else (NEG, ARSH, END, …):
+                    // invalidate dst.
+                    _ => {
+                        self.state[dst] = None;
+                    }
+                }
+            }
+            // BPF_JMP — only CALL has a register effect.
+            0x05 => {
+                if matches!(insn.kind, InsnKind::Call | InsnKind::CallReg) {
+                    // r0 = return; r1..r5 clobbered.
+                    self.state[0] = Some("<return>".into());
+                    for r in 1..=5 {
+                        self.state[r] = None;
+                    }
+                }
+                // EXIT / jumps / etc. don't change reg values.
+            }
+            // BPF_JMP32 — same idea, no register write.
+            0x06 => {}
+            _ => {}
+        }
+    }
+}
+
+/// Format a `[r10 + offset]` reference as a stack-slot name.
+/// When `take_addr` is true, render as `&local_N` (or
+/// `&arg_N`); otherwise as `[local_N]`.
+fn render_stack_ref(offset: i16, take_addr: bool) -> String {
+    let prefix = if take_addr { "&" } else { "[" };
+    let suffix = if take_addr { "" } else { "]" };
+    if offset >= 0 {
+        format!("{prefix}arg_{offset:x}{suffix}")
+    } else {
+        let abs = u32::from(offset.unsigned_abs());
+        format!("{prefix}local_{abs:x}{suffix}")
+    }
+}
+
+/// When a register holds `"r10"` (or a pointer-to-r10 form
+/// like `"&local_8"`), adjust the offset by `delta` and return
+/// the new symbolic name. Returns `None` when the base isn't
+/// a recognisable frame-pointer form.
+fn fold_stack_add(base: &str, delta: i32) -> Option<String> {
+    if base == "r10" {
+        // Pointer-to-r10 after adding `delta`. Convention:
+        // negative delta → local; non-negative → arg.
+        if delta < 0 {
+            return Some(format!("&local_{:x}", delta.unsigned_abs()));
+        }
+        return Some(format!("&arg_{delta:x}"));
+    }
+    if let Some(rest) = base.strip_prefix("&local_") {
+        let cur = i64::from_str_radix(rest, 16).ok()?;
+        let new = -cur + i64::from(delta);
+        if new <= 0 {
+            return Some(format!("&local_{:x}", new.unsigned_abs()));
+        }
+        return Some(format!("&arg_{new:x}"));
+    }
+    if let Some(rest) = base.strip_prefix("&arg_") {
+        let cur = i64::from_str_radix(rest, 16).ok()?;
+        let new = cur + i64::from(delta);
+        if new < 0 {
+            return Some(format!("&local_{:x}", new.unsigned_abs()));
+        }
+        return Some(format!("&arg_{new:x}"));
+    }
+    None
+}
+
+/// Try to surface a string literal at `vaddr` via the supplied
+/// data lookup. Returns a quoted, escaped Rust-style literal
+/// (e.g. `"Hello, world!"`).
+///
+/// Two cases are handled:
+///   1. **Direct**: `vaddr` lands in a section whose bytes at
+///      that offset are printable ASCII. Read up to ~96 bytes
+///      or to a NUL / non-printable byte and quote it.
+///   2. **Slice descriptor**: `vaddr` lands in a section like
+///      `.data.rel.ro` that holds 16-byte `{ ptr: u64, len: u64 }`
+///      slice descriptors. Read both, range-check the length,
+///      follow `ptr` to recover the bytes, and quote.
+fn read_inline_string(lookup: &dyn DataLookup, vaddr: u64) -> Option<String> {
+    if let Some(s) = read_string_direct(lookup, vaddr, 96) {
+        return Some(s);
+    }
+    read_string_via_slice_descriptor(lookup, vaddr)
+}
+
+fn read_string_direct(lookup: &dyn DataLookup, vaddr: u64, max_len: usize) -> Option<String> {
+    let (_section, bytes, offset) = lookup.section_at(vaddr)?;
+    let tail = bytes.get(offset..)?;
+    let mut end = 0;
+    for (i, &b) in tail.iter().take(max_len).enumerate() {
+        if b == 0 {
+            end = i;
+            break;
+        }
+        if !(b == b'\t' || b == b'\n' || (0x20..0x7f).contains(&b)) {
+            end = i;
+            break;
+        }
+        end = i + 1;
+    }
+    if end < 4 {
+        return None;
+    }
+    let s = std::str::from_utf8(&tail[..end]).ok()?;
+    Some(format!("{s:?}"))
+}
+
+fn read_string_via_slice_descriptor(lookup: &dyn DataLookup, vaddr: u64) -> Option<String> {
+    let (_section, bytes, offset) = lookup.section_at(vaddr)?;
+    let descriptor = bytes.get(offset..offset + 16)?;
+    // Solana SBF stores R_BPF_64_RELATIVE pointers with the
+    // static vaddr in the **upper 32 bits** of an 8-byte slot
+    // (low 32 stay zero on disk; the loader resolves them at
+    // runtime by adding the program's load base). For static
+    // analysis we just take the upper u32 as the vaddr —
+    // that's what the string will end up referencing once
+    // the program is loaded.
+    let ptr = u64::from(u32::from_le_bytes(descriptor[4..8].try_into().ok()?));
+    let len = u64::from_le_bytes(descriptor[8..16].try_into().ok()?);
+    if len == 0 || len > 1024 || ptr == 0 {
+        return None;
+    }
+    let (_section2, ptr_bytes, ptr_offset) = lookup.section_at(ptr)?;
+    let slice = ptr_bytes.get(ptr_offset..ptr_offset + len as usize)?;
+    let s = std::str::from_utf8(slice).ok()?;
+    // Must be mostly printable.
+    if s.chars()
+        .any(|c| (c as u32) < 0x20 && c != '\t' && c != '\n')
+    {
+        return None;
+    }
+    Some(format!("{s:?}"))
+}
+
+/// Render a call's resolved r1..r5 values as a single comment.
+/// Returns `None` when every slot is unknown — the comment
+/// would be empty noise.
+fn render_call_args(args: &[Option<String>; 5]) -> Option<String> {
+    let mut parts = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if let Some(v) = a {
+            parts.push(format!("r{}={v}", i + 1));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("args: {}", parts.join(", ")))
     }
 }
