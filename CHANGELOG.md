@@ -9,6 +9,21 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF argument + return inference (decompile layer 6 of 6).
+  New `decompile/args.rs::infer_bpf_signature` runs a
+  one-pass read-before-write analysis per function: registers
+  among r1..r5 that are read before being written are
+  inferred as arguments; r0 being written anywhere means the
+  function returns `u64`. Fills `FnDecl.signature` so
+  functions render as
+  `fn sub_31f00(arg_0: u64 @r1, arg_1: u64 @r2) -> u64`.
+  For `3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr`:
+  ~242 functions get arg lists; ~283 get return types;
+  `entrypoint` renders as `fn entrypoint(arg_0: u64 @r1) -> u64`.
+  Round-trip stays byte-identical because the signature is
+  metadata; the lowered bytes come from the `@asm` payload.
+  A full SSA-based pass (L6a) refines this for branch-dependent
+  liveness; L6b's linear scan covers the common cases.
 - BPF structural if-then recovery (decompile layer 5 of 6).
   New `Stmt::IfBlock { cond_text, cond_bytes, then_body,
   then_tail_jmp, else_body }` and `Stmt::WhileBlock` AST

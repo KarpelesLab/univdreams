@@ -31,6 +31,7 @@ use ud_arch_bpf::{call_target, format_insn, jump_target, BpfVariant, DecodedInsn
 use ud_ast::{FnDecl, Stmt};
 use ud_ir::Function;
 
+use super::args::infer_bpf_signature;
 use super::stack_slots::rewrite_slots;
 
 /// Name of the BPF frame-pointer register. Hard-coded by the
@@ -92,12 +93,18 @@ pub fn build_function(
     // because the jcc bytes ride in `cond_bytes` and the body
     // statements keep their own pinned `@asm` bytes.
     let body = wrap_if_blocks(body, f, &intra_targets);
+    // Layer-6b: infer arity + return type from per-register
+    // read-before-write analysis. Renders as a Rust-shaped
+    // signature on the FnDecl; the AST emit / parse path
+    // already round-trips signatures, so this is pure addition
+    // with no round-trip impact.
+    let signature = infer_bpf_signature(f);
     FnDecl {
         addr: Some(f.addr.0),
         name: f.name.clone(),
         attrs: Vec::new(),
         locals: Vec::new(),
-        signature: None,
+        signature,
         body,
     }
 }
@@ -253,13 +260,13 @@ fn invert_bpf_cond(insn: &DecodedInsn) -> String {
         format!("0x{:x}", insn.imm as u32)
     };
     let cmp = match op {
-        0x1 => "!=",                                            // jeq
-        0x2 | 0x6 => "<=",                                      // jgt / jsgt
-        0x3 | 0x7 => "<",                                       // jge / jsge
-        0x4 => return format!("({dst} & {rhs}) == 0"),          // jset
-        0x5 => "==",                                            // jne
-        0xa | 0xc => ">=",                                      // jlt / jslt
-        0xb | 0xd => ">",                                       // jle / jsle
+        0x1 => "!=",                                   // jeq
+        0x2 | 0x6 => "<=",                             // jgt / jsgt
+        0x3 | 0x7 => "<",                              // jge / jsge
+        0x4 => return format!("({dst} & {rhs}) == 0"), // jset
+        0x5 => "==",                                   // jne
+        0xa | 0xc => ">=",                             // jlt / jslt
+        0xb | 0xd => ">",                              // jle / jsle
         _ => "?",
     };
     format!("{dst} {cmp} {rhs}")

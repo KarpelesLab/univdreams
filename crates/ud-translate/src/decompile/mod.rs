@@ -29,6 +29,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod aarch64;
+mod args;
 mod bpf;
 mod build_function;
 mod build_module;
