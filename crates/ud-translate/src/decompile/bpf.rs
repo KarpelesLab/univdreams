@@ -31,6 +31,12 @@ use ud_arch_bpf::{call_target, format_insn, jump_target, BpfVariant, DecodedInsn
 use ud_ast::{FnDecl, Stmt};
 use ud_ir::Function;
 
+use super::stack_slots::rewrite_slots;
+
+/// Name of the BPF frame-pointer register. Hard-coded by the
+/// ISA — there is no other choice on any BPF variant.
+const BPF_FP: &str = "r10";
+
 /// Build a `FnDecl` from a lifted BPF function.
 ///
 /// `name_at` maps function entry addresses → names (for jump
@@ -89,7 +95,11 @@ fn render_text(
             return format!("call {name}");
         }
     }
-    format_insn(insn, variant)
+    // Layer-3 rewrite: `[r10 - 0x38]` → `[local_38]`,
+    // `[r10 + 0x10]` → `[arg_10]`. The bytes don't change;
+    // round-trip stays byte-identical via the pinned @asm
+    // payload.
+    rewrite_slots(&format_insn(insn, variant), BPF_FP)
 }
 
 /// Annotate jumps whose target is a known function (cross-

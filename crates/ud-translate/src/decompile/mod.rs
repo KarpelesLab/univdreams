@@ -39,6 +39,7 @@ mod patterns;
 pub mod pe;
 pub mod raw6502;
 mod ssa;
+mod stack_slots;
 
 pub use data_lookup::DataLookup;
 pub use macho::{decompile_macho, decompile_macho_to_text};

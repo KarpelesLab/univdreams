@@ -9,6 +9,19 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF stack-slot naming (decompile layer 3 of 6). New
+  `decompile/stack_slots.rs::rewrite_slots(text, fp_reg)`
+  generic helper rewrites `[r10 - 0x38]` → `[local_38]` and
+  `[r10 + 0x10]` → `[arg_10]` on every BPF `@asm` text. Bytes
+  unchanged; round-trip stays byte-identical.
+  For `3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr`: 9 415
+  `local_*` references in place of raw `[r10 ± hex]`
+  operands, with zero remaining raw forms.
+  The helper is arch-agnostic (takes the frame-pointer register
+  name); folding x86's existing `rename_ebp_slot` to share it
+  is deferred (the x86 form is spaceless, `[ebp-0x40]`, vs BPF's
+  spaced `[r10 - 0x40]` — same shape but the parser needs both
+  spellings; tracked as a follow-up).
 - BPF function discovery from call sites (decompile layer 2
   of 6). New `ud-analysis::call_sites::discover_from_bpf_call_sites`
   walks executable sections, decodes every BPF slot, and
