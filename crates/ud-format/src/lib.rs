@@ -11,6 +11,7 @@
 //! * [`macho`] — thin 64-bit Mach-O (`MachoFile`).
 //! * [`raw`] — headerless flat images, e.g. 6502 ROMs
 //!   (`RawImage`).
+//! * [`wasm`] — WebAssembly modules (`WasmFile`).
 //!
 //! These were four separate crates (`ud-format-elf`,
 //! `-pe`, `-macho`, `-raw`); they were merged because they
@@ -22,3 +23,4 @@ pub mod elf;
 pub mod macho;
 pub mod pe;
 pub mod raw;
+pub mod wasm;

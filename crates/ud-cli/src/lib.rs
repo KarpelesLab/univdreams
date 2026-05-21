@@ -71,6 +71,12 @@ fn pipeline_bytes(bytes: &[u8]) -> Vec<u8> {
         // Mach-O-shaped but rejected by v1 (32-bit, unsupported
         // cputype, fat wrapper); fall through to byte-copy.
     }
+    if ud_format::wasm::is_wasm(bytes) {
+        if let Ok(wasm) = ud_format::wasm::WasmFile::parse(bytes) {
+            return wasm.write_to_vec();
+        }
+        // WASM-shaped but rejected; fall through to byte-copy.
+    }
     bytes.to_vec()
 }
 
@@ -121,6 +127,8 @@ pub enum SourceRoundTripError {
     PeFormat(#[from] ud_format::pe::Error),
     #[error(transparent)]
     MachoFormat(#[from] ud_format::macho::Error),
+    #[error(transparent)]
+    WasmFormat(#[from] ud_format::wasm::Error),
     #[error("parse of decompile output failed: {0}")]
     Parse(String),
     #[error(transparent)]
@@ -131,6 +139,8 @@ pub enum SourceRoundTripError {
     MachoLower(#[from] ud_translate::compile::MachoLowerError),
     #[error(transparent)]
     RawLower(#[from] ud_translate::compile::RawLowerError),
+    #[error(transparent)]
+    WasmLower(#[from] ud_translate::compile::WasmLowerError),
 }
 
 /// Run `input` through the full source pipeline:
@@ -172,6 +182,15 @@ pub fn roundtrip_through_source(
             .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
         let warnings = ud_translate::compile::verify_asm(&parsed);
         let rebuilt = ud_translate::compile::lower_to_macho(&parsed)?;
+        (text, warnings, rebuilt)
+    } else if ud_format::wasm::is_wasm(&input_bytes) {
+        let wasm = ud_format::wasm::WasmFile::parse(&input_bytes)?;
+        let ast = ud_translate::decompile::decompile_wasm(&wasm);
+        let text = ud_ast::emit(&ast);
+        let parsed = ud_translate::compile::parse(&text)
+            .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_translate::compile::verify_asm(&parsed);
+        let rebuilt = ud_translate::compile::lower_to_wasm(&parsed)?;
         (text, warnings, rebuilt)
     } else if let Some(load_addr) = raw_6502_load_addr(&input_bytes) {
         let image = ud_format::raw::RawImage::new(input_bytes.clone(), load_addr);

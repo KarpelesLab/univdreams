@@ -446,13 +446,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let macho = ud_format::macho::MachoFile::parse(&bytes)
                     .with_context(|| format!("parse {} as Mach-O", input.display()))?;
                 ud_translate::decompile::decompile_macho_to_text(&macho)
+            } else if ud_format::wasm::is_wasm(&bytes) {
+                let wasm = ud_format::wasm::WasmFile::parse(&bytes)
+                    .with_context(|| format!("parse {} as WASM", input.display()))?;
+                ud_translate::decompile::decompile_wasm_to_text(&wasm)
             } else if let Some(load_addr) = ud_cli::raw_6502_load_addr(&bytes) {
                 let image = ud_format::raw::RawImage::new(bytes, load_addr);
                 ud_translate::decompile::decompile_raw_6502_to_text(&image)
                     .with_context(|| format!("decompile {} as 6502 raw", input.display()))?
             } else {
                 anyhow::bail!(
-                    "unrecognised binary format: {} (expected ELF, PE, Mach-O, or 6502 raw image)",
+                    "unrecognised binary format: {} (expected ELF, PE, Mach-O, WASM, or 6502 raw image)",
                     input.display()
                 );
             };
@@ -506,7 +510,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     _ => None,
                 })
                 .ok_or_else(|| {
-                    anyhow::anyhow!("`@module.format` is missing — expected \"elf\", \"pe\", \"macho\", or \"raw\"")
+                    anyhow::anyhow!("`@module.format` is missing — expected \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw\"")
                 })?;
             let bytes = match format.as_str() {
                 "elf" => ud_translate::compile::lower_to_elf(&ast)
@@ -515,10 +519,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     .with_context(|| format!("lower {} to PE", input.display()))?,
                 "macho" => ud_translate::compile::lower_to_macho(&ast)
                     .with_context(|| format!("lower {} to Mach-O", input.display()))?,
+                "wasm" => ud_translate::compile::lower_to_wasm(&ast)
+                    .with_context(|| format!("lower {} to WASM", input.display()))?,
                 "raw" => ud_translate::compile::lower_to_raw(&ast)
                     .with_context(|| format!("lower {} to raw", input.display()))?,
                 other => anyhow::bail!(
-                    "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", or \"raw\")"
+                    "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw\")"
                 ),
             };
             std::fs::write(&output, &bytes)

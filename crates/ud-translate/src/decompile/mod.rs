@@ -42,11 +42,13 @@ pub mod pe;
 pub mod raw6502;
 mod ssa;
 mod stack_slots;
+pub mod wasm;
 
 pub use data_lookup::DataLookup;
 pub use macho::{decompile_macho, decompile_macho_to_text};
 pub use pe::{decompile_pe, decompile_pe_to_text};
 pub use raw6502::{decompile_raw_6502, decompile_raw_6502_to_text};
+pub use wasm::{decompile_wasm, decompile_wasm_to_text};
 
 use std::collections::HashMap;
 
