@@ -9,6 +9,15 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF branch labels (decompile layer 4 of 6). Intra-function
+  jump targets now get a `label_<addr>:` marker emitted before
+  the corresponding `@asm` line, and the jump's text operand is
+  rewritten from `+0xN` / `-0xN` to `label_<target_hex>`.
+  Cross-function tail-calls still pick up the `// -> name`
+  annotation. The infrastructure (`Stmt::Label`, lexer, parser,
+  emitter, lower-skip) was already in place for x86; this layer
+  just wires it from the BPF decompile path. ~9,488 label
+  references emitted for `3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr`.
 - BPF stack-slot naming (decompile layer 3 of 6). New
   `decompile/stack_slots.rs::rewrite_slots(text, fp_reg)`
   generic helper rewrites `[r10 - 0x38]` → `[local_38]` and

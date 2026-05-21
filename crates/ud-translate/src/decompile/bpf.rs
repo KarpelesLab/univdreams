@@ -50,12 +50,39 @@ pub fn build_function(
     call_site_names: &HashMap<u64, String>,
     variant: BpfVariant,
 ) -> FnDecl {
+    // Layer-4 pre-pass: collect every jump target *inside*
+    // this function. A target outside the function's address
+    // range is a cross-function tail-call and stays as
+    // numeric offset / comment annotation; only intra-function
+    // jumps get `label_<addr>:` markers.
+    let fn_start = f.addr.0;
+    let fn_end = fn_start.saturating_add(f.size() as u64);
+    let mut intra_targets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for block in &f.blocks {
+        for insn in &block.insns {
+            if matches!(
+                insn.kind,
+                InsnKind::Jmp | InsnKind::JmpCond | InsnKind::JmpCond32
+            ) {
+                let t = jump_target(insn);
+                if (fn_start..fn_end).contains(&t) {
+                    intra_targets.insert(t);
+                }
+            }
+        }
+    }
+
     let mut body = Vec::new();
     for block in &f.blocks {
         for insn in &block.insns {
-            let text = render_text(insn, variant, name_at, call_site_names);
+            // Emit a `label_<addr>:` marker before every
+            // instruction that's a known jump target.
+            if intra_targets.contains(&insn.addr.0) {
+                body.push(Stmt::Label { addr: insn.addr.0 });
+            }
+            let text = render_text(insn, variant, name_at, call_site_names, &intra_targets);
             body.push(Stmt::asm(text, insn.bytes.to_vec()));
-            if let Some(annotation) = call_or_branch_annotation(insn, name_at) {
+            if let Some(annotation) = call_or_branch_annotation(insn, name_at, &intra_targets) {
                 body.push(Stmt::Comment(annotation));
             }
         }
@@ -85,6 +112,7 @@ fn render_text(
     variant: BpfVariant,
     name_at: &HashMap<u64, String>,
     call_site_names: &HashMap<u64, String>,
+    intra_targets: &std::collections::BTreeSet<u64>,
 ) -> String {
     if matches!(insn.kind, InsnKind::Call) {
         if let Some(name) = call_site_names.get(&insn.addr.0) {
@@ -95,21 +123,64 @@ fn render_text(
             return format!("call {name}");
         }
     }
-    // Layer-3 rewrite: `[r10 - 0x38]` → `[local_38]`,
-    // `[r10 + 0x10]` → `[arg_10]`. The bytes don't change;
-    // round-trip stays byte-identical via the pinned @asm
-    // payload.
-    rewrite_slots(&format_insn(insn, variant), BPF_FP)
+    // Layer-4: rewrite the relative-offset operand of intra-
+    // function jumps to a `label_<addr>` reference. The trailing
+    // `, +0xN` is replaced with `, label_<target_hex>`. Calls
+    // already get name substitution above; jumps to other
+    // functions stay as offsets and pick up a `// -> name`
+    // comment via `call_or_branch_annotation`.
+    let mut text = rewrite_slots(&format_insn(insn, variant), BPF_FP);
+    if matches!(
+        insn.kind,
+        InsnKind::Jmp | InsnKind::JmpCond | InsnKind::JmpCond32
+    ) {
+        let target = jump_target(insn);
+        if intra_targets.contains(&target) {
+            text = rewrite_branch_offset(&text, target);
+        }
+    }
+    text
 }
 
-/// Annotate jumps whose target is a known function (cross-
-/// function tail-calls are rare in BPF but possible). Calls
-/// are already named by `render_text` so they need no
-/// extra annotation.
-fn call_or_branch_annotation(insn: &DecodedInsn, name_at: &HashMap<u64, String>) -> Option<String> {
+/// Replace the trailing relative offset of a jump (`+0xN` or
+/// `-0xN`) with `label_<target_hex>`. Keeps the rest of the
+/// line unchanged so unconditional `ja` and conditional
+/// `jeq r1, 0x0, +0x2` forms both work — the offset is always
+/// the last token before end-of-line.
+fn rewrite_branch_offset(text: &str, target: u64) -> String {
+    let label_ref = format!("label_{target:x}");
+    if let Some((head, _)) = text.rsplit_once(", +0x") {
+        return format!("{head}, {label_ref}");
+    }
+    if let Some((head, _)) = text.rsplit_once(", -0x") {
+        return format!("{head}, {label_ref}");
+    }
+    // Unconditional jump (`ja +0xN`): no comma.
+    if let Some((head, _)) = text.rsplit_once(" +0x") {
+        return format!("{head} {label_ref}");
+    }
+    if let Some((head, _)) = text.rsplit_once(" -0x") {
+        return format!("{head} {label_ref}");
+    }
+    text.to_string()
+}
+
+/// Annotate jumps whose target is a known function — i.e.
+/// cross-function tail-calls. Intra-function jumps now point
+/// at named labels and need no comment.
+fn call_or_branch_annotation(
+    insn: &DecodedInsn,
+    name_at: &HashMap<u64, String>,
+    intra_targets: &std::collections::BTreeSet<u64>,
+) -> Option<String> {
     match insn.kind {
         InsnKind::Jmp | InsnKind::JmpCond | InsnKind::JmpCond32 => {
-            name_at.get(&jump_target(insn)).map(|n| format!("-> {n}"))
+            let target = jump_target(insn);
+            if intra_targets.contains(&target) {
+                // Already labelled — no extra comment needed.
+                return None;
+            }
+            name_at.get(&target).map(|n| format!("-> {n}"))
         }
         _ => None,
     }
