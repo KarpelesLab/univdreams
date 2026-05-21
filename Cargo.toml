@@ -8,6 +8,7 @@ members = [
     "crates/ud-arch-x86",
     "crates/ud-arch-aarch64",
     "crates/ud-arch-6502",
+    "crates/ud-arch-bpf",
     "crates/ud-signatures",
     "crates/ud-debug",
     "crates/ud-analysis",

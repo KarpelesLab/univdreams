@@ -118,7 +118,15 @@ fn collect_one_table(
         if st_type != STT_FUNC && st_type != STT_GNU_IFUNC {
             continue;
         }
-        if st_value == 0 || st_shndx == SHN_UNDEF {
+        // SHN_UNDEF symbols are imports — not a defined
+        // function in this object. We *don't* skip on
+        // `st_value == 0` though: relocatable object files
+        // (`.o`) commonly place the first function in `.text`
+        // at offset 0, which is a legitimate address. Linked
+        // executables don't put real symbols at vaddr 0, so
+        // the stricter behaviour wasn't necessary even
+        // historically.
+        if st_shndx == SHN_UNDEF {
             continue;
         }
 

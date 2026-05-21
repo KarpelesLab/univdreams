@@ -23,5 +23,6 @@ ud-debug = { version = "0.1.1", path = "../ud-debug" }
 ud-arch-x86 = { version = "0.1.1", path = "../ud-arch-x86" }
 ud-arch-aarch64 = { version = "0.1.1", path = "../ud-arch-aarch64" }
 ud-arch-6502 = { version = "0.1.1", path = "../ud-arch-6502" }
+ud-arch-bpf = { version = "0.1.1", path = "../ud-arch-bpf" }
 ud-format = { version = "0.1.1", path = "../ud-format" }
 thiserror = "2"

@@ -29,6 +29,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod aarch64;
+mod bpf;
 mod build_function;
 mod build_module;
 mod data_lookup;
@@ -50,13 +51,16 @@ use ud_analysis::{discover_functions, FunctionMap};
 use ud_arch_x86::{decode, lift_function, Bitness};
 use ud_ast::{Item, UdFile};
 use ud_debug::DebugFunction;
-use ud_format::elf::{Elf64File, ElfClass, Shdr64, EM_386, EM_AARCH64, EM_X86_64};
+use ud_format::elf::{
+    Elf64File, ElfClass, Shdr64, EM_386, EM_AARCH64, EM_BPF, EM_SBF, EM_X86_64, SHF_EXECINSTR,
+};
 
 /// Which arch backend to drive for a given ELF.
 #[derive(Debug, Clone, Copy)]
 enum Arch {
     X86 { bitness: Bitness },
     Aarch64,
+    Bpf { variant: ud_arch_bpf::BpfVariant },
 }
 
 /// Errors surfaced by the top-level entry point.
@@ -79,6 +83,9 @@ pub enum Error {
 
     #[error(transparent)]
     Aarch64Decode(ud_arch_aarch64::Error),
+
+    #[error(transparent)]
+    BpfDecode(ud_arch_bpf::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -94,6 +101,21 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
             bitness: Bitness::Bits32,
         },
         (ElfClass::Elf64, EM_AARCH64) => Arch::Aarch64,
+        // Linux eBPF — `e_machine = 247`. Always ELF64-LE
+        // regardless of host endianness; SBF support below
+        // covers the Solana-specific machine number.
+        (ElfClass::Elf64, EM_BPF) => Arch::Bpf {
+            variant: ud_arch_bpf::BpfVariant::Linux,
+        },
+        // Solana SBF — `e_machine = 263`. sBPFv1 vs sBPFv2 is
+        // a runtime decision made by the loader from
+        // `e_flags`; for the decompile path we default to
+        // sBPFv1 since the encoding is shared and the variant
+        // only changes a handful of mnemonics. A future pass
+        // can sharpen this once a real sBPFv2 fixture lands.
+        (ElfClass::Elf64, EM_SBF) => Arch::Bpf {
+            variant: ud_arch_bpf::BpfVariant::Sbfv1,
+        },
         _ => return Err(Error::UnsupportedMachine(elf.ehdr.e_machine)),
     };
 
@@ -748,14 +770,24 @@ fn build_section_items(
     let section_end = sh.sh_addr.saturating_add(sh.sh_size);
 
     // Functions whose entire range falls inside this section.
-    let mut funcs: Vec<_> = map
-        .iter()
-        .filter(|f| {
-            f.size > 0
-                && f.addr.0 >= section_start
-                && f.addr.0.saturating_add(f.size) <= section_end
-        })
-        .collect();
+    // For relocatable object files (`.o`) multiple sections
+    // share `sh_addr = 0`, so an address-range match alone
+    // would pull `.text` functions into `.symtab` / `.strtab`
+    // too. Filter on `SHF_EXECINSTR` first: data sections
+    // never contain functions regardless of how their address
+    // range overlaps.
+    let is_exec = sh.sh_flags & SHF_EXECINSTR != 0;
+    let mut funcs: Vec<_> = if is_exec {
+        map.iter()
+            .filter(|f| {
+                f.size > 0
+                    && f.addr.0 >= section_start
+                    && f.addr.0.saturating_add(f.size) <= section_end
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     funcs.sort_by_key(|f| f.addr.0);
 
     let mut out = Vec::new();
@@ -787,6 +819,12 @@ fn build_section_items(
                     ud_arch_aarch64::decode(slice, f.addr.0).map_err(Error::Aarch64Decode)?;
                 let lifted = ud_arch_aarch64::lift_function(f.name.clone(), &insns);
                 aarch64::build_function(&lifted, name_at)
+            }
+            Arch::Bpf { variant } => {
+                let insns =
+                    ud_arch_bpf::decode(slice, f.addr.0, variant).map_err(Error::BpfDecode)?;
+                let lifted = ud_arch_bpf::lift_function(f.name.clone(), &insns);
+                bpf::build_function(&lifted, name_at, variant)
             }
         };
         out.push(Item::Function(fn_decl));

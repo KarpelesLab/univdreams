@@ -8,6 +8,54 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+### Added
+- New `ud-arch-bpf` crate — Linux eBPF + Solana SBF
+  (sBPFv1 / sBPFv2) instruction decoder, classifier, lifter,
+  and `format_insn` text renderer. Fixed-width 8-byte slots
+  with `lddw` (opcode 0x18) coalescing its two slots into one
+  `DecodedInsn` carrying the combined 64-bit immediate plus a
+  follow-up `LddwSecondHalf` continuation, so round-trip
+  preserves the full 16 bytes verbatim. Variant-gated mnemonics
+  for `callx` (SBFv1+) and the sBPFv2 PQR division ops.
+- ELF `e_machine` constants: `EM_BPF = 247` (Linux eBPF) and
+  `EM_SBF = 263` (Solana SBF, both v1 and v2). The decompile
+  dispatch picks BPF when either is present.
+- New `decompile/bpf.rs` renderer — mirrors `decompile/aarch64.rs`:
+  one `@asm("text", [bytes])` line per slot, with `// -> name`
+  annotations on direct jumps whose target is a known function.
+- Linux eBPF round-trip test (`tests/bpf_round_trip.rs`) +
+  fixture (`testdata/hello-clang-ebpf-linux.o`, built via
+  `scripts/build-bpf-fixtures.sh` against brew-llvm with the
+  `bpf` target). The test currently round-trips byte-identical
+  via `lower_to_elf(parse(decompile_to_text(elf)))`.
+- `@module.arch` mapping for `i386`, `aarch64`, `bpf`, `sbf`
+  next to the existing `x86_64` entry — these were previously
+  rendered as `"unknown"`.
+
+### Changed
+- `ud_analysis::discover_from_symbol_tables` no longer skips
+  function symbols with `st_value == 0`. Relocatable ELF
+  objects (`.o`) commonly place the first function in `.text`
+  at offset 0; the old check rejected those. Linked
+  executables don't put real symbols at vaddr 0, so this is
+  strictly a relaxation of an over-strict filter.
+- `decompile::build_section_items` now only attaches
+  discovered functions to executable (`SHF_EXECINSTR`)
+  sections. Without this, a function at offset 0 inside `.text`
+  of a relocatable `.o` would also get rendered into every
+  other `sh_addr == 0` section (`.symtab`, `.strtab`, …).
+
+### Out of scope (deferred)
+- Real BPF assembler (text → bytes from scratch). Round-trip
+  works via the pinned `@asm` byte list — same shape as x86.
+- BPF relocation interpretation. `.rel<sec>` / `.rela<sec>`
+  ride as opaque section bytes.
+- Murmur3 syscall-hash → name resolution for SBF `call imm`.
+- Solana SBFv1 / SBFv2 test fixtures — the platform-tools
+  download is large enough that committing pre-built `.so`
+  artefacts is the practical path; placeholder lives in
+  `scripts/build-bpf-fixtures.sh`.
+
 ## [0.1.5] — 2026-05-21
 
 ### Added

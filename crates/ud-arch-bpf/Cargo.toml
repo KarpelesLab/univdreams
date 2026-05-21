@@ -1,0 +1,20 @@
+[package]
+name = "ud-arch-bpf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Linux eBPF + Solana SBF (sBPFv1 / sBPFv2) instruction decoder + lifter for univdreams."
+
+[lints]
+workspace = true
+
+[dependencies]
+ud-core = { version = "0.1.1", path = "../ud-core" }
+ud-ir = { version = "0.1.1", path = "../ud-ir" }
+thiserror = "2"

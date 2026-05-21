@@ -71,6 +71,14 @@ pub const EM_X86_64: u16 = 62;
 /// `e_machine` value for `AArch64`.
 pub const EM_AARCH64: u16 = 183;
 
+/// `e_machine` value for Linux eBPF.
+pub const EM_BPF: u16 = 247;
+
+/// `e_machine` value for Solana SBF (classic sBPFv1 / sBPFv2).
+/// Not assigned in the GABI registry but used by the Solana
+/// toolchain and Agave loader for on-chain programs.
+pub const EM_SBF: u16 = 263;
+
 /// On-disk size of an ELF64 ELF header.
 const EHDR64_SIZE: u16 = 64;
 
