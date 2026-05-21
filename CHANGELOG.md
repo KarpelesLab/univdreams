@@ -8,7 +8,34 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-05-21
+
 ### Added
+- AVX / AVX2 coverage for the SSE2 integer family — enough to
+  finish MagicYUV's encode + decode end-to-end and the corpus
+  hits **12/12 encode + 12/12 decode, 5/5 lossless round-trips
+  pixel-exact**. New ops:
+  - `0x66 0F 60..6F / 70..7F / D0..FF` SSE2 integer family
+    (PUNPCK / PACK / PCMP / PADD / PSUB / PMUL / PMIN / PMAX /
+    PAVG / PSAD / PMADD / saturating add+sub) dispatched per-lane
+    on both `xmm` and `ymm`; the ymm form runs the same per-128
+    kernel across both halves.
+  - VEX-encoded Group 12/13/14 imm8 shifts (`0F 71/72/73`) at
+    both `xmm` and `ymm` sizes, including PSRLDQ / PSLLDQ.
+  - VEX `PSHUFD` / `PSHUFLW` / `PSHUFHW` (`0F 70` with `66/F3/F2`
+    prefix) on `xmm` + `ymm`.
+  - VPBROADCAST{B,W,D,Q} and VBROADCASTI128 (AVX2 `0F 38 5x/7x`).
+  - VEX MOV family: VMOVUPS/VMOVAPS load+store, VMOVDQA/VMOVDQU
+    load+store, VMOVNTDQ/VMOVNTPS stores — all in both 128 and
+    256-bit sizes.
+  - VEX scalar moves: VMOVD load/store, VMOVQ load/store,
+    VPINSRB/W, VPEXTRB/W/D, VPMOVMSKB (128 and 256).
+  - VPCMPEQD ymm (256-bit), VPXOR/VPAND/VPANDN/VPOR (128 and
+    256), VZEROUPPER.
+  - Non-VEX `0F 38 F0/F1` — MOVBE r32, m32 / m32, r32 (with the
+    `0x66` operand-size prefix reducing to 16-bit). MagicYUV's
+    decode path uses big-endian byte-swap loads on its packed
+    output stream.
 - `Bih.tail: Vec<u8>` — the bytes past the canonical 40-byte
   header when the codec advertises `bi_size > 40`. Several
   codecs store per-instance config in the BIH extension area;

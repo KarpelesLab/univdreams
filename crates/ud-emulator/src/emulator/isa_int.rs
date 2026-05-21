@@ -1705,11 +1705,83 @@ impl Cpu {
             0x10..=0x1F | 0x28..=0x2F | 0x50..=0x5F | 0xC2 | 0xC4..=0xC6 => {
                 super::isa_sse::dispatch(self, mmu, op2, entry_eip)
             }
+            // ---- 0F 38 — 3-byte opcode escape. The few
+            // non-VEX 0F38 instructions in scope here are the
+            // MOVBE byte-reversed loads/stores; everything else
+            // in this space is VEX-prefixed and reaches us via
+            // the `0xC4` dispatcher in `step`, not here.
+            0x38 => {
+                let op3 = mmu.fetch_x8(self.regs.eip)?;
+                self.regs.eip = self.regs.eip.wrapping_add(1);
+                match op3 {
+                    // 0F 38 F0 /r — MOVBE r32, m32 (load).
+                    0xF0 => self.movbe_load(mmu),
+                    // 0F 38 F1 /r — MOVBE m32, r32 (store).
+                    0xF1 => self.movbe_store(mmu),
+                    _ => Err(Trap::UndefinedOpcode {
+                        eip: entry_eip,
+                        opcode: 0x0F_3800 | u32::from(op3),
+                    }),
+                }
+            }
             other => Err(Trap::UndefinedOpcode {
                 eip: entry_eip,
                 opcode: 0x0F00 | u32::from(other),
             }),
         }
+    }
+
+    /// `0F 38 F0 /r` — MOVBE r32, m32. Loads from memory with
+    /// each byte reversed (big-endian on-disk, little-endian in
+    /// register).
+    fn movbe_load(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
+        let dst = Reg32::from_bits(mr.reg);
+        let v = match op {
+            Operand::Mem32(addr) => mmu.load32(addr)?,
+            Operand::Reg32(_) => {
+                return Err(Trap::UndefinedOpcode {
+                    eip: self.regs.eip.wrapping_sub(consumed as u32 + 3),
+                    opcode: 0x0F_38_F000,
+                });
+            }
+        };
+        self.regs.set32(dst, v.swap_bytes());
+        Ok(StepOk::Continued)
+    }
+
+    /// `0F 38 F1 /r` — MOVBE m32, r32. Stores a register byte-
+    /// reversed to memory. With the `0x66` operand-size prefix
+    /// the access is 16-bit (MOVBE m16, r16); we treat the
+    /// 16-bit case the same way — `swap_bytes` on the low half.
+    fn movbe_store(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
+        let src = self.regs.get32(Reg32::from_bits(mr.reg));
+        match op {
+            Operand::Mem32(addr) => {
+                if self.op_size_16 {
+                    let v = (src as u16).swap_bytes();
+                    mmu.write(addr, &v.to_le_bytes())?;
+                } else {
+                    mmu.store32(addr, src.swap_bytes())?;
+                }
+            }
+            Operand::Reg32(_) => {
+                return Err(Trap::UndefinedOpcode {
+                    eip: self.regs.eip.wrapping_sub(consumed as u32 + 3),
+                    opcode: 0x0F_38_F100,
+                });
+            }
+        }
+        Ok(StepOk::Continued)
     }
 
     /// CPUID — return a fixed Pentium-class response. Per design
