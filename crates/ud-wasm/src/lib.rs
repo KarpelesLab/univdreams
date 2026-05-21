@@ -21,13 +21,14 @@ use ud_translate::compile::AsmWarning;
 ///
 /// `format` picks the decompile path:
 ///
-/// * `"auto"` — header-detect ELF64-LE, PE, or thin Mach-O. Refuses
-///   inputs without a recognisable header so that arbitrary bytes
-///   (which 6502 raw images, by definition, are) can't be silently
-///   misinterpreted as code.
+/// * `"auto"` — header-detect ELF64-LE, PE, thin Mach-O, or WASM.
+///   Refuses inputs without a recognisable header so that arbitrary
+///   bytes (which 6502 raw images, by definition, are) can't be
+///   silently misinterpreted as code.
 /// * `"elf"` — force ELF64-LE.
 /// * `"pe"` — force PE/COFF.
 /// * `"macho"` — force thin 64-bit Mach-O.
+/// * `"wasm"` — force a WebAssembly module.
 /// * `"raw-6502"` — interpret as a raw 6502 image whose load address
 ///   is derived from the file length (top of the 16-bit address
 ///   space).
@@ -39,9 +40,10 @@ pub fn decompile(bytes: &[u8], format: &str) -> Result<String, JsError> {
         "elf" => decompile_as_elf(bytes),
         "pe" => decompile_as_pe(bytes),
         "macho" => decompile_as_macho(bytes),
+        "wasm" => decompile_as_wasm(bytes),
         "raw-6502" => decompile_as_raw_6502(bytes),
         other => Err(JsError::new(&format!(
-            "unsupported format hint {other:?} (expected \"auto\", \"elf\", \"pe\", \"macho\", or \"raw-6502\")"
+            "unsupported format hint {other:?} (expected \"auto\", \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw-6502\")"
         ))),
     }
 }
@@ -56,8 +58,11 @@ fn decompile_auto(bytes: &[u8]) -> Result<String, JsError> {
     if ud_format::macho::is_macho64(bytes) {
         return decompile_as_macho(bytes);
     }
+    if ud_format::wasm::is_wasm(bytes) {
+        return decompile_as_wasm(bytes);
+    }
     Err(JsError::new(
-        "auto-detect found no ELF / PE / Mach-O header. Pick an explicit format if this is a raw image (e.g. 6502).",
+        "auto-detect found no ELF / PE / Mach-O / WASM header. Pick an explicit format if this is a raw image (e.g. 6502).",
     ))
 }
 
@@ -78,6 +83,12 @@ fn decompile_as_macho(bytes: &[u8]) -> Result<String, JsError> {
     let macho = ud_format::macho::MachoFile::parse(bytes)
         .map_err(|e| JsError::new(&format!("parse Mach-O: {e}")))?;
     Ok(ud_translate::decompile::decompile_macho_to_text(&macho))
+}
+
+fn decompile_as_wasm(bytes: &[u8]) -> Result<String, JsError> {
+    let wasm = ud_format::wasm::WasmFile::parse(bytes)
+        .map_err(|e| JsError::new(&format!("parse WASM: {e}")))?;
+    Ok(ud_translate::decompile::decompile_wasm_to_text(&wasm))
 }
 
 fn decompile_as_raw_6502(bytes: &[u8]) -> Result<String, JsError> {
@@ -104,7 +115,9 @@ pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
     let ast = ud_translate::compile::parse(source)
         .map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
     let format = read_string(&ast.module, "format").ok_or_else(|| {
-        JsError::new("missing `@module.format` (expected \"elf\", \"pe\", \"macho\", or \"raw\")")
+        JsError::new(
+            "missing `@module.format` (expected \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw\")",
+        )
     })?;
     let warnings = ud_translate::compile::verify_asm(&ast);
     let bytes = match format.as_str() {
@@ -115,10 +128,12 @@ pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
         "macho" => ud_translate::compile::lower_to_macho(&ast).map_err(|e| {
             JsError::new(&with_warnings(&format!("lower to Mach-O: {e}"), &warnings))
         }),
+        "wasm" => ud_translate::compile::lower_to_wasm(&ast)
+            .map_err(|e| JsError::new(&with_warnings(&format!("lower to WASM: {e}"), &warnings))),
         "raw" => ud_translate::compile::lower_to_raw(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to raw: {e}"), &warnings))),
         other => Err(JsError::new(&format!(
-            "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", or \"raw\")"
+            "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw\")"
         ))),
     }?;
     Ok(bytes)
