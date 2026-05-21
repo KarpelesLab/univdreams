@@ -260,10 +260,51 @@ fn wrap_if_blocks_in_seq(
                     if let Some(&label_idx) = label_pos.get(&target) {
                         if label_idx > i {
                             let inner = &body[i + 1..label_idx];
+                            // Try while-loop shape first: the
+                            // jcc must be the FIRST statement
+                            // after an entry label, and the
+                            // last `@asm` of the body must be
+                            // `ja label_<entry>`.
+                            if let Some((body_stmts, tail_bytes)) =
+                                try_match_while(inner, insn_addr.unwrap(), &out)
+                            {
+                                let body_recursed = wrap_if_blocks_in_seq(body_stmts, jcc_by_addr);
+                                out.push(Stmt::WhileBlock {
+                                    cond_text: jcc.2.clone(),
+                                    entry_bytes: jcc.1.clone(),
+                                    tail_bytes,
+                                    body: body_recursed,
+                                });
+                                i = label_idx;
+                                continue;
+                            }
+                            // First: try the if-then-else
+                            // shape. The "then" arm's tail
+                            // `ja label_DONE` would violate
+                            // strict self-containment, so we
+                            // need to factor it out before the
+                            // self-containment check.
+                            if let Some((then_body, tail, else_body, advance)) = try_split_then_else(
+                                inner,
+                                target,
+                                &label_pos,
+                                &body,
+                                label_idx,
+                                insn_addr.unwrap(),
+                                jcc_by_addr,
+                            ) {
+                                out.push(Stmt::IfBlock {
+                                    cond_text: jcc.2.clone(),
+                                    cond_bytes: jcc.1.clone(),
+                                    then_body,
+                                    then_tail_jmp: tail,
+                                    else_body,
+                                });
+                                i = advance;
+                                continue;
+                            }
+                            // Otherwise: simple if-then.
                             if region_is_self_contained(inner, insn_addr.unwrap(), target) {
-                                // Recursively wrap nested
-                                // if-blocks inside this region
-                                // first.
                                 let inner_owned: Vec<Stmt> = inner.to_vec();
                                 let then_body = wrap_if_blocks_in_seq(inner_owned, jcc_by_addr);
                                 out.push(Stmt::IfBlock {
@@ -285,6 +326,97 @@ fn wrap_if_blocks_in_seq(
         i += 1;
     }
     out
+}
+
+/// Detect a top-checked while-loop: the jcc we're considering
+/// is preceded by a label (the loop entry), and the inner
+/// body ends with `ja label_<entry>`. The jcc's target is the
+/// loop's exit; the body executes when the jcc would *not*
+/// take (inverted condition, same as if-then). Returns the
+/// body stmts (without the trailing ja) plus the ja's bytes.
+fn try_match_while(
+    inner: &[Stmt],
+    jcc_addr: u64,
+    out_so_far: &[Stmt],
+) -> Option<(Vec<Stmt>, Vec<u8>)> {
+    let _ = jcc_addr;
+    // Last @asm in inner must be `ja label_<target>` where
+    // target is some label that *appears in `out_so_far`* —
+    // i.e., we've already emitted the loop entry label. This
+    // is the back-edge that defines a loop.
+    let last_idx = inner.iter().rposition(|s| matches!(s, Stmt::Asm { .. }))?;
+    let Stmt::Asm { text, bytes } = &inner[last_idx] else {
+        return None;
+    };
+    let label_hex = text.strip_prefix("ja label_")?;
+    let ja_target = u64::from_str_radix(label_hex, 16).ok()?;
+    // Search out_so_far for a Label with addr == ja_target.
+    let mut found = false;
+    for s in out_so_far.iter().rev() {
+        if let Stmt::Label { addr } = s {
+            if *addr == ja_target {
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+    let body_stmts: Vec<Stmt> = inner[..last_idx].to_vec();
+    Some((body_stmts, bytes.clone()))
+}
+
+/// `(then_body, then_tail_jmp_bytes, else_body, advance_to_idx)`
+/// — the four pieces an if-then-else needs.
+type ThenElseSplit = (Vec<Stmt>, Vec<u8>, Vec<Stmt>, usize);
+
+/// Detect an if-then-else: the inner body ends with
+/// `ja label_DONE` where DONE > target, and the run from
+/// `target` to `DONE` is a self-contained else arm. Returns
+/// `(then_body, tail_jmp, else_body, advance_to_idx)` on
+/// success.
+#[allow(clippy::too_many_arguments)]
+fn try_split_then_else(
+    inner: &[Stmt],
+    target: u64,
+    label_pos: &HashMap<u64, usize>,
+    full_body: &[Stmt],
+    label_idx: usize,
+    jcc_addr: u64,
+    jcc_by_addr: &HashMap<u64, (u64, Vec<u8>, String, String)>,
+) -> Option<ThenElseSplit> {
+    // Find the last @asm in `inner` — the candidate tail jmp.
+    let last_asm_idx = inner.iter().rposition(|s| matches!(s, Stmt::Asm { .. }))?;
+    let Stmt::Asm { text, bytes } = &inner[last_asm_idx] else {
+        return None;
+    };
+    let label_hex = text.strip_prefix("ja label_")?;
+    let done_addr = u64::from_str_radix(label_hex, 16).ok()?;
+    if done_addr <= target {
+        return None;
+    }
+    let &done_idx = label_pos.get(&done_addr)?;
+    if done_idx <= label_idx {
+        return None;
+    }
+    // The then arm is everything up to (but not including)
+    // the tail-jmp. Verify it's self-contained over
+    // [jcc_addr, target) ignoring the tail-jmp itself.
+    if !region_is_self_contained(&inner[..last_asm_idx], jcc_addr, target) {
+        return None;
+    }
+    // The else arm is the run between target's label and
+    // done_addr's label.
+    let else_slice = &full_body[label_idx..done_idx];
+    if !region_is_self_contained(else_slice, target, done_addr) {
+        return None;
+    }
+    let tail_jmp = bytes.clone();
+    let then_inner: Vec<Stmt> = inner[..last_asm_idx].to_vec();
+    let then_body = wrap_if_blocks_in_seq(then_inner, jcc_by_addr);
+    let else_body = wrap_if_blocks_in_seq(else_slice.to_vec(), jcc_by_addr);
+    Some((then_body, tail_jmp, else_body, done_idx))
 }
 
 /// The pinned `@asm` bytes for a BPF slot are exactly 8 bytes;

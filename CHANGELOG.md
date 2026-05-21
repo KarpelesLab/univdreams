@@ -9,6 +9,20 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF if-then-else + while-loop detection. The `wrap_if_blocks`
+  pass now recognises two more structural shapes:
+  - **if-then-else**: an inner body ending in
+    `ja label_DONE` where `DONE > join_label`. The `ja`'s
+    bytes ride in `then_tail_jmp`; the statements between the
+    join label and `DONE` become `else_body`.
+  - **while-loop**: an inner body ending in
+    `ja label_<entry>` where the entry label has already been
+    emitted (= back-edge defining a loop). Emits `Stmt::WhileBlock`
+    with the jcc bytes in `entry_bytes` and the back-`ja`
+    bytes in `tail_bytes`.
+  For `3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr`: 54
+  if-then-else arms, 191 while-loops. Round-trip stays
+  byte-identical.
 - BPF function-call-style call-site rendering. The value
   tracker now feeds into a function-invocation comment beneath
   every call site: `// → sub_X(arg_0, arg_1)` for local calls,
