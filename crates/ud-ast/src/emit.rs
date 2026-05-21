@@ -492,6 +492,58 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_byte_list(out, bytes);
             writeln!(out, "])").unwrap();
         }
+        Stmt::IfBlock {
+            cond_text,
+            cond_bytes,
+            then_body,
+            then_tail_jmp,
+            else_body,
+        } => {
+            // `ifblock` (one word) distinguishes the structural
+            // if/else recovered by the BPF-side CFG pass from the
+            // x86 `Stmt::IfBranch` which emits a bare `if`. The
+            // bytes layout is also different (no separate cmp
+            // prefix, optional tail-jmp). Treat them as cousins
+            // sharing the source-language "if" concept.
+            write!(out, "{indent}ifblock ({}) [", render_cond(cond_text)).unwrap();
+            emit_byte_list(out, cond_bytes);
+            writeln!(out, "] {{").unwrap();
+            let body_indent = format!("{indent}    ");
+            emit_stmts(out, then_body, &body_indent);
+            if else_body.is_empty() && then_tail_jmp.is_empty() {
+                writeln!(out, "{indent}}}").unwrap();
+            } else {
+                write!(out, "{indent}}} else").unwrap();
+                if !then_tail_jmp.is_empty() {
+                    out.push_str(" tail=[");
+                    emit_byte_list(out, then_tail_jmp);
+                    out.push(']');
+                }
+                writeln!(out, " {{").unwrap();
+                emit_stmts(out, else_body, &body_indent);
+                writeln!(out, "{indent}}}").unwrap();
+            }
+        }
+        Stmt::WhileBlock {
+            cond_text,
+            entry_bytes,
+            tail_bytes,
+            body,
+        } => {
+            write!(
+                out,
+                "{indent}whileblock ({}) entry=[",
+                render_cond(cond_text)
+            )
+            .unwrap();
+            emit_byte_list(out, entry_bytes);
+            out.push_str("] tail=[");
+            emit_byte_list(out, tail_bytes);
+            writeln!(out, "] {{").unwrap();
+            let body_indent = format!("{indent}    ");
+            emit_stmts(out, body, &body_indent);
+            writeln!(out, "{indent}}}").unwrap();
+        }
     }
 }
 

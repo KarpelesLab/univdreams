@@ -1075,6 +1075,35 @@ fn propagate_one_stmt(
             state.invalidate_all();
             *cursor += bytes.len() as u64;
         }
+        Stmt::IfBlock {
+            cond_text,
+            cond_bytes,
+            then_body,
+            then_tail_jmp,
+            else_body,
+        } => {
+            *cond_text = state.substitute(cond_text);
+            *cursor += cond_bytes.len() as u64;
+            state.invalidate_all();
+            forward_propagate_in_seq(then_body, state, writes_at, cursor, bitness);
+            *cursor += then_tail_jmp.len() as u64;
+            state.invalidate_all();
+            forward_propagate_in_seq(else_body, state, writes_at, cursor, bitness);
+            state.invalidate_all();
+        }
+        Stmt::WhileBlock {
+            cond_text,
+            entry_bytes,
+            tail_bytes,
+            body,
+        } => {
+            *cond_text = state.substitute(cond_text);
+            *cursor += entry_bytes.len() as u64;
+            state.invalidate_all();
+            forward_propagate_in_seq(body, state, writes_at, cursor, bitness);
+            *cursor += tail_bytes.len() as u64;
+            state.invalidate_all();
+        }
         Stmt::Label { .. } | Stmt::Comment(_) => {}
     }
 }
@@ -1646,9 +1675,20 @@ fn annotate_in_seq(stmts: &mut Vec<Stmt>, state: &mut RegState) {
                 }
                 state.invalidate_all();
             }
-            Stmt::Loop { body, .. } => {
+            Stmt::Loop { body, .. } | Stmt::WhileBlock { body, .. } => {
                 state.invalidate_all();
                 annotate_in_seq(body, state);
+                state.invalidate_all();
+            }
+            Stmt::IfBlock {
+                then_body,
+                else_body,
+                ..
+            } => {
+                state.invalidate_all();
+                annotate_in_seq(then_body, state);
+                state.invalidate_all();
+                annotate_in_seq(else_body, state);
                 state.invalidate_all();
             }
             Stmt::Prologue { .. }
@@ -2015,6 +2055,7 @@ fn switch_encoded_size(stmt: &Stmt) -> usize {
 /// `Stmt::Goto` and `Stmt::Switch` regenerate their bytes at
 /// lower time from the cursor + target address — for them the
 /// size depends on the cursor position.
+#[allow(clippy::too_many_lines)]
 fn stmt_total_bytes_at(stmt: &Stmt, cursor: u64) -> usize {
     #[allow(clippy::match_same_arms)]
     match stmt {
@@ -2098,6 +2139,33 @@ fn stmt_total_bytes_at(stmt: &Stmt, cursor: u64) -> usize {
             n += body_n;
             n += tail_bytes.len();
             n
+        }
+        Stmt::IfBlock {
+            cond_bytes,
+            then_body,
+            then_tail_jmp,
+            else_body,
+            ..
+        } => {
+            let mut n = cond_bytes.len();
+            let mut sub = cursor + n as u64;
+            let then_n = stmts_total_bytes_at(then_body, sub);
+            n += then_n;
+            sub += then_n as u64;
+            n += then_tail_jmp.len();
+            sub += then_tail_jmp.len() as u64;
+            n += stmts_total_bytes_at(else_body, sub);
+            n
+        }
+        Stmt::WhileBlock {
+            entry_bytes,
+            body,
+            tail_bytes,
+            ..
+        } => {
+            let n_entry = entry_bytes.len();
+            let body_n = stmts_total_bytes_at(body, cursor + n_entry as u64);
+            n_entry + body_n + tail_bytes.len()
         }
         Stmt::Label { .. } | Stmt::Comment(_) => 0,
         Stmt::Switch { .. } => switch_encoded_size(stmt),
@@ -2276,6 +2344,8 @@ fn stmt_bytes_field_mut(stmt: &mut Stmt) -> Option<&mut Vec<u8>> {
         | Stmt::IfReturn { .. }
         | Stmt::IfBranch { .. }
         | Stmt::Loop { .. }
+        | Stmt::IfBlock { .. }
+        | Stmt::WhileBlock { .. }
         | Stmt::Label { .. }
         | Stmt::Comment(_)
         | Stmt::Goto { .. }
@@ -2327,9 +2397,22 @@ fn rewrite_ecx_in_stmt(stmt: &mut Stmt) {
         }
         Stmt::Loop {
             cond_text, body, ..
+        }
+        | Stmt::WhileBlock {
+            cond_text, body, ..
         } => {
             apply(cond_text);
             rewrite_ecx_as_this(body);
+        }
+        Stmt::IfBlock {
+            cond_text,
+            then_body,
+            else_body,
+            ..
+        } => {
+            apply(cond_text);
+            rewrite_ecx_as_this(then_body);
+            rewrite_ecx_as_this(else_body);
         }
         Stmt::ReturnExpr { text, .. } => apply(text),
         Stmt::IfReturn {

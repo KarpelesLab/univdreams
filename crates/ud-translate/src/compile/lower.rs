@@ -579,6 +579,28 @@ fn lower_stmts_into(
                 lower_stmts_into(fn_name, base_addr, body, out)?;
                 out.extend_from_slice(tail_bytes);
             }
+            Stmt::IfBlock {
+                cond_bytes,
+                then_body,
+                then_tail_jmp,
+                else_body,
+                ..
+            } => {
+                out.extend_from_slice(cond_bytes);
+                lower_stmts_into(fn_name, base_addr, then_body, out)?;
+                out.extend_from_slice(then_tail_jmp);
+                lower_stmts_into(fn_name, base_addr, else_body, out)?;
+            }
+            Stmt::WhileBlock {
+                entry_bytes,
+                tail_bytes,
+                body,
+                ..
+            } => {
+                out.extend_from_slice(entry_bytes);
+                lower_stmts_into(fn_name, base_addr, body, out)?;
+                out.extend_from_slice(tail_bytes);
+            }
             Stmt::Comment(_) => {}
         }
     }

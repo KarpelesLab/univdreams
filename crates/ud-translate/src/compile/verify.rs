@@ -234,6 +234,28 @@ fn verify_stmts(
                 verify_stmts(f, section, body, cursor, out);
                 *cursor = cursor.saturating_add(tail_bytes.len() as u64);
             }
+            Stmt::IfBlock {
+                cond_bytes,
+                then_body,
+                then_tail_jmp,
+                else_body,
+                ..
+            } => {
+                *cursor = cursor.saturating_add(cond_bytes.len() as u64);
+                verify_stmts(f, section, then_body, cursor, out);
+                *cursor = cursor.saturating_add(then_tail_jmp.len() as u64);
+                verify_stmts(f, section, else_body, cursor, out);
+            }
+            Stmt::WhileBlock {
+                entry_bytes,
+                tail_bytes,
+                body,
+                ..
+            } => {
+                *cursor = cursor.saturating_add(entry_bytes.len() as u64);
+                verify_stmts(f, section, body, cursor, out);
+                *cursor = cursor.saturating_add(tail_bytes.len() as u64);
+            }
             Stmt::Comment(_) => {}
         }
     }

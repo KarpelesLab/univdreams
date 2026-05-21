@@ -683,6 +683,47 @@ pub enum Stmt {
         tail_bytes: Vec<u8>,
         body: Vec<Stmt>,
     },
+
+    /// `if (cond_text) #[bytes=[…]] { … } [else { … }]` —
+    /// structured if/else recovered from a forward conditional
+    /// jump.
+    ///
+    /// `cond_bytes` carries the jcc instruction itself (8 bytes
+    /// on BPF, 2–6 on x86). The body is whatever fell through
+    /// the conditional; the `else` body is whatever sat past
+    /// the unconditional jump at the end of the `then` body
+    /// (when present).
+    ///
+    /// Lower order: `cond_bytes` → walk `then_body` Stmts → if
+    /// `else_body` is `Some`: `then_tail_jmp` (the unconditional
+    /// branch skipping the else) → walk `else_body` Stmts.
+    ///
+    /// Round-trip preservation: every encoded byte rides
+    /// somewhere in `cond_bytes` / `then_tail_jmp` / a nested
+    /// `@asm`. Editing `cond_text` is purely cosmetic until an
+    /// arch-side text re-encoder lands.
+    IfBlock {
+        cond_text: String,
+        cond_bytes: Vec<u8>,
+        then_body: Vec<Stmt>,
+        then_tail_jmp: Vec<u8>,
+        else_body: Vec<Stmt>,
+    },
+
+    /// `while (cond_text) #[bytes=[…]] { … }` — a top-checked
+    /// loop. `entry_bytes` pins the loop-header jcc that skips
+    /// the body when the condition is false on first entry;
+    /// `tail_bytes` pins the unconditional jump at the end of
+    /// the body that branches back to the header.
+    ///
+    /// Lower order: `entry_bytes` → walk `body` Stmts →
+    /// `tail_bytes`.
+    WhileBlock {
+        cond_text: String,
+        entry_bytes: Vec<u8>,
+        tail_bytes: Vec<u8>,
+        body: Vec<Stmt>,
+    },
 }
 
 impl Stmt {

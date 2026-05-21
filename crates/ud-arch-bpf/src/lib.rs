@@ -174,17 +174,33 @@ pub fn decode(bytes: &[u8], start: u64, variant: BpfVariant) -> Result<Vec<Decod
         let imm = i32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
 
         if opcode == 0x18 {
-            // LDDW — coalesce with the following slot.
-            if i + 2 * INSN_SIZE > bytes.len() {
-                return Err(Error::LddwTruncated { offset: i });
+            // LDDW — coalesce with the following slot. When
+            // the continuation slot is missing or starts with
+            // a non-zero opcode (e.g. a function boundary that
+            // happens to land mid-`lddw` after layer-2's
+            // call-target harvest), fall through to the
+            // generic slot emission below. That way the orphan
+            // bytes survive as a `@bpf 0x…` placeholder and
+            // round-trip stays byte-identical.
+            let has_well_formed_pair =
+                i + 2 * INSN_SIZE <= bytes.len() && bytes[i + INSN_SIZE] == 0;
+            if !has_well_formed_pair {
+                // Treat as a regular slot (no LDDW pairing).
+                out.push(DecodedInsn {
+                    addr: VAddr(addr),
+                    bytes: raw,
+                    kind: InsnKind::Unknown,
+                    opcode,
+                    dst,
+                    src,
+                    offset,
+                    imm,
+                    imm64: None,
+                });
+                i += INSN_SIZE;
+                continue;
             }
             let cont = &bytes[i + INSN_SIZE..i + 2 * INSN_SIZE];
-            if cont[0] != 0 {
-                return Err(Error::LddwBadContinuation {
-                    offset: i,
-                    opcode: cont[0],
-                });
-            }
             let imm_hi = u32::from_le_bytes([cont[4], cont[5], cont[6], cont[7]]);
             let imm_lo = imm as u32;
             let imm64 = (u64::from(imm_hi) << 32) | u64::from(imm_lo);
@@ -292,14 +308,19 @@ fn classify_jmp(opcode: u8, variant: BpfVariant) -> InsnKind {
     match op {
         // JA = 0x05 (op nibble 0, class 5).
         0x0 => InsnKind::Jmp,
-        // CALL (0x85) / CALLX (0x8d) both have op nibble 0x8;
-        // the source bit (bit 3) distinguishes them. CALLX is
-        // sBPF-only — treat it as JmpCond on Linux (the byte
-        // pattern would never reach the verifier there but the
-        // CFG classifier should still be defensible).
+        // CALL (0x85) and CALL-with-src=1 (0x8d) both live in
+        // JMP class with op nibble 0x8. On Linux eBPF 0x8d is
+        // a BPF-to-BPF local call (imm is a relative slot
+        // offset); on SBF it's CALLX (register-source). Either
+        // way it's a call, not a conditional jump.
         0x8 => {
             if opcode == 0x8d && matches!(variant, BpfVariant::Sbfv1 | BpfVariant::Sbfv2) {
                 InsnKind::CallReg
+            } else if opcode == 0x8d {
+                // Linux BPF-to-BPF call: target = next + imm*8,
+                // same shape as a CALL_IMM. Classify as Call so
+                // layer-2 picks up the target.
+                InsnKind::Call
             } else if opcode == 0x85 {
                 InsnKind::Call
             } else {
@@ -646,12 +667,17 @@ mod tests {
     }
 
     #[test]
-    fn call_reg_only_on_sbf() {
-        // 0x8d = callx — SBFv1+ only.
+    fn opcode_8d_classification_per_variant() {
+        // 0x8d in JMP class with the source bit set:
+        //   * SBFv1+: register-source callx (`callx r3`).
+        //   * Linux eBPF: BPF-to-BPF local call (`imm` is a
+        //     relative slot offset).
+        // Both classify as a "call" — register-target on SBF,
+        // imm-target on Linux.
         let bytes = [0x8d, 0x30, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             decode(&bytes, 0, BpfVariant::Linux).unwrap()[0].kind,
-            InsnKind::JmpCond,
+            InsnKind::Call,
         );
         assert_eq!(
             decode(&bytes, 0, BpfVariant::Sbfv1).unwrap()[0].kind,

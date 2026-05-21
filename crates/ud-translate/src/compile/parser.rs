@@ -737,6 +737,14 @@ impl Parser {
                     let stmt = self.parse_if_stmt()?;
                     body.push(stmt);
                 }
+                TokenKind::Ident(name) if name == "ifblock" => {
+                    let stmt = self.parse_ifblock_stmt()?;
+                    body.push(stmt);
+                }
+                TokenKind::Ident(name) if name == "whileblock" => {
+                    let stmt = self.parse_whileblock_stmt()?;
+                    body.push(stmt);
+                }
                 TokenKind::Ident(name) if name == "do" => {
                     let stmt = self.parse_do_while_stmt()?;
                     body.push(stmt);
@@ -1621,6 +1629,8 @@ impl Parser {
                 self.parse_stmt_at_directive(&dir_name, &dir_tok)
             }
             TokenKind::Ident(name) if name == "if" => self.parse_if_stmt(),
+            TokenKind::Ident(name) if name == "ifblock" => self.parse_ifblock_stmt(),
+            TokenKind::Ident(name) if name == "whileblock" => self.parse_whileblock_stmt(),
             TokenKind::Ident(name) if name == "do" => self.parse_do_while_stmt(),
             TokenKind::Ident(name) if name == "goto" => self.parse_goto_stmt(),
             TokenKind::Ident(name) if name == "return" => self.parse_return_stmt(),
@@ -1685,6 +1695,88 @@ impl Parser {
             entry_jmp_bytes,
             tail_bytes,
             body,
+        })
+    }
+
+    /// Parse `ifblock (<cond>) [<cond_bytes>] { <then> } [else [tail=[<jmp>]] { <else> }]`.
+    ///
+    /// `ifblock` (one word) is the BPF-style structural if/else
+    /// emitted by the layer-5 CFG pass. Distinct from the
+    /// x86-style `if (cond) [bytes] { … }` (which parses to
+    /// `Stmt::IfBranch`) because BPF needs a tail-jmp byte slot
+    /// for the unconditional jump that skips the `else` arm.
+    fn parse_ifblock_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // consume `ifblock`
+        self.expect(&TokenKind::LParen, "`(` after `ifblock`")?;
+        let cond_text = self.parse_paren_inner()?;
+        self.expect(&TokenKind::RParen, "`)` to close `ifblock` condition")?;
+        let cond_bytes = self.parse_byte_list()?;
+        self.expect(&TokenKind::LBrace, "`{` to open `ifblock` body")?;
+        let then_body = self.parse_stmt_list_until_rbrace()?;
+        self.expect(&TokenKind::RBrace, "`}` to close `ifblock` body")?;
+        let (then_tail_jmp, else_body) = if matches!(&self.peek().kind, TokenKind::Ident(n) if n == "else")
+        {
+            self.bump(); // consume `else`
+            let tail = if matches!(&self.peek().kind, TokenKind::Ident(n) if n == "tail") {
+                self.bump(); // consume `tail`
+                self.expect(&TokenKind::Eq, "`=` after `tail`")?;
+                self.parse_byte_list()?
+            } else {
+                Vec::new()
+            };
+            self.expect(&TokenKind::LBrace, "`{` after `else`")?;
+            let body = self.parse_stmt_list_until_rbrace()?;
+            self.expect(&TokenKind::RBrace, "`}` to close `else` body")?;
+            (tail, body)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(Stmt::IfBlock {
+            cond_text,
+            cond_bytes,
+            then_body,
+            then_tail_jmp,
+            else_body,
+        })
+    }
+
+    /// Parse `whileblock (<cond>) entry=[<bytes>] tail=[<bytes>] { <body> }`.
+    fn parse_whileblock_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // consume `whileblock`
+        self.expect(&TokenKind::LParen, "`(` after `whileblock`")?;
+        let cond_text = self.parse_paren_inner()?;
+        self.expect(&TokenKind::RParen, "`)` to close `whileblock` condition")?;
+        self.expect_keyword("entry")?;
+        self.expect(&TokenKind::Eq, "`=` after `entry`")?;
+        let entry_bytes = self.parse_byte_list()?;
+        self.expect_keyword("tail")?;
+        self.expect(&TokenKind::Eq, "`=` after `tail`")?;
+        let tail_bytes = self.parse_byte_list()?;
+        self.expect(&TokenKind::LBrace, "`{` to open `whileblock` body")?;
+        let body = self.parse_stmt_list_until_rbrace()?;
+        self.expect(&TokenKind::RBrace, "`}` to close `whileblock` body")?;
+        Ok(Stmt::WhileBlock {
+            cond_text,
+            entry_bytes,
+            tail_bytes,
+            body,
+        })
+    }
+
+    /// Expect a specific identifier keyword (e.g. `entry`, `tail`).
+    fn expect_keyword(&mut self, kw: &str) -> Result<(), ParseError> {
+        let tok = self.peek().clone();
+        if let TokenKind::Ident(name) = &tok.kind {
+            if name == kw {
+                self.bump();
+                return Ok(());
+            }
+        }
+        Err(ParseError::Expected {
+            expected: format!("`{kw}`"),
+            got: describe(&tok.kind),
+            line: tok.line,
+            col: tok.col,
         })
     }
 

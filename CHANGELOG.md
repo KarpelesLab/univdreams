@@ -9,6 +9,26 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF structural if-then recovery (decompile layer 5 of 6).
+  New `Stmt::IfBlock { cond_text, cond_bytes, then_body,
+  then_tail_jmp, else_body }` and `Stmt::WhileBlock` AST
+  variants in `ud-ast`, wired through parser / emitter / lower
+  / verify / build_function. The BPF decompile pass identifies
+  forward `jcc -> body -> label` triplets in each function,
+  verifies the body is self-contained (every jump stays
+  within the candidate range), and wraps it as `ifblock (cond)
+  [bytes] { ... }`. Nested if-blocks recurse. The pinned jcc
+  bytes ride in `cond_bytes`; body statements keep their own
+  `@asm` bytes; round-trip stays byte-identical.
+  For `3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr`: ~995
+  ifblock regions recovered, with readable C-like conditions
+  (`r1 != 0`, `r9 < r6`, `r4 == r1`, …).
+- `ud_arch_bpf::call_target` for `imm`-based local-call
+  targets and a tightened classifier for opcode `0x8d`
+  (BPF-to-BPF call on Linux; CALLX on SBF). The decoder is
+  also lenient when a function boundary lands mid-LDDW: the
+  orphan first slot rides as an `InsnKind::Unknown` so the
+  bytes survive verbatim.
 - BPF branch labels (decompile layer 4 of 6). Intra-function
   jump targets now get a `label_<addr>:` marker emitted before
   the corresponding `@asm` line, and the jump's text operand is
