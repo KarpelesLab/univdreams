@@ -123,6 +123,39 @@ enum Command {
         #[command(subcommand)]
         command: VfwCommand,
     },
+
+    /// Fetch a Solana on-chain program by its base58 ID and
+    /// decompile it. Recognises the three current SBF
+    /// loaders (`BPFLoader2`, `BPFLoaderUpgradeable`,
+    /// `LoaderV4`) and strips the loader-state header before
+    /// feeding the raw ELF into the standard decompile path.
+    ///
+    /// ELFs are cached under `~/.cache/univdreams/solana/` so
+    /// repeated invocations don't hammer the RPC endpoint.
+    /// Pass `--no-cache` to force a fresh fetch.
+    Solana {
+        /// Program ID (base58, 32 bytes).
+        program_id: String,
+
+        /// RPC endpoint URL. Defaults to Solana's public
+        /// mainnet endpoint.
+        #[arg(long, default_value = ud_cli::solana::DEFAULT_RPC)]
+        rpc: String,
+
+        /// Skip the local cache and force a fresh fetch.
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Save the raw ELF bytes to this path *before*
+        /// decompiling. Useful for diffing across runs or
+        /// hand-inspecting with another tool.
+        #[arg(long)]
+        save_elf: Option<PathBuf>,
+
+        /// Where to write the `.ud` source. Defaults to stdout.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -504,6 +537,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             max_instructions,
             json,
         } => analyze(&input, max_instructions, json),
+        Command::Solana {
+            program_id,
+            rpc,
+            no_cache,
+            save_elf,
+            out,
+        } => solana_cmd(
+            &program_id,
+            &rpc,
+            !no_cache,
+            save_elf.as_deref(),
+            out.as_deref(),
+        ),
         Command::Vfw { command } => match command {
             VfwCommand::Probe {
                 dll,
@@ -976,6 +1022,35 @@ fn encode_cmd(
 
     let _ = sandbox.ic_compress_end(hic);
     let _ = sandbox.ic_close(hic);
+    Ok(())
+}
+
+/// `ud solana <program-id>` — fetch + decompile a Solana
+/// on-chain program. Writes the `.ud` text to `out` (or stdout)
+/// and optionally saves the raw ELF to `save_elf` for
+/// inspection.
+fn solana_cmd(
+    program_id: &str,
+    rpc_url: &str,
+    use_cache: bool,
+    save_elf: Option<&Path>,
+    out: Option<&Path>,
+) -> anyhow::Result<()> {
+    let elf_bytes = ud_cli::solana::fetch_program_elf(program_id, rpc_url, use_cache)
+        .with_context(|| format!("fetch {program_id} from {rpc_url}"))?;
+    if let Some(path) = save_elf {
+        std::fs::write(path, &elf_bytes).with_context(|| format!("write {}", path.display()))?;
+    }
+    let elf = ud_format::elf::Elf64File::parse(&elf_bytes)
+        .with_context(|| format!("parse stripped ELF from {program_id}"))?;
+    let source = ud_translate::decompile::decompile_to_text(&elf)
+        .with_context(|| format!("decompile {program_id}"))?;
+    if let Some(path) = out {
+        std::fs::write(path, source).with_context(|| format!("write {}", path.display()))?;
+    } else {
+        use std::io::Write as _;
+        std::io::stdout().write_all(source.as_bytes())?;
+    }
     Ok(())
 }
 

@@ -794,14 +794,15 @@ fn build_section_items(
     let mut cursor = section_start;
 
     for f in &funcs {
-        // Gap before this function — emit raw bytes.
+        // Gap before this function — usually padding bytes, but
+        // for stripped BPF binaries (Solana programs without a
+        // `.symtab`) the gap is the whole program. Lift it as
+        // anonymous BPF code instead of `@raw` so the output is
+        // actually readable.
         if cursor < f.addr.0 {
             let lo = (cursor - section_start) as usize;
             let hi = (f.addr.0 - section_start) as usize;
-            out.push(Item::Raw {
-                addr: cursor,
-                bytes: data[lo..hi].to_vec(),
-            });
+            emit_gap(&mut out, arch, is_exec, cursor, &data[lo..hi], name_at)?;
         }
         // The function itself.
         let lo = (f.addr.0 - section_start) as usize;
@@ -834,13 +835,72 @@ fn build_section_items(
     // Trailing gap to the section's end.
     if cursor < section_end {
         let lo = (cursor - section_start) as usize;
-        out.push(Item::Raw {
-            addr: cursor,
-            bytes: data[lo..].to_vec(),
-        });
+        emit_gap(&mut out, arch, is_exec, cursor, &data[lo..], name_at)?;
     }
 
     Ok(out)
+}
+
+/// Emit a section gap. For non-executable sections or non-BPF
+/// arches, the gap is preserved as `@raw` bytes (the historical
+/// behaviour). For executable BPF sections, the gap is lifted
+/// as anonymous BPF code under a synthetic `fragment_<addr>`
+/// function so stripped Solana programs surface as readable
+/// instructions instead of one giant byte blob.
+///
+/// BPF is the only arch we lift gaps for because BPF `.text`
+/// is guaranteed to contain instruction-aligned 8-byte slots
+/// only. x86 `.text` may mix jump-table data with code, so
+/// blanket-decoding a gap there can produce nonsense; aarch64
+/// is the same concern at a smaller scale. The fix slot in
+/// `discover_functions` for x86 / aarch64 is call-site /
+/// landing-pad-style function discovery, which is its own
+/// project.
+fn emit_gap(
+    out: &mut Vec<Item>,
+    arch: Arch,
+    is_exec: bool,
+    addr: u64,
+    bytes: &[u8],
+    name_at: &HashMap<u64, String>,
+) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if is_exec {
+        if let Arch::Bpf { variant } = arch {
+            // BPF slots are 8 bytes. If the gap doesn't align
+            // to that, the leading misaligned bytes ride out as
+            // `@raw` and the rest gets lifted. This usually
+            // means the section has padding ahead of the first
+            // instruction; rare on Solana programs but cheap
+            // to defend against.
+            let prefix_len = bytes.len() % ud_arch_bpf::INSN_SIZE;
+            let (prefix, code) = bytes.split_at(prefix_len);
+            if !prefix.is_empty() {
+                out.push(Item::Raw {
+                    addr,
+                    bytes: prefix.to_vec(),
+                });
+            }
+            let code_addr = addr + prefix_len as u64;
+            if !code.is_empty() {
+                let insns =
+                    ud_arch_bpf::decode(code, code_addr, variant).map_err(Error::BpfDecode)?;
+                let lifted =
+                    ud_arch_bpf::lift_function(format!("fragment_{code_addr:x}"), &insns);
+                out.push(Item::Function(bpf::build_function(
+                    &lifted, name_at, variant,
+                )));
+            }
+            return Ok(());
+        }
+    }
+    out.push(Item::Raw {
+        addr,
+        bytes: bytes.to_vec(),
+    });
+    Ok(())
 }
 
 #[cfg(test)]

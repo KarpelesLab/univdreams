@@ -9,6 +9,24 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- `ud solana <program-id>` — fetch a Solana on-chain program
+  directly from a JSON-RPC endpoint and decompile it. Recognises
+  the three current SBF loaders (`BPFLoader2`,
+  `BPFLoaderUpgradeable`, `LoaderV4`), strips their loader-state
+  header (validating the ELF magic at the chosen offset), and
+  feeds the raw ELF into the standard decompile path. Fetched
+  ELFs are cached under `~/.cache/univdreams/solana/` so
+  repeated invocations don't hammer the RPC; `--no-cache`
+  forces a refresh. End-to-end demo:
+  `ud solana 3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr`
+  fetches a 365 KB ELF and round-trips it byte-identical through
+  `.ud` source.
+- `decompile/mod.rs::emit_gap` — for executable BPF sections,
+  byte runs that aren't covered by a function symbol are lifted
+  as anonymous `fragment_<addr>` functions instead of riding out
+  as one giant `@raw` blob. Stripped Solana programs (which
+  only expose `.dynsym` with the entrypoint + a panic handler)
+  now surface as readable BPF instead of ~315 KB of hex.
 - New `ud-arch-bpf` crate — Linux eBPF + Solana SBF
   (sBPFv1 / sBPFv2) instruction decoder, classifier, lifter,
   and `format_insn` text renderer. Fixed-width 8-byte slots

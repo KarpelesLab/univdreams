@@ -4,6 +4,8 @@
 //! split lets integration tests call the same code path as the binary
 //! without spawning a subprocess.
 
+pub mod solana;
+
 use std::path::Path;
 
 use ud_core::{assert_bytes_equal, Error, Result};
