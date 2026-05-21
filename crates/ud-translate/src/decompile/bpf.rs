@@ -19,6 +19,13 @@
 //! is purely textual, so editing the text doesn't change the
 //! recompiled bytes.
 //!
+//! Each call also gets a function-call-style comment beneath
+//! it (`// → sub_X(arg_0, arg_1)` / `// → sol_log_("Hello", 13)`)
+//! built from the per-block value tracker's snapshot of r1..r5
+//! at the call site. The tracker knows about immediates,
+//! register copies, frame-pointer arithmetic, lddw-resolved
+//! string literals, and stack-slot loads.
+//!
 //! LDDW (load 64-bit immediate) is rendered as a pair of
 //! `@asm` lines — one for the `lddw` slot itself plus a
 //! continuation slot whose text reads `<lddw-cont 0x…>`. Both
@@ -121,18 +128,34 @@ pub fn build_function(
             if let Some(annotation) = call_or_branch_annotation(insn, name_at, &intra_targets) {
                 body.push(Stmt::Comment(annotation));
             }
-            // Layer-6c: if this is a `call <syscall>` whose
-            // name we recognise, append a signature comment so
-            // the reader sees what arguments the syscall
-            // expects (sol_log_, sol_memcpy_, …).
+            // Layer-6c / 6c+: format the call site as a
+            // function-call-style comment. For recognised
+            // syscalls we know the arity, so we render only
+            // that many args. For unknown / local calls we
+            // fall back to the generic `args: r1=…` form.
             if matches!(insn.kind, InsnKind::Call) {
-                if let Some(name) = call_site_names.get(&insn.addr.0) {
-                    if let Some(sig) = solana_syscall_signature(name) {
-                        body.push(Stmt::Comment(sig.to_string()));
-                    }
-                }
                 if let Some(args) = call_args {
-                    if let Some(line) = render_call_args(&args) {
+                    let callee_name = call_site_names.get(&insn.addr.0).cloned();
+                    let line = if let Some(name) = callee_name {
+                        // Syscall: use the SDK signature
+                        // (already showing types) plus the
+                        // resolved values.
+                        let sig = solana_syscall_signature(&name);
+                        let arity = sig.map_or(5, syscall_arity);
+                        if let Some(sig_str) = sig {
+                            body.push(Stmt::Comment(sig_str.to_string()));
+                        }
+                        format_call_invocation(&name, arity, &args)
+                    } else if let Some(callee) = name_at.get(&call_target(insn)) {
+                        // Local call to a known function. We
+                        // don't know its arity without a
+                        // second pass; render all five slots
+                        // that have resolved values.
+                        format_call_invocation(callee, 5, &args)
+                    } else {
+                        render_call_args(&args).unwrap_or_default()
+                    };
+                    if !line.is_empty() {
                         body.push(Stmt::Comment(line));
                     }
                 }
@@ -140,7 +163,7 @@ pub fn build_function(
             // Apply this instruction's effect on the tracker
             // *after* snapshotting (so the next insn sees the
             // new state).
-            tracker.apply(insn);
+            tracker.apply(insn, data);
         }
     }
     // Layer-5a: detect forward `jcc -> body -> label` patterns
@@ -508,8 +531,12 @@ impl RegTracker {
     }
 
     /// Update the tracker by interpreting `insn`'s effect.
+    /// If `data` is provided and a lddw's imm64 resolves to a
+    /// printable string via the `DataLookup`, the register is
+    /// set to the string literal so subsequent call-arg
+    /// snapshots show the string instead of a raw address.
     #[allow(clippy::match_same_arms)]
-    fn apply(&mut self, insn: &DecodedInsn) {
+    fn apply(&mut self, insn: &DecodedInsn, data: Option<&dyn DataLookup>) {
         let class = insn.opcode & 0x07;
         let op_nibble = insn.opcode >> 4;
         let is_reg_src = (insn.opcode & 0x08) != 0;
@@ -522,8 +549,16 @@ impl RegTracker {
             // BPF_LD (LDDW + legacy packet loads).
             0x00 => {
                 if insn.opcode == 0x18 {
-                    // `lddw r, imm64` — value known.
-                    self.state[dst] = Some(format!("0x{:x}", insn.imm64.unwrap_or(0)));
+                    let imm = insn.imm64.unwrap_or(0);
+                    // If the imm64 resolves to a string
+                    // literal via DataLookup, store the
+                    // literal (`"..."`) — the call-arg
+                    // annotation reads better as
+                    // `r1="Hello, world!"` than `r1=0x52b20`.
+                    let val = data
+                        .and_then(|d| read_inline_string(d, imm))
+                        .unwrap_or_else(|| format!("0x{imm:x}"));
+                    self.state[dst] = Some(val);
                 } else {
                     self.state[dst] = None;
                 }
@@ -710,6 +745,56 @@ fn read_string_via_slice_descriptor(lookup: &dyn DataLookup, vaddr: u64) -> Opti
 /// Render a call's resolved r1..r5 values as a single comment.
 /// Returns `None` when every slot is unknown — the comment
 /// would be empty noise.
+/// Format a call as `name(arg_0, arg_1, …)` using the
+/// tracker-resolved register values. Trailing unknowns are
+/// trimmed; if every slot is unknown we omit the args list
+/// entirely (the bare name is enough). The `arity` cap
+/// reflects how many arguments the callee actually takes —
+/// for known syscalls it's the SDK signature, for unknown
+/// callees it's the conservative "up to 5".
+fn format_call_invocation(name: &str, arity: usize, args: &[Option<String>; 5]) -> String {
+    let n = arity.min(5);
+    let mut parts = Vec::new();
+    for slot in args.iter().take(n) {
+        match slot {
+            Some(v) => parts.push(v.clone()),
+            None => parts.push("?".into()),
+        }
+    }
+    // Drop trailing "?" placeholders so a syscall with only
+    // the first arg known doesn't render as `(value, ?, ?, ?, ?)`.
+    while let Some(last) = parts.last() {
+        if last == "?" {
+            parts.pop();
+        } else {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        format!("→ {name}()")
+    } else {
+        format!("→ {name}({})", parts.join(", "))
+    }
+}
+
+/// Count the parentheses-bounded arguments in a syscall
+/// signature like `"sol_log_(msg: *const u8, len: u64)"`.
+/// Returns the comma count + 1 inside the outermost parens,
+/// or 5 (conservative) when parsing fails.
+fn syscall_arity(sig: &str) -> usize {
+    let Some(open) = sig.find('(') else { return 5 };
+    let Some(close) = sig.rfind(')') else {
+        return 5;
+    };
+    if close <= open + 1 {
+        return 0;
+    }
+    let inner = &sig[open + 1..close];
+    // Strip any return-type tail (the `-> X` only appears
+    // *after* the closing paren, so it shouldn't be here).
+    inner.split(',').count()
+}
+
 fn render_call_args(args: &[Option<String>; 5]) -> Option<String> {
     let mut parts = Vec::new();
     for (i, a) in args.iter().enumerate() {

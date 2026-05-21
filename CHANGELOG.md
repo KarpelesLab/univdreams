@@ -9,6 +9,16 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF function-call-style call-site rendering. The value
+  tracker now feeds into a function-invocation comment beneath
+  every call site: `// → sub_X(arg_0, arg_1)` for local calls,
+  `// → sol_log_("Hello, world!", 13)` for syscalls (with the
+  signature's arity used to cap the rendered args), and
+  `// → abort()` for parameterless syscalls. The tracker also
+  picks up lddw-resolved string literals so a register holding
+  a string ptr renders as `"Hello"` directly in the args
+  list. ~18 sol_log_ calls + ~1473 local calls + 205 abort()
+  invocations now read as function calls.
 - BPF call-site argument tracking + `.rodata` string
   resolution (decompile L6c+). New per-basic-block
   `RegTracker` walks the BPF slot stream tracking each
