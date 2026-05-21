@@ -32,6 +32,7 @@ use ud_ast::{FnDecl, Stmt};
 use ud_ir::Function;
 
 use super::args::infer_bpf_signature;
+use super::idioms::solana_syscall_signature;
 use super::stack_slots::rewrite_slots;
 
 /// Name of the BPF frame-pointer register. Hard-coded by the
@@ -85,6 +86,17 @@ pub fn build_function(
             body.push(Stmt::asm(text, insn.bytes.to_vec()));
             if let Some(annotation) = call_or_branch_annotation(insn, name_at, &intra_targets) {
                 body.push(Stmt::Comment(annotation));
+            }
+            // Layer-6c: if this is a `call <syscall>` whose
+            // name we recognise, append a signature comment so
+            // the reader sees what arguments the syscall
+            // expects (sol_log_, sol_memcpy_, …).
+            if matches!(insn.kind, InsnKind::Call) {
+                if let Some(name) = call_site_names.get(&insn.addr.0) {
+                    if let Some(sig) = solana_syscall_signature(name) {
+                        body.push(Stmt::Comment(sig.to_string()));
+                    }
+                }
             }
         }
     }

@@ -35,6 +35,7 @@ mod build_function;
 mod build_module;
 mod data_lookup;
 mod expr;
+mod idioms;
 pub mod macho;
 mod patterns;
 pub mod pe;

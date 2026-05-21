@@ -9,6 +9,16 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 ## [Unreleased]
 
 ### Added
+- BPF Solana-syscall signature annotations (decompile L6c).
+  New `decompile/idioms.rs::solana_syscall_signature` is a
+  fixed lookup table for the ~30 most common Anza / Solana
+  syscalls (sol_log_, sol_memcpy_, sol_invoke_signed_*,
+  sol_try_find_program_address, sol_keccak256, …). Every
+  `call <syscall>` now gets a `// signature` comment right
+  underneath showing the expected argument types so the
+  reader doesn't have to look the syscall up. ~267 annotations
+  emitted for `3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr`.
+  Round-trip neutral — comments are zero-byte at lower time.
 - BPF argument + return inference (decompile layer 6 of 6).
   New `decompile/args.rs::infer_bpf_signature` runs a
   one-pass read-before-write analysis per function: registers
