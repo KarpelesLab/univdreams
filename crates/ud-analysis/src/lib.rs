@@ -23,6 +23,7 @@
 pub mod bpf_relocs;
 pub mod call_sites;
 mod eh_frame;
+mod entry;
 mod function_map;
 mod plt;
 mod signatures;
@@ -68,6 +69,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub fn discover_functions(elf: &Elf64File) -> Result<FunctionMap> {
     let mut map = FunctionMap::new();
 
+    // ELF `e_entry` — the loader-invoked entry. For Solana BPF
+    // programs nothing in `.text` calls it, so without this
+    // source the address would get buried inside an earlier
+    // function whose body spans the entry's address. Naming
+    // is `entry_point` for BPF / SBF, `_start` otherwise.
+    for f in entry::discover_entry_point(elf) {
+        map.insert(f);
+    }
     for f in discover_from_eh_frame(elf)? {
         map.insert(f);
     }

@@ -165,6 +165,34 @@ fn crt_helpers_named_via_signatures() {
     }
 }
 
+/// The ELF header's `e_entry` is always discovered as a function,
+/// whether or not the symbol table mentions it. The provenance
+/// must include the new `Entry` source on whichever function ends
+/// up at that address — guards against regression of the
+/// entry-point hook (which matters for stripped Solana programs
+/// where the entry would otherwise be buried in a preceding fn).
+#[test]
+fn entry_point_is_always_discovered() {
+    let path = workspace_root().join("testdata/sqrt-gcc13-O0");
+    let Some(map) = discover_fixture(&path) else {
+        eprintln!("note: {} unavailable; skipping", path.display());
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let elf = Elf64File::parse(&bytes).unwrap();
+    let entry_addr = elf.ehdr.e_entry;
+    assert!(entry_addr != 0, "fixture has no e_entry");
+    let entry_fn = map
+        .iter()
+        .find(|f| f.addr.0 == entry_addr)
+        .expect("no function at e_entry");
+    assert!(
+        entry_fn.sources.contains(&FunctionSource::Entry),
+        "expected Entry provenance, got {:?}",
+        entry_fn.sources
+    );
+}
+
 /// Functions covered by both .eh_frame and the symbol table should
 /// record both sources, with the symbol-table name winning.
 #[test]
