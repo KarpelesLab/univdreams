@@ -1,16 +1,23 @@
 //! BPF idiom recognition (decompile L6c, focused subset).
 //!
-//! v1 of L6c ships a Solana-syscall signature annotator:
-//! when a `call <syscall_name>` is rendered (via L1's
-//! relocation-derived name map), we add a `// <signature>`
-//! comment underneath listing the expected argument names
-//! and types from the Solana SDK. The values themselves
-//! aren't computed (that needs the value-flow pass L6a
-//! would provide); the annotation is a reading aid that
-//! makes `call sol_log_` immediately legible as
-//! `sol_log_(msg: *const u8, len: u64)`.
+//! Two layers ride here:
 //!
-//! Round-trip neutral: the annotation is a `Stmt::Comment`,
+//! 1. [`solana_syscall_signature`] — when a `call
+//!    <syscall_name>` is rendered (via L1's relocation-derived
+//!    name map), we add a `// <signature>` comment underneath
+//!    listing the expected argument names and types from the
+//!    Solana SDK. Makes `call sol_log_` immediately legible as
+//!    `sol_log_(msg: *const u8, len: u64)`.
+//!
+//! 2. [`solana_semantic_comment`] + [`annotate_pda_verify`] —
+//!    a security-audit reading layer. Pubkey-sized
+//!    `sol_memcmp_` calls get flagged as "Pubkey equality
+//!    check"; `sol_try_find_program_address` followed by a
+//!    32-byte `sol_memcmp_` inside the same function is
+//!    flagged as a PDA verification guard. `sol_invoke_signed_*`
+//!    sites are tagged as CPI for grep-ability.
+//!
+//! Round-trip neutral: every annotation is a `Stmt::Comment`,
 //! zero bytes at lower time.
 //!
 //! A full L6c with slice-index / option / struct-field idiom
@@ -18,6 +25,8 @@
 //! infrastructure that lives in `ssa.rs` and `expr.rs` —
 //! currently x86-coupled. Generalising those (L6a) unlocks
 //! the next tier of idiom matches.
+
+use ud_ast::Stmt;
 
 /// Solana SDK / Anza syscalls and their argument signatures.
 /// The list is intentionally small — only the syscalls we've
@@ -87,5 +96,313 @@ pub fn solana_syscall_signature(name: &str) -> Option<&'static str> {
         "sol_remaining_compute_units" => Some("sol_remaining_compute_units() -> u64"),
         "abort" => Some("abort() -> !"),
         _ => None,
+    }
+}
+
+/// Marker prefix every annotation in this module emits, so
+/// downstream tools can grep for "Solana idiom" hits without
+/// false positives from arbitrary user comments.
+const TAG: &str = "[solana]";
+
+/// Per-call semantic annotation. Returns `Some(comment)` for
+/// recognised Solana patterns where the call's argument values
+/// alone are enough to commit to an interpretation; `None`
+/// otherwise.
+///
+/// The `args` array is the L6c+ tracker's snapshot of r1..r5
+/// at the call site — already-rendered text, not parsed
+/// values. We look at it textually because the tracker stores
+/// hex literals (`"0x20"`) and locals (`"local_50"`) the same
+/// way.
+#[must_use]
+pub fn solana_semantic_comment(name: &str, args: &[Option<String>; 5]) -> Option<String> {
+    match name {
+        "sol_memcmp_" => {
+            // sol_memcmp_(a, b, n) -> i32; n is in r3 (args[2]).
+            // A constant n tells us what's being compared.
+            args[2].as_deref().and_then(parse_int_arg).map(|n| match n {
+                32 => format!("{TAG} 32-byte compare — likely Pubkey equality check"),
+                8 => format!("{TAG} 8-byte compare — likely discriminator / u64 check"),
+                16 => format!("{TAG} 16-byte compare — likely u128 / hash-prefix check"),
+                64 => format!("{TAG} 64-byte compare — likely signature / hash check"),
+                n => format!("{TAG} {n}-byte memcmp"),
+            })
+        }
+        "sol_try_find_program_address" => Some(format!(
+            "{TAG} PDA derivation — derives Pubkey + bump from seeds + program_id"
+        )),
+        "sol_create_program_address" => Some(format!(
+            "{TAG} PDA derivation (no-bump) — derives Pubkey from seeds + program_id"
+        )),
+        "sol_invoke_signed_rust" | "sol_invoke_signed_c" => Some(format!(
+            "{TAG} CPI — signed cross-program invocation (program acts as PDA signer)"
+        )),
+        "sol_get_clock_sysvar" => Some(format!(
+            "{TAG} sysvar fetch — Clock (slot, unix_timestamp, epoch, …)"
+        )),
+        "sol_get_rent_sysvar" => Some(format!("{TAG} sysvar fetch — Rent (exemption thresholds)")),
+        "sol_get_epoch_schedule_sysvar" => Some(format!("{TAG} sysvar fetch — EpochSchedule")),
+        "sol_get_fees_sysvar" => Some(format!("{TAG} sysvar fetch — Fees")),
+        "sol_set_return_data" => Some(format!(
+            "{TAG} sets program return data (visible to caller of this CPI)"
+        )),
+        "sol_get_return_data" => Some(format!(
+            "{TAG} reads return data set by the most recent CPI callee"
+        )),
+        "sol_secp256k1_recover" => Some(format!(
+            "{TAG} secp256k1 signature recovery — outputs the recovered pubkey"
+        )),
+        "sol_sha256" | "sol_keccak256" | "sol_blake3" => {
+            Some(format!("{TAG} cryptographic hash — output is 32 bytes"))
+        }
+        "sol_log_data" => Some(format!(
+            "{TAG} emits structured log data (visible in tx logs / event consumers)"
+        )),
+        _ => None,
+    }
+}
+
+/// Post-process a function body, inserting "PDA verification
+/// check" annotations.
+///
+/// Pattern: a `sol_try_find_program_address` / `sol_create_program_address`
+/// call followed within `WINDOW` statements by a 32-byte
+/// `sol_memcmp_` call. The PDA syscall writes the derived
+/// address into a local; if the program then memcmps that
+/// 32-byte buffer against another buffer, the program is
+/// almost certainly verifying "this incoming account is the
+/// PDA we expect."
+///
+/// We do this lexically over already-emitted statements so we
+/// don't need value-flow analysis — the tag on the memcmp
+/// (which we already emitted via [`solana_semantic_comment`])
+/// gives us the n=32 filter cheaply.
+pub fn annotate_pda_verify(body: &mut Vec<Stmt>) {
+    annotate_pda_verify_in(body);
+}
+
+/// How many statements after a PDA-derive we'll still
+/// consider a 32-byte memcmp as "PDA verification". The
+/// derivation typically leaves r0 set to the address
+/// buffer and a memcmp follows within a few ops; 30 is
+/// generous enough for register-shuffle prologue.
+const PDA_VERIFY_WINDOW: usize = 30;
+
+/// Recursive worker. Annotates the slice in place, then
+/// descends into any `IfBlock` / `WhileBlock` children so a
+/// memcmp nested inside structural wrapping still gets the
+/// "PDA verification check" tag. Sibling structural blocks
+/// don't carry the pattern across each other — the search
+/// stops at the boundary of the current `Vec<Stmt>`.
+fn annotate_pda_verify_in(body: &mut Vec<Stmt>) {
+    // Recurse first so deeper levels are annotated before we
+    // scan this level. Order doesn't affect correctness — the
+    // PDA-derive/memcmp pair is constrained to one nesting
+    // level by `is_pda_derive_marker` / `is_pubkey_memcmp_marker`
+    // matching only direct `Stmt::Comment` children of the
+    // current vector — but doing it bottom-up keeps the
+    // semantics easy to reason about.
+    for stmt in body.iter_mut() {
+        match stmt {
+            Stmt::IfBlock {
+                then_body,
+                else_body,
+                ..
+            } => {
+                annotate_pda_verify_in(then_body);
+                annotate_pda_verify_in(else_body);
+            }
+            Stmt::WhileBlock { body: wb, .. } => annotate_pda_verify_in(wb),
+            _ => {}
+        }
+    }
+
+    // Walk back-to-front so insertions don't invalidate
+    // earlier indices.
+    let mut hits: Vec<usize> = Vec::new();
+    for (i, stmt) in body.iter().enumerate() {
+        if !is_pda_derive_marker(stmt) {
+            continue;
+        }
+        let end = body.len().min(i + 1 + PDA_VERIFY_WINDOW);
+        for (j, candidate) in body.iter().enumerate().take(end).skip(i + 1) {
+            if is_pubkey_memcmp_marker(candidate) {
+                hits.push(j);
+                break;
+            }
+        }
+    }
+    for hit in hits.into_iter().rev() {
+        body.insert(
+            hit,
+            Stmt::Comment(format!(
+                "{TAG} >>> PDA verification check: derived PDA being compared against passed-in pubkey"
+            )),
+        );
+    }
+}
+
+fn is_pda_derive_marker(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Comment(s) if s.contains("PDA derivation"))
+}
+
+fn is_pubkey_memcmp_marker(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Comment(s) if s.contains("32-byte compare"))
+}
+
+/// Parse a tracker-rendered scalar arg into an integer.
+/// Accepts both `"0x20"` and `"32"` shapes; returns `None`
+/// for compound expressions (locals, addresses, …) since we
+/// can't commit to a value for those.
+/// Scan a function body for security-relevant syscalls and
+/// return a one-line summary suitable for the head of the
+/// function. Returns `None` when the function only touches
+/// trivial helpers (`sol_log_`, plain memcpy / memset).
+///
+/// The output is grep-friendly: every interesting capability
+/// shows as a fixed lowercase token (`cpi`, `pda-derive`,
+/// `sysvar`, `return-data`, `pubkey-memcmp`, `log-data`).
+/// Auditors can grep the dump for "function-summary: .*cpi"
+/// to enumerate every function that performs a cross-program
+/// invocation, without re-reading the source.
+#[must_use]
+pub fn solana_function_summary(body: &[Stmt]) -> Option<String> {
+    let mut caps: Vec<&'static str> = Vec::new();
+    walk_for_summary(body, &mut caps);
+    if caps.is_empty() {
+        return None;
+    }
+    caps.sort_unstable();
+    caps.dedup();
+    Some(format!("{TAG} function-summary: {}", caps.join(", ")))
+}
+
+fn walk_for_summary(body: &[Stmt], caps: &mut Vec<&'static str>) {
+    for stmt in body {
+        match stmt {
+            Stmt::Asm { text, .. } if text.starts_with("call ") => match text.as_str() {
+                "call sol_invoke_signed_rust" | "call sol_invoke_signed_c" => {
+                    caps.push("cpi");
+                }
+                "call sol_try_find_program_address" | "call sol_create_program_address" => {
+                    caps.push("pda-derive");
+                }
+                "call sol_get_clock_sysvar"
+                | "call sol_get_rent_sysvar"
+                | "call sol_get_epoch_schedule_sysvar"
+                | "call sol_get_fees_sysvar" => {
+                    caps.push("sysvar");
+                }
+                "call sol_set_return_data" | "call sol_get_return_data" => {
+                    caps.push("return-data");
+                }
+                "call sol_memcmp_" => caps.push("memcmp"),
+                "call sol_secp256k1_recover" => caps.push("secp256k1"),
+                "call sol_sha256" | "call sol_keccak256" | "call sol_blake3" => {
+                    caps.push("hash");
+                }
+                "call sol_log_data" => caps.push("log-data"),
+                _ => {}
+            },
+            Stmt::IfBlock {
+                then_body,
+                else_body,
+                ..
+            } => {
+                walk_for_summary(then_body, caps);
+                walk_for_summary(else_body, caps);
+            }
+            Stmt::WhileBlock { body: wb, .. } => walk_for_summary(wb, caps),
+            _ => {}
+        }
+    }
+}
+
+fn parse_int_arg(text: &str) -> Option<u64> {
+    let t = text.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    t.parse::<u64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `slot` returns `Option<String>` so callers can plug it
+    // straight into the `[Option<String>; 5]` shape that the
+    // tracker hands us — wrapping/unwrapping inside each test
+    // body would be noisier than the wrap here.
+    #[allow(clippy::unnecessary_wraps)]
+    fn slot(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn memcmp_pubkey_size_is_flagged() {
+        let args = [None, None, slot("0x20"), None, None];
+        let c = solana_semantic_comment("sol_memcmp_", &args).unwrap();
+        assert!(c.contains("Pubkey equality check"), "{c}");
+    }
+
+    #[test]
+    fn memcmp_discriminator_size_is_flagged() {
+        let args = [None, None, slot("0x8"), None, None];
+        let c = solana_semantic_comment("sol_memcmp_", &args).unwrap();
+        assert!(c.contains("discriminator"), "{c}");
+    }
+
+    #[test]
+    fn memcmp_with_unknown_n_yields_no_comment() {
+        let args = [None, None, None, None, None];
+        assert!(solana_semantic_comment("sol_memcmp_", &args).is_none());
+    }
+
+    #[test]
+    fn cpi_call_is_tagged() {
+        let args: [Option<String>; 5] = Default::default();
+        let c = solana_semantic_comment("sol_invoke_signed_rust", &args).unwrap();
+        assert!(c.contains("CPI"));
+    }
+
+    #[test]
+    fn pda_verify_post_pass_inserts_annotation() {
+        let mut body = vec![
+            Stmt::Comment(format!("{TAG} PDA derivation — derives Pubkey + bump")),
+            Stmt::Asm {
+                text: "mov64 r1, r0".into(),
+                bytes: vec![],
+            },
+            Stmt::Comment(format!(
+                "{TAG} 32-byte compare — likely Pubkey equality check"
+            )),
+        ];
+        annotate_pda_verify(&mut body);
+        assert_eq!(body.len(), 4);
+        // The "PDA verification check" comment should land
+        // immediately before the 32-byte-compare tag.
+        match &body[2] {
+            Stmt::Comment(s) => {
+                assert!(s.contains("PDA verification check"), "{s}");
+            }
+            _ => panic!("expected a Comment at index 2; got {:?}", body[2]),
+        }
+    }
+
+    #[test]
+    fn pda_verify_post_pass_skips_when_no_memcmp_follows() {
+        let mut body = vec![Stmt::Comment(format!(
+            "{TAG} PDA derivation — derives Pubkey + bump"
+        ))];
+        annotate_pda_verify(&mut body);
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn parse_int_arg_decimal_and_hex() {
+        assert_eq!(parse_int_arg("32"), Some(32));
+        assert_eq!(parse_int_arg("0x20"), Some(32));
+        assert_eq!(parse_int_arg("local_50"), None);
     }
 }

@@ -40,7 +40,9 @@ use ud_ir::Function;
 
 use super::args::infer_bpf_signature;
 use super::data_lookup::DataLookup;
-use super::idioms::solana_syscall_signature;
+use super::idioms::{
+    annotate_pda_verify, solana_function_summary, solana_semantic_comment, solana_syscall_signature,
+};
 use super::stack_slots::rewrite_slots;
 
 /// Name of the BPF frame-pointer register. Hard-coded by the
@@ -145,6 +147,9 @@ pub fn build_function(
                         if let Some(sig_str) = sig {
                             body.push(Stmt::Comment(sig_str.to_string()));
                         }
+                        if let Some(semantic) = solana_semantic_comment(&name, &args) {
+                            body.push(Stmt::Comment(semantic));
+                        }
                         format_call_invocation(&name, arity, &args)
                     } else if let Some(callee) = name_at.get(&call_target(insn)) {
                         // Local call to a known function. We
@@ -170,7 +175,19 @@ pub fn build_function(
     // and wrap them in `Stmt::IfBlock`. Bytes are preserved
     // because the jcc bytes ride in `cond_bytes` and the body
     // statements keep their own pinned `@asm` bytes.
-    let body = wrap_if_blocks(body, f, &intra_targets);
+    let mut body = wrap_if_blocks(body, f, &intra_targets);
+    // L6c-Solana: insert "PDA verification check" annotations
+    // where a `sol_try_find_program_address` is followed shortly
+    // by a 32-byte `sol_memcmp_`. Round-trip-neutral comments.
+    annotate_pda_verify(&mut body);
+    // L6c-Solana: prepend a one-line "function-summary" comment
+    // listing the security-relevant syscalls reachable from this
+    // function (cpi, pda-derive, sysvar, return-data, …).
+    // Auditors can grep `function-summary: .*cpi` to enumerate
+    // every CPI-bearing function in the dump.
+    if let Some(summary) = solana_function_summary(&body) {
+        body.insert(0, Stmt::Comment(summary));
+    }
     // (signature was computed up-front so the L6c+ tracker
     // could seed r1..r5; reuse it here.)
     FnDecl {
