@@ -20,6 +20,8 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+pub mod ssa;
+
 use ud_core::VAddr;
 
 /// An architecture's per-instruction type, plugged into the shared IR.
