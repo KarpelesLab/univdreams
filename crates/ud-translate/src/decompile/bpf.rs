@@ -91,6 +91,13 @@ pub fn build_function(
     let signature = infer_bpf_signature(f);
     let arity = signature.as_ref().map_or(0, |s| s.params.len() as u8);
 
+    // L6a-arc: build SSA + IP→insn index up-front so the
+    // post-label call-arg fallback can chase reaching defs
+    // when the per-block tracker comes up empty. Cost is
+    // sub-millisecond on every function we've measured.
+    let ssa = super::bpf_ssa::build_bpf_ssa(f);
+    let insns_by_addr = super::bpf_args_ssa::index_by_addr(f);
+
     // Layer-6c+ pre-pass: track per-register values across
     // each linear instruction sequence so we can annotate
     // call sites with their actual argument values (r1..r5)
@@ -114,8 +121,26 @@ pub fn build_function(
             // Snapshot the call args BEFORE the instruction
             // applies its own state effects, so a `call`'s
             // args are the *incoming* values of r1..r5.
+            //
+            // For any slot the per-block tracker couldn't
+            // resolve (typically because a label reset wiped
+            // the state), fall back to SSA-driven reaching-
+            // def resolution. Strictly additive: tracker's
+            // answer wins when it has one.
             let call_args = if matches!(insn.kind, InsnKind::Call) {
-                Some(tracker.snapshot_call_args())
+                let mut args = tracker.snapshot_call_args();
+                for (slot, arg) in args.iter_mut().enumerate() {
+                    if arg.is_none() {
+                        *arg = super::bpf_args_ssa::resolve_arg(
+                            &ssa,
+                            &insns_by_addr,
+                            insn.addr.0,
+                            slot,
+                            data,
+                        );
+                    }
+                }
+                Some(args)
             } else {
                 None
             };
@@ -842,7 +867,7 @@ fn fold_stack_add(base: &str, delta: i32) -> Option<String> {
 ///      `.data.rel.ro` that holds 16-byte `{ ptr: u64, len: u64 }`
 ///      slice descriptors. Read both, range-check the length,
 ///      follow `ptr` to recover the bytes, and quote.
-fn read_inline_string(lookup: &dyn DataLookup, vaddr: u64) -> Option<String> {
+pub(super) fn read_inline_string(lookup: &dyn DataLookup, vaddr: u64) -> Option<String> {
     if let Some(s) = read_string_direct(lookup, vaddr, 96) {
         return Some(s);
     }
