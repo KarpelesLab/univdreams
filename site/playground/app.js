@@ -13,7 +13,14 @@ import { bracketMatching, indentOnInput, syntaxHighlighting, defaultHighlightSty
 import { cpp } from "https://esm.sh/@codemirror/lang-cpp@6";
 import { oneDark } from "https://esm.sh/@codemirror/theme-one-dark@6";
 
-import init, { decompile, compile, verify } from "../wasm/ud_wasm.js";
+import init, {
+  decompile,
+  compile,
+  verify,
+  solana_classify_loader,
+  solana_programdata_pubkey_base58,
+  solana_strip_elf,
+} from "../wasm/ud_wasm.js";
 
 const $status        = document.getElementById("status");
 const $filename      = document.getElementById("filename");
@@ -22,10 +29,162 @@ const $compile       = document.getElementById("btn-compile");
 const $verify        = document.getElementById("btn-verify");
 const $loadUrl       = document.getElementById("btn-load-url");
 const $exampleMsmpeg = document.getElementById("example-msmpeg4");
+const $exampleSolana = document.getElementById("example-solana");
 const $format        = document.getElementById("format-select");
+const $programId     = document.getElementById("program-id");
+const $loadProgram   = document.getElementById("btn-load-program");
 
 const MSMPEG4_URL =
   "https://samples.oxideav.org/codecs/windows/msmpeg4/wmpcdcs8-mpg4c32.dll";
+
+const SOLANA_RPC_DEFAULT = "https://api.mainnet-beta.solana.com";
+const SOLANA_EXAMPLE = "3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr";
+
+// Base58 alphabet — Bitcoin / Solana convention. Used to
+// decode the user-supplied program ID and the RPC's `owner`
+// field into raw 32-byte arrays the WASM bindings accept.
+// Encoding back to base58 lives in Rust (bs58 crate via
+// solana_programdata_pubkey_base58).
+const BASE58_ALPHABET =
+  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_INDEX = (() => {
+  const t = new Int8Array(128).fill(-1);
+  for (let i = 0; i < BASE58_ALPHABET.length; i++) {
+    t[BASE58_ALPHABET.charCodeAt(i)] = i;
+  }
+  return t;
+})();
+
+function base58Decode(str) {
+  if (typeof str !== "string" || str.length === 0) {
+    throw new Error("base58: empty input");
+  }
+  // Count leading "1"s — each is one leading zero byte.
+  let zeros = 0;
+  while (zeros < str.length && str.charCodeAt(zeros) === 49 /* '1' */) {
+    zeros++;
+  }
+  // Carry-multiply digits into a big-endian byte buffer
+  // sized for the maximum possible decoded length.
+  const size = (((str.length - zeros) * 733) / 1000) | 0; // log(58)/log(256) ≈ 0.733
+  const b = new Uint8Array(size + 1);
+  let length = 0;
+  for (let i = zeros; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    const digit = code < 128 ? BASE58_INDEX[code] : -1;
+    if (digit < 0) {
+      throw new Error(`base58: invalid character '${str[i]}'`);
+    }
+    let carry = digit;
+    let j = 0;
+    for (let k = b.length - 1; (carry !== 0 || j < length) && k >= 0; k--, j++) {
+      carry += 58 * b[k];
+      b[k] = carry % 256;
+      carry = (carry / 256) | 0;
+    }
+    length = j;
+  }
+  // Skip leading buffer zeros, then prepend the explicit
+  // leading-zero bytes encoded as "1"s.
+  let skip = b.length - length;
+  while (skip < b.length && b[skip] === 0) skip++;
+  const out = new Uint8Array(zeros + (b.length - skip));
+  out.set(b.subarray(skip), zeros);
+  return out;
+}
+
+function base64Decode(str) {
+  // Native atob is fine for arbitrary base64. Convert each
+  // char to a byte; no DOMString roundtrip needed.
+  const bin = atob(str);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function solanaRpc(rpcUrl, method, params) {
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
+  const resp = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  });
+  if (!resp.ok) {
+    throw new Error(`RPC HTTP ${resp.status} ${resp.statusText}`);
+  }
+  const json = await resp.json();
+  if (json.error) {
+    throw new Error(`RPC error ${json.error.code}: ${json.error.message}`);
+  }
+  return json.result;
+}
+
+async function fetchSolanaProgram(programId, rpcUrl) {
+  setStatus(`Fetching ${programId} from ${new URL(rpcUrl).host}…`, "");
+  const account = await solanaRpc(rpcUrl, "getAccountInfo", [
+    programId,
+    { encoding: "base64" },
+  ]);
+  if (!account || !account.value) {
+    throw new Error(`account ${programId} does not exist`);
+  }
+  const owner = account.value.owner;
+  const [b64payload, encoding] = account.value.data;
+  if (encoding !== "base64") {
+    throw new Error(`unexpected data encoding ${encoding}`);
+  }
+  const programAccountData = base64Decode(b64payload);
+  const kind = solana_classify_loader(owner);
+  if (kind === "unknown") {
+    throw new Error(
+      `${programId}: owner ${owner} is not a known BPF loader (BPFLoader2, BPFLoaderUpgradeable, LoaderV4)`,
+    );
+  }
+
+  let elf;
+  if (kind === "upgradeable") {
+    const pdAddr = solana_programdata_pubkey_base58(programAccountData);
+    setStatus(`Fetching ProgramData ${pdAddr.slice(0, 8)}…`, "");
+    const pd = await solanaRpc(rpcUrl, "getAccountInfo", [
+      pdAddr,
+      { encoding: "base64" },
+    ]);
+    if (!pd || !pd.value) {
+      throw new Error(`ProgramData account ${pdAddr} does not exist`);
+    }
+    const pdData = base64Decode(pd.value.data[0]);
+    elf = solana_strip_elf(pdData, kind);
+  } else {
+    elf = solana_strip_elf(programAccountData, kind);
+  }
+
+  uploadName = `${programId}.elf`;
+  $filename.textContent = `${programId} (${elf.length} bytes, ${kind})`;
+  await decompileBytes(elf, programId);
+}
+
+function onLoadProgram() {
+  const id = $programId.value.trim();
+  if (!id) {
+    setStatus("Enter a Solana program ID (base58) and click 'Load from chain'.", "warn");
+    return;
+  }
+  // Cheap sanity check — base58 decodes to exactly 32 bytes
+  // for a valid pubkey. Catches obvious typos before the
+  // RPC roundtrip.
+  try {
+    const bytes = base58Decode(id);
+    if (bytes.length !== 32) {
+      throw new Error(`decoded to ${bytes.length} bytes (expected 32)`);
+    }
+  } catch (e) {
+    setStatus(`Invalid program ID: ${e.message || e}`, "error");
+    return;
+  }
+  void fetchSolanaProgram(id, SOLANA_RPC_DEFAULT).catch((e) => {
+    setStatus(`Solana fetch failed: ${e.message || e}`, "error");
+  });
+}
 
 let editor;
 let uploadName = "input.bin";
@@ -82,14 +241,33 @@ async function start() {
   $compile.addEventListener("click", onCompile);
   $verify.addEventListener("click", onVerify);
   $loadUrl.addEventListener("click", onLoadUrlPrompt);
+  $loadProgram.addEventListener("click", onLoadProgram);
+  $programId.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") onLoadProgram();
+  });
   if ($exampleMsmpeg) {
     $exampleMsmpeg.addEventListener("click", (ev) => {
       ev.preventDefault();
       void loadFromUrl(MSMPEG4_URL);
     });
   }
+  if ($exampleSolana) {
+    $exampleSolana.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      $programId.value = SOLANA_EXAMPLE;
+      onLoadProgram();
+    });
+  }
 
-  setStatus("Ready. Upload a binary, paste a URL, or edit the sample and click Compile.", "ok");
+  // Deep-link: ?program=<id> auto-loads on page load.
+  const queryProgram = new URLSearchParams(window.location.search).get("program");
+  if (queryProgram) {
+    $programId.value = queryProgram;
+    onLoadProgram();
+    return;
+  }
+
+  setStatus("Ready. Upload a binary, paste a URL or Solana program ID, or edit the sample and click Compile.", "ok");
 }
 
 function onLoadUrlPrompt() {

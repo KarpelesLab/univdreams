@@ -26,12 +26,23 @@ Try it on the Windows msmpeg4 codec DLL (420 KB):
 <a href="#" id="example-msmpeg4">load wmpcdcs8-mpg4c32.dll</a>
 &mdash; structural decompilation of a real-world video codec, including i386 stdcall calls, switch tables, and Win32 imports.
 </p>
+<p class="playground-intro">
+Or load a live Solana program by its address — the browser fetches the on-chain bytes via JSON-RPC and decompiles them in-place. Try
+<a href="#" id="example-solana">3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr</a>
+(the Chief Pussy staking dApp, ~365 KB).
+Append <code>?program=&lt;id&gt;</code> to this page's URL to deep-link a program.
+</p>
 
 <div class="playground">
   <div class="toolbar">
     <label class="file-btn" for="upload">Upload binary…</label>
     <input id="upload" type="file">
     <button id="btn-load-url" class="file-btn">Load from URL…</button>
+    <input id="program-id" type="text"
+           placeholder="Solana program ID (base58)"
+           size="48"
+           autocomplete="off">
+    <button id="btn-load-program" class="file-btn">Load from chain</button>
     <label for="format-select" class="format-label">Format:</label>
     <select id="format-select">
       <option value="auto" selected>auto (ELF / PE / Mach-O / WASM header)</option>
