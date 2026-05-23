@@ -265,9 +265,16 @@ fn is_pubkey_memcmp_marker(stmt: &Stmt) -> bool {
 /// Auditors can grep the dump for "function-summary: .*cpi"
 /// to enumerate every function that performs a cross-program
 /// invocation, without re-reading the source.
+///
+/// When the body contains a `sol_log_("Instruction: …", N)`
+/// call (the canonical pattern Solana programs use to mark
+/// their instruction-dispatch handlers), the variant name
+/// rides in the caps list as `handler:<name>` — so grepping
+/// `function-summary: .*handler:` enumerates every
+/// instruction handler in the program.
 #[must_use]
 pub fn solana_function_summary(body: &[Stmt]) -> Option<String> {
-    let mut caps: Vec<&'static str> = Vec::new();
+    let mut caps: Vec<String> = Vec::new();
     walk_for_summary(body, &mut caps);
     if caps.is_empty() {
         return None;
@@ -277,33 +284,46 @@ pub fn solana_function_summary(body: &[Stmt]) -> Option<String> {
     Some(format!("{TAG} function-summary: {}", caps.join(", ")))
 }
 
-fn walk_for_summary(body: &[Stmt], caps: &mut Vec<&'static str>) {
+fn walk_for_summary(body: &[Stmt], caps: &mut Vec<String>) {
     for stmt in body {
         match stmt {
             Stmt::Asm { text, .. } if text.starts_with("call ") => match text.as_str() {
                 "call sol_invoke_signed_rust" | "call sol_invoke_signed_c" => {
-                    caps.push("cpi");
+                    caps.push("cpi".into());
                 }
                 "call sol_try_find_program_address" | "call sol_create_program_address" => {
-                    caps.push("pda-derive");
+                    caps.push("pda-derive".into());
                 }
                 "call sol_get_clock_sysvar"
                 | "call sol_get_rent_sysvar"
                 | "call sol_get_epoch_schedule_sysvar"
                 | "call sol_get_fees_sysvar" => {
-                    caps.push("sysvar");
+                    caps.push("sysvar".into());
                 }
                 "call sol_set_return_data" | "call sol_get_return_data" => {
-                    caps.push("return-data");
+                    caps.push("return-data".into());
                 }
-                "call sol_memcmp_" => caps.push("memcmp"),
-                "call sol_secp256k1_recover" => caps.push("secp256k1"),
+                "call sol_memcmp_" => caps.push("memcmp".into()),
+                "call sol_secp256k1_recover" => caps.push("secp256k1".into()),
                 "call sol_sha256" | "call sol_keccak256" | "call sol_blake3" => {
-                    caps.push("hash");
+                    caps.push("hash".into());
                 }
-                "call sol_log_data" => caps.push("log-data"),
+                "call sol_log_data" => caps.push("log-data".into()),
                 _ => {}
             },
+            // Instruction-handler markers ride in the
+            // tracker-rendered call comment beneath each
+            // `call sol_log_`. The L6c+ tracker resolves r1
+            // (msg) to its rodata string literal and r2 (len)
+            // to a known integer, so the comment shape is
+            // `→ sol_log_("…", 0xN)` — exactly what we need
+            // to slice the first N chars off the string and
+            // check for the "Instruction: " prefix.
+            Stmt::Comment(s) => {
+                if let Some(name) = extract_instruction_handler(s) {
+                    caps.push(format!("handler:{name}"));
+                }
+            }
             Stmt::IfBlock {
                 then_body,
                 else_body,
@@ -324,6 +344,52 @@ fn parse_int_arg(text: &str) -> Option<u64> {
         return u64::from_str_radix(hex, 16).ok();
     }
     t.parse::<u64>().ok()
+}
+
+/// Extract a Solana instruction-handler variant name from a
+/// rendered call comment.
+///
+/// Looks for the shape `→ sol_log_("…", N)` and, when the
+/// first `N` characters of the literal start with the
+/// canonical `"Instruction: "` prefix Solana programs use to
+/// announce their dispatch leaf, returns the trailing
+/// variant name (e.g. `"Stake (amount="`).
+///
+/// We tolerate the literal being longer than `N` — the L6c+
+/// renderer truncates `.rodata` blobs at a fixed visible
+/// width, but the trailing characters past `N` aren't part of
+/// the actual logged message. We tolerate `N` being longer
+/// than what the renderer kept by slicing to whichever is
+/// smaller; in practice every handler-mark fits.
+#[must_use]
+pub fn extract_instruction_handler(comment: &str) -> Option<String> {
+    // Anchor: only match the L6c+ "→ sol_log_(" call-site
+    // comment shape. Other comments (signatures, semantic
+    // tags) won't carry the (literal, len) pair.
+    let body = comment.strip_prefix("→ sol_log_(")?.trim_end_matches(')');
+    // The literal is the first comma-separated arg, quoted.
+    let lit_start = body.find('"')? + 1;
+    let lit_end = lit_start
+        + body[lit_start..]
+            .char_indices()
+            .find_map(|(i, c)| (c == '"').then_some(i))?;
+    let literal = &body[lit_start..lit_end];
+    // The length is the second comma-separated arg.
+    let tail = body[lit_end + 1..].trim_start_matches(',').trim();
+    let len = parse_int_arg(tail.split(',').next()?.trim())? as usize;
+    let bytes = literal.as_bytes();
+    let effective_len = len.min(bytes.len());
+    // Be safe with UTF-8: truncate to the largest valid char
+    // boundary at-or-below `effective_len`.
+    let prefix_end = (0..=effective_len)
+        .rev()
+        .find(|&i| literal.is_char_boundary(i))?;
+    let prefix = &literal[..prefix_end];
+    let name = prefix.strip_prefix("Instruction: ")?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 #[cfg(test)]
@@ -404,5 +470,51 @@ mod tests {
         assert_eq!(parse_int_arg("32"), Some(32));
         assert_eq!(parse_int_arg("0x20"), Some(32));
         assert_eq!(parse_int_arg("local_50"), None);
+    }
+
+    #[test]
+    fn extract_handler_simple() {
+        // "Instruction: " (13) + "Stake (amount=" (14) = 27 chars = 0x1b.
+        let c = r#"→ sol_log_("Instruction: Stake (amount=more rodata blob…", 0x1b)"#;
+        assert_eq!(
+            extract_instruction_handler(c),
+            Some("Stake (amount=".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_handler_decimal_len() {
+        // 13 chars after the prefix = "ClaimRewards" -> "Instruction: ClaimRewards" = 25.
+        let c = r#"→ sol_log_("Instruction: ClaimRewardstrailing junk", 25)"#;
+        assert_eq!(
+            extract_instruction_handler(c),
+            Some("ClaimRewards".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_handler_no_match_for_other_log_strings() {
+        let c = r#"→ sol_log_("error: bad input", 0x10)"#;
+        assert_eq!(extract_instruction_handler(c), None);
+    }
+
+    #[test]
+    fn extract_handler_no_match_for_non_log_comments() {
+        let c = "[solana] CPI — signed cross-program invocation";
+        assert_eq!(extract_instruction_handler(c), None);
+    }
+
+    #[test]
+    fn function_summary_picks_up_handler() {
+        // "Instruction: " (13) + "Unstake (amount=" (16) = 29 chars = 0x1d.
+        let body = vec![
+            Stmt::Asm {
+                text: "call sol_log_".into(),
+                bytes: vec![],
+            },
+            Stmt::Comment(r#"→ sol_log_("Instruction: Unstake (amount=more rodata", 0x1d)"#.into()),
+        ];
+        let s = solana_function_summary(&body).unwrap();
+        assert!(s.contains("handler:Unstake (amount="), "{s}");
     }
 }
