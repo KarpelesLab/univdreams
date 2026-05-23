@@ -246,6 +246,74 @@ fn is_pda_derive_marker(stmt: &Stmt) -> bool {
     matches!(stmt, Stmt::Comment(s) if s.contains("PDA derivation"))
 }
 
+/// Insert per-handler region banners.
+///
+/// For each detected handler marker (a `lddw r?,
+/// "Instruction: <variant>…"` asm line, or a `→ sol_log_("…",
+/// N)` comment whose first N chars carry the `Instruction:`
+/// prefix), prepend a `// [solana] === handler: <variant> ===`
+/// banner comment immediately above. Banners act as navigation
+/// anchors for the giant inlined dispatchers Rust emits at
+/// -O2/-O3 (chiefstaker fits all 18 instruction handlers into
+/// one ~30K-line function).
+///
+/// We dedup consecutive banners for the same variant — when a
+/// variant is referenced twice in quick succession (e.g. once
+/// in a lddw and once in a downstream sol_log_ comment), only
+/// the first banner appears.
+///
+/// Round-trip neutral: every inserted statement is a
+/// `Stmt::Comment`, which lowers to zero bytes.
+pub fn annotate_handler_banners(body: &mut Vec<Stmt>) {
+    annotate_handler_banners_in(body);
+}
+
+fn annotate_handler_banners_in(body: &mut Vec<Stmt>) {
+    // Recurse into structural wrappers first.
+    for stmt in body.iter_mut() {
+        match stmt {
+            Stmt::IfBlock {
+                then_body,
+                else_body,
+                ..
+            } => {
+                annotate_handler_banners_in(then_body);
+                annotate_handler_banners_in(else_body);
+            }
+            Stmt::WhileBlock { body: wb, .. } => annotate_handler_banners_in(wb),
+            _ => {}
+        }
+    }
+
+    // Pass 1: collect (index, variant_name) for every hit at
+    // this nesting level.
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    let mut last_seen: Option<String> = None;
+    for (i, stmt) in body.iter().enumerate() {
+        let detected = match stmt {
+            Stmt::Asm { text, .. } => extract_instruction_handler_from_lddw(text),
+            Stmt::Comment(s) => extract_instruction_handler(s),
+            _ => None,
+        };
+        if let Some(name) = detected {
+            // Dedup: skip when we just emitted a banner for
+            // this exact variant. We track only the most-
+            // recent variant — distinct variants always get
+            // a fresh banner, even if interleaved.
+            if last_seen.as_deref() != Some(name.as_str()) {
+                hits.push((i, name.clone()));
+                last_seen = Some(name);
+            }
+        }
+    }
+
+    // Pass 2: insert back-to-front so earlier indices stay
+    // valid.
+    for (at, name) in hits.into_iter().rev() {
+        body.insert(at, Stmt::Comment(format!("{TAG} === handler: {name} ===")));
+    }
+}
+
 fn is_pubkey_memcmp_marker(stmt: &Stmt) -> bool {
     matches!(stmt, Stmt::Comment(s) if s.contains("32-byte compare"))
 }
@@ -635,5 +703,59 @@ mod tests {
         let s = solana_function_summary(&body).unwrap();
         assert!(s.contains("handler:Unstake"), "{s}");
         assert!(!s.contains("handler:Unstake ("), "{s}");
+    }
+
+    #[test]
+    fn handler_banners_insert_above_each_marker() {
+        let mut body = vec![
+            Stmt::Asm {
+                text: r#"lddw r1, "Instruction: Stake (amount=""#.into(),
+                bytes: vec![],
+            },
+            Stmt::Asm {
+                text: "call sol_log_".into(),
+                bytes: vec![],
+            },
+            Stmt::Asm {
+                text: r#"lddw r1, "Instruction: Unstake (amount=""#.into(),
+                bytes: vec![],
+            },
+        ];
+        annotate_handler_banners(&mut body);
+        assert_eq!(body.len(), 5);
+        match &body[0] {
+            Stmt::Comment(s) => assert!(s.contains("=== handler: Stake ==="), "{s}"),
+            _ => panic!("expected a banner Comment at index 0; got {:?}", body[0]),
+        }
+        match &body[3] {
+            Stmt::Comment(s) => assert!(s.contains("=== handler: Unstake ==="), "{s}"),
+            _ => panic!("expected a banner Comment at index 3; got {:?}", body[3]),
+        }
+    }
+
+    #[test]
+    fn handler_banners_dedup_consecutive_same_variant() {
+        // Two consecutive markers for the same variant — only
+        // one banner should land.
+        let mut body = vec![
+            Stmt::Asm {
+                text: r#"lddw r1, "Instruction: ClaimRewardsInstruction: DepositRewards""#.into(),
+                bytes: vec![],
+            },
+            Stmt::Comment(r#"→ sol_log_("Instruction: ClaimRewardsInstruction:", 0x19)"#.into()),
+        ];
+        annotate_handler_banners(&mut body);
+        let banners: Vec<&String> = body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Comment(t) if t.contains("=== handler: ClaimRewards ===") => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            banners.len(),
+            1,
+            "expected exactly one banner, got {body:?}"
+        );
     }
 }

@@ -41,7 +41,8 @@ use ud_ir::Function;
 use super::args::infer_bpf_signature;
 use super::data_lookup::DataLookup;
 use super::idioms::{
-    annotate_pda_verify, solana_function_summary, solana_semantic_comment, solana_syscall_signature,
+    annotate_handler_banners, annotate_pda_verify, solana_function_summary,
+    solana_semantic_comment, solana_syscall_signature,
 };
 use super::stack_slots::rewrite_slots;
 
@@ -180,6 +181,12 @@ pub fn build_function(
     // where a `sol_try_find_program_address` is followed shortly
     // by a 32-byte `sol_memcmp_`. Round-trip-neutral comments.
     annotate_pda_verify(&mut body);
+    // L6c-Solana: insert per-handler `=== handler: <name> ===`
+    // banners above every detected instruction-handler marker
+    // (lddw of an "Instruction: <name>…" literal, or a
+    // `→ sol_log_(…)` comment carrying one). Lets auditors
+    // navigate a giant inlined dispatcher by handler name.
+    annotate_handler_banners(&mut body);
     // L6c-Solana: prepend a one-line "function-summary" comment
     // listing the security-relevant syscalls reachable from this
     // function (cpi, pda-derive, sysvar, return-data, …).
