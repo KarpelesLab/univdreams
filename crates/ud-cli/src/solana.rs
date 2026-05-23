@@ -39,33 +39,7 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::Deserialize;
-
-/// Loader program IDs (base58).
-const BPF_LOADER_V2: &str = "BPFLoader2111111111111111111111111111111111";
-const BPF_LOADER_UPGRADEABLE: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
-const LOADER_V4: &str = "LoaderV411111111111111111111111111111111111";
-
-/// Borsh enum tag values for `UpgradeableLoaderState`. Encoded
-/// as a u32 LE.
-const UPGRADEABLE_STATE_PROGRAM: u32 = 2;
-const UPGRADEABLE_STATE_PROGRAM_DATA: u32 = 3;
-
-/// `UpgradeableLoaderState::ProgramData` header size when the
-/// `upgrade_authority_address: Option<Pubkey>` is `Some`:
-/// 4 (enum tag) + 8 (slot) + 1 (option tag) + 32 (pubkey).
-const PROGRAMDATA_HEADER_WITH_AUTH: usize = 45;
-
-/// Same header when the authority is `None`:
-/// 4 (enum tag) + 8 (slot) + 1 (option tag) = 13 bytes.
-const PROGRAMDATA_HEADER_NO_AUTH: usize = 13;
-
-/// `LoaderV4State` is 48 bytes: 8 (slot) + 32 (authority or
-/// next-version pubkey) + 8 (`LoaderV4Status` repr).
-const LOADER_V4_HEADER: usize = 48;
-
-/// ELF magic — sanity-check we stripped the right number of
-/// bytes.
-const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+use ud_format::solana::{self as solana_layout, LoaderKind};
 
 /// Default RPC endpoint when `--rpc` isn't given. Solana's
 /// public mainnet endpoint — heavily rate-limited but the
@@ -96,16 +70,16 @@ pub fn fetch_program_elf(program_id: &str, rpc_url: &str, use_cache: bool) -> Re
     let owner = account.owner.clone();
     let data = account.decoded_data()?;
 
-    let elf = match owner.as_str() {
-        BPF_LOADER_V2 => {
-            // Non-upgradeable: account data IS the ELF.
-            verify_elf(&data, owner.as_str(), 0)?;
-            data
-        }
-        BPF_LOADER_UPGRADEABLE => fetch_upgradeable_elf(rpc_url, &data, program_id)?,
-        LOADER_V4 => strip_loader_v4(&data)?,
-        other => bail!(
-            "{program_id}: unknown loader {other} — supported: \
+    let elf = match solana_layout::classify_loader(owner.as_str()) {
+        LoaderKind::BpfLoader2 => solana_layout::strip_bpf_loader_v2(&data)
+            .with_context(|| format!("{program_id}: BPFLoader2 strip"))?
+            .to_vec(),
+        LoaderKind::Upgradeable => fetch_upgradeable_elf(rpc_url, &data, program_id)?,
+        LoaderKind::LoaderV4 => solana_layout::strip_loader_v4(&data)
+            .with_context(|| format!("{program_id}: LoaderV4 strip"))?
+            .to_vec(),
+        LoaderKind::Unknown => bail!(
+            "{program_id}: unknown loader {owner} — supported: \
              BPFLoader2, BPFLoaderUpgradeable, LoaderV4"
         ),
     };
@@ -126,127 +100,25 @@ pub fn fetch_program_elf(program_id: &str, rpc_url: &str, use_cache: bool) -> Re
     Ok(elf)
 }
 
-/// Two-step fetch for upgradeable programs.
+/// Two-step fetch for upgradeable programs: the Program
+/// account points at a ProgramData account that carries the
+/// actual ELF.
 fn fetch_upgradeable_elf(
     rpc_url: &str,
     program_account_data: &[u8],
     program_id: &str,
 ) -> Result<Vec<u8>> {
-    // The program account contains `UpgradeableLoaderState::Program`:
-    //   tag:4 (= 2) + programdata_address:32 = 36 bytes total.
-    if program_account_data.len() < 36 {
-        bail!(
-            "{program_id}: upgradeable Program account too short ({} bytes; \
-             expected ≥36)",
-            program_account_data.len()
-        );
-    }
-    let tag = u32::from_le_bytes([
-        program_account_data[0],
-        program_account_data[1],
-        program_account_data[2],
-        program_account_data[3],
-    ]);
-    if tag != UPGRADEABLE_STATE_PROGRAM {
-        bail!(
-            "{program_id}: upgradeable Program account has unexpected enum tag {tag} \
-             (expected {UPGRADEABLE_STATE_PROGRAM})"
-        );
-    }
-    let pd_pubkey_bytes: [u8; 32] = program_account_data[4..36]
-        .try_into()
-        .expect("36-byte prefix splits cleanly");
+    let pd_pubkey_bytes = solana_layout::programdata_pubkey(program_account_data)
+        .with_context(|| format!("{program_id}: Program account"))?;
     let programdata_address = bs58::encode(pd_pubkey_bytes).into_string();
 
-    // Step 2: fetch ProgramData.
     let pd = rpc_get_account(rpc_url, &programdata_address)
         .with_context(|| format!("getAccountInfo (ProgramData) {programdata_address}"))?;
     let pd_data = pd.decoded_data()?;
 
-    // Strip the ProgramData header. Try the 45-byte form first
-    // (Some authority); fall back to 13 bytes (None).
-    let stripped = strip_programdata(&pd_data, &programdata_address)?;
-    verify_elf(
-        stripped,
-        BPF_LOADER_UPGRADEABLE,
-        stripped_offset(&pd_data, stripped),
-    )?;
+    let stripped = solana_layout::strip_bpf_loader_upgradeable(&pd_data)
+        .with_context(|| format!("{programdata_address}: ProgramData strip"))?;
     Ok(stripped.to_vec())
-}
-
-fn strip_programdata<'a>(data: &'a [u8], address: &str) -> Result<&'a [u8]> {
-    if data.len() < PROGRAMDATA_HEADER_NO_AUTH {
-        bail!(
-            "{address}: ProgramData account too short ({} bytes)",
-            data.len()
-        );
-    }
-    let tag = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if tag != UPGRADEABLE_STATE_PROGRAM_DATA {
-        bail!("{address}: ProgramData enum tag {tag} (expected {UPGRADEABLE_STATE_PROGRAM_DATA})");
-    }
-    // Option<Pubkey> byte at offset 12 is 1 when authority is
-    // `Some`, 0 when `None`.
-    let auth_present = data.get(12).copied().unwrap_or(0) != 0;
-    let header = if auth_present {
-        PROGRAMDATA_HEADER_WITH_AUTH
-    } else {
-        PROGRAMDATA_HEADER_NO_AUTH
-    };
-    if data.len() < header + ELF_MAGIC.len() {
-        bail!(
-            "{address}: ProgramData payload too short ({} bytes after header)",
-            data.len().saturating_sub(header)
-        );
-    }
-    if data[header..header + 4] != ELF_MAGIC {
-        // If the chosen header doesn't expose ELF magic, the
-        // other variant might. Try the alternative once before
-        // failing.
-        let alt = if auth_present {
-            PROGRAMDATA_HEADER_NO_AUTH
-        } else {
-            PROGRAMDATA_HEADER_WITH_AUTH
-        };
-        if data.len() >= alt + 4 && data[alt..alt + 4] == ELF_MAGIC {
-            return Ok(&data[alt..]);
-        }
-        bail!(
-            "{address}: ProgramData: no ELF magic at offset {header} \
-             (tried alternative {alt} too)"
-        );
-    }
-    Ok(&data[header..])
-}
-
-fn strip_loader_v4(data: &[u8]) -> Result<Vec<u8>> {
-    if data.len() < LOADER_V4_HEADER + ELF_MAGIC.len() {
-        bail!(
-            "LoaderV4 account too short ({} bytes; expected ≥{})",
-            data.len(),
-            LOADER_V4_HEADER + ELF_MAGIC.len()
-        );
-    }
-    if data[LOADER_V4_HEADER..LOADER_V4_HEADER + 4] != ELF_MAGIC {
-        bail!("LoaderV4 account: no ELF magic at offset {LOADER_V4_HEADER}");
-    }
-    Ok(data[LOADER_V4_HEADER..].to_vec())
-}
-
-fn verify_elf(bytes: &[u8], loader: &str, offset: usize) -> Result<()> {
-    if bytes.len() < ELF_MAGIC.len() || bytes[..4] != ELF_MAGIC {
-        bail!("{loader}: stripped payload at offset {offset} doesn't carry ELF magic");
-    }
-    Ok(())
-}
-
-fn stripped_offset(original: &[u8], stripped: &[u8]) -> usize {
-    // Both `stripped` and `original` come from the same buffer;
-    // computing their pointer delta gives the stripped header
-    // size for diagnostic messages.
-    let orig_ptr = original.as_ptr() as usize;
-    let strip_ptr = stripped.as_ptr() as usize;
-    strip_ptr.saturating_sub(orig_ptr)
 }
 
 fn cache_dir() -> Result<PathBuf> {

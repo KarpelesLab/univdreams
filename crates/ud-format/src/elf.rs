@@ -23,7 +23,11 @@ use std::ops::Range;
 const EI_NIDENT: usize = 16;
 
 /// ELF magic bytes (`\x7fELF`) at the start of `e_ident`.
-const ELFMAG: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
+/// Compatibility alias for the original private name —
+/// many internal sites still reference `ELFMAG`.
+pub(crate) const ELFMAG: [u8; 4] = ELF_MAGIC;
 
 /// `e_ident[EI_CLASS]` value for 32-bit objects.
 const ELFCLASS32: u8 = 1;

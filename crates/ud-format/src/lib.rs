@@ -23,4 +23,5 @@ pub mod elf;
 pub mod macho;
 pub mod pe;
 pub mod raw;
+pub mod solana;
 pub mod wasm;
