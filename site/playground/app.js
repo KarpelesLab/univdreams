@@ -32,12 +32,19 @@ const $exampleMsmpeg = document.getElementById("example-msmpeg4");
 const $exampleSolana = document.getElementById("example-solana");
 const $format        = document.getElementById("format-select");
 const $programId     = document.getElementById("program-id");
+const $rpcUrl        = document.getElementById("rpc-url");
 const $loadProgram   = document.getElementById("btn-load-program");
 
 const MSMPEG4_URL =
   "https://samples.oxideav.org/codecs/windows/msmpeg4/wmpcdcs8-mpg4c32.dll";
 
-const SOLANA_RPC_DEFAULT = "https://api.mainnet-beta.solana.com";
+// Default mainnet RPC: Helius. `api.mainnet-beta.solana.com`
+// rejects browser-origin requests with HTTP 403, so the
+// playground needs an endpoint whose CORS policy lets a
+// page on github.io read account data. Users can override
+// in the RPC input or via ?rpc=<url>.
+const SOLANA_RPC_DEFAULT =
+  "https://kristi-cykm4t-fast-mainnet.helius-rpc.com";
 const SOLANA_EXAMPLE = "3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr";
 
 // Base58 alphabet — Bitcoin / Solana convention. Used to
@@ -181,7 +188,8 @@ function onLoadProgram() {
     setStatus(`Invalid program ID: ${e.message || e}`, "error");
     return;
   }
-  void fetchSolanaProgram(id, SOLANA_RPC_DEFAULT).catch((e) => {
+  const rpc = ($rpcUrl.value || "").trim() || SOLANA_RPC_DEFAULT;
+  void fetchSolanaProgram(id, rpc).catch((e) => {
     setStatus(`Solana fetch failed: ${e.message || e}`, "error");
   });
 }
@@ -259,8 +267,14 @@ async function start() {
     });
   }
 
+  // Populate the RPC input with the default (and any
+  // `?rpc=<url>` override) so the user can see / edit it
+  // before triggering a fetch.
+  const params = new URLSearchParams(window.location.search);
+  $rpcUrl.value = params.get("rpc") || SOLANA_RPC_DEFAULT;
+
   // Deep-link: ?program=<id> auto-loads on page load.
-  const queryProgram = new URLSearchParams(window.location.search).get("program");
+  const queryProgram = params.get("program");
   if (queryProgram) {
     $programId.value = queryProgram;
     onLoadProgram();
