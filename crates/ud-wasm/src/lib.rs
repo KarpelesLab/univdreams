@@ -15,6 +15,7 @@
 use wasm_bindgen::prelude::*;
 
 use ud_ast::{Module, Value};
+use ud_format::solana::LoaderKind;
 use ud_translate::compile::AsmWarning;
 
 /// Decompile a binary blob to `.ud` source.
@@ -149,6 +150,68 @@ pub fn verify(source: &str) -> Result<String, JsError> {
         .map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
     let warnings = ud_translate::compile::verify_asm(&ast);
     Ok(format_warnings(&warnings))
+}
+
+/// Classify a Solana account's owner pubkey against the three
+/// loaders univdreams knows how to strip.
+///
+/// `owner` is the base58 string Solana RPC returns in the
+/// `value.owner` field of `getAccountInfo`. The browser
+/// playground passes it through verbatim — no decoding
+/// needed.
+///
+/// Returns one of `"bpf_loader_2"`, `"upgradeable"`,
+/// `"loader_v4"`, or `"unknown"`. The JS side dispatches on
+/// the result: BpfLoader2 / LoaderV4 strip immediately,
+/// Upgradeable requires a second RPC fetch (see
+/// [`solana_programdata_pubkey_base58`]).
+#[wasm_bindgen]
+#[must_use]
+pub fn solana_classify_loader(owner: &str) -> String {
+    set_panic_hook();
+    match ud_format::solana::classify_loader(owner) {
+        LoaderKind::BpfLoader2 => "bpf_loader_2",
+        LoaderKind::Upgradeable => "upgradeable",
+        LoaderKind::LoaderV4 => "loader_v4",
+        LoaderKind::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+/// For an upgradeable Program account, return the base58
+/// pubkey of the ProgramData account it points at. JS uses
+/// this to issue the second `getAccountInfo` call.
+#[wasm_bindgen]
+pub fn solana_programdata_pubkey_base58(program_data: &[u8]) -> Result<String, JsError> {
+    set_panic_hook();
+    let pk = ud_format::solana::programdata_pubkey(program_data)
+        .map_err(|e| JsError::new(&format!("Solana Program account: {e}")))?;
+    Ok(bs58::encode(pk).into_string())
+}
+
+/// Strip the loader-state wrapping. `loader` is one of the
+/// strings [`solana_classify_loader`] returns
+/// (`"bpf_loader_2"`, `"upgradeable"`, `"loader_v4"`). For
+/// the upgradeable kind, pass the **ProgramData** account's
+/// raw data (NOT the original Program account's) — JS is
+/// responsible for fetching that account first.
+#[wasm_bindgen]
+pub fn solana_strip_elf(account_data: &[u8], loader: &str) -> Result<Vec<u8>, JsError> {
+    set_panic_hook();
+    let stripped: &[u8] = match loader {
+        "bpf_loader_2" => ud_format::solana::strip_bpf_loader_v2(account_data)
+            .map_err(|e| JsError::new(&format!("BPFLoader2: {e}")))?,
+        "upgradeable" => ud_format::solana::strip_bpf_loader_upgradeable(account_data)
+            .map_err(|e| JsError::new(&format!("BPFLoaderUpgradeable: {e}")))?,
+        "loader_v4" => ud_format::solana::strip_loader_v4(account_data)
+            .map_err(|e| JsError::new(&format!("LoaderV4: {e}")))?,
+        other => {
+            return Err(JsError::new(&format!(
+                "unknown loader hint {other:?} (expected \"bpf_loader_2\", \"upgradeable\", \"loader_v4\")"
+            )))
+        }
+    };
+    Ok(stripped.to_vec())
 }
 
 fn with_warnings(msg: &str, warnings: &[AsmWarning]) -> String {

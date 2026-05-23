@@ -24,3 +24,4 @@ ud-format = { version = "0.1.1", path = "../ud-format" }
 ud-translate = { version = "0.1.1", path = "../ud-translate" }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
+bs58 = "0.5"
