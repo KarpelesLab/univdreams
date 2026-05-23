@@ -28,12 +28,15 @@ const $upload        = document.getElementById("upload");
 const $compile       = document.getElementById("btn-compile");
 const $verify        = document.getElementById("btn-verify");
 const $loadUrl       = document.getElementById("btn-load-url");
+const $urlInput      = document.getElementById("url-input");
 const $exampleMsmpeg = document.getElementById("example-msmpeg4");
 const $exampleSolana = document.getElementById("example-solana");
 const $format        = document.getElementById("format-select");
 const $programId     = document.getElementById("program-id");
 const $rpcUrl        = document.getElementById("rpc-url");
 const $loadProgram   = document.getElementById("btn-load-program");
+const $tabs          = document.querySelectorAll(".tabs .tab");
+const $tabPanels     = document.querySelectorAll(".tab-panel");
 
 const MSMPEG4_URL =
   "https://samples.oxideav.org/codecs/windows/msmpeg4/wmpcdcs8-mpg4c32.dll";
@@ -248,20 +251,29 @@ async function start() {
   $upload.addEventListener("change", onUpload);
   $compile.addEventListener("click", onCompile);
   $verify.addEventListener("click", onVerify);
-  $loadUrl.addEventListener("click", onLoadUrlPrompt);
+  $loadUrl.addEventListener("click", onLoadFromUrl);
+  $urlInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") onLoadFromUrl();
+  });
   $loadProgram.addEventListener("click", onLoadProgram);
   $programId.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") onLoadProgram();
   });
+  for (const tab of $tabs) {
+    tab.addEventListener("click", () => selectTab(tab.dataset.tab));
+  }
   if ($exampleMsmpeg) {
     $exampleMsmpeg.addEventListener("click", (ev) => {
       ev.preventDefault();
+      selectTab("url");
+      $urlInput.value = MSMPEG4_URL;
       void loadFromUrl(MSMPEG4_URL);
     });
   }
   if ($exampleSolana) {
     $exampleSolana.addEventListener("click", (ev) => {
       ev.preventDefault();
+      selectTab("chain");
       $programId.value = SOLANA_EXAMPLE;
       onLoadProgram();
     });
@@ -273,23 +285,44 @@ async function start() {
   const params = new URLSearchParams(window.location.search);
   $rpcUrl.value = params.get("rpc") || SOLANA_RPC_DEFAULT;
 
-  // Deep-link: ?program=<id> auto-loads on page load.
+  // Deep-link: ?program=<id> auto-loads on page load and
+  // switches the toolbar to the Solana-chain tab.
   const queryProgram = params.get("program");
   if (queryProgram) {
+    selectTab("chain");
     $programId.value = queryProgram;
     onLoadProgram();
+    return;
+  }
+  // Same for ?url=<binary-url>: pre-load the URL tab.
+  const queryUrl = params.get("url");
+  if (queryUrl) {
+    selectTab("url");
+    $urlInput.value = queryUrl;
+    void loadFromUrl(queryUrl);
     return;
   }
 
   setStatus("Ready. Upload a binary, paste a URL or Solana program ID, or edit the sample and click Compile.", "ok");
 }
 
-function onLoadUrlPrompt() {
-  const url = prompt(
-    "Fetch a binary from a URL (CORS must allow GET; e.g. samples.oxideav.org):",
-    MSMPEG4_URL,
-  );
-  if (!url) return;
+function selectTab(name) {
+  for (const tab of $tabs) {
+    const active = tab.dataset.tab === name;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  for (const panel of $tabPanels) {
+    panel.classList.toggle("hidden", panel.dataset.panel !== name);
+  }
+}
+
+function onLoadFromUrl() {
+  const url = ($urlInput.value || "").trim();
+  if (!url) {
+    setStatus("Enter a URL and click Fetch.", "warn");
+    return;
+  }
   void loadFromUrl(url);
 }
 

@@ -34,19 +34,41 @@ Append <code>?program=&lt;id&gt;</code> to this page's URL to deep-link a progra
 </p>
 
 <div class="playground">
+  <div class="tabs" role="tablist">
+    <button type="button" class="tab active" data-tab="upload" role="tab" aria-selected="true">Upload binary</button>
+    <button type="button" class="tab" data-tab="url" role="tab" aria-selected="false">From URL</button>
+    <button type="button" class="tab" data-tab="chain" role="tab" aria-selected="false">Solana chain</button>
+  </div>
+
   <div class="toolbar">
-    <label class="file-btn" for="upload">Upload binary…</label>
-    <input id="upload" type="file">
-    <button id="btn-load-url" class="file-btn">Load from URL…</button>
-    <input id="program-id" type="text"
-           placeholder="Solana program ID (base58)"
-           size="48"
-           autocomplete="off">
-    <input id="rpc-url" type="text"
-           placeholder="Solana RPC URL"
-           size="42"
-           autocomplete="off">
-    <button id="btn-load-program" class="file-btn">Load from chain</button>
+    <div class="tab-actions">
+      <div class="tab-panel" data-panel="upload">
+        <label class="file-btn" for="upload">Choose file…</label>
+        <input id="upload" type="file">
+      </div>
+      <div class="tab-panel hidden" data-panel="url">
+        <input id="url-input" type="text"
+               placeholder="https://example.com/binary.elf"
+               size="44"
+               autocomplete="off">
+        <button id="btn-load-url" class="file-btn">Fetch</button>
+      </div>
+      <div class="tab-panel hidden" data-panel="chain">
+        <input id="program-id" type="text"
+               placeholder="Solana program ID (base58)"
+               size="44"
+               autocomplete="off">
+        <input id="rpc-url" type="text"
+               placeholder="RPC URL"
+               size="36"
+               autocomplete="off">
+        <button id="btn-load-program" class="file-btn">Load</button>
+      </div>
+    </div>
+
+    <span id="filename" class="filename"></span>
+    <span class="spacer"></span>
+
     <label for="format-select" class="format-label">Format:</label>
     <select id="format-select">
       <option value="auto" selected>auto (ELF / PE / Mach-O / WASM header)</option>
@@ -56,8 +78,7 @@ Append <code>?program=&lt;id&gt;</code> to this page's URL to deep-link a progra
       <option value="wasm">WebAssembly (force)</option>
       <option value="raw-6502">raw 6502 image</option>
     </select>
-    <span id="filename" class="filename"></span>
-    <span class="spacer"></span>
+
     <button id="btn-verify">Verify</button>
     <button id="btn-compile" class="primary">Compile &amp; download</button>
   </div>
