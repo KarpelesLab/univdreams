@@ -33,6 +33,8 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_sign_loss)]
 
+use std::collections::BTreeSet;
+
 use ud_core::VAddr;
 use ud_ir::{ArchInsn, BasicBlock, Function, Terminator};
 
@@ -374,36 +376,118 @@ pub fn call_target(insn: &DecodedInsn) -> u64 {
 
 /// Lift a decoded instruction stream into a CFG.
 ///
-/// v1: one basic block per function, terminator driven by the
-/// last instruction's kind. The eBPF / SBF verifier guarantees
-/// the entry point is at the start of the slice; for functions
-/// containing internal branches we render every slot as an
-/// `@asm` line and let the human read the offsets.
+/// Slices the stream into basic blocks at every intra-function
+/// jump target and immediately after every control-flow exit
+/// (`exit` / unconditional `ja` / conditional `j*`). The
+/// resulting `Function<DecodedInsn>` is suitable for
+/// downstream SSA / dominance / liveness analyses — joins at
+/// reconvergence points generate proper phi placement, which
+/// the previous single-block-per-function shape could never
+/// produce.
+///
+/// Calls (`call imm` and indirect `callx`) are **not** block
+/// terminators: control flow returns through them
+/// normally and the following slot stays in the same block.
+/// Only when a call is the function's last instruction does
+/// `Terminator::IndirectBranch` surface on its block.
+///
+/// The byte-identity contract still holds — every instruction
+/// rides in some block in original address order, and
+/// `Function::emit_bytes` concatenates blocks back into the
+/// original byte stream.
 #[must_use]
 pub fn lift_function(name: String, insns: &[DecodedInsn]) -> Function<DecodedInsn> {
     let addr = insns.first().map_or(VAddr(0), |i| i.addr);
-    let terminator = insns
-        .last()
-        .map_or(Terminator::Fallthrough, |i| match i.kind {
-            InsnKind::Exit => Terminator::Return,
-            InsnKind::Jmp => Terminator::UnconditionalBranch {
-                target: VAddr(jump_target(i)),
-            },
-            InsnKind::JmpCond | InsnKind::JmpCond32 => Terminator::ConditionalBranch {
-                taken: VAddr(jump_target(i)),
-                fallthrough: VAddr(i.addr.0.wrapping_add(INSN_SIZE as u64)),
-            },
-            InsnKind::CallReg => Terminator::IndirectBranch,
-            _ => Terminator::Fallthrough,
-        });
-    Function {
-        addr,
-        name,
-        blocks: vec![BasicBlock {
+    if insns.is_empty() {
+        return Function {
             addr,
-            insns: insns.to_vec(),
-            terminator,
-        }],
+            name,
+            blocks: Vec::new(),
+        };
+    }
+    let fn_start = addr.0;
+    let fn_end = insns
+        .last()
+        .map_or(fn_start, |i| i.addr.0.wrapping_add(INSN_SIZE as u64));
+
+    // Collect block boundaries: function entry, every intra-
+    // function jump target, and the slot immediately after
+    // every control-flow exit (jmp/jcc/exit). LDDW second
+    // halves are never boundary candidates — the verifier
+    // forbids jumps into mid-`lddw` and we never need to
+    // split between the two slots of an `lddw` pair.
+    let mut boundaries: BTreeSet<u64> = BTreeSet::new();
+    boundaries.insert(fn_start);
+    for i in insns {
+        if matches!(
+            i.kind,
+            InsnKind::Jmp | InsnKind::JmpCond | InsnKind::JmpCond32
+        ) {
+            let t = jump_target(i);
+            if (fn_start..fn_end).contains(&t) {
+                boundaries.insert(t);
+            }
+        }
+        if matches!(
+            i.kind,
+            InsnKind::Jmp | InsnKind::JmpCond | InsnKind::JmpCond32 | InsnKind::Exit
+        ) {
+            let next = i.addr.0.wrapping_add(INSN_SIZE as u64);
+            if next < fn_end {
+                boundaries.insert(next);
+            }
+        }
+    }
+
+    // Walk the stream once, emitting a block whenever the
+    // current insn lands on a boundary (and we have prior
+    // insns accumulated).
+    let mut blocks: Vec<BasicBlock<DecodedInsn>> = Vec::new();
+    let mut current: Vec<DecodedInsn> = Vec::new();
+    let mut current_addr: u64 = fn_start;
+    for i in insns {
+        if boundaries.contains(&i.addr.0) && !current.is_empty() {
+            let term = block_terminator(&current);
+            blocks.push(BasicBlock {
+                addr: VAddr(current_addr),
+                insns: std::mem::take(&mut current),
+                terminator: term,
+            });
+            current_addr = i.addr.0;
+        }
+        current.push(i.clone());
+    }
+    if !current.is_empty() {
+        let term = block_terminator(&current);
+        blocks.push(BasicBlock {
+            addr: VAddr(current_addr),
+            insns: current,
+            terminator: term,
+        });
+    }
+
+    Function { addr, name, blocks }
+}
+
+/// Pick the terminator for a block from its last instruction's
+/// kind. Falls through to the next block when the last insn
+/// isn't a control-flow primitive — typically because the
+/// block ended at a jump target rather than at an exit.
+fn block_terminator(insns: &[DecodedInsn]) -> Terminator {
+    let Some(last) = insns.last() else {
+        return Terminator::Fallthrough;
+    };
+    match last.kind {
+        InsnKind::Exit => Terminator::Return,
+        InsnKind::Jmp => Terminator::UnconditionalBranch {
+            target: VAddr(jump_target(last)),
+        },
+        InsnKind::JmpCond | InsnKind::JmpCond32 => Terminator::ConditionalBranch {
+            taken: VAddr(jump_target(last)),
+            fallthrough: VAddr(last.addr.0.wrapping_add(INSN_SIZE as u64)),
+        },
+        InsnKind::CallReg => Terminator::IndirectBranch,
+        _ => Terminator::Fallthrough,
     }
 }
 

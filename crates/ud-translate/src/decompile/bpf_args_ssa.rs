@@ -136,15 +136,30 @@ fn resolve_def(
     }
 }
 
-/// Phi consensus: when every incoming def resolves to the
-/// same string, commit that. Returns `None` when any
-/// incoming is unresolvable or when two resolved values
-/// differ.
+/// Phi consensus: commit a value when the **concrete**
+/// incoming defs all resolve to the same string.
 ///
-/// `depth` is the SAME depth-counter as the caller's
-/// (we're not consuming a recursion budget for the phi
-/// itself — only for the def-chain walks underneath each
-/// incoming).
+/// Phi-typed incomings (the def at the predecessor is
+/// itself a phi at some other block) are SKIPPED, not
+/// followed. Those almost always correspond to loop
+/// back-edges: a loop header's phi has one incoming from
+/// the pre-loop block (concrete) and one from the
+/// back-edge (which is the phi itself, transitively).
+/// Following the back-edge yields an infinite recursion
+/// terminated by the depth budget — and the answer is
+/// always `None`, which incorrectly kills consensus even
+/// when the concrete def alone is the only value that can
+/// reach the phi (because the loop body never writes the
+/// variable).
+///
+/// Skipping phi-typed incomings means: when every "real"
+/// def reaching the join agrees, we commit to that value;
+/// the loop-back-edge arm is treated as "the same value
+/// flowing around again", consistent with the loop body
+/// not having an intervening write.
+///
+/// Returns `None` when no concrete incoming resolves, or
+/// when two concrete incomings disagree.
 fn resolve_phi_consensus(
     ssa: &SsaInfo,
     insns_by_addr: &HashMap<u64, &DecodedInsn>,
@@ -152,11 +167,13 @@ fn resolve_phi_consensus(
     data: Option<&dyn DataLookup>,
     depth: usize,
 ) -> Option<String> {
-    if incoming.is_empty() {
-        return None;
-    }
     let mut consensus: Option<String> = None;
     for &inc in incoming {
+        let record = ssa.defs.get(inc.0 as usize)?;
+        if matches!(record.site, DefSite::Phi { .. }) {
+            // Loop back-edge / nested phi — skip.
+            continue;
+        }
         let resolved = resolve_def(ssa, insns_by_addr, inc, data, depth + 1)?;
         match &consensus {
             None => consensus = Some(resolved),
