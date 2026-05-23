@@ -589,14 +589,20 @@ fn render_text(
             return format!("{call_mnem} {name}");
         }
     }
-    // Layer 6c+: for `lddw r, imm64` whose imm64 lands in a
-    // readable section with printable string content (typical
-    // pattern for sol_log_ message pointers), surface the
-    // string as the operand.
+    // Layer 6c+: for `lddw r, imm64` whose imm64 lands in
+    // a readable section with printable string content
+    // (typical pattern for sol_log_ message pointers),
+    // surface the string as the operand. We also append the
+    // original `@0x<imm>` so the lower path can recover the
+    // exact rodata address from the text alone — the same
+    // literal may live at multiple addresses in rodata
+    // (overlapping suffixes), so a string→address table
+    // can't disambiguate, but a per-call-site annotation
+    // can.
     if matches!(insn.kind, InsnKind::Lddw) {
         if let (Some(imm), Some(lookup)) = (insn.imm64, data) {
             if let Some(s) = read_inline_string(lookup, imm) {
-                return format!("lddw r{}, {s}", insn.dst);
+                return format!("lddw r{}, {s} @0x{imm:x}", insn.dst);
             }
         }
     }

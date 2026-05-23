@@ -695,6 +695,25 @@ pub fn desymbolize_bpf_text(text: &str, insn_addr: u64, opcode_hint: Option<u8>)
         return Some(format!("{prefix}{separator}{offset_text}"));
     }
 
+    // String-resolved `lddw rN, "literal" @0x<imm>` — the
+    // renderer rewrites the imm64 to its rodata literal for
+    // readability and appends `@0x<imm>` so the address is
+    // still recoverable. We strip the string and substitute
+    // the numeric form the assembler accepts.
+    if let Some(rest) = text.strip_prefix("lddw ") {
+        if let Some(at) = rest.find(" @0x") {
+            let head_with_reg = &rest[..at]; // "rN, \"string\""
+            let imm_text = &rest[at + 4..]; // "<hex>"
+                                            // The bit before the comma is the register
+                                            // (it carries no rewritable syntax). Keep that
+                                            // and drop the string literal.
+            if let Some(comma) = head_with_reg.find(',') {
+                let reg = head_with_reg[..comma].trim();
+                return Some(format!("lddw {reg}, 0x{}", imm_text.trim()));
+            }
+        }
+    }
+
     // Stack-slot rewrites — the BPF renderer collapses
     // `[r10 - 0xN]` to `[local_<N>]` (local var) and
     // `[r10 + 0xN]` to `[arg_<N>]` (incoming arg slot).
@@ -924,6 +943,20 @@ mod tests {
         assert_eq!(dsym, "call_internal -1");
         let bytes = assemble_bpf(&dsym).unwrap();
         assert_eq!(bytes, vec![0x85, 0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn desymbolise_lddw_with_string_and_addr_annotation() {
+        // Renderer-side form: a string-resolved lddw
+        // carries the rodata address as an `@0xN` suffix so
+        // the lower path can reproduce the bytes from text
+        // alone. The desymbolizer drops the string and
+        // forwards the address to the assembler.
+        let text = r#"lddw r3, "src/extension/mod.rs" @0x52b20"#;
+        let dsym = desymbolize_bpf_text(text, 0x1000, None).unwrap();
+        assert_eq!(dsym, "lddw r3, 0x52b20");
+        let bytes = assemble_bpf(&dsym).unwrap();
+        assert_eq!(bytes, vec![0x18, 0x03, 0x00, 0x00, 0x20, 0x2b, 0x05, 0x00]);
     }
 
     #[test]

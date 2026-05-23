@@ -522,10 +522,30 @@ pub fn format_insn(insn: &DecodedInsn, variant: BpfVariant) -> String {
 }
 
 fn format_ld(insn: &DecodedInsn) -> String {
-    // LDDW (opcode 0x18) — load 64-bit immediate.
+    // LDDW (opcode 0x18) — load 64-bit immediate. For a
+    // well-formed pair the decoder set `imm64` to the
+    // joined value. For an orphaned LDDW (continuation
+    // slot stolen by a downstream pass, e.g. function-
+    // boundary harvest mid-pair), `imm64` is None and we
+    // render just the slot's own `imm32` so the byte-drop
+    // pass can round-trip it via `assemble_bpf` — the
+    // separated continuation slot rides as its own
+    // `<lddw-cont 0x…>` line and round-trips too.
     if insn.opcode == 0x18 {
-        let imm = insn.imm64.unwrap_or(0);
+        let imm = match insn.imm64 {
+            Some(v) => v,
+            None => u64::from(insn.imm as u32),
+        };
         return format!("lddw r{}, 0x{:x}", insn.dst, imm);
+    }
+    // Opcode 0 — typically the continuation slot of an
+    // LDDW pair. The decoder labels these `LddwSecondHalf`
+    // when the pair was well-formed; orphans fall through
+    // here with `kind = Unknown`. Render them as the
+    // continuation form regardless so the byte-drop pass
+    // recognises them uniformly.
+    if insn.opcode == 0 {
+        return format!("<lddw-cont 0x{:08x}>", insn.imm as u32);
     }
     // LD_ABS / LD_IND (legacy packet loads, opcodes 0x20, 0x28,
     // 0x30, 0x38, 0x40, 0x48, 0x50). Render generically; corpus

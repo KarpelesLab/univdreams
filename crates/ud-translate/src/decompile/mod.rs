@@ -240,6 +240,7 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
 /// `lddw r1, "string"`) fails to parse → bytes stay pinned.
 /// A future symbolic-resolver layer (described in the plan
 /// at `magical-popping-oasis.md`) extends coverage to those.
+#[allow(clippy::too_many_lines)]
 fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
     /// Walk a slice of statements, threading the cursor IP
     /// so each @asm's address is known. Symbolic-form
@@ -361,23 +362,62 @@ fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
         0
     }
 
-    fn visit_item(item: &mut Item) {
-        match item {
-            Item::Function(fd) => {
-                let mut ip = fn_base_addr(fd);
-                visit_stmts(&mut fd.body, &mut ip);
-            }
-            Item::Section { items, .. } => {
-                for sub in items.iter_mut() {
-                    visit_item(sub);
+    /// Walk a section's items in order, threading a
+    /// cursor through them so functions whose `@addr` was
+    /// dropped (because their address equals the running
+    /// cursor) still get their base IP recovered. Mirrors
+    /// `drop_redundant_function_addrs` plus
+    /// `build_function::lowered_body_size_at` — and
+    /// matches exactly what the lower path does at
+    /// recompile time.
+    fn visit_section_items(section_addr: u64, items: &mut [Item]) {
+        let mut cursor = section_addr;
+        for item in items.iter_mut() {
+            match item {
+                Item::Function(fd) => {
+                    let start = if let Some(a) = fd.addr {
+                        a
+                    } else if let Some(rest) = fd.name.strip_prefix("sub_") {
+                        u64::from_str_radix(rest, 16).unwrap_or(cursor)
+                    } else {
+                        cursor
+                    };
+                    // CRITICAL: compute body_size BEFORE
+                    // visit_stmts runs — visit_stmts drops
+                    // bytes from @asm lines, which causes
+                    // `lowered_body_size_at` to report 0
+                    // for those (it sums `bytes.len()`).
+                    // Capturing the size beforehand keeps
+                    // the section cursor consistent with
+                    // what lower-time will reconstruct.
+                    let body_size = build_function::lowered_body_size_at(&fd.body, start);
+                    let mut ip = start;
+                    visit_stmts(&mut fd.body, &mut ip);
+                    cursor = start.saturating_add(body_size);
                 }
+                Item::Raw { addr, bytes } => {
+                    cursor = (*addr).saturating_add(bytes.len() as u64);
+                }
+                Item::Section { addr, items, .. } => {
+                    visit_section_items(*addr, items);
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
     for item in items.iter_mut() {
-        visit_item(item);
+        match item {
+            Item::Section { addr, items, .. } => visit_section_items(*addr, items),
+            // Top-level functions without an enclosing
+            // section (unusual but possible) — best effort
+            // with whatever addr we can recover.
+            Item::Function(fd) => {
+                let mut ip = fn_base_addr(fd);
+                visit_stmts(&mut fd.body, &mut ip);
+            }
+            _ => {}
+        }
     }
 }
 
