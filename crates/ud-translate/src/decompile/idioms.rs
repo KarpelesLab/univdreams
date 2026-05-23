@@ -287,6 +287,17 @@ pub fn solana_function_summary(body: &[Stmt]) -> Option<String> {
 fn walk_for_summary(body: &[Stmt], caps: &mut Vec<String>) {
     for stmt in body {
         match stmt {
+            // Instruction-handler markers via `lddw r?,
+            // "Instruction: <variant>…"`. Catches the
+            // `msg!()`-formatted log paths where the eventual
+            // `sol_log_` call's args[0] points at a
+            // stack-allocated formatter output rather than
+            // the original rodata literal.
+            Stmt::Asm { text, .. } if text.starts_with("lddw ") => {
+                if let Some(name) = extract_instruction_handler_from_lddw(text) {
+                    caps.push(format!("handler:{name}"));
+                }
+            }
             Stmt::Asm { text, .. } if text.starts_with("call ") => match text.as_str() {
                 "call sol_invoke_signed_rust" | "call sol_invoke_signed_c" => {
                     caps.push("cpi".into());
@@ -347,6 +358,57 @@ fn parse_int_arg(text: &str) -> Option<u64> {
 }
 
 /// Extract a Solana instruction-handler variant name from a
+/// `lddw r?, "Instruction: …"` asm line.
+///
+/// The L6c+ string-resolver embeds the rodata literal in the
+/// `lddw`'s rendered text, so it's visible regardless of how
+/// the bytes get consumed downstream — important because
+/// Rust's `msg!()` formatter pipelines the literal through a
+/// stack-allocated `fmt::Arguments` struct, and the eventual
+/// `sol_log_` call sees the formatter's *output* (a heap
+/// buffer) rather than the original literal. Scanning `lddw`
+/// catches those handlers; scanning the rendered
+/// `→ sol_log_(…)` comment only catches the unformatted path.
+///
+/// Variant-name boundary heuristic: rodata strings in
+/// Solana programs are typically concatenated, so the
+/// literal we see is `"Instruction: <variant>Instruction:
+/// <next-variant>…"`. The next `"Instruction:"` substring
+/// after the prefix is the boundary. When no second prefix
+/// is found, we take the entire remainder.
+#[must_use]
+pub fn extract_instruction_handler_from_lddw(text: &str) -> Option<String> {
+    // Match shape `lddw r?, "Instruction: …"`.
+    let body = text.strip_prefix("lddw ")?;
+    let (_reg, rest) = body.split_once(", ")?;
+    let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
+    let after_prefix = inner.strip_prefix("Instruction: ")?;
+    // Boundary: the earliest of `"Instruction:"` (next
+    // concatenated variant in rodata) or ` (` (start of the
+    // format-string parameter list, e.g. `" (amount="`). When
+    // neither is found we refuse to commit, because the
+    // rendered literal is a truncated window into rodata and
+    // could span into an unrelated string downstream — which
+    // would manifest as a junky variant name like
+    // `FixStakeAccountconnection reset)`. Refusing those is
+    // safe: cleanly-bounded callers (the `→ sol_log_(…, N)`
+    // path) already pick them up.
+    let by_next_marker = after_prefix.find("Instruction:");
+    let by_param_open = after_prefix.find(" (");
+    let end = match (by_next_marker, by_param_open) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return None,
+    };
+    let name = after_prefix[..end].trim_end();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Extract a Solana instruction-handler variant name from a
 /// rendered call comment.
 ///
 /// Looks for the shape `→ sol_log_("…", N)` and, when the
@@ -386,10 +448,17 @@ pub fn extract_instruction_handler(comment: &str) -> Option<String> {
         .find(|&i| literal.is_char_boundary(i))?;
     let prefix = &literal[..prefix_end];
     let name = prefix.strip_prefix("Instruction: ")?;
-    if name.is_empty() {
+    // Canonicalise: clip off the format-args list when one is
+    // present, so the comment-based path and the lddw-based
+    // path emit the same string for the same variant.
+    let canonical = match name.find(" (") {
+        Some(at) => &name[..at],
+        None => name,
+    };
+    if canonical.is_empty() {
         return None;
     }
-    Some(name.to_string())
+    Some(canonical.to_string())
 }
 
 #[cfg(test)]
@@ -473,13 +542,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_handler_simple() {
+    fn extract_handler_simple_with_params() {
         // "Instruction: " (13) + "Stake (amount=" (14) = 27 chars = 0x1b.
+        // The trailing " (amount=" is the format-args list;
+        // both extractors canonicalise to just "Stake".
         let c = r#"→ sol_log_("Instruction: Stake (amount=more rodata blob…", 0x1b)"#;
-        assert_eq!(
-            extract_instruction_handler(c),
-            Some("Stake (amount=".to_string())
-        );
+        assert_eq!(extract_instruction_handler(c), Some("Stake".to_string()));
     }
 
     #[test]
@@ -505,8 +573,58 @@ mod tests {
     }
 
     #[test]
+    fn lddw_extract_param_boundary() {
+        // " (" delimits the variant name from its format-args list.
+        let t = r#"lddw r1, "Instruction: Stake (amount=""#;
+        assert_eq!(
+            extract_instruction_handler_from_lddw(t),
+            Some("Stake".to_string())
+        );
+    }
+
+    #[test]
+    fn lddw_extract_first_of_concatenated_variants() {
+        let t = r#"lddw r1, "Instruction: CompleteUnstakeInstruction: CancelUnstakeRequestInstruction: CloseStakeAccountInstr""#;
+        assert_eq!(
+            extract_instruction_handler_from_lddw(t),
+            Some("CompleteUnstake".to_string())
+        );
+    }
+
+    #[test]
+    fn lddw_extract_refuses_truncated_blob_with_no_boundary() {
+        // No second "Instruction:" and no " (" — could be a
+        // truncated rodata window into an unrelated string.
+        let t = r#"lddw r1, "Instruction: FixStakeAccountconnection reset) when slicing""#;
+        assert_eq!(extract_instruction_handler_from_lddw(t), None);
+    }
+
+    #[test]
+    fn lddw_extract_rejects_non_instruction_strings() {
+        let t = r#"lddw r1, "some other string""#;
+        assert_eq!(extract_instruction_handler_from_lddw(t), None);
+    }
+
+    #[test]
+    fn lddw_extract_rejects_non_lddw_asm() {
+        let t = r#"mov64 r1, "Instruction: Stake (a""#;
+        assert_eq!(extract_instruction_handler_from_lddw(t), None);
+    }
+
+    #[test]
+    fn function_summary_picks_up_handler_from_lddw() {
+        let body = vec![Stmt::Asm {
+            text: r#"lddw r1, "Instruction: InitializePool (tau=""#.into(),
+            bytes: vec![],
+        }];
+        let s = solana_function_summary(&body).unwrap();
+        assert!(s.contains("handler:InitializePool"), "{s}");
+    }
+
+    #[test]
     fn function_summary_picks_up_handler() {
         // "Instruction: " (13) + "Unstake (amount=" (16) = 29 chars = 0x1d.
+        // Variant canonicalises to "Unstake" (param list stripped).
         let body = vec![
             Stmt::Asm {
                 text: "call sol_log_".into(),
@@ -515,6 +633,7 @@ mod tests {
             Stmt::Comment(r#"→ sol_log_("Instruction: Unstake (amount=more rodata", 0x1d)"#.into()),
         ];
         let s = solana_function_summary(&body).unwrap();
-        assert!(s.contains("handler:Unstake (amount="), "{s}");
+        assert!(s.contains("handler:Unstake"), "{s}");
+        assert!(!s.contains("handler:Unstake ("), "{s}");
     }
 }
