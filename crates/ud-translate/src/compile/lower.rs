@@ -362,20 +362,40 @@ fn lower_stmts_into(
         match stmt {
             Stmt::Asm { text, bytes } => {
                 if bytes.is_empty() {
-                    // Bytes were dropped at decompile time because
-                    // the canonical text re-assembles to them
-                    // exactly. Re-encode now via the in-crate
-                    // x86 assembler. The IP we feed it is the
-                    // statement's cursor position so RIP-relative
-                    // forms resolve correctly once we cover them.
+                    // Bytes were dropped at decompile time
+                    // because the canonical text re-assembles to
+                    // them exactly. Re-encode now. We try the
+                    // x86 assembler first (covers the historical
+                    // path with RIP-relative forms; the IP we
+                    // feed it is the statement's cursor
+                    // position). If that fails, we fall back to
+                    // the BPF assembler — BPF instructions are
+                    // arch-disjoint from x86 mnemonics, so the
+                    // two paths can't both succeed on the same
+                    // text. If both fail we surface the BPF
+                    // error as the user-facing message, since
+                    // BPF is the path most likely to expand its
+                    // coverage soon.
                     let ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
                     let encoded =
                         ud_arch_x86::assemble_intel(ud_arch_x86::Bitness::Bits64, text, ip)
-                            .map_err(|e| LowerError::AsmAssembleFailed {
-                                fn_name: fn_name.to_string(),
-                                stmt_index: i,
-                                text: text.clone(),
-                                message: e.to_string(),
+                            .or_else(|x86_err| {
+                                ud_arch_bpf::assemble_bpf(text)
+                                    .map_err(|bpf_err| (x86_err.to_string(), bpf_err.to_string()))
+                            })
+                            .map_err(|(_x86_err, bpf_err)| {
+                                // Both assemblers refused the text.
+                                // We surface the BPF error since x86
+                                // typically fails with a parse-error
+                                // on BPF mnemonics that isn't
+                                // actionable to the user.
+                                let message = bpf_err;
+                                LowerError::AsmAssembleFailed {
+                                    fn_name: fn_name.to_string(),
+                                    stmt_index: i,
+                                    text: text.clone(),
+                                    message,
+                                }
                             })?;
                     out.extend_from_slice(&encoded);
                 } else {

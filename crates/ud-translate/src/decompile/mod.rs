@@ -217,8 +217,84 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
     if let Some(bitness) = bitness {
         drop_regenerable_asm_bytes(&mut items, bitness);
     }
+    if matches!(arch, Arch::Bpf { .. }) {
+        drop_regenerable_asm_bytes_bpf(&mut items);
+    }
 
     Ok(UdFile { module, items })
+}
+
+/// BPF analog of [`drop_regenerable_asm_bytes`] for x86.
+///
+/// BPF instructions are fixed-width 8-byte slots and branch
+/// offsets are slot-relative within the text — there's no
+/// IP threading needed; the assembler is a pure
+/// `text → bytes` function. We walk every `Stmt::Asm` and
+/// `Stmt::Comment` recursively (recursing into the BPF
+/// structural variants `IfBlock` and `WhileBlock` that the
+/// L5b layer produces), try to re-encode the text via
+/// [`ud_arch_bpf::assemble_bpf`], and drop the pinned bytes
+/// when the result matches.
+///
+/// Symbolic text (`call sub_X`, `jeq …, label_Y`,
+/// `lddw r1, "string"`) fails to parse → bytes stay pinned.
+/// A future symbolic-resolver layer (described in the plan
+/// at `magical-popping-oasis.md`) extends coverage to those.
+fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
+    fn visit_stmts(stmts: &mut [ud_ast::Stmt]) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                ud_ast::Stmt::Asm { text, bytes } => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if let Ok(encoded) = ud_arch_bpf::assemble_bpf(text) {
+                        if encoded == *bytes {
+                            bytes.clear();
+                        }
+                    }
+                }
+                ud_ast::Stmt::IfBlock {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    visit_stmts(then_body);
+                    visit_stmts(else_body);
+                }
+                ud_ast::Stmt::WhileBlock { body: wb, .. } => visit_stmts(wb),
+                ud_ast::Stmt::IfBranch {
+                    pre_body,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    visit_stmts(pre_body);
+                    visit_stmts(then_body);
+                    if let Some(eb) = else_body {
+                        visit_stmts(eb);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn visit_item(item: &mut Item) {
+        match item {
+            Item::Function(fd) => visit_stmts(&mut fd.body),
+            Item::Section { items, .. } => {
+                for sub in items.iter_mut() {
+                    visit_item(sub);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for item in items.iter_mut() {
+        visit_item(item);
+    }
 }
 
 /// Walk every `Stmt::Asm` in the AST. For each, try to encode
