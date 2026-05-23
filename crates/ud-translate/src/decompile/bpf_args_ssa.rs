@@ -31,12 +31,19 @@
 //! * Function-entry register (the variable comes in via the
 //!   ABI as an arg) → `arg_<N-1>` if N ∈ 1..=5.
 //!
+//! ## Phi joins
+//!
+//! When the reaching def is a phi (multiple predecessors
+//! with different defs), we recursively resolve each
+//! incoming def. If every incoming resolves to the same
+//! string, we commit — both arms wrote the same constant /
+//! aliased the same stack slot, so the join is unambiguous
+//! at the value level. If any incoming returns `None` (we
+//! couldn't classify it) or any two incoming differ, we
+//! return `None` rather than guess.
+//!
 //! ## What we can't (yet)
 //!
-//! * Phi joins: when the reaching def is a phi (multiple
-//!   predecessors with different defs), we don't try to
-//!   commit — could be refined to "all incoming defs
-//!   resolve to the same value" but the gain is small.
 //! * Memory chases through pointers — `ldxdw rN, [rM+off]`
 //!   for `rM != r10` resolves to the opaque `Memory` var,
 //!   which SSA can't decompose without an alias model.
@@ -96,7 +103,9 @@ fn resolve_def(
             let insn = *insns_by_addr.get(ip)?;
             resolve_insn(ssa, insns_by_addr, insn, &record.var, data, depth + 1)
         }
-        DefSite::Phi { .. } => None,
+        DefSite::Phi { incoming, .. } => {
+            resolve_phi_consensus(ssa, insns_by_addr, incoming, data, depth)
+        }
         DefSite::Entry => {
             // ABI: r1..r5 are arg registers; r6..r9 are
             // callee-saved (presumed live but unnamed by
@@ -125,6 +134,37 @@ fn resolve_def(
             }
         }
     }
+}
+
+/// Phi consensus: when every incoming def resolves to the
+/// same string, commit that. Returns `None` when any
+/// incoming is unresolvable or when two resolved values
+/// differ.
+///
+/// `depth` is the SAME depth-counter as the caller's
+/// (we're not consuming a recursion budget for the phi
+/// itself — only for the def-chain walks underneath each
+/// incoming).
+fn resolve_phi_consensus(
+    ssa: &SsaInfo,
+    insns_by_addr: &HashMap<u64, &DecodedInsn>,
+    incoming: &[ud_ir::ssa::DefId],
+    data: Option<&dyn DataLookup>,
+    depth: usize,
+) -> Option<String> {
+    if incoming.is_empty() {
+        return None;
+    }
+    let mut consensus: Option<String> = None;
+    for &inc in incoming {
+        let resolved = resolve_def(ssa, insns_by_addr, inc, data, depth + 1)?;
+        match &consensus {
+            None => consensus = Some(resolved),
+            Some(prev) if *prev == resolved => {}
+            Some(_) => return None,
+        }
+    }
+    consensus
 }
 
 fn resolve_insn(
@@ -340,6 +380,121 @@ mod tests {
         let ix = index_by_addr(&f);
         let arg = resolve_arg(&ssa, &ix, 0x1010, 0, None);
         assert_eq!(arg, Some("&local_50".into()));
+    }
+
+    /// Diamond CFG where both arms write the same constant
+    /// to r1. The merge block has a phi for r1 with two
+    /// incoming defs; both resolve to `"0x2a"`, so the
+    /// consensus rule commits to that value.
+    ///
+    /// BPF's production `lift_function` only emits single-
+    /// block functions today, so we construct the blocks
+    /// directly here to exercise the phi path.
+    #[test]
+    fn phi_with_unanimous_incoming_commits_to_value() {
+        // Slot layout (8 bytes each):
+        //   0x1000  jeq r0, 0, +2      (skip to arm2 if zero)
+        //   0x1008  mov64 r1, 0x2a     (arm1)
+        //   0x1010  ja +1              (skip arm2)
+        //   0x1018  mov64 r1, 0x2a     (arm2 — same value)
+        //   0x1020  call 0             (merge)
+        //   0x1028  exit
+        let bytes = [
+            0x15, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // jeq r0, 0, +2
+            0xb7, 0x01, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, // mov r1, 0x2a
+            0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ja +1
+            0xb7, 0x01, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, // mov r1, 0x2a
+            0x85, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // call
+            0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+        ];
+        let insns = decode(&bytes, 0x1000, BpfVariant::Sbfv1).expect("decode");
+        // Slice into four blocks: entry, arm1, arm2, merge.
+        let block_entry = BasicBlock {
+            addr: VAddr(0x1000),
+            insns: vec![insns[0].clone()],
+            terminator: Terminator::ConditionalBranch {
+                taken: VAddr(0x1018),
+                fallthrough: VAddr(0x1008),
+            },
+        };
+        let block_arm1 = BasicBlock {
+            addr: VAddr(0x1008),
+            insns: vec![insns[1].clone(), insns[2].clone()],
+            terminator: Terminator::UnconditionalBranch {
+                target: VAddr(0x1020),
+            },
+        };
+        let block_arm2 = BasicBlock {
+            addr: VAddr(0x1018),
+            insns: vec![insns[3].clone()],
+            terminator: Terminator::Fallthrough,
+        };
+        let block_merge = BasicBlock {
+            addr: VAddr(0x1020),
+            insns: vec![insns[4].clone(), insns[5].clone()],
+            terminator: Terminator::Return,
+        };
+        let f = Function {
+            addr: VAddr(0x1000),
+            name: "diamond".into(),
+            blocks: vec![block_entry, block_arm1, block_arm2, block_merge],
+        };
+
+        let ssa = super::super::bpf_ssa::build_bpf_ssa(&f);
+        let ix = index_by_addr(&f);
+        let arg = resolve_arg(&ssa, &ix, 0x1020, 0, None);
+        assert_eq!(arg, Some("0x2a".into()));
+    }
+
+    /// Same diamond but with divergent values. Phi consensus
+    /// must NOT commit — we can't tell which arm ran.
+    #[test]
+    fn phi_with_divergent_incoming_does_not_commit() {
+        let bytes = [
+            0x15, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // jeq r0, 0, +2
+            0xb7, 0x01, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, // mov r1, 0x2a
+            0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ja +1
+            0xb7, 0x01, 0x00, 0x00, 0x37, 0x00, 0x00, 0x00, // mov r1, 0x37 (different!)
+            0x85, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // call
+            0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+        ];
+        let insns = decode(&bytes, 0x1000, BpfVariant::Sbfv1).expect("decode");
+        let f = Function {
+            addr: VAddr(0x1000),
+            name: "diamond".into(),
+            blocks: vec![
+                BasicBlock {
+                    addr: VAddr(0x1000),
+                    insns: vec![insns[0].clone()],
+                    terminator: Terminator::ConditionalBranch {
+                        taken: VAddr(0x1018),
+                        fallthrough: VAddr(0x1008),
+                    },
+                },
+                BasicBlock {
+                    addr: VAddr(0x1008),
+                    insns: vec![insns[1].clone(), insns[2].clone()],
+                    terminator: Terminator::UnconditionalBranch {
+                        target: VAddr(0x1020),
+                    },
+                },
+                BasicBlock {
+                    addr: VAddr(0x1018),
+                    insns: vec![insns[3].clone()],
+                    terminator: Terminator::Fallthrough,
+                },
+                BasicBlock {
+                    addr: VAddr(0x1020),
+                    insns: vec![insns[4].clone(), insns[5].clone()],
+                    terminator: Terminator::Return,
+                },
+            ],
+        };
+
+        let ssa = super::super::bpf_ssa::build_bpf_ssa(&f);
+        let ix = index_by_addr(&f);
+        let arg = resolve_arg(&ssa, &ix, 0x1020, 0, None);
+        assert_eq!(arg, None);
     }
 
     /// At entry, before any def of r1, r1 is the function
