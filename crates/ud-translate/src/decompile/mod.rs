@@ -241,48 +241,132 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
 /// A future symbolic-resolver layer (described in the plan
 /// at `magical-popping-oasis.md`) extends coverage to those.
 fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
-    fn visit_stmts(stmts: &mut [ud_ast::Stmt]) {
+    /// Walk a slice of statements, threading the cursor IP
+    /// so each @asm's address is known. Symbolic-form
+    /// rewrites in the text (`label_<hex>`, `sub_<hex>`)
+    /// get de-symbolised against the cursor before the
+    /// assembly attempt — that lets us drop bytes from
+    /// jumps and intra-program calls, not just pure forms.
+    fn visit_stmts(stmts: &mut [ud_ast::Stmt], ip: &mut u64) {
         for stmt in stmts.iter_mut() {
             match stmt {
                 ud_ast::Stmt::Asm { text, bytes } => {
+                    let here = *ip;
                     if bytes.is_empty() {
+                        // No bytes to drop; advance by the
+                        // BPF slot width so addresses stay
+                        // consistent across the walk.
+                        *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
                         continue;
                     }
+                    // Try the pure form first (no rewrites);
+                    // covers `exit`, `<lddw-cont …>`, and
+                    // any @asm that escaped the symbolic
+                    // rewrites.
+                    let mut dropped = false;
                     if let Ok(encoded) = ud_arch_bpf::assemble_bpf(text) {
                         if encoded == *bytes {
                             bytes.clear();
+                            dropped = true;
                         }
                     }
+                    // De-symbolise then try again. CRITICAL:
+                    // we must only drop bytes when the
+                    // **lower-time default** (no opcode hint
+                    // available, since the .ud only carries
+                    // text) reproduces the original bytes.
+                    // Otherwise the asymmetry between
+                    // decompile and lower silently breaks the
+                    // round-trip. So we deliberately call the
+                    // resolver with `None` here, matching
+                    // exactly what lower will do.
+                    if !dropped {
+                        if let Some(desym) = ud_arch_bpf::desymbolize_bpf_text(text, here, None) {
+                            if desym != *text {
+                                if let Ok(encoded) = ud_arch_bpf::assemble_bpf(&desym) {
+                                    if encoded == *bytes {
+                                        bytes.clear();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
                 }
                 ud_ast::Stmt::IfBlock {
+                    cond_bytes,
                     then_body,
+                    then_tail_jmp,
                     else_body,
                     ..
                 } => {
-                    visit_stmts(then_body);
-                    visit_stmts(else_body);
+                    *ip = ip.saturating_add(cond_bytes.len() as u64);
+                    visit_stmts(then_body, ip);
+                    *ip = ip.saturating_add(then_tail_jmp.len() as u64);
+                    visit_stmts(else_body, ip);
                 }
-                ud_ast::Stmt::WhileBlock { body: wb, .. } => visit_stmts(wb),
+                ud_ast::Stmt::WhileBlock {
+                    entry_bytes,
+                    body: wb,
+                    tail_bytes,
+                    ..
+                } => {
+                    *ip = ip.saturating_add(entry_bytes.len() as u64);
+                    visit_stmts(wb, ip);
+                    *ip = ip.saturating_add(tail_bytes.len() as u64);
+                }
                 ud_ast::Stmt::IfBranch {
                     pre_body,
+                    cond_bytes,
                     then_body,
                     else_body,
                     ..
                 } => {
-                    visit_stmts(pre_body);
-                    visit_stmts(then_body);
+                    visit_stmts(pre_body, ip);
+                    *ip = ip.saturating_add(cond_bytes.len() as u64);
+                    visit_stmts(then_body, ip);
                     if let Some(eb) = else_body {
-                        visit_stmts(eb);
+                        visit_stmts(eb, ip);
                     }
                 }
+                // Labels and comments don't consume bytes;
+                // anything else the BPF decompile path
+                // doesn't emit today, so we conservatively
+                // leave the cursor where it is and continue
+                // (a future addition would need to extend
+                // this match).
                 _ => {}
             }
         }
     }
 
+    /// Recover the function's IP-space starting address.
+    /// Order of preference:
+    /// 1. `fd.addr` if set (`@addr(0x…)` survived the
+    ///    `drop_redundant_function_addrs` pass).
+    /// 2. Hex suffix of the name: `sub_<hex>` maps to the
+    ///    address directly (this is the convention the
+    ///    decompiler uses when no real symbol exists).
+    /// 3. Zero — give up; the byte-drop won't fire for
+    ///    address-dependent symbolic forms in this function.
+    fn fn_base_addr(fd: &ud_ast::FnDecl) -> u64 {
+        if let Some(a) = fd.addr {
+            return a;
+        }
+        if let Some(rest) = fd.name.strip_prefix("sub_") {
+            if let Ok(a) = u64::from_str_radix(rest, 16) {
+                return a;
+            }
+        }
+        0
+    }
+
     fn visit_item(item: &mut Item) {
         match item {
-            Item::Function(fd) => visit_stmts(&mut fd.body),
+            Item::Function(fd) => {
+                let mut ip = fn_base_addr(fd);
+                visit_stmts(&mut fd.body, &mut ip);
+            }
             Item::Section { items, .. } => {
                 for sub in items.iter_mut() {
                     visit_item(sub);

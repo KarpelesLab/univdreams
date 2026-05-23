@@ -127,7 +127,26 @@ pub fn assemble_bpf(text: &str) -> Result<Vec<u8>, AssembleError> {
 
         // ---------------- Control flow ----------------
         "ja" => assemble_ja(&operands),
-        "call" => assemble_call(&operands),
+        "call" => assemble_call(&operands, /* src=*/ 0),
+        // BPF-to-BPF intra-program calls have two encodings
+        // in the wild:
+        //
+        //   * Solana sBPF: opcode `0x85`, src=1, imm=signed
+        //     slot count. Emitted by `format_insn` as
+        //     `call <hex>` (same as syscall — the src nibble
+        //     distinguishes them in the byte stream).
+        //   * Linux eBPF + a few toolchains that misuse
+        //     `EM_BPF` for SBF: opcode `0x8d`, src=0,
+        //     imm=signed slot count.
+        //
+        // Neither is in `format_insn`'s output directly —
+        // the de-symbolizer in `ud-translate` rewrites the
+        // user-facing `call sub_<hex>` text into one of the
+        // two mnemonics below based on the original byte's
+        // opcode, so the byte-drop pass can recover the
+        // exact encoding.
+        "call_internal" => assemble_call(&operands, /* src=*/ 1),
+        "call_local" => assemble_call_local(&operands),
         "callx" => assemble_callx(&operands),
 
         // ---------------- ALU + jumps with suffix ----------------
@@ -232,10 +251,35 @@ fn assemble_ja(operands: &[&str]) -> Result<Vec<u8>, AssembleError> {
     Ok(encode_slot(0x05, 0, 0, off, 0))
 }
 
-fn assemble_call(operands: &[&str]) -> Result<Vec<u8>, AssembleError> {
+fn assemble_call(operands: &[&str], src: u8) -> Result<Vec<u8>, AssembleError> {
     arity(operands, 1, "call")?;
-    let imm = parse_int(operands[0], "call")?;
-    Ok(encode_slot(0x85, 0, 0, 0, imm))
+    let imm = parse_int_signed(operands[0], "call")?;
+    Ok(encode_slot(0x85, 0, src, 0, imm))
+}
+
+/// Linux BPF-to-BPF call: opcode `0x8d`, dst=0, src=0,
+/// imm=signed slot count.
+fn assemble_call_local(operands: &[&str]) -> Result<Vec<u8>, AssembleError> {
+    arity(operands, 1, "call_local")?;
+    let imm = parse_int_signed(operands[0], "call_local")?;
+    Ok(encode_slot(0x8d, 0, 0, 0, imm))
+}
+
+/// Like [`parse_int`] but accepts a leading `-` so callers
+/// can pass signed slot counts (used by the desymbolised
+/// `call_internal` form, whose imm may be negative when
+/// calling a function earlier in the section).
+fn parse_int_signed(text: &str, ctx: &'static str) -> Result<i32, AssembleError> {
+    let t = text.trim();
+    if let Some(rest) = t.strip_prefix('-') {
+        let v = parse_uint(rest, ctx)?;
+        if v > 0x8000_0000 {
+            return Err(AssembleError::ImmediateOverflow { value: v, bits: 32 });
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        return Ok(-(v as i64) as i32);
+    }
+    parse_int(t, ctx)
 }
 
 fn assemble_callx(operands: &[&str]) -> Result<Vec<u8>, AssembleError> {
@@ -504,6 +548,91 @@ fn parse_branch_offset(text: &str) -> Result<i16, AssembleError> {
     i16::try_from(signed).map_err(|_| AssembleError::OffsetOverflow(signed))
 }
 
+/// Convert a symbolic BPF @asm text — the form
+/// `crates/ud-translate/src/decompile/bpf.rs` produces
+/// after applying `label_<hex>` and `sub_<hex>` rewrites —
+/// into the numeric form [`assemble_bpf`] accepts.
+///
+/// The rewrites both encode their target address into the
+/// name (`label_4ab28` ↔ address 0x4ab28, same for
+/// `sub_<hex>`). Recovering the address is therefore as
+/// simple as parsing the hex suffix; no map lookup needed.
+/// `insn_addr` is the address of the @asm being assembled
+/// — branch offsets and internal-call imms are slot-relative
+/// to the *next* instruction (insn_addr + 8).
+///
+/// When the input has no symbolic refs, the output is the
+/// input unchanged. Returns `None` when a symbolic name
+/// doesn't parse to a hex address — the caller treats that
+/// the same as an assembler error and keeps the bytes
+/// pinned.
+#[must_use]
+pub fn desymbolize_bpf_text(text: &str, insn_addr: u64, opcode_hint: Option<u8>) -> Option<String> {
+    // Calls: `call sub_<hex>` → the right intra-program call
+    // mnemonic. The opcode_hint tells us which encoding the
+    // original byte stream used (`0x8d` = Linux BPF-to-BPF,
+    // anything else = Solana sBPF with src=1). When the
+    // caller doesn't know (lower path, no original bytes),
+    // we default to `call_internal` (Solana sBPF), which
+    // is the dominant convention.
+    if let Some(rest) = text.strip_prefix("call sub_") {
+        let target = u64::from_str_radix(rest.trim(), 16).ok()?;
+        let next_slot = insn_addr.wrapping_add(INSN_SIZE as u64);
+        #[allow(clippy::cast_possible_wrap)]
+        let delta = (target as i64).wrapping_sub(next_slot as i64);
+        if delta % (INSN_SIZE as i64) != 0 {
+            return None;
+        }
+        let slot_count = delta / (INSN_SIZE as i64);
+        let mnemonic = match opcode_hint {
+            Some(0x8d) => "call_local",
+            _ => "call_internal",
+        };
+        return Some(format!("{mnemonic} {slot_count}"));
+    }
+
+    // Conditional jumps + `ja`: replace a trailing
+    // `, label_<hex>` (or `, label_<hex>` after the third
+    // operand for `jXX`) with the slot-relative `+0xN` /
+    // `-0xN` shape `assemble_bpf` parses.
+    if let Some(label_at) = text.find(", label_").or_else(|| text.find(" label_")) {
+        // Two shapes:
+        //   `jXX rA, rhs, label_<hex>`  — JmpCond, 3 operands
+        //   `ja label_<hex>`            — 1 operand
+        let prefix = &text[..label_at];
+        let suffix_offset = label_at
+            + match text.as_bytes().get(label_at) {
+                Some(b',') => 2, // ", "
+                _ => 1,          // " "
+            };
+        let label_name = &text[suffix_offset..];
+        let hex = label_name.strip_prefix("label_")?;
+        let target = u64::from_str_radix(hex.trim(), 16).ok()?;
+        let next_slot = insn_addr.wrapping_add(INSN_SIZE as u64);
+        #[allow(clippy::cast_possible_wrap)]
+        let delta = (target as i64).wrapping_sub(next_slot as i64);
+        if delta % (INSN_SIZE as i64) != 0 {
+            return None;
+        }
+        let slot_offset = delta / (INSN_SIZE as i64);
+        let offset_text = if slot_offset >= 0 {
+            format!("+0x{slot_offset:x}")
+        } else {
+            format!("-0x{:x}", -slot_offset)
+        };
+        let separator = if text.as_bytes().get(label_at) == Some(&b',') {
+            ", "
+        } else {
+            " "
+        };
+        return Some(format!("{prefix}{separator}{offset_text}"));
+    }
+
+    // Nothing to de-symbolize — return as-is so the caller
+    // can still attempt assembly on the pure-form path.
+    Some(text.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +718,97 @@ mod tests {
     fn unrecognised_mnemonic_text_returns_err() {
         let err = assemble_bpf("<jcc?> r1, r2, +0x1").unwrap_err();
         assert!(matches!(err, AssembleError::UnknownMnemonic(_)));
+    }
+
+    /// `call sub_<hex>` desymbolises to `call_internal <slot_count>`,
+    /// which assembles to opcode 0x85 with src=1 and the
+    /// computed relative slot count in imm — matching the
+    /// bytes Solana BPF emits for an intra-program call.
+    #[test]
+    fn desymbolise_internal_call_round_trips() {
+        // Forward call from 0x1000 to 0x2000 — 0x1000 / 8 =
+        // 0x200 slots forward; but the offset is computed
+        // from the next slot (0x1008), so 0xff8 / 8 = 0x1ff slots.
+        let text = "call sub_2000";
+        let desym = desymbolize_bpf_text(text, 0x1000, None).unwrap();
+        assert_eq!(desym, "call_internal 511"); // 0xff8 / 8 = 511
+        let bytes = assemble_bpf(&desym).unwrap();
+        assert_eq!(bytes[0], 0x85); // call opcode
+        assert_eq!(bytes[1], 0x10); // src=1, dst=0
+        let imm = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(imm, 511);
+    }
+
+    #[test]
+    fn desymbolise_backward_call() {
+        // Backward call: from 0x2000 to 0x1000.
+        // Next slot = 0x2008, target = 0x1000, delta = -0x1008 / 8 = -513.
+        let text = "call sub_1000";
+        let desym = desymbolize_bpf_text(text, 0x2000, None).unwrap();
+        assert_eq!(desym, "call_internal -513");
+        let bytes = assemble_bpf(&desym).unwrap();
+        let imm = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(imm, -513);
+    }
+
+    #[test]
+    fn desymbolise_jcc_label_round_trips() {
+        // jeq r1, 0x0, label_1010 at insn_addr 0x1000:
+        //   next_slot = 0x1008, target = 0x1010, delta = 8,
+        //   slot_offset = +1.
+        let text = "jeq r1, 0x0, label_1010";
+        let desym = desymbolize_bpf_text(text, 0x1000, None).unwrap();
+        assert_eq!(desym, "jeq r1, 0x0, +0x1");
+        let bytes = assemble_bpf(&desym).unwrap();
+        assert_eq!(bytes[0], 0x15); // jeq imm-src JMP
+        let off = i16::from_le_bytes(bytes[2..4].try_into().unwrap());
+        assert_eq!(off, 1);
+    }
+
+    #[test]
+    fn desymbolise_backward_jcc() {
+        // jgt r2, r3, label_1000 at insn_addr 0x1020:
+        //   next_slot = 0x1028, target = 0x1000, delta = -0x28,
+        //   slot_offset = -5.
+        let text = "jgt r2, r3, label_1000";
+        let desym = desymbolize_bpf_text(text, 0x1020, None).unwrap();
+        assert_eq!(desym, "jgt r2, r3, -0x5");
+        let bytes = assemble_bpf(&desym).unwrap();
+        let off = i16::from_le_bytes(bytes[2..4].try_into().unwrap());
+        assert_eq!(off, -5);
+    }
+
+    #[test]
+    fn desymbolise_ja_label() {
+        // ja label_1008 at insn_addr 0x1000:
+        //   next_slot = 0x1008, target = 0x1008, delta = 0.
+        let text = "ja label_1008";
+        let desym = desymbolize_bpf_text(text, 0x1000, None).unwrap();
+        assert_eq!(desym, "ja +0x0");
+        let bytes = assemble_bpf(&desym).unwrap();
+        assert_eq!(bytes[0], 0x05);
+        let off = i16::from_le_bytes(bytes[2..4].try_into().unwrap());
+        assert_eq!(off, 0);
+    }
+
+    #[test]
+    fn desymbolise_non_symbolic_text_passes_through() {
+        let text = "ldxdw r0, [r5 - 0xff8]";
+        assert_eq!(desymbolize_bpf_text(text, 0x1000, None).unwrap(), text);
+    }
+
+    #[test]
+    fn desymbolise_syscall_call_falls_through_then_assemble_fails() {
+        // `call sol_log_` has no `sub_<hex>` shape — it
+        // returns unchanged. The caller then tries
+        // assemble_bpf, which can't parse `sol_log_` as a
+        // numeric imm and returns Err. The combined effect
+        // is "byte-drop pass keeps bytes pinned" — exactly
+        // what we want for syscall sites where we don't
+        // know the imm.
+        let through = desymbolize_bpf_text("call sol_log_", 0x1000, None).unwrap();
+        assert_eq!(through, "call sol_log_");
+        assert!(assemble_bpf(&through).is_err());
     }
 
     #[test]

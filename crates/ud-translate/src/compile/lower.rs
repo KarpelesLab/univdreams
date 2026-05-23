@@ -379,23 +379,38 @@ fn lower_stmts_into(
                     let ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
                     let encoded =
                         ud_arch_x86::assemble_intel(ud_arch_x86::Bitness::Bits64, text, ip)
-                            .or_else(|x86_err| {
-                                ud_arch_bpf::assemble_bpf(text)
-                                    .map_err(|bpf_err| (x86_err.to_string(), bpf_err.to_string()))
-                            })
-                            .map_err(|(_x86_err, bpf_err)| {
-                                // Both assemblers refused the text.
-                                // We surface the BPF error since x86
-                                // typically fails with a parse-error
-                                // on BPF mnemonics that isn't
-                                // actionable to the user.
-                                let message = bpf_err;
-                                LowerError::AsmAssembleFailed {
-                                    fn_name: fn_name.to_string(),
-                                    stmt_index: i,
-                                    text: text.clone(),
-                                    message,
+                            .or_else(|_x86_err| ud_arch_bpf::assemble_bpf(text))
+                            .or_else(|bpf_err| {
+                                // BPF-symbolic forms: try the
+                                // de-symboliser before giving up.
+                                // It rewrites `call sub_<hex>`
+                                // and `jXX …, label_<hex>` to
+                                // numeric forms the BPF
+                                // assembler can encode.
+                                // At lower time we don't
+                                // have the original opcode
+                                // bytes (the .ud carries only
+                                // text). Default to the Solana
+                                // sBPF call encoding — that's
+                                // the dominant case; Linux
+                                // BPF-to-BPF programs always
+                                // edit their @asm with the
+                                // explicit `call_local`
+                                // mnemonic.
+                                if let Some(desym) =
+                                    ud_arch_bpf::desymbolize_bpf_text(text, ip, None)
+                                {
+                                    if desym != *text {
+                                        return ud_arch_bpf::assemble_bpf(&desym);
+                                    }
                                 }
+                                Err(bpf_err)
+                            })
+                            .map_err(|bpf_err| LowerError::AsmAssembleFailed {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                                text: text.clone(),
+                                message: bpf_err.to_string(),
                             })?;
                     out.extend_from_slice(&encoded);
                 } else {
