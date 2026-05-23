@@ -568,12 +568,25 @@ fn render_text(
     data: Option<&dyn DataLookup>,
 ) -> String {
     if matches!(insn.kind, InsnKind::Call) {
+        // BPF-to-BPF intra-program calls have two encodings:
+        // Solana sBPF uses opcode 0x85 + src=1; the Linux
+        // BPF-to-BPF convention uses opcode 0x8d. We
+        // surface the distinction in the rendered text by
+        // using a `call` vs `call_local` mnemonic so the
+        // byte-drop pass and the lower path can recover the
+        // exact original encoding from the text alone (no
+        // hidden bytes, no out-of-band hint).
+        let call_mnem = if insn.opcode == 0x8d {
+            "call_local"
+        } else {
+            "call"
+        };
         if let Some(name) = call_site_names.get(&insn.addr.0) {
-            return format!("call {name}");
+            return format!("{call_mnem} {name}");
         }
         let target = call_target(insn);
         if let Some(name) = name_at.get(&target) {
-            return format!("call {name}");
+            return format!("{call_mnem} {name}");
         }
     }
     // Layer 6c+: for `lddw r, imm64` whose imm64 lands in a

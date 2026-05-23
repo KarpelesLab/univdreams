@@ -269,6 +269,53 @@ fn assemble_call_local(operands: &[&str]) -> Result<Vec<u8>, AssembleError> {
 /// can pass signed slot counts (used by the desymbolised
 /// `call_internal` form, whose imm may be negative when
 /// calling a function earlier in the section).
+/// Helper for `desymbolize_bpf_text`: compute the signed
+/// slot offset between two instruction addresses, expressed
+/// in BPF slot units (8 bytes). Returns `None` when the
+/// delta isn't slot-aligned (would never happen for a
+/// well-formed BPF binary but defensively guarded).
+fn slot_offset_from(target: u64, insn_addr: u64) -> Option<i64> {
+    let next_slot = insn_addr.wrapping_add(INSN_SIZE as u64);
+    #[allow(clippy::cast_possible_wrap)]
+    let delta = (target as i64).wrapping_sub(next_slot as i64);
+    if delta % (INSN_SIZE as i64) != 0 {
+        return None;
+    }
+    Some(delta / (INSN_SIZE as i64))
+}
+
+/// Recognise a textual `call <name>` (or `call_local
+/// <name>`) where `<name>` is symbolic — a function name
+/// like `abort`, `sol_log_`, `entrypoint`, etc. — rather
+/// than a numeric immediate the assembler can parse
+/// directly. Used by the syscall-placeholder branch of
+/// `desymbolize_bpf_text` to skip pure-form callees that
+/// the assembler already handles.
+fn is_symbolic_callee(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    if name.starts_with("0x") || name.starts_with("0X") {
+        return false;
+    }
+    if name.starts_with("sub_") {
+        return false;
+    }
+    // First char must be a letter or `_`; pure-numeric
+    // literals are caught above. Conditional-jump shapes
+    // like `r1, r2, label_X` would have a `,` in `name`
+    // — exclude those too.
+    let first = name.as_bytes()[0];
+    if first.is_ascii_digit() {
+        return false;
+    }
+    if name.contains(',') {
+        return false;
+    }
+    true
+}
+
 fn parse_int_signed(text: &str, ctx: &'static str) -> Result<i32, AssembleError> {
     let t = text.trim();
     if let Some(rest) = t.strip_prefix('-') {
@@ -568,27 +615,47 @@ fn parse_branch_offset(text: &str) -> Result<i16, AssembleError> {
 /// pinned.
 #[must_use]
 pub fn desymbolize_bpf_text(text: &str, insn_addr: u64, opcode_hint: Option<u8>) -> Option<String> {
-    // Calls: `call sub_<hex>` → the right intra-program call
-    // mnemonic. The opcode_hint tells us which encoding the
-    // original byte stream used (`0x8d` = Linux BPF-to-BPF,
-    // anything else = Solana sBPF with src=1). When the
-    // caller doesn't know (lower path, no original bytes),
-    // we default to `call_internal` (Solana sBPF), which
-    // is the dominant convention.
+    // Intra-program calls — EXPLICIT `call_local sub_<hex>`
+    // form. The renderer emits this when the original byte
+    // encoding is the Linux BPF-to-BPF opcode `0x8d`. The
+    // mnemonic itself tells us which assembler path to take
+    // — opcode_hint is moot here.
+    if let Some(rest) = text.strip_prefix("call_local sub_") {
+        let target = u64::from_str_radix(rest.trim(), 16).ok()?;
+        let slots = slot_offset_from(target, insn_addr)?;
+        return Some(format!("call_local {slots}"));
+    }
+
+    // Intra-program calls — Solana sBPF default form. The
+    // renderer emits plain `call sub_<hex>` for the
+    // `0x85 src=1` encoding.
     if let Some(rest) = text.strip_prefix("call sub_") {
         let target = u64::from_str_radix(rest.trim(), 16).ok()?;
-        let next_slot = insn_addr.wrapping_add(INSN_SIZE as u64);
-        #[allow(clippy::cast_possible_wrap)]
-        let delta = (target as i64).wrapping_sub(next_slot as i64);
-        if delta % (INSN_SIZE as i64) != 0 {
-            return None;
-        }
-        let slot_count = delta / (INSN_SIZE as i64);
+        let slots = slot_offset_from(target, insn_addr)?;
         let mnemonic = match opcode_hint {
             Some(0x8d) => "call_local",
             _ => "call_internal",
         };
-        return Some(format!("{mnemonic} {slot_count}"));
+        return Some(format!("{mnemonic} {slots}"));
+    }
+
+    // Syscall placeholders — `call <name>` (or
+    // `call_local <name>`) where the name isn't a
+    // `sub_<hex>` placeholder. Solana SBF programs emit
+    // these with the imm field set to `-1` (0xffffffff) as
+    // a relocation marker the loader patches at load time.
+    // We rewrite to `call_internal -1` / `call_local -1`;
+    // the byte-drop pass's match-test catches sites whose
+    // original imm wasn't `-1` and keeps those pinned.
+    if let Some(name) = text.strip_prefix("call ") {
+        if is_symbolic_callee(name) {
+            return Some("call_internal -1".to_string());
+        }
+    }
+    if let Some(name) = text.strip_prefix("call_local ") {
+        if is_symbolic_callee(name) {
+            return Some("call_local -1".to_string());
+        }
     }
 
     // Conditional jumps + `ja`: replace a trailing
@@ -628,9 +695,57 @@ pub fn desymbolize_bpf_text(text: &str, insn_addr: u64, opcode_hint: Option<u8>)
         return Some(format!("{prefix}{separator}{offset_text}"));
     }
 
+    // Stack-slot rewrites — the BPF renderer collapses
+    // `[r10 - 0xN]` to `[local_<N>]` (local var) and
+    // `[r10 + 0xN]` to `[arg_<N>]` (incoming arg slot).
+    // Reverse those so `assemble_bpf` can parse the
+    // resulting `[r10 ± 0xN]` form.
+    let mut s = text.to_string();
+    let mut changed = false;
+    if s.contains("[local_") {
+        s = rewrite_stack_slot(&s, "[local_", "[r10 - 0x");
+        changed = true;
+    }
+    if s.contains("[arg_") {
+        s = rewrite_stack_slot(&s, "[arg_", "[r10 + 0x");
+        changed = true;
+    }
+    if changed {
+        return Some(s);
+    }
+
     // Nothing to de-symbolize — return as-is so the caller
     // can still attempt assembly on the pure-form path.
     Some(text.to_string())
+}
+
+/// Rewrite every occurrence of `prefix<hex>]` in `text`
+/// (e.g. `[local_40]`) to `replacement<hex>]` (e.g.
+/// `[r10 - 0x40]`). The hex body is preserved verbatim; the
+/// only change is the prefix/suffix wrapping.
+fn rewrite_stack_slot(text: &str, prefix: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(prefix) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + prefix.len()..];
+        // Find the closing `]`.
+        if let Some(close) = after.find(']') {
+            let hex = &after[..close];
+            out.push_str(replacement);
+            out.push_str(hex);
+            out.push(']');
+            rest = &after[close + 1..];
+        } else {
+            // Malformed (no closing `]`) — bail with the
+            // partial output appended; the caller's
+            // assemble step will fail cleanly.
+            out.push_str(&rest[at..]);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -798,17 +913,30 @@ mod tests {
     }
 
     #[test]
-    fn desymbolise_syscall_call_falls_through_then_assemble_fails() {
-        // `call sol_log_` has no `sub_<hex>` shape — it
-        // returns unchanged. The caller then tries
-        // assemble_bpf, which can't parse `sol_log_` as a
-        // numeric imm and returns Err. The combined effect
-        // is "byte-drop pass keeps bytes pinned" — exactly
-        // what we want for syscall sites where we don't
-        // know the imm.
-        let through = desymbolize_bpf_text("call sol_log_", 0x1000, None).unwrap();
-        assert_eq!(through, "call sol_log_");
-        assert!(assemble_bpf(&through).is_err());
+    fn desymbolise_syscall_call_yields_relocation_placeholder() {
+        // Solana SBF syscalls (and the `abort` stub) carry
+        // a literal `-1` imm at decompile time — the loader
+        // patches it at load. We rewrite `call <name>`
+        // (any non-`sub_<hex>` callee) to `call_internal -1`
+        // so the byte-drop pass can recover the encoding
+        // when the original bytes used that placeholder.
+        let dsym = desymbolize_bpf_text("call sol_log_", 0x1000, None).unwrap();
+        assert_eq!(dsym, "call_internal -1");
+        let bytes = assemble_bpf(&dsym).unwrap();
+        assert_eq!(bytes, vec![0x85, 0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn desymbolise_call_local_explicit_form() {
+        // `call_local sub_<hex>` in the .ud text — the
+        // explicit Linux BPF-to-BPF form. Yields the 0x8d
+        // opcode regardless of opcode_hint.
+        let dsym = desymbolize_bpf_text("call_local sub_1010", 0x1000, None).unwrap();
+        assert_eq!(dsym, "call_local 1");
+        let bytes = assemble_bpf(&dsym).unwrap();
+        assert_eq!(bytes[0], 0x8d);
+        let imm = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(imm, 1);
     }
 
     #[test]
