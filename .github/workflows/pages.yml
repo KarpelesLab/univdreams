@@ -19,7 +19,7 @@ env:
   # Pin wasm-bindgen-cli to the same version the workspace resolves
   # so the JS glue matches the runtime exactly. Bump in lockstep
   # when ud-wasm's Cargo.lock entry changes.
-  WASM_BINDGEN_VERSION: "0.2.121"
+  WASM_BINDGEN_VERSION: "0.2.122"
 
 jobs:
   build:
