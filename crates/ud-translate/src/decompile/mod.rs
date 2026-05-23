@@ -31,6 +31,7 @@
 mod aarch64;
 mod args;
 mod bpf;
+mod bpf_ssa;
 mod build_function;
 mod build_module;
 mod data_lookup;
