@@ -1178,6 +1178,55 @@ pub fn register(registry: &mut Registry) {
         stub_get_console_mode as StubFn,
         2,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/timezoneapi/nf-timezoneapi-localfiletimetofiletime
+    registry.register(
+        "kernel32.dll",
+        "LocalFileTimeToFileTime",
+        stub_local_file_time_to_file_time as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectorya
+    registry.register(
+        "kernel32.dll",
+        "RemoveDirectoryA",
+        stub_remove_directory_a as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setendoffile
+    registry.register(
+        "kernel32.dll",
+        "SetEndOfFile",
+        stub_returns_true as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileattributesa
+    registry.register(
+        "kernel32.dll",
+        "SetFileAttributesA",
+        stub_returns_true as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfiletime
+    registry.register(
+        "kernel32.dll",
+        "SetFileTime",
+        stub_returns_true as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-setprocessworkingsetsize
+    registry.register(
+        "kernel32.dll",
+        "SetProcessWorkingSetSize",
+        stub_returns_true as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/consoleapi/nf-consoleapi-writeconsolew
+    registry.register(
+        "kernel32.dll",
+        "WriteConsoleW",
+        stub_write_console_w as StubFn,
+        5,
+    );
 }
 
 // ----- Heap ----------------------------------------------------------
@@ -4658,6 +4707,89 @@ fn stub_get_console_mode(
     }
     state.last_error = ERROR_INVALID_HANDLE;
     Ok(0)
+}
+
+/// `BOOL LocalFileTimeToFileTime(const FILETIME *lpLocalFileTime,
+/// LPFILETIME lpFileTime)`. Single-timezone sandbox — copy the
+/// 8-byte FILETIME through unchanged.
+fn stub_local_file_time_to_file_time(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_src = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalFileTimeToFileTime", t))?;
+    let p_dst = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("LocalFileTimeToFileTime", t))?;
+    if p_src == 0 || p_dst == 0 {
+        return Ok(0);
+    }
+    let lo = mmu
+        .load32(p_src)
+        .map_err(|t| trap_to_win32("LocalFileTimeToFileTime", t))?;
+    let hi = mmu
+        .load32(p_src + 4)
+        .map_err(|t| trap_to_win32("LocalFileTimeToFileTime", t))?;
+    mmu.store32(p_dst, lo)
+        .map_err(|t| trap_to_win32("LocalFileTimeToFileTime", t))?;
+    mmu.store32(p_dst + 4, hi)
+        .map_err(|t| trap_to_win32("LocalFileTimeToFileTime", t))?;
+    Ok(1)
+}
+
+/// `BOOL RemoveDirectoryA(LPCSTR lpPathName)`. Drops the
+/// directory marker from the VFS; success either way.
+fn stub_remove_directory_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("RemoveDirectoryA", t))?;
+    if p_name == 0 {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(0);
+    }
+    let name = read_cstr(mmu, p_name, 260)?;
+    let marker = format!("{}\\.dir", name.trim_end_matches(['\\', '/']));
+    if let Some(vfs) = state.context.vfs.as_mut() {
+        vfs.remove(&marker);
+    }
+    Ok(1)
+}
+
+/// `BOOL WriteConsoleW(HANDLE hConsoleOutput, const VOID *lpBuffer,
+/// DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten,
+/// LPVOID lpReserved)`. Captures the UTF-16 buffer into the
+/// `debug_log` so the monitor's "what did the installer say?"
+/// view picks it up. Reports the full count as written.
+fn stub_write_console_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WriteConsoleW", t))?;
+    let p_buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WriteConsoleW", t))?;
+    let n_chars = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WriteConsoleW", t))?;
+    let lp_written = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WriteConsoleW", t))?;
+    let _resv = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("WriteConsoleW", t))?;
+    if p_buf != 0 && n_chars > 0 {
+        let cap = (n_chars as usize).min(4096);
+        let mut units = Vec::with_capacity(cap);
+        for i in 0..cap {
+            units.push(
+                mmu.load16(p_buf + (i as u32) * 2)
+                    .map_err(|t| trap_to_win32("WriteConsoleW", t))?,
+            );
+        }
+        let s = String::from_utf16_lossy(&units);
+        state.debug_log.push(s);
+    }
+    if lp_written != 0 {
+        mmu.store32(lp_written, n_chars)
+            .map_err(|t| trap_to_win32("WriteConsoleW", t))?;
+    }
+    Ok(1)
 }
 
 #[cfg(test)]

@@ -1412,10 +1412,32 @@ impl Cpu {
                 eip: entry_eip,
                 mnemonic: "far call/jmp",
             }),
-            0x8E | 0x8C => Err(Trap::PrivilegedOpcode {
-                eip: entry_eip,
-                mnemonic: "mov sreg",
-            }),
+            // `MOV r/m16, Sreg` (0x8C) and `MOV Sreg, r/m16` (0x8E).
+            // Userland 32-bit code uses these only to save/restore
+            // segment selectors into a CONTEXT structure (the CRT's
+            // RtlCaptureContext-style exception bookkeeping). The
+            // segment selectors don't affect memory addressing in
+            // the flat user-mode model — CS/DS/ES/SS use a fixed
+            // flat selector, FS_BASE is set elsewhere (TIB), GS is
+            // unused. We hand back canonical Win32 selector values
+            // on read; writes are accepted and discarded.
+            //
+            // Reference: Intel SDM Vol. 2A `MOV — Move to/from
+            // Segment Register` instruction reference.
+            0x8C => {
+                let mr = self.fetch_modrm(mmu)?;
+                let value = win32_segment_selector(mr.reg);
+                let (_old, dst) = self.resolve_op16(mr, mmu)?;
+                self.write_op16(dst, value, mmu)?;
+                Ok(StepOk::Continued)
+            }
+            0x8E => {
+                let mr = self.fetch_modrm(mmu)?;
+                // Read + discard — the selector value carries no
+                // meaning in our flat memory model.
+                let _ = self.resolve_op16(mr, mmu)?;
+                Ok(StepOk::Continued)
+            }
 
             other => Err(Trap::UndefinedOpcode {
                 eip: entry_eip,
@@ -1964,6 +1986,16 @@ impl Cpu {
                 Ok(())
             }
             Op8Dst::Mem(addr) => mmu.store8(addr, value),
+        }
+    }
+
+    fn write_op16(&mut self, dst: Op16Dst, value: u16, mmu: &mut Mmu) -> Result<(), Trap> {
+        match dst {
+            Op16Dst::Reg(r) => {
+                self.regs.set16(r, value);
+                Ok(())
+            }
+            Op16Dst::Mem(addr) => mmu.store16(addr, value),
         }
     }
 
@@ -3209,10 +3241,24 @@ enum Op8Dst {
 
 #[derive(Copy, Clone, Debug)]
 enum Op16Dst {
-    #[allow(dead_code)]
     Reg(Reg16),
-    #[allow(dead_code)]
     Mem(u32),
+}
+
+/// Canonical Win32 user-mode segment selector value for a ModR/M
+/// reg-field index. The selector itself carries no meaning in the
+/// flat memory model — codecs only read this back to stash into a
+/// `CONTEXT` struct's `SegCs` / `SegDs` / … slots.
+fn win32_segment_selector(reg_field: u8) -> u16 {
+    match reg_field & 7 {
+        0 => 0x0023, // ES
+        1 => 0x001B, // CS
+        2 => 0x0023, // SS
+        3 => 0x0023, // DS
+        4 => 0x003B, // FS — per-thread TIB selector
+        5 => 0x0000, // GS — unused in 32-bit NT
+        _ => 0x0000,
+    }
 }
 
 /// String-operation operand size. The dword-form opcodes
