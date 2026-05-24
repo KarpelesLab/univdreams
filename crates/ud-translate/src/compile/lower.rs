@@ -684,10 +684,8 @@ fn lower_stmts_into(
                 // Resolve cond_bytes (regenerate when empty).
                 let cb = if cond_bytes.is_empty() {
                     let then_tail_size = then_tail_jmp_len(then_tail_jmp, else_body);
-                    let cond_target = ifblock_ip
-                        + cond_len as u64
-                        + then_buf.len() as u64
-                        + then_tail_size;
+                    let cond_target =
+                        ifblock_ip + cond_len as u64 + then_buf.len() as u64 + then_tail_size;
                     arch.encode_cond_jump(
                         cond_text,
                         ifblock_ip,
@@ -710,11 +708,9 @@ fn lower_stmts_into(
                         Vec::new()
                     } else {
                         // Emit a `ja` over the else body.
-                        let ttj_ip = base_addr
-                            .map_or(0, |a| a.saturating_add(out.len() as u64));
+                        let ttj_ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
                         let jmp_size =
-                            arch.encoded_jump_size(ttj_ip, ttj_ip, EncodeHints::default())
-                                as u64;
+                            arch.encoded_jump_size(ttj_ip, ttj_ip, EncodeHints::default()) as u64;
                         let jmp_target = ttj_ip + jmp_size + else_buf.len() as u64;
                         arch.encode_jump(ttj_ip, jmp_target, EncodeHints::default())
                             .map_err(|e| LowerError::AsmAssembleFailed {
@@ -755,18 +751,13 @@ fn lower_stmts_into(
                     let tail_size = tail_bytes_len(tail_bytes);
                     let cond_target =
                         entry_ip + entry_len as u64 + body_buf.len() as u64 + tail_size;
-                    arch.encode_cond_jump(
-                        cond_text,
-                        entry_ip,
-                        cond_target,
-                        EncodeHints::default(),
-                    )
-                    .map_err(|e| LowerError::AsmAssembleFailed {
-                        fn_name: fn_name.to_string(),
-                        stmt_index: i,
-                        text: format!("whileblock({cond_text})"),
-                        message: e.to_string(),
-                    })?
+                    arch.encode_cond_jump(cond_text, entry_ip, cond_target, EncodeHints::default())
+                        .map_err(|e| LowerError::AsmAssembleFailed {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                            text: format!("whileblock({cond_text})"),
+                            message: e.to_string(),
+                        })?
                 } else {
                     entry_bytes.clone()
                 };
@@ -775,14 +766,13 @@ fn lower_stmts_into(
                 let tb = if tail_bytes.is_empty() {
                     // `ja` back to entry_ip from the current cursor.
                     let ja_ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
-                    arch.encode_jump(ja_ip, entry_ip, EncodeHints::default()).map_err(|e| {
-                        LowerError::AsmAssembleFailed {
+                    arch.encode_jump(ja_ip, entry_ip, EncodeHints::default())
+                        .map_err(|e| LowerError::AsmAssembleFailed {
                             fn_name: fn_name.to_string(),
                             stmt_index: i,
                             text: format!("whileblock({cond_text}) tail"),
                             message: e.to_string(),
-                        }
-                    })?
+                        })?
                 } else {
                     tail_bytes.clone()
                 };

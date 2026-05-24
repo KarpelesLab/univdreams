@@ -218,81 +218,82 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
         drop_regenerable_asm_bytes(&mut items, bitness);
     }
     if matches!(arch, Arch::Bpf { .. }) {
-        drop_regenerable_asm_bytes_bpf(&mut items);
+        // Build an ad-hoc codec for the byte-drop pass —
+        // mirrors what the compile-side does via
+        // `compile::module::resolve_arch_codec`, but the
+        // decompile pipeline doesn't yet have a parsed
+        // `@module` to resolve through the registry. We
+        // already classified the arch from `e_machine` above,
+        // so construct the codec directly.
+        let Arch::Bpf { variant } = arch else {
+            unreachable!();
+        };
+        let codec = ud_arch_bpf::BpfCodec(variant);
+        drop_regenerable_bytes(&mut items, &codec);
     }
 
     Ok(UdFile { module, items })
 }
 
-/// BPF analog of [`drop_regenerable_asm_bytes`] for x86.
+/// Generic byte-drop pass driven by an [`ud_arch_codec::ArchCodec`].
 ///
-/// BPF instructions are fixed-width 8-byte slots and branch
-/// offsets are slot-relative within the text — there's no
-/// IP threading needed; the assembler is a pure
-/// `text → bytes` function. We walk every `Stmt::Asm` and
-/// `Stmt::Comment` recursively (recursing into the BPF
-/// structural variants `IfBlock` and `WhileBlock` that the
-/// L5b layer produces), try to re-encode the text via
-/// [`ud_arch_bpf::assemble_bpf`], and drop the pinned bytes
-/// when the result matches.
+/// Walks every `Stmt::Asm` / `Stmt::IfBlock` / `Stmt::WhileBlock`
+/// recursively, asks the codec to re-encode each one's
+/// canonical text form, and clears the pinned bytes when the
+/// codec reproduces them exactly. The byte-identity guard means
+/// "drop only when the lower-time default reproduces these
+/// bytes" — the same regen happens on both sides, so a passing
+/// drop on this side guarantees round-trip.
 ///
-/// Symbolic text (`call sub_X`, `jeq …, label_Y`,
-/// `lddw r1, "string"`) fails to parse → bytes stay pinned.
-/// A future symbolic-resolver layer (described in the plan
-/// at `magical-popping-oasis.md`) extends coverage to those.
-#[allow(clippy::too_many_lines)]
-fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
+/// Originally BPF-specific; the trait abstraction lets the same
+/// loop service any fixed-width arch whose codec implements
+/// `assemble_one`, `desymbolize`, `encode_cond_jump`, and
+/// `encode_jump`. Arches without those methods return
+/// `Unsupported` and the loop is a no-op for them.
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
+fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCodec) {
+    // Probe the arch's fixed instruction width via a
+    // self-relative jump-size query. BPF returns 8;
+    // fixed-width arches return their natural width.
+    let slot_size = arch.encoded_jump_size(0, 0, ud_arch_codec::EncodeHints::default()) as u64;
+
     /// Walk a slice of statements, threading the cursor IP
-    /// so each @asm's address is known. Symbolic-form
-    /// rewrites in the text (`label_<hex>`, `sub_<hex>`)
-    /// get de-symbolised against the cursor before the
-    /// assembly attempt — that lets us drop bytes from
-    /// jumps and intra-program calls, not just pure forms.
-    fn visit_stmts(stmts: &mut [ud_ast::Stmt], ip: &mut u64) {
+    /// so each @asm's address is known.
+    fn visit_stmts(
+        stmts: &mut [ud_ast::Stmt],
+        ip: &mut u64,
+        arch: &dyn ud_arch_codec::ArchCodec,
+        slot_size: u64,
+    ) {
         for stmt in stmts.iter_mut() {
             match stmt {
                 ud_ast::Stmt::Asm { text, bytes } => {
                     let here = *ip;
                     if bytes.is_empty() {
-                        // No bytes to drop; advance by the
-                        // BPF slot width so addresses stay
-                        // consistent across the walk.
-                        *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
+                        *ip = ip.saturating_add(slot_size);
                         continue;
                     }
-                    // Try the pure form first (no rewrites);
-                    // covers `exit`, `<lddw-cont …>`, and
-                    // any @asm that escaped the symbolic
-                    // rewrites.
+                    // Try the pure form first; symbolic forms
+                    // (BPF's `call sub_<hex>`, `jeq …,
+                    // label_<hex>`) need desymbolize first.
                     let mut dropped = false;
-                    if let Ok(encoded) = ud_arch_bpf::assemble_bpf(text) {
+                    if let Ok(encoded) = arch.assemble_one(text, here) {
                         if encoded == *bytes {
                             bytes.clear();
                             dropped = true;
                         }
                     }
-                    // De-symbolise then try again. CRITICAL:
-                    // we must only drop bytes when the
-                    // **lower-time default** (no opcode hint
-                    // available, since the .ud only carries
-                    // text) reproduces the original bytes.
-                    // Otherwise the asymmetry between
-                    // decompile and lower silently breaks the
-                    // round-trip. So we deliberately call the
-                    // resolver with `None` here, matching
-                    // exactly what lower will do.
                     if !dropped {
-                        if let Some(desym) = ud_arch_bpf::desymbolize_bpf_text(text, here, None) {
-                            if desym != *text {
-                                if let Ok(encoded) = ud_arch_bpf::assemble_bpf(&desym) {
-                                    if encoded == *bytes {
-                                        bytes.clear();
-                                    }
+                        let desym = arch.desymbolize(text, here);
+                        if desym != *text {
+                            if let Ok(encoded) = arch.assemble_one(&desym, here) {
+                                if encoded == *bytes {
+                                    bytes.clear();
                                 }
                             }
                         }
                     }
-                    *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
+                    *ip = ip.saturating_add(slot_size);
                 }
                 ud_ast::Stmt::IfBlock {
                     cond_text,
@@ -301,51 +302,51 @@ fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
                     then_tail_jmp,
                     else_body,
                 } => {
-                    // First, try to drop `cond_bytes`. The
-                    // jcc skips when `cond_text` is false,
-                    // landing at the start of the else body
-                    // (or past the then-body when there's
-                    // no else). Its slot-offset = (then_body
-                    // size + then_tail_jmp size) / 8.
+                    // Cond_bytes: jcc skipping the then-body
+                    // (and the tail ja) when cond_text is
+                    // false. Target = past then_body + tail.
                     if !cond_bytes.is_empty() {
+                        let cond_ip = *ip;
                         let then_body_size = build_function::lowered_body_size_at(
                             then_body,
-                            ip.saturating_add(cond_bytes.len() as u64),
+                            cond_ip.saturating_add(cond_bytes.len() as u64),
                         );
-                        let skip_bytes = then_body_size + then_tail_jmp.len() as u64;
-                        if let Ok(offset) = i16::try_from(skip_bytes / 8) {
-                            if let Ok(encoded) =
-                                ud_arch_bpf::assemble_bpf_ifblock_cond(cond_text, offset)
-                            {
-                                if encoded == *cond_bytes {
-                                    cond_bytes.clear();
-                                }
+                        let target = cond_ip
+                            .saturating_add(slot_size)
+                            .saturating_add(then_body_size)
+                            .saturating_add(then_tail_jmp.len() as u64);
+                        if let Ok(encoded) = arch.encode_cond_jump(
+                            cond_text,
+                            cond_ip,
+                            target,
+                            ud_arch_codec::EncodeHints::default(),
+                        ) {
+                            if encoded == *cond_bytes {
+                                cond_bytes.clear();
                             }
                         }
                     }
-                    // Advance using `lowered_body_size_at`
-                    // again because the post-drop `cond_bytes`
-                    // length might be 0 here. The lower-time
-                    // size of an IfBlock equals the original
-                    // structural framing — pre-drop length —
-                    // so we restore via INSN_SIZE.
-                    *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
-                    visit_stmts(then_body, ip);
-                    // Try to drop `then_tail_jmp` (a `ja`
-                    // over the else body). slot_offset =
-                    // else_body_size / 8.
+                    *ip = ip.saturating_add(slot_size);
+                    visit_stmts(then_body, ip, arch, slot_size);
+                    // then_tail_jmp: unconditional `ja` over
+                    // the else body.
                     if !then_tail_jmp.is_empty() {
-                        let else_size = build_function::lowered_body_size_at(else_body, *ip + 8);
-                        if let Ok(offset) = i16::try_from(else_size / 8) {
-                            if let Ok(encoded) = ud_arch_bpf::assemble_bpf_ja(offset) {
-                                if encoded == *then_tail_jmp {
-                                    then_tail_jmp.clear();
-                                }
+                        let ttj_ip = *ip;
+                        let else_size = build_function::lowered_body_size_at(
+                            else_body,
+                            ttj_ip.saturating_add(slot_size),
+                        );
+                        let target = ttj_ip.saturating_add(slot_size).saturating_add(else_size);
+                        if let Ok(encoded) =
+                            arch.encode_jump(ttj_ip, target, ud_arch_codec::EncodeHints::default())
+                        {
+                            if encoded == *then_tail_jmp {
+                                then_tail_jmp.clear();
                             }
                         }
-                        *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
+                        *ip = ip.saturating_add(slot_size);
                     }
-                    visit_stmts(else_body, ip);
+                    visit_stmts(else_body, ip, arch, slot_size);
                 }
                 ud_ast::Stmt::WhileBlock {
                     cond_text,
@@ -359,38 +360,35 @@ fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
                             wb,
                             entry_ip.saturating_add(entry_bytes.len() as u64),
                         );
-                        let skip_bytes = body_size + tail_bytes.len() as u64;
-                        if let Ok(offset) = i16::try_from(skip_bytes / 8) {
-                            if let Ok(encoded) =
-                                ud_arch_bpf::assemble_bpf_ifblock_cond(cond_text, offset)
-                            {
-                                if encoded == *entry_bytes {
-                                    entry_bytes.clear();
-                                }
+                        let target = entry_ip
+                            .saturating_add(slot_size)
+                            .saturating_add(body_size)
+                            .saturating_add(tail_bytes.len() as u64);
+                        if let Ok(encoded) = arch.encode_cond_jump(
+                            cond_text,
+                            entry_ip,
+                            target,
+                            ud_arch_codec::EncodeHints::default(),
+                        ) {
+                            if encoded == *entry_bytes {
+                                entry_bytes.clear();
                             }
                         }
                     }
-                    *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
-                    let body_start = *ip;
-                    visit_stmts(wb, ip);
-                    // `tail_bytes` is a `ja` back to the
-                    // loop header (entry_ip). Slot-offset is
-                    // negative — distance from the ja's next
-                    // slot back to entry_ip.
+                    *ip = ip.saturating_add(slot_size);
+                    visit_stmts(wb, ip, arch, slot_size);
                     if !tail_bytes.is_empty() {
                         let ja_ip = *ip;
-                        #[allow(clippy::cast_possible_wrap)]
-                        let delta = (entry_ip as i64).wrapping_sub((ja_ip as i64).wrapping_add(8));
-                        if let Ok(offset_slots) = i16::try_from(delta / 8) {
-                            if let Ok(encoded) = ud_arch_bpf::assemble_bpf_ja(offset_slots) {
-                                if encoded == *tail_bytes {
-                                    tail_bytes.clear();
-                                }
+                        // Back-edge: jump to entry_ip.
+                        if let Ok(encoded) =
+                            arch.encode_jump(ja_ip, entry_ip, ud_arch_codec::EncodeHints::default())
+                        {
+                            if encoded == *tail_bytes {
+                                tail_bytes.clear();
                             }
                         }
-                        *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
+                        *ip = ip.saturating_add(slot_size);
                     }
-                    let _ = body_start;
                 }
                 ud_ast::Stmt::IfBranch {
                     pre_body,
@@ -399,19 +397,13 @@ fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
                     else_body,
                     ..
                 } => {
-                    visit_stmts(pre_body, ip);
+                    visit_stmts(pre_body, ip, arch, slot_size);
                     *ip = ip.saturating_add(cond_bytes.len() as u64);
-                    visit_stmts(then_body, ip);
+                    visit_stmts(then_body, ip, arch, slot_size);
                     if let Some(eb) = else_body {
-                        visit_stmts(eb, ip);
+                        visit_stmts(eb, ip, arch, slot_size);
                     }
                 }
-                // Labels and comments don't consume bytes;
-                // anything else the BPF decompile path
-                // doesn't emit today, so we conservatively
-                // leave the cursor where it is and continue
-                // (a future addition would need to extend
-                // this match).
                 _ => {}
             }
         }
@@ -446,7 +438,12 @@ fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
     /// `build_function::lowered_body_size_at` — and
     /// matches exactly what the lower path does at
     /// recompile time.
-    fn visit_section_items(section_addr: u64, items: &mut [Item]) {
+    fn visit_section_items(
+        section_addr: u64,
+        items: &mut [Item],
+        arch: &dyn ud_arch_codec::ArchCodec,
+        slot_size: u64,
+    ) {
         let mut cursor = section_addr;
         for item in items.iter_mut() {
             match item {
@@ -463,19 +460,16 @@ fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
                     // bytes from @asm lines, which causes
                     // `lowered_body_size_at` to report 0
                     // for those (it sums `bytes.len()`).
-                    // Capturing the size beforehand keeps
-                    // the section cursor consistent with
-                    // what lower-time will reconstruct.
                     let body_size = build_function::lowered_body_size_at(&fd.body, start);
                     let mut ip = start;
-                    visit_stmts(&mut fd.body, &mut ip);
+                    visit_stmts(&mut fd.body, &mut ip, arch, slot_size);
                     cursor = start.saturating_add(body_size);
                 }
                 Item::Raw { addr, bytes } => {
                     cursor = (*addr).saturating_add(bytes.len() as u64);
                 }
                 Item::Section { addr, items, .. } => {
-                    visit_section_items(*addr, items);
+                    visit_section_items(*addr, items, arch, slot_size);
                 }
                 _ => {}
             }
@@ -484,13 +478,12 @@ fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
 
     for item in items.iter_mut() {
         match item {
-            Item::Section { addr, items, .. } => visit_section_items(*addr, items),
-            // Top-level functions without an enclosing
-            // section (unusual but possible) — best effort
-            // with whatever addr we can recover.
+            Item::Section { addr, items, .. } => {
+                visit_section_items(*addr, items, arch, slot_size);
+            }
             Item::Function(fd) => {
                 let mut ip = fn_base_addr(fd);
-                visit_stmts(&mut fd.body, &mut ip);
+                visit_stmts(&mut fd.body, &mut ip, arch, slot_size);
             }
             _ => {}
         }
