@@ -1065,6 +1065,119 @@ pub fn register(registry: &mut Registry) {
         stub_returns_zero as StubFn,
         3,
     );
+
+    // ---- Install-monitor additions (QuickTime 7.7.9 trail) --------
+    //
+    // The file-IO / directory / temp-path stubs below route through
+    // [`crate::context::VirtualFs`] when one is attached, so an
+    // installer's writes land in the monitor report. Without a VFS
+    // attached they fall back to conservative success values.
+    //
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppatha
+    registry.register(
+        "kernel32.dll",
+        "GetTempPathA",
+        stub_get_temp_path_a as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettempfilenamea
+    registry.register(
+        "kernel32.dll",
+        "GetTempFileNameA",
+        stub_get_temp_file_name_a as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
+    registry.register(
+        "kernel32.dll",
+        "CreateFileA",
+        stub_create_file_a as StubFn,
+        7,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectorya
+    registry.register(
+        "kernel32.dll",
+        "CreateDirectoryA",
+        stub_create_directory_a as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefilea
+    registry.register(
+        "kernel32.dll",
+        "DeleteFileA",
+        stub_delete_file_a as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesa
+    registry.register(
+        "kernel32.dll",
+        "GetFileAttributesA",
+        stub_get_file_attributes_a as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfilesize
+    registry.register(
+        "kernel32.dll",
+        "GetFileSize",
+        stub_get_file_size as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-dosdatetimetofiletime
+    registry.register(
+        "kernel32.dll",
+        "DosDateTimeToFileTime",
+        stub_dos_date_time_to_file_time as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createmutexa
+    registry.register(
+        "kernel32.dll",
+        "CreateMutexA",
+        stub_create_mutex_a as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-releasemutex
+    registry.register(
+        "kernel32.dll",
+        "ReleaseMutex",
+        stub_returns_true as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessa
+    registry.register(
+        "kernel32.dll",
+        "CreateProcessA",
+        stub_create_process_a as StubFn,
+        10,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess
+    registry.register(
+        "kernel32.dll",
+        "GetExitCodeProcess",
+        stub_get_exit_code_process as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/wincon/nf-wincon-getconsolecp
+    registry.register(
+        "kernel32.dll",
+        "GetConsoleCP",
+        stub_get_console_cp as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/wincon/nf-wincon-getconsoleoutputcp
+    registry.register(
+        "kernel32.dll",
+        "GetConsoleOutputCP",
+        stub_get_console_cp as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/consoleapi/nf-consoleapi-getconsolemode
+    registry.register(
+        "kernel32.dll",
+        "GetConsoleMode",
+        stub_get_console_mode as StubFn,
+        2,
+    );
 }
 
 // ----- Heap ----------------------------------------------------------
@@ -2038,8 +2151,10 @@ fn stub_virtual_free(
 
 /// `BOOL WriteFile(HANDLE hFile, LPCVOID lpBuffer,
 /// DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten,
-/// LPOVERLAPPED lpOverlapped)`. Stub failure: returns FALSE,
-/// sets last error to ERROR_INVALID_HANDLE.
+/// LPOVERLAPPED lpOverlapped)`. When the handle was minted by the
+/// virtual filesystem, the bytes flow through it so the monitor
+/// can report what was written. Unknown handles fall through to
+/// fail-soft "wrote nothing".
 const ERROR_INVALID_HANDLE: u32 = 6;
 fn stub_write_file(
     cpu: &mut Cpu,
@@ -2047,14 +2162,28 @@ fn stub_write_file(
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WriteFile", t))?;
-    let _lp_buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WriteFile", t))?;
-    let _n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WriteFile", t))?;
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WriteFile", t))?;
+    let lp_buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WriteFile", t))?;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WriteFile", t))?;
     let lp_written = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WriteFile", t))?;
     let _lp_ovl = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("WriteFile", t))?;
+    if let Some(vfs) = state.context.vfs.as_mut() {
+        if vfs.owns(h) && lp_buf != 0 {
+            let mut buf = vec![0u8; n as usize];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = mmu
+                    .load8(lp_buf + i as u32)
+                    .map_err(|t| trap_to_win32("WriteFile", t))?;
+            }
+            let written = vfs.write_handle(h, &buf).unwrap_or(0) as u32;
+            if lp_written != 0 {
+                mmu.store32(lp_written, written)
+                    .map_err(|t| trap_to_win32("WriteFile", t))?;
+            }
+            return Ok(1);
+        }
+    }
     if lp_written != 0 {
-        // Best-effort write zero into bytes-written so the
-        // caller's error path doesn't UB-read garbage.
         mmu.store32(lp_written, 0)
             .map_err(|t| trap_to_win32("WriteFile", t))?;
     }
@@ -2097,13 +2226,30 @@ fn trap_to_win32(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {
 // branches (registry, dialog config, error-popup paths) that the
 // `IC*` decode pipeline never executes.
 
-/// `BOOL CloseHandle(HANDLE)`. Always succeeds.
+/// `BOOL CloseHandle(HANDLE)`. Closes the corresponding VFS or
+/// registry handle when one is owned by [`crate::context`]; falls
+/// through to a no-op success otherwise (the historical
+/// behaviour, used by the wide set of synthetic handles minted
+/// elsewhere in the kernel32 stub family).
 fn stub_close_handle(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CloseHandle", t))?;
+    if let Some(vfs) = state.context.vfs.as_mut() {
+        if vfs.owns(h) {
+            vfs.close(h);
+            return Ok(1);
+        }
+    }
+    if let Some(reg) = state.context.registry.as_mut() {
+        if reg.owns(h) {
+            reg.close_key(h);
+            return Ok(1);
+        }
+    }
     Ok(1)
 }
 
@@ -3673,17 +3819,34 @@ fn stub_load_library_w(
 }
 
 /// `BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED)`.
-/// No filesystem mapped — report "read 0 bytes" success.
+/// When the handle was minted by the virtual filesystem, copies
+/// the bytes into the guest buffer; otherwise reports "read 0
+/// bytes" success (the historical no-FS fallback).
 fn stub_read_file(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    _state: &mut HostState,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ReadFile", t))?;
-    let _buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("ReadFile", t))?;
-    let _n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("ReadFile", t))?;
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ReadFile", t))?;
+    let buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("ReadFile", t))?;
+    let n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("ReadFile", t))?;
     let out = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("ReadFile", t))?;
+    if let Some(vfs) = state.context.vfs.as_mut() {
+        if vfs.owns(h) && buf != 0 {
+            let mut tmp = vec![0u8; n as usize];
+            let got = vfs.read_handle(h, &mut tmp).unwrap_or(0);
+            if got > 0 {
+                mmu.write(buf, &tmp[..got])
+                    .map_err(|t| trap_to_win32("ReadFile", t))?;
+            }
+            if out != 0 {
+                mmu.store32(out, got as u32)
+                    .map_err(|t| trap_to_win32("ReadFile", t))?;
+            }
+            return Ok(1);
+        }
+    }
     if out != 0 {
         mmu.store32(out, 0)
             .map_err(|t| trap_to_win32("ReadFile", t))?;
@@ -4092,6 +4255,409 @@ fn stub_get_module_handle_ex_a(
             .map_err(|t| trap_to_win32("GetModuleHandleExA", t))?;
     }
     Ok(1)
+}
+
+// ============================================================
+// Install-monitor stub implementations
+// ============================================================
+
+/// Canonical temp directory string handed back to the guest. Kept
+/// in one place so the monitor's "what did the installer write?"
+/// report can match `c:/temp/*` paths reliably.
+const TEMP_PATH_A: &[u8] = b"C:\\Temp\\\0";
+
+/// Write `s` into the guest buffer at `dst`, capped at `cch`
+/// bytes (including the NUL). Returns the number of bytes
+/// actually written (excluding the NUL).
+fn write_cstr(
+    mmu: &mut Mmu,
+    dst: u32,
+    cch: u32,
+    s: &[u8],
+    stub: &'static str,
+) -> Result<u32, Win32Error> {
+    if dst == 0 || cch == 0 {
+        return Ok(0);
+    }
+    let cap = cch.saturating_sub(1) as usize;
+    let n = s.len().min(cap);
+    if n > 0 {
+        mmu.write(dst, &s[..n])
+            .map_err(|t| trap_to_win32(stub, t))?;
+    }
+    mmu.store8(dst + n as u32, 0)
+        .map_err(|t| trap_to_win32(stub, t))?;
+    Ok(n as u32)
+}
+
+/// `DWORD GetTempPathA(DWORD nBufferLength, LPSTR lpBuffer)`.
+/// Writes `"C:\\Temp\\"` (length 8) plus a NUL into the buffer.
+/// Returns the path length (excluding NUL). If the buffer is too
+/// small, returns the required length including NUL — matching
+/// the MSDN contract.
+fn stub_get_temp_path_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let n_buf = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetTempPathA", t))?;
+    let lp_buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetTempPathA", t))?;
+    let path = &TEMP_PATH_A[..TEMP_PATH_A.len() - 1]; // strip trailing NUL
+    let need = path.len() as u32 + 1; // including NUL
+    if lp_buf == 0 || n_buf < need {
+        return Ok(need);
+    }
+    write_cstr(mmu, lp_buf, n_buf, path, "GetTempPathA")?;
+    Ok(path.len() as u32)
+}
+
+/// `UINT GetTempFileNameA(LPCSTR lpPathName, LPCSTR lpPrefixString,
+/// UINT uUnique, LPSTR lpTempFileName)`. Builds a deterministic
+/// `pathname\prefix<unique>.tmp` string and writes it back. When
+/// `uUnique == 0`, picks a fresh counter from the tick. Creates a
+/// zero-byte entry in the VFS so a follow-up `CreateFileA` sees
+/// the file.
+fn stub_get_temp_file_name_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_path = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetTempFileNameA", t))?;
+    let p_prefix = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetTempFileNameA", t))?;
+    let mut unique = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetTempFileNameA", t))?;
+    let dst = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("GetTempFileNameA", t))?;
+    let path = if p_path != 0 {
+        read_cstr(mmu, p_path, 260)?
+    } else {
+        String::new()
+    };
+    let prefix = if p_prefix != 0 {
+        read_cstr(mmu, p_prefix, 3)?
+    } else {
+        String::new()
+    };
+    if unique == 0 {
+        state.tick = state.tick.wrapping_add(1);
+        unique = state.tick;
+    }
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    let full = if trimmed.is_empty() {
+        format!("{prefix}{unique:04X}.tmp")
+    } else {
+        format!("{trimmed}\\{prefix}{unique:04X}.tmp")
+    };
+    if let Some(vfs) = state.context.vfs.as_mut() {
+        vfs.insert(&full, Vec::new());
+    }
+    write_cstr(mmu, dst, 260, full.as_bytes(), "GetTempFileNameA")?;
+    Ok(unique)
+}
+
+/// `HANDLE CreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess,
+/// DWORD dwShareMode, LPSECURITY_ATTRIBUTES, DWORD dwCreationDisposition,
+/// DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)`. Routes the
+/// open through the VFS when one is attached; returns
+/// `INVALID_HANDLE_VALUE` (= `0xFFFFFFFF`) otherwise. The MSDN
+/// `dwCreationDisposition` axis is honoured at a coarse level —
+/// `CREATE_ALWAYS` / `CREATE_NEW` / `TRUNCATE_EXISTING` truncate
+/// the backing file; `OPEN_EXISTING` fails when the file is
+/// absent.
+const CREATE_NEW: u32 = 1;
+const CREATE_ALWAYS: u32 = 2;
+const OPEN_EXISTING: u32 = 3;
+const TRUNCATE_EXISTING: u32 = 5;
+const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_FILE_EXISTS: u32 = 80;
+
+fn stub_create_file_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateFileA", t))?;
+    let access = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateFileA", t))?;
+    let _share = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateFileA", t))?;
+    let _sa = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateFileA", t))?;
+    let disp = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CreateFileA", t))?;
+    let _attrs = arg_dword(cpu, mmu, 5).map_err(|t| trap_to_win32("CreateFileA", t))?;
+    let _tmpl = arg_dword(cpu, mmu, 6).map_err(|t| trap_to_win32("CreateFileA", t))?;
+    if p_name == 0 {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(INVALID_HANDLE_VALUE);
+    }
+    let name = read_cstr(mmu, p_name, 260)?;
+    let Some(vfs) = state.context.vfs.as_mut() else {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(INVALID_HANDLE_VALUE);
+    };
+    let exists = vfs.contains(&name);
+    match disp {
+        OPEN_EXISTING => {
+            if !exists {
+                state.last_error = ERROR_FILE_NOT_FOUND;
+                return Ok(INVALID_HANDLE_VALUE);
+            }
+        }
+        CREATE_NEW => {
+            if exists {
+                state.last_error = ERROR_FILE_EXISTS;
+                return Ok(INVALID_HANDLE_VALUE);
+            }
+            vfs.insert(&name, Vec::new());
+        }
+        CREATE_ALWAYS | TRUNCATE_EXISTING => {
+            vfs.write_path(&name, Vec::new());
+        }
+        _ => {
+            // OPEN_ALWAYS (4) and unknown values: open if exists,
+            // create empty otherwise.
+            if !exists {
+                vfs.insert(&name, Vec::new());
+            }
+        }
+    }
+    let fa = crate::context::FileAccess::from_win32_desired_access(access);
+    match vfs.open(&name, fa) {
+        Some(h) => Ok(h),
+        None => {
+            state.last_error = ERROR_FILE_NOT_FOUND;
+            Ok(INVALID_HANDLE_VALUE)
+        }
+    }
+}
+
+/// `BOOL CreateDirectoryA(LPCSTR lpPathName, LPSECURITY_ATTRIBUTES
+/// lpSecurityAttributes)`. Creates a `<path>/.dir` marker in the
+/// VFS so directory existence is observable; otherwise reports
+/// success. Returns FALSE only when the path is NULL or already
+/// recorded.
+fn stub_create_directory_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateDirectoryA", t))?;
+    let _sa = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateDirectoryA", t))?;
+    if p_name == 0 {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(0);
+    }
+    let name = read_cstr(mmu, p_name, 260)?;
+    let marker = format!("{}\\.dir", name.trim_end_matches(['\\', '/']));
+    if let Some(vfs) = state.context.vfs.as_mut() {
+        if vfs.contains(&marker) {
+            state.last_error = ERROR_FILE_EXISTS;
+            return Ok(0);
+        }
+        vfs.insert(&marker, Vec::new());
+    }
+    Ok(1)
+}
+
+/// `BOOL DeleteFileA(LPCSTR lpFileName)`. Removes from the VFS
+/// when present; reports success even without a VFS attached.
+fn stub_delete_file_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("DeleteFileA", t))?;
+    if p_name == 0 {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(0);
+    }
+    let name = read_cstr(mmu, p_name, 260)?;
+    if let Some(vfs) = state.context.vfs.as_mut() {
+        vfs.remove(&name);
+    }
+    Ok(1)
+}
+
+/// `DWORD GetFileAttributesA(LPCSTR lpFileName)`. Reports
+/// `FILE_ATTRIBUTE_NORMAL = 0x80` when the path exists in the
+/// VFS (file or `.dir` marker); otherwise returns
+/// `INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF`.
+fn stub_get_file_attributes_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetFileAttributesA", t))?;
+    if p_name == 0 {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(0xFFFF_FFFF);
+    }
+    let name = read_cstr(mmu, p_name, 260)?;
+    let Some(vfs) = state.context.vfs.as_ref() else {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(0xFFFF_FFFF);
+    };
+    if vfs.contains(&name) {
+        return Ok(0x80); // FILE_ATTRIBUTE_NORMAL
+    }
+    let dir_marker = format!("{}\\.dir", name.trim_end_matches(['\\', '/']));
+    if vfs.contains(&dir_marker) {
+        return Ok(0x10); // FILE_ATTRIBUTE_DIRECTORY
+    }
+    state.last_error = ERROR_FILE_NOT_FOUND;
+    Ok(0xFFFF_FFFF)
+}
+
+/// `DWORD GetFileSize(HANDLE hFile, LPDWORD lpFileSizeHigh)`.
+/// Returns the low dword of the file size (high dword written
+/// through `lpFileSizeHigh` when non-NULL). `INVALID_FILE_SIZE
+/// = 0xFFFFFFFF` for unknown handles.
+fn stub_get_file_size(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetFileSize", t))?;
+    let p_hi = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetFileSize", t))?;
+    if let Some(vfs) = state.context.vfs.as_ref() {
+        if let Some(sz) = vfs.size(h) {
+            if p_hi != 0 {
+                mmu.store32(p_hi, (sz >> 32) as u32)
+                    .map_err(|t| trap_to_win32("GetFileSize", t))?;
+            }
+            return Ok(sz as u32);
+        }
+    }
+    state.last_error = ERROR_INVALID_HANDLE;
+    Ok(0xFFFF_FFFF)
+}
+
+/// `BOOL DosDateTimeToFileTime(WORD wFatDate, WORD wFatTime,
+/// LPFILETIME lpFileTime)`. Pure conversion — no environment
+/// state. We emit a deterministic FILETIME for the given pair so
+/// the installer's archive-extract path proceeds.
+fn stub_dos_date_time_to_file_time(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let fat_date =
+        arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("DosDateTimeToFileTime", t))? & 0xFFFF;
+    let fat_time =
+        arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("DosDateTimeToFileTime", t))? & 0xFFFF;
+    let p_out = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("DosDateTimeToFileTime", t))?;
+    if p_out == 0 {
+        return Ok(0);
+    }
+    let year = 1980 + ((fat_date >> 9) & 0x7F) as i32;
+    let month = ((fat_date >> 5) & 0x0F).max(1) as i32;
+    let day = (fat_date & 0x1F).max(1) as i32;
+    let hour = ((fat_time >> 11) & 0x1F) as i32;
+    let minute = ((fat_time >> 5) & 0x3F) as i32;
+    let second = ((fat_time & 0x1F) * 2) as i32;
+    // Days from 1601-01-01 to year-01-01 (approx — ignore leap-day
+    // distribution beyond Gregorian arithmetic). This is the
+    // "FILETIME = 100-ns ticks since 1601-01-01" surface; the
+    // installer only needs a strictly-increasing reproducible
+    // value, not a precise calendar conversion.
+    let days_from_1601 = (year - 1601) as i64 * 365 + ((year - 1601) / 4) as i64
+        - ((year - 1601) / 100) as i64
+        + ((year - 1601) / 400) as i64;
+    let month_days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let mut day_of_year = month_days[(month - 1).clamp(0, 11) as usize] as i64;
+    if month > 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+        day_of_year += 1;
+    }
+    day_of_year += day as i64 - 1;
+    let total_days = days_from_1601 + day_of_year;
+    let total_seconds =
+        total_days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    let ticks = (total_seconds * 10_000_000) as u64;
+    mmu.store32(p_out, ticks as u32)
+        .map_err(|t| trap_to_win32("DosDateTimeToFileTime", t))?;
+    mmu.store32(p_out + 4, (ticks >> 32) as u32)
+        .map_err(|t| trap_to_win32("DosDateTimeToFileTime", t))?;
+    Ok(1)
+}
+
+/// `HANDLE CreateMutexA(LPSECURITY_ATTRIBUTES, BOOL bInitialOwner,
+/// LPCSTR lpName)`. We don't model mutexes; hand back a non-zero
+/// synthetic handle so the installer's RAII wrapper doesn't bail.
+fn stub_create_mutex_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state.next_hic = state.next_hic.wrapping_add(1);
+    Ok(0x6A00_0000 | state.next_hic)
+}
+
+/// `BOOL CreateProcessA(...)`. The installer occasionally spawns
+/// a helper (verifier, rollback agent). The sandbox can't actually
+/// fork — we report failure with `ERROR_FILE_NOT_FOUND` so the
+/// caller falls into its single-process fallback path.
+fn stub_create_process_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state.last_error = ERROR_FILE_NOT_FOUND;
+    Ok(0)
+}
+
+/// `BOOL GetExitCodeProcess(HANDLE hProcess, LPDWORD lpExitCode)`.
+/// Always reports `STILL_ACTIVE = 259` so callers that block on
+/// the spawned process don't observe a misleading 0 exit code.
+fn stub_get_exit_code_process(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetExitCodeProcess", t))?;
+    let p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetExitCodeProcess", t))?;
+    if p != 0 {
+        mmu.store32(p, 259)
+            .map_err(|t| trap_to_win32("GetExitCodeProcess", t))?;
+    }
+    Ok(1)
+}
+
+/// `UINT GetConsoleCP(void)` / `UINT GetConsoleOutputCP(void)`.
+/// CP_OEMCP = 437 — the historical US OEM code page. Installers
+/// only consult this to choose a banner-string encoding.
+fn stub_get_console_cp(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(437)
+}
+
+/// `BOOL GetConsoleMode(HANDLE hConsoleHandle, LPDWORD lpMode)`.
+/// No console attached — report failure so the caller's
+/// "redirected to file" branch runs.
+fn stub_get_console_mode(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetConsoleMode", t))?;
+    let p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetConsoleMode", t))?;
+    if p != 0 {
+        mmu.store32(p, 0)
+            .map_err(|t| trap_to_win32("GetConsoleMode", t))?;
+    }
+    state.last_error = ERROR_INVALID_HANDLE;
+    Ok(0)
 }
 
 #[cfg(test)]

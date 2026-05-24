@@ -29,6 +29,7 @@ pub mod comctl32;
 pub mod gdi32;
 pub mod kernel32;
 pub mod mfplat;
+pub mod msi;
 pub mod msvcrt;
 pub mod ole32;
 pub mod shell32;
@@ -707,6 +708,15 @@ impl Registry {
         self.by_name.len() - before
     }
 
+    /// Register every msi.dll stub — Windows Installer surface
+    /// touched by application installers (QuickTime, …).
+    /// Returns the number registered.
+    pub fn register_msi(&mut self) -> usize {
+        let before = self.by_name.len();
+        msi::register(self);
+        self.by_name.len() - before
+    }
+
     /// Register the version.dll / comctl32.dll / shell32.dll /
     /// shlwapi.dll stub families — the config-dialog and
     /// settings-file surface VfW codecs pull in alongside their
@@ -742,6 +752,7 @@ impl Registry {
             + self.register_msvcr80()
             + self.register_msvcr90()
             + self.register_mfplat()
+            + self.register_msi()
             + self.register_shell_support()
             + host_count
     }
