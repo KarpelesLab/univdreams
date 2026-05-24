@@ -5279,22 +5279,163 @@ fn stub_release_mutex(
 /// LPSTARTUPINFO lpStartupInfo,
 /// LPPROCESS_INFORMATION lpProcessInformation)`.
 ///
-/// Phase 5b semantics: every `CreateProcessA` call succeeds.
-/// The "child" is a synthetic ProcessState pre-marked
-/// `Terminated` with exit code 0 (Phase 5c will optionally
-/// load + run a real PE when the target EXE is in the VFS).
-/// `WaitForSingleObject` on the returned process handle
-/// observes the signaled state immediately;
-/// `GetExitCodeProcess` reports the recorded exit code.
+/// Tries to load + run the child PE for `CreateProcessA` when
+/// the target EXE is staged in the virtual filesystem. The
+/// PE is rebased to the next slot in the child-image arena
+/// and its imports resolved strictly against the parent's
+/// registry (no fallback thunks — the child needs every
+/// import it lists to be host-stubbed). Returns
+/// `Some(child_pid, child_tid)` on success and `None` when
+/// the file isn't in the VFS, lacks relocations, has
+/// unresolved imports, or fails any parse step. The caller
+/// then falls back to the synthetic immediate-exit child.
+fn try_spawn_child_pe(
+    state: &mut HostState,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    target_path: &str,
+    cmd: &str,
+) -> Option<(u32, u32)> {
+    use crate::emulator::isa_int::RET_SENTINEL;
+    use crate::emulator::mmu::Perm;
+    use crate::pe;
+    use crate::sched::ThreadStatus;
+    // Read PE bytes from the VFS.
+    let vfs = state.context.vfs.as_ref()?;
+    let bytes = vfs.read(target_path)?.to_vec();
+    let parsed = pe::header::parse(&bytes).ok()?;
+    // Require base relocations: `IMAGE_FILE_RELOCS_STRIPPED` (0x0001)
+    // means the PE can only be loaded at its preferred base,
+    // which would collide with the parent.
+    if (parsed.file.characteristics & 0x0001) != 0
+        && parsed.optional.image_base == state.processes[&1].image_base
+    {
+        return None;
+    }
+    // Reserve the next child image base + heap arena.
+    let child_image_base = state.next_child_image_base;
+    if child_image_base == 0 {
+        return None;
+    }
+    state.next_child_image_base = child_image_base.wrapping_add(crate::win32::CHILD_IMAGE_STRIDE);
+    let heap_start = state.next_child_heap_base;
+    let heap_end = heap_start.wrapping_add(crate::win32::CHILD_HEAP_SIZE);
+    if heap_start == 0 || heap_end > state.child_heap_arena_end {
+        return None;
+    }
+    state.next_child_heap_base = heap_end;
+    // Map the child's sections at the target base.
+    let secs = pe::sections::map_sections_at(mmu, &parsed, &bytes, child_image_base).ok()?;
+    let delta = child_image_base.wrapping_sub(parsed.optional.image_base);
+    if delta != 0 {
+        pe::reloc::apply(mmu, &parsed, child_image_base, delta).ok()?;
+    }
+    // Strict import resolution — every import must be host-stubbed.
+    pe::imports::resolve_strict(mmu, &parsed, child_image_base, registry).ok()?;
+    // Stamp final permissions.
+    for s in &secs {
+        pe::sections::apply_section_permissions(mmu, s);
+    }
+    // Reserve a stack for the primary thread.
+    let stack_top = state.cur_process().next_thread_stack_top;
+    let stack_bottom = state.cur_process().thread_stack_pool_bottom;
+    if stack_top == 0 || stack_top.saturating_sub(stack_bottom) < crate::win32::THREAD_STACK_SIZE {
+        return None;
+    }
+    state.cur_process_mut().next_thread_stack_top = stack_top - crate::win32::THREAD_STACK_SIZE;
+    // Reserve a TIB for the primary thread.
+    let tib_addr = if state.cur_process().tib_pool_bottom != 0 {
+        let addr = state.cur_process().next_tib_addr;
+        state.cur_process_mut().next_tib_addr = addr.wrapping_add(crate::win32::THREAD_TIB_SIZE);
+        let _ = mmu.store32(addr, 0xFFFF_FFFF);
+        let _ = mmu.store32(addr + 0x18, addr);
+        addr
+    } else {
+        0
+    };
+    // Mint child PID + TID + ProcessState.
+    let parent_pid = state.cur_thread().pid;
+    let child_pid = state.next_pid;
+    state.next_pid = state.next_pid.wrapping_add(1);
+    let child_tid = state.next_tid;
+    state.next_tid = state.next_tid.wrapping_add(1);
+    let entry_point = child_image_base.wrapping_add(parsed.optional.address_of_entry_point);
+    let _ = Perm::R; // silence unused warning if not referenced
+    let mut child_proc = crate::win32::ProcessState {
+        pid: child_pid,
+        parent_pid,
+        image_base: child_image_base,
+        primary_module_base: child_image_base,
+        process_heap_handle: 0xDEAD_BEEF,
+        next_hic: 1,
+        rand_state: 1,
+        heap_cursor: heap_start,
+        heap_arena_end: heap_end,
+        exit_code: None,
+        ..crate::win32::ProcessState::default()
+    };
+    // Children inherit the parent's pools for thread stacks +
+    // TIBs by default (the bootstrap pools have plenty of
+    // room).
+    child_proc.thread_stack_pool_bottom = stack_bottom;
+    child_proc.next_thread_stack_top = state.cur_process().next_thread_stack_top;
+    child_proc.tib_pool_bottom = state.cur_process().tib_pool_bottom;
+    child_proc.next_tib_addr = state.cur_process().next_tib_addr;
+    child_proc
+        .modules
+        .insert(target_path.to_ascii_lowercase(), child_image_base);
+    if let Some(rsrc_dir) = parsed.optional.data_directories.get(2) {
+        if rsrc_dir.virtual_address != 0 && rsrc_dir.size != 0 {
+            child_proc.module_resource_dirs.insert(
+                child_image_base,
+                child_image_base.wrapping_add(rsrc_dir.virtual_address),
+            );
+        }
+    }
+    state.processes.insert(child_pid, child_proc);
+    // Build the primary thread's CPU.
+    let mut new_cpu = Cpu::new();
+    new_cpu.regs.set_esp(stack_top - 0x10);
+    new_cpu.regs.eip = entry_point;
+    if tib_addr != 0 {
+        new_cpu.set_fs_base(tib_addr);
+    }
+    // Children's entry points are stdcall void(void) for EXEs
+    // (the CRT entry handles its own argv). Push a RET_SENTINEL
+    // so a plain RET inside the entry routine surfaces "thread
+    // done" to our run loop.
+    new_cpu.push32(mmu, RET_SENTINEL).ok()?;
+    let mut child_thread = crate::win32::ThreadState::new(child_tid, child_pid);
+    child_thread.parked_cpu = Some(new_cpu);
+    child_thread.tib_addr = tib_addr;
+    child_thread.status = ThreadStatus::Ready;
+    state.threads.insert(child_tid, child_thread);
+    state
+        .debug_log
+        .push(format!("spawned child PE {target_path:?} (cmd={cmd:?}) pid={child_pid} base={child_image_base:#010x}"));
+    Some((child_pid, child_tid))
+}
+
+/// Phase 5b/c semantics: every `CreateProcessA` call succeeds.
+/// Phase 5c: when the target EXE is staged in the VFS and its
+/// imports are all satisfied by the host stub registry,
+/// [`try_spawn_child_pe`] loads it at a fresh image base and
+/// mints a real `Ready` primary thread the scheduler will run
+/// alongside the parent. Otherwise the child is a synthetic
+/// ProcessState pre-marked `Terminated` with exit code 0 (the
+/// fall-through path that keeps installer-class binaries
+/// moving past their msiexec invocation when no real msiexec
+/// is staged).
 ///
-/// The PROCESS_INFORMATION struct is filled with synthetic
-/// handles + the child PID/TID so the caller's outer
-/// "spawn-and-wait" RAII wrapper proceeds.
+/// `WaitForSingleObject` on the returned process handle blocks
+/// until the child's exit_code is set (or returns immediately
+/// for the synthetic path); `GetExitCodeProcess` reports the
+/// recorded exit code.
 fn stub_create_process_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    registry: &Registry,
 ) -> Result<u32, Win32Error> {
     use crate::sched::{ThreadStatus, WaitObject};
     let p_app = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateProcessA", t))?;
@@ -5308,10 +5449,6 @@ fn stub_create_process_a(
     let _si = arg_dword(cpu, mmu, 8).map_err(|t| trap_to_win32("CreateProcessA", t))?;
     let pi = arg_dword(cpu, mmu, 9).map_err(|t| trap_to_win32("CreateProcessA", t))?;
 
-    // Record the would-be child for the install-monitor's
-    // benefit. Even though we don't execute the binary, the
-    // call argument tells the analyst what the installer
-    // wanted to spawn.
     let app = if p_app != 0 {
         read_cstr(mmu, p_app, 260).unwrap_or_default()
     } else {
@@ -5326,23 +5463,45 @@ fn stub_create_process_a(
         .debug_log
         .push(format!("CreateProcessA(app={app:?}, cmd={cmd:?})"));
 
-    // Mint a synthetic, pre-Terminated child process so any
-    // outer Wait*/GetExitCodeProcess resolves immediately.
-    let parent_pid = state.cur_thread().pid;
-    let child_pid = state.next_pid;
-    state.next_pid = state.next_pid.wrapping_add(1);
-    let child_tid = state.next_tid;
-    state.next_tid = state.next_tid.wrapping_add(1);
-    let child_proc = crate::win32::ProcessState {
-        pid: child_pid,
-        parent_pid,
-        exit_code: Some(0),
-        ..crate::win32::ProcessState::default()
+    // Phase 5c: try to load the target EXE as a real child PE
+    // from the VFS. Falls through to the synthetic path on
+    // any failure (file missing, no relocations, unresolved
+    // imports, …).
+    let target = if !app.is_empty() {
+        app.clone()
+    } else if !cmd.is_empty() {
+        // The first whitespace-delimited token of lpCommandLine
+        // is the EXE path. Strip optional surrounding quotes.
+        let first = cmd.split_whitespace().next().unwrap_or("");
+        first.trim_matches('"').to_string()
+    } else {
+        String::new()
     };
-    state.processes.insert(child_pid, child_proc);
-    let mut child_thread = crate::win32::ThreadState::new(child_tid, child_pid);
-    child_thread.status = ThreadStatus::Terminated;
-    state.threads.insert(child_tid, child_thread);
+    let (child_pid, child_tid) = match (!target.is_empty())
+        .then(|| try_spawn_child_pe(state, mmu, registry, &target, &cmd))
+        .flatten()
+    {
+        Some(pair) => pair,
+        None => {
+            // Mint a synthetic, pre-Terminated child process.
+            let parent_pid = state.cur_thread().pid;
+            let pid = state.next_pid;
+            state.next_pid = state.next_pid.wrapping_add(1);
+            let tid = state.next_tid;
+            state.next_tid = state.next_tid.wrapping_add(1);
+            let child_proc = crate::win32::ProcessState {
+                pid,
+                parent_pid,
+                exit_code: Some(0),
+                ..crate::win32::ProcessState::default()
+            };
+            state.processes.insert(pid, child_proc);
+            let mut child_thread = crate::win32::ThreadState::new(tid, pid);
+            child_thread.status = ThreadStatus::Terminated;
+            state.threads.insert(tid, child_thread);
+            (pid, tid)
+        }
+    };
     let h_process = state
         .scheduler
         .insert_object(WaitObject::Process { pid: child_pid });

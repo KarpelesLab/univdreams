@@ -26,8 +26,20 @@ const PAGE_SIZE: u32 = 0x1000;
 /// memory, zero-fill the BSS tail, and record permissions to be
 /// stamped on by [`apply_section_permissions`].
 pub fn map_sections(mmu: &mut Mmu, parsed: &Parsed, bytes: &[u8]) -> Result<Vec<Section>, PeError> {
+    map_sections_at(mmu, parsed, bytes, parsed.optional.image_base)
+}
+
+/// Like [`map_sections`] but lays sections out at an explicit
+/// image base. `CreateProcessA` uses this to load each child PE
+/// at a unique base so multiple processes can coexist in the
+/// shared MMU.
+pub fn map_sections_at(
+    mmu: &mut Mmu,
+    parsed: &Parsed,
+    bytes: &[u8],
+    image_base: u32,
+) -> Result<Vec<Section>, PeError> {
     let mut out = Vec::with_capacity(parsed.sections.len());
-    let image_base = parsed.optional.image_base;
 
     // Map the headers themselves so the codec can read them via
     // RVA-relative reads.

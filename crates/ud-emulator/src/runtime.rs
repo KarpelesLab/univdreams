@@ -68,6 +68,17 @@ const TIB_POOL_BOTTOM: u32 = 0x7FFC_0000;
 const TIB_POOL_SIZE: u32 = 0x0001_E000; // ~120 KiB → 30 TIBs
 const TIB_POOL_TOP: u32 = TIB_POOL_BOTTOM + TIB_POOL_SIZE;
 
+/// Child-process pools. `CreateProcessA` loads each spawned PE
+/// at [`CHILD_IMAGE_BASE_START`] + N * `CHILD_IMAGE_STRIDE` and
+/// gives each child a private 16 MiB heap arena out of
+/// `[CHILD_HEAP_POOL_START, CHILD_HEAP_POOL_END)`. Picked above
+/// the parent's mapped regions but below TEB / stack-pool
+/// addresses to keep guest pointers easy to read in traces.
+const CHILD_IMAGE_BASE_START: u32 = 0x1000_0000;
+const CHILD_HEAP_POOL_START: u32 = 0xA000_0000;
+const CHILD_HEAP_POOL_SIZE: u32 = 0x1000_0000; // 256 MiB → 16 children
+const CHILD_HEAP_POOL_END: u32 = CHILD_HEAP_POOL_START + CHILD_HEAP_POOL_SIZE;
+
 /// One sandbox instance per loaded codec DLL.
 pub struct Sandbox {
     pub mmu: Mmu,
@@ -196,6 +207,14 @@ impl Sandbox {
         // fresh TIB out of this pool for each spawned thread,
         // setting the new thread's FS base to its own TIB.
         mmu.map(TIB_POOL_BOTTOM, TIB_POOL_SIZE, Perm::R | Perm::W);
+        // Child-process heap pool (R+W+X). Each `CreateProcessA`
+        // carves a 16 MiB heap arena from this region for the
+        // spawned child.
+        mmu.map(
+            CHILD_HEAP_POOL_START,
+            CHILD_HEAP_POOL_SIZE,
+            Perm::R | Perm::W | Perm::X,
+        );
         // FS:[0x30] would be the PEB pointer — we leave it 0
         // until a codec actually dereferences it.
 
@@ -214,7 +233,12 @@ impl Sandbox {
         let mut host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
             .with_const_arena(CONST_ARENA_START, CONST_ARENA_END)
             .with_thread_stack_pool(THREAD_STACK_POOL_BOTTOM, THREAD_STACK_POOL_TOP)
-            .with_tib_pool(TIB_POOL_BOTTOM, TIB_POOL_TOP);
+            .with_tib_pool(TIB_POOL_BOTTOM, TIB_POOL_TOP)
+            .with_child_arena(
+                CHILD_IMAGE_BASE_START,
+                CHILD_HEAP_POOL_START,
+                CHILD_HEAP_POOL_END,
+            );
         // Bootstrap thread's TIB lives at the runtime-owned
         // TEB_BASE (already mapped + seeded above) — mirror
         // its address into ThreadState so SetLastError /
@@ -381,6 +405,7 @@ impl Sandbox {
         let mut options = crate::pe::LoadOptions {
             imports: crate::pe::imports::ResolveMode::FailSoft,
             fail_soft_log: Some(Vec::new()),
+            target_image_base: None,
         };
         let mut loader = Loader::new(&mut self.mmu, &mut self.registry, &mut self.host);
         let img = loader.load_with_options(name, bytes, &mut options)?;
@@ -1516,6 +1541,75 @@ mod tests {
             let t = sb.host.threads.get(&tid).unwrap();
             assert!(matches!(t.status, crate::sched::ThreadStatus::Ready));
         }
+    }
+
+    /// Phase 5c: when the target EXE is staged in the
+    /// VirtualFs, `CreateProcessA` actually loads it at a
+    /// fresh image base and mints a Ready primary thread the
+    /// scheduler can run alongside the parent. The PE used
+    /// here is the synthetic-DLL fixture — it has a real PE
+    /// header and the only import (`kernel32!ExitProcess`) is
+    /// satisfied by our stub registry.
+    #[test]
+    fn create_process_a_loads_real_child_pe_from_vfs() {
+        use crate::pe::test_image::build_minimal_dll;
+        let mut sb = Sandbox::default();
+        // Stage a child binary in the VFS.
+        let dll_bytes = build_minimal_dll();
+        let child_path = "c:\\setup\\helper.exe";
+        let mut vfs = crate::context::VirtualFs::new();
+        vfs.insert(child_path, dll_bytes);
+        sb.host.context.vfs = Some(vfs);
+
+        // Stage a PROCESS_INFORMATION scratch region.
+        sb.mmu.map(0x500_0000, 0x1000, Perm::R | Perm::W);
+        let pi = 0x500_0000u32;
+        // Stage the lpApplicationName string.
+        sb.mmu.map(0x500_1000, 0x1000, Perm::R | Perm::W);
+        let app_ptr = 0x500_1000u32;
+        sb.mmu
+            .write_initializer(app_ptr, child_path.as_bytes())
+            .unwrap();
+        sb.mmu.store8(app_ptr + child_path.len() as u32, 0).unwrap();
+
+        let create_proc = sb
+            .registry
+            .resolve("kernel32.dll", "CreateProcessA")
+            .unwrap();
+        for &a in [app_ptr, 0u32, 0, 0, 0, 0, 0, 0, 0, pi].iter().rev() {
+            sb.cpu.push32(&mut sb.mmu, a).unwrap();
+        }
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = create_proc;
+        sb.run_until_sentinel().unwrap();
+        assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 1, "CreateProcessA TRUE");
+
+        // The new process should be in the table, distinct PID,
+        // and its primary thread Ready (not Terminated like the
+        // fake-child fallback).
+        let child_pid = sb.mmu.load32(pi + 8).unwrap();
+        let child_tid = sb.mmu.load32(pi + 12).unwrap();
+        let p = sb
+            .host
+            .processes
+            .get(&child_pid)
+            .expect("child process present");
+        assert_ne!(
+            p.image_base, 0,
+            "child PE was rebased into a fresh image slot"
+        );
+        assert_eq!(p.parent_pid, 1);
+        let t = sb
+            .host
+            .threads
+            .get(&child_tid)
+            .expect("child primary thread present");
+        assert!(matches!(
+            t.status,
+            crate::sched::ThreadStatus::Ready | crate::sched::ThreadStatus::Running
+        ));
+        // The minimal-DLL entry just rets, so a subsequent
+        // run_until_sentinel will Halt it cleanly.
     }
 
     /// Phase 3d: `EnterCriticalSection` takes ownership of an

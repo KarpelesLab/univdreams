@@ -324,6 +324,15 @@ pub struct ProcessState {
 /// LastError at 0x34, …).
 pub const THREAD_TIB_SIZE: u32 = 0x0000_1000;
 
+/// Stride between consecutive child PE image bases. 256 MiB
+/// per child gives plenty of room for sections + heap + stack
+/// + TIB without colliding with adjacent processes.
+pub const CHILD_IMAGE_STRIDE: u32 = 0x1000_0000;
+
+/// Per-child-process heap arena size. Each spawned child
+/// carves this much from the host's child-heap pool.
+pub const CHILD_HEAP_SIZE: u32 = 0x0100_0000; // 16 MiB
+
 /// Default per-thread stack size, in bytes. 64 KiB matches the
 /// typical Win32 reserve size; many codec / installer threads
 /// use only a few hundred bytes.
@@ -455,6 +464,18 @@ pub struct HostState {
     pub active_pid: u32,
     /// Cursor for the next `CreateProcessA` to mint a PID.
     pub next_pid: u32,
+    /// Image base for the next child PE loaded via
+    /// `CreateProcessA`. `0` until a child-image arena is
+    /// configured (via [`Self::with_child_image_arena`]); the
+    /// runtime walks the cursor forward by [`CHILD_IMAGE_STRIDE`]
+    /// per spawn.
+    pub next_child_image_base: u32,
+    /// Heap-arena pool the next child process carves its
+    /// per-process heap from. `[next_child_heap_base,
+    /// child_heap_arena_end)`. Each spawn takes
+    /// [`CHILD_HEAP_SIZE`] bytes.
+    pub next_child_heap_base: u32,
+    pub child_heap_arena_end: u32,
     /// Thread table keyed by TID. Phase 2 of the scheduler
     /// refactor: there is always at least one thread, with
     /// `tid = 1`, owning the live `Cpu` on `Sandbox`. Phase 3
@@ -547,6 +568,9 @@ impl Default for HostState {
             processes,
             active_pid: 1,
             next_pid: 2,
+            next_child_image_base: 0,
+            next_child_heap_base: 0,
+            child_heap_arena_end: 0,
             threads,
             active_tid: 1,
             next_tid: 2,
@@ -680,6 +704,22 @@ impl HostState {
         p.tib_pool_bottom = bottom;
         p.next_tib_addr = bottom;
         let _ = top; // explicit upper bound is informational
+        self
+    }
+
+    /// Configure the child-process pools: image-base cursor
+    /// + heap arena. `CreateProcessA` carves a child PE into
+    /// `[image_base, image_base + CHILD_IMAGE_STRIDE)` and a
+    /// 16 MiB heap out of `[heap_start, heap_end)`.
+    pub fn with_child_arena(
+        mut self,
+        image_base_cursor: u32,
+        heap_start: u32,
+        heap_end: u32,
+    ) -> Self {
+        self.next_child_image_base = image_base_cursor;
+        self.next_child_heap_base = heap_start;
+        self.child_heap_arena_end = heap_end;
         self
     }
 
@@ -1284,9 +1324,11 @@ fn handle_yield(cpu: &mut Cpu, state: &mut HostState, req: crate::sched::YieldRe
             t.status = ThreadStatus::Ready;
         }
         YieldRequest::Exit { code } => {
+            let tid = state.active_tid;
             let t = state.cur_thread_mut();
             t.status = ThreadStatus::Terminated;
             t.wait = None;
+            on_thread_terminated(state, tid);
             // Signal any pending `WaitForSingleObject` against
             // this thread's Thread WaitObject. (Phase 3c will
             // implement the wake side; here we just mark the
@@ -1347,13 +1389,85 @@ fn schedule_next_thread(cpu: &mut Cpu, state: &mut HostState) {
         t.parked_cpu = Some(parked);
     }
     // Restore the next thread's parked CPU into the live one.
+    let mut new_pid = None;
     if let Some(t) = state.threads.get_mut(&next_tid) {
         if let Some(c) = t.parked_cpu.take() {
             *cpu = c;
         }
         t.status = ThreadStatus::Running;
+        new_pid = Some(t.pid);
     }
     state.active_tid = next_tid;
+    // When the new thread lives in a different process, update
+    // `active_pid` so the Deref-resolved per-process state
+    // (heap arena, modules, hwnd registry, …) points at the
+    // new process. Phase 5c.
+    if let Some(pid) = new_pid {
+        if state.processes.contains_key(&pid) {
+            state.active_pid = pid;
+        }
+    }
+}
+
+/// After a thread terminates, check whether its owning
+/// process has any live threads left. If not, record the
+/// process's exit code (defaulting to 0 if not already set)
+/// and wake every thread blocked on a `WaitObject::Process`
+/// targeting that PID. Phase 5c — chains the natural Win32
+/// "last thread out marks the process exited" contract.
+fn on_thread_terminated(state: &mut HostState, tid: u32) {
+    let pid = match state.threads.get(&tid) {
+        Some(t) => t.pid,
+        None => return,
+    };
+    let alive = state
+        .threads
+        .values()
+        .any(|t| t.pid == pid && !matches!(t.status, crate::sched::ThreadStatus::Terminated));
+    if alive {
+        return;
+    }
+    if let Some(p) = state.processes.get_mut(&pid) {
+        if p.exit_code.is_none() {
+            p.exit_code = Some(0);
+        }
+    }
+    // Wake every Process-handle waiter on this PID.
+    let handles: Vec<u32> = state
+        .scheduler
+        .objects
+        .iter()
+        .filter_map(|(h, obj)| match obj {
+            crate::sched::WaitObject::Process { pid: p } if *p == pid => Some(*h),
+            _ => None,
+        })
+        .collect();
+    for h in handles {
+        for waiter_tid in crate::sched::waiters_on(&state.threads, h) {
+            if let Some(t) = state.threads.get_mut(&waiter_tid) {
+                t.status = crate::sched::ThreadStatus::Ready;
+                t.wait = None;
+            }
+        }
+    }
+    // Same for any pending Thread-handle waits on this TID.
+    let thread_handles: Vec<u32> = state
+        .scheduler
+        .objects
+        .iter()
+        .filter_map(|(h, obj)| match obj {
+            crate::sched::WaitObject::Thread { tid: t } if *t == tid => Some(*h),
+            _ => None,
+        })
+        .collect();
+    for h in thread_handles {
+        for waiter_tid in crate::sched::waiters_on(&state.threads, h) {
+            if let Some(t) = state.threads.get_mut(&waiter_tid) {
+                t.status = crate::sched::ThreadStatus::Ready;
+                t.wait = None;
+            }
+        }
+    }
 }
 
 /// Earliest `resume_after_instructions` across every
@@ -1467,7 +1581,9 @@ pub fn run_until_sentinel(
             if state.active_tid == 1 {
                 return Ok(());
             }
+            let dead_tid = state.active_tid;
             state.cur_thread_mut().status = crate::sched::ThreadStatus::Terminated;
+            on_thread_terminated(state, dead_tid);
             schedule_next_thread(cpu, state);
             // After the switch the live CPU points at the next
             // thread; if no other was Ready, we're back on the
@@ -1550,7 +1666,9 @@ pub fn run_until_sentinel(
                     return Ok(());
                 }
                 cpu.regs.eip = RET_SENTINEL;
+                let dead_tid = state.active_tid;
                 state.cur_thread_mut().status = crate::sched::ThreadStatus::Terminated;
+                on_thread_terminated(state, dead_tid);
                 schedule_next_thread(cpu, state);
                 continue;
             }

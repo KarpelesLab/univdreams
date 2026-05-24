@@ -149,6 +149,69 @@ pub fn resolve_with(
     Ok(())
 }
 
+/// Strict resolver that doesn't mutate the registry. Used by
+/// the child-process loader in `CreateProcessA` where the
+/// caller has only `&Registry` (the `StubFn` signature). On a
+/// missing import returns `PeError::UnknownImportFunction`;
+/// the child-process spawn falls back to the synthetic
+/// immediate-exit path in that case.
+pub fn resolve_strict(
+    mmu: &mut Mmu,
+    parsed: &Parsed,
+    image_base: u32,
+    registry: &Registry,
+) -> Result<(), PeError> {
+    let dir = parsed.optional.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if dir.virtual_address == 0 || dir.size == 0 {
+        return Ok(());
+    }
+    let mut desc = image_base.wrapping_add(dir.virtual_address);
+    loop {
+        let original_first_thunk = mmu.load32(desc)?;
+        let name_rva = mmu.load32(desc.wrapping_add(12))?;
+        let first_thunk = mmu.load32(desc.wrapping_add(16))?;
+        if original_first_thunk == 0 && first_thunk == 0 && name_rva == 0 {
+            break;
+        }
+        let dll_name = read_cstr(mmu, image_base.wrapping_add(name_rva))?;
+        let dll_lower = dll_name.to_ascii_lowercase();
+        let ilt = if original_first_thunk != 0 {
+            image_base.wrapping_add(original_first_thunk)
+        } else {
+            image_base.wrapping_add(first_thunk)
+        };
+        let iat = image_base.wrapping_add(first_thunk);
+        let mut i: u32 = 0;
+        loop {
+            let entry = mmu.load32(ilt.wrapping_add(4 * i))?;
+            if entry == 0 {
+                break;
+            }
+            let (import_name, resolved) = if (entry & IMAGE_ORDINAL_FLAG32) != 0 {
+                let ord = entry & 0xFFFF;
+                let name = format!("@{ord}");
+                let r = registry.resolve(&dll_lower, &name);
+                (name, r)
+            } else {
+                let by_name = image_base.wrapping_add(entry & 0x7FFF_FFFF);
+                let name = read_cstr(mmu, by_name.wrapping_add(2))?;
+                let r = registry.resolve(&dll_lower, &name);
+                (name, r)
+            };
+            let Some(thunk) = resolved else {
+                return Err(PeError::UnknownImportFunction {
+                    dll: dll_lower.clone(),
+                    name: import_name,
+                });
+            };
+            mmu.store32(iat.wrapping_add(4 * i), thunk)?;
+            i = i.wrapping_add(1);
+        }
+        desc = desc.wrapping_add(20);
+    }
+    Ok(())
+}
+
 fn read_cstr(mmu: &Mmu, mut addr: u32) -> Result<String, PeError> {
     let mut bytes = Vec::new();
     for _ in 0..1024 {

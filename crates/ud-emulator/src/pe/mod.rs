@@ -173,6 +173,15 @@ pub struct LoadOptions {
     /// pushed here for the caller to log. Ignored in strict
     /// mode (every miss is already a load-time error).
     pub fail_soft_log: Option<Vec<(String, String)>>,
+    /// Override the PE's preferred image base. When `Some`,
+    /// the loader maps sections at the given address and walks
+    /// the relocation table to fix up absolute references.
+    /// `CreateProcessA` uses this to load each child PE at a
+    /// unique base so multiple processes can coexist in the
+    /// shared MMU. PEs without relocations (`IMAGE_FILE_RELOCS_STRIPPED`)
+    /// are rejected when a target base is requested that
+    /// differs from the preferred one.
+    pub target_image_base: Option<u32>,
 }
 
 impl Default for imports::ResolveMode {
@@ -216,20 +225,19 @@ impl<'a> Loader<'a> {
     ) -> Result<Image, PeError> {
         let parsed = header::parse(bytes)?;
 
-        // Map sections: each section gets at least VirtualSize
-        // bytes mapped at ImageBase + VirtualAddress. Bytes from
-        // the file are written via write_initializer (which
-        // bypasses the W bit — fine, we're populating).
-        let secs = sections::map_sections(self.mmu, &parsed, bytes)?;
-
-        // Apply base relocations. Round-1 always uses the
-        // preferred base — relocations are a no-op delta. We
-        // still parse + walk the table to make sure malformed
-        // blocks are rejected, but we use delta=0 so no bytes
-        // change. This keeps the codepath exercised in tests.
         let preferred_base = parsed.optional.image_base;
-        let load_base = preferred_base;
+        let load_base = options.target_image_base.unwrap_or(preferred_base);
         let delta = load_base.wrapping_sub(preferred_base);
+
+        // Map sections at the chosen base.
+        let secs = sections::map_sections_at(self.mmu, &parsed, bytes, load_base)?;
+
+        // Apply base relocations. When loading at the preferred
+        // base, delta is 0 and the relocation pass is a no-op
+        // walk (still exercised for malformed-block detection).
+        // When the target base differs, the relocation table
+        // patches absolute references; PEs without a `.reloc`
+        // table can only be loaded at their preferred base.
         if delta != 0 {
             reloc::apply(self.mmu, &parsed, load_base, delta)?;
         }
