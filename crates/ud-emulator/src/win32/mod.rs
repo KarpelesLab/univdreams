@@ -157,13 +157,22 @@ pub struct HicEntry {
     pub driver_id: u32,
 }
 
-/// The host-side state every stub may read or mutate.
+/// Per-process emulator state. Phase 1 of the scheduler refactor
+/// (see `magical-popping-oasis` plan): every field that is
+/// conceptually scoped to a single Win32 *process* lives here.
+/// Today there is exactly one [`ProcessState`] per [`HostState`];
+/// Phase 5 will switch this to a `BTreeMap<pid, ProcessState>`
+/// indexed by an `active_pid` cursor, which keeps stub bodies
+/// unchanged (they reach state through [`HostState`]'s
+/// auto-deref).
 ///
-/// This is the "operating system" of the sandbox — the heap, the
-/// LastError TLS, the pseudo-tick counter, the loaded-module
-/// registry, etc. One per emulator instance.
+/// The conceptual boundary: anything a child process spawned via
+/// `CreateProcessA` should NOT share with its parent goes here.
+/// Anything truly shared (virtual filesystem, virtual registry,
+/// host-side trace buffers, the clock, the instruction budget)
+/// stays on [`HostState`].
 #[derive(Default)]
-pub struct HostState {
+pub struct ProcessState {
     /// Heap allocations keyed by guest address.
     pub heap: BTreeMap<u32, Vec<u8>>,
     /// Cursor for the next heap allocation. Walks through a
@@ -172,29 +181,12 @@ pub struct HostState {
     pub heap_arena_end: u32,
     /// Default process heap handle returned by `GetProcessHeap`.
     pub process_heap_handle: u32,
-    /// Last error code (`SetLastError` / `GetLastError`).
-    pub last_error: u32,
-    /// Lazily-allocated guest address of the C-CRT `errno` cell.
-    /// `None` until the first call to `msvcrt::_errno`, then
-    /// stable for the lifetime of the sandbox so repeated calls
-    /// return the same pointer (the contract `int * _errno(void)`
-    /// requires).
-    pub errno_cell: Option<u32>,
-    /// Pseudo-tick counter incremented on every `GetTickCount`.
-    pub tick: u32,
     /// Loaded-module registry: name → ImageBase.
     pub modules: BTreeMap<String, u32>,
     /// Most-recently-loaded codec module's image base — returned
     /// by `GetModuleHandleA(NULL)`. Set to 0 if no DLL has been
     /// loaded yet.
     pub primary_module_base: u32,
-    /// Lines that the codec wrote to `OutputDebugString*`. Tests
-    /// can introspect to confirm a known string was emitted.
-    pub debug_log: Vec<String>,
-    /// Lines that the codec wrote to `MessageBoxA` (also mirrored
-    /// to `eprintln!`). Distinct from `debug_log` so a test can
-    /// distinguish OutputDebugStringA traffic from real popups.
-    pub message_box_log: Vec<String>,
     /// Open codec handles. Synthesised inside the host (no codec
     /// guest memory is consumed); each handle is a small integer
     /// the codec sees as an `HIC`.
@@ -207,31 +199,13 @@ pub struct HostState {
     /// the no-fixture unit tests). Set to 0 when no codec is
     /// loaded — `ICOpen` then refuses to mint a HIC.
     pub default_driver_proc: u32,
-    /// Set by `kernel32!ExitProcess` to break out of the
-    /// emulator loop in lieu of unwinding to `RET_SENTINEL`.
-    /// `Some(code)` means "the codec asked to terminate"; the
-    /// run-loop converts this into a clean return so the calling
-    /// host code can introspect what happened.
+    /// Set by `kernel32!ExitProcess` (and `TerminateProcess` on
+    /// the current process) to break out of the emulator loop in
+    /// lieu of unwinding to `RET_SENTINEL`. `Some(code)` means
+    /// "this process asked to terminate"; the run-loop converts
+    /// this into a clean return so the calling host code can
+    /// introspect what happened.
     pub exit_requested: Option<u32>,
-    /// Optional per-run instruction budget. Decremented at each
-    /// top-of-loop iteration in [`run_until_sentinel`] (both
-    /// instruction steps and stub dispatches count). When it
-    /// hits zero the run loop bails with
-    /// [`Win32Error::BudgetExhausted`] so adversarial guests
-    /// can't loop the host. `None` (the default) keeps the
-    /// historical unbounded behaviour.
-    pub instruction_budget: Option<u64>,
-    /// Counts how many instructions actually ran in the last
-    /// (or current) run-loop session. Useful for the analysis
-    /// front-ends to report "ran for N instructions, budget
-    /// was M". Reset to zero on each top-level run entry.
-    pub instructions_executed: u64,
-    /// Optional emulation-context layer (virtual filesystem,
-    /// virtual registry, future surfaces). When `None`, the
-    /// Win32 stubs that would consult it fall through to
-    /// their fail-soft default. See [`crate::context::Context`]
-    /// for the contract.
-    pub context: crate::context::Context,
     /// Read-only constant-data arena. Used by stubs like
     /// `GetCommandLineA` / `GetEnvironmentStrings` that need to
     /// hand out stable guest pointers to canned strings. The
@@ -259,21 +233,6 @@ pub struct HostState {
     /// Counter for the next synthetic HWND allocation. Starts at
     /// 0; first HWND handed out is `HWND_BASE + 0`.
     pub next_hwnd_index: u32,
-    /// When `true`, [`dispatch_stub`] appends one line per Win32
-    /// call to [`HostState::stub_trace`]. Off by default; round-8 tests flip
-    /// it on while triaging which stub returns a bad value.
-    pub trace_stubs: bool,
-    /// Per-call trace lines populated when [`HostState::trace_stubs`] is on.
-    /// Format: `dll!name(arg0, arg1, …) → 0xRET`. The args are
-    /// the first `arg_dwords` (or, for known cdecl shapes, the
-    /// override from [`cdecl_trace_arg_count`]) dwords off the
-    /// guest stack, captured BEFORE the stub mutates them.
-    pub stub_trace: Vec<String>,
-    /// Structured per-call log, populated when [`HostState::trace_stubs`]
-    /// is on. Parallel to [`HostState::stub_trace`]; analysis front-ends
-    /// (the `ud analyze` JSON output) consume this directly so
-    /// they don't have to re-parse the formatted string.
-    pub stub_calls: Vec<StubCall>,
     /// Set of `DriverProc` VAs that have already received the
     /// one-time `DRV_LOAD` + `DRV_ENABLE` initialisation pair.
     /// Round 11 — without this, `IR50_32.DLL`'s `DRV_LOAD` handler
@@ -319,6 +278,111 @@ pub struct HostState {
     pub rand_state: u32,
 }
 
+impl ProcessState {
+    /// Construct a fresh process with the heap arena at
+    /// `[heap_start, heap_end)` (caller is responsible for
+    /// mapping that region in the MMU as R+W).
+    #[must_use]
+    pub fn new(heap_start: u32, heap_end: u32) -> Self {
+        ProcessState {
+            heap_cursor: heap_start,
+            heap_arena_end: heap_end,
+            process_heap_handle: 0xDEAD_BEEF,
+            next_hic: 1,
+            rand_state: 1,
+            ..ProcessState::default()
+        }
+    }
+}
+
+/// The host-side state every stub may read or mutate.
+///
+/// This is the "operating system" of the sandbox — the heap, the
+/// LastError TLS, the pseudo-tick counter, the loaded-module
+/// registry, etc. One per emulator instance.
+///
+/// `HostState` is the union of (a) **truly shared** state
+/// (virtual filesystem, virtual registry, trace buffers, clock,
+/// instruction budget) and (b) the **current process**'s
+/// [`ProcessState`], exposed through [`std::ops::Deref`] so that
+/// existing stub bodies that read `state.heap` / `state.modules`
+/// / etc. continue to compile unchanged. The split prepares
+/// Phase 5 of the scheduler refactor (`CreateProcessA` spawning
+/// a real child PE) without churning every Win32 stub today.
+#[derive(Default)]
+pub struct HostState {
+    /// Active process. Phase 5 will swap this for a process
+    /// table + an `active_pid` cursor; until then there is
+    /// always exactly one.
+    pub process: ProcessState,
+    /// Last error code (`SetLastError` / `GetLastError`). Phase
+    /// 2 will move this to per-thread storage; it stays here
+    /// for now so the single-thread baseline is unchanged.
+    pub last_error: u32,
+    /// Lazily-allocated guest address of the C-CRT `errno` cell.
+    /// `None` until the first call to `msvcrt::_errno`, then
+    /// stable for the lifetime of the sandbox so repeated calls
+    /// return the same pointer (the contract `int * _errno(void)`
+    /// requires).
+    pub errno_cell: Option<u32>,
+    /// Pseudo-tick counter incremented on every `GetTickCount`.
+    pub tick: u32,
+    /// Lines that the codec wrote to `OutputDebugString*`. Tests
+    /// can introspect to confirm a known string was emitted.
+    pub debug_log: Vec<String>,
+    /// Lines that the codec wrote to `MessageBoxA` (also mirrored
+    /// to `eprintln!`). Distinct from `debug_log` so a test can
+    /// distinguish OutputDebugStringA traffic from real popups.
+    pub message_box_log: Vec<String>,
+    /// Optional per-run instruction budget. Decremented at each
+    /// top-of-loop iteration in [`run_until_sentinel`] (both
+    /// instruction steps and stub dispatches count). When it
+    /// hits zero the run loop bails with
+    /// [`Win32Error::BudgetExhausted`] so adversarial guests
+    /// can't loop the host. `None` (the default) keeps the
+    /// historical unbounded behaviour.
+    pub instruction_budget: Option<u64>,
+    /// Counts how many instructions actually ran in the last
+    /// (or current) run-loop session. Useful for the analysis
+    /// front-ends to report "ran for N instructions, budget
+    /// was M". Reset to zero on each top-level run entry.
+    pub instructions_executed: u64,
+    /// Optional emulation-context layer (virtual filesystem,
+    /// virtual registry, future surfaces). When `None`, the
+    /// Win32 stubs that would consult it fall through to
+    /// their fail-soft default. See [`crate::context::Context`]
+    /// for the contract.
+    pub context: crate::context::Context,
+    /// When `true`, [`dispatch_stub`] appends one line per Win32
+    /// call to [`HostState::stub_trace`]. Off by default; round-8 tests flip
+    /// it on while triaging which stub returns a bad value.
+    pub trace_stubs: bool,
+    /// Per-call trace lines populated when [`HostState::trace_stubs`] is on.
+    /// Format: `dll!name(arg0, arg1, …) → 0xRET`. The args are
+    /// the first `arg_dwords` (or, for known cdecl shapes, the
+    /// override from [`cdecl_trace_arg_count`]) dwords off the
+    /// guest stack, captured BEFORE the stub mutates them.
+    pub stub_trace: Vec<String>,
+    /// Structured per-call log, populated when [`HostState::trace_stubs`]
+    /// is on. Parallel to [`HostState::stub_trace`]; analysis front-ends
+    /// (the `ud analyze` JSON output) consume this directly so
+    /// they don't have to re-parse the formatted string.
+    pub stub_calls: Vec<StubCall>,
+}
+
+impl std::ops::Deref for HostState {
+    type Target = ProcessState;
+    fn deref(&self) -> &ProcessState {
+        &self.process
+    }
+}
+
+impl std::ops::DerefMut for HostState {
+    fn deref_mut(&mut self) -> &mut ProcessState {
+        &mut self.process
+    }
+}
+
 impl HostState {
     /// Construct a HostState with the heap arena at `[heap_start,
     /// heap_end)` (caller is responsible for mapping that region
@@ -331,42 +395,25 @@ impl HostState {
     /// don't use them can leave it at zero.
     pub fn new(heap_start: u32, heap_end: u32) -> Self {
         HostState {
-            heap_cursor: heap_start,
-            heap_arena_end: heap_end,
-            process_heap_handle: 0xDEAD_BEEF,
-            last_error: 0,
-            errno_cell: None,
-            tick: 0,
-            heap: BTreeMap::new(),
-            modules: BTreeMap::new(),
-            primary_module_base: 0,
-            debug_log: Vec::new(),
-            message_box_log: Vec::new(),
-            hics: BTreeMap::new(),
-            next_hic: 1,
-            default_driver_proc: 0,
-            exit_requested: None,
-            instruction_budget: None,
-            instructions_executed: 0,
-            context: crate::context::Context::default(),
-            const_arena_cursor: 0,
-            const_arena_end: 0,
-            command_line_ptr: 0,
-            environment_strings_ptr: 0,
-            gdi_hdcs: None,
-            hwnd_registry: std::collections::BTreeSet::new(),
-            next_hwnd_index: 0,
-            trace_stubs: false,
-            stub_trace: Vec::new(),
-            stub_calls: Vec::new(),
-            loaded_drivers: std::collections::BTreeSet::new(),
-            module_resource_dirs: BTreeMap::new(),
-            com: crate::com::ComObjectTable::new(),
-            // MSVC documents the C standard's "no `srand` called yet"
-            // initial state as `state = 1`.  See round 55 + the
-            // `rand_state` field doc comment for the LCG contract.
-            rand_state: 1,
+            process: ProcessState::new(heap_start, heap_end),
+            ..HostState::default()
         }
+    }
+
+    /// Borrow the active process. Phase 5 will use `active_pid`
+    /// to pick from a process table; until then this returns
+    /// the singleton.
+    #[must_use]
+    pub fn cur_process(&self) -> &ProcessState {
+        &self.process
+    }
+
+    /// Mutable borrow of the active process. Pair to
+    /// [`Self::cur_process`]. Prefer over the auto-deref when
+    /// the call site needs to make the per-process scope
+    /// explicit (audits, future merge conflicts).
+    pub fn cur_process_mut(&mut self) -> &mut ProcessState {
+        &mut self.process
     }
 
     /// Configure the const-arena (region for canned read-only
@@ -375,8 +422,8 @@ impl HostState {
     /// (the arena bytes are written via `write_initializer`,
     /// so any page perms suffice as long as the page is mapped).
     pub fn with_const_arena(mut self, start: u32, end: u32) -> Self {
-        self.const_arena_cursor = start;
-        self.const_arena_end = end;
+        self.process.const_arena_cursor = start;
+        self.process.const_arena_end = end;
         self
     }
 
