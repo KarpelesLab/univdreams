@@ -1035,7 +1035,8 @@ fn propagate_one_stmt(
         | Stmt::LocalSet { bytes, .. }
         | Stmt::LocalArith { bytes, .. }
         | Stmt::LocalCompound { bytes, .. }
-        | Stmt::Inc16 { bytes, .. } => {
+        | Stmt::Inc16 { bytes, .. }
+        | Stmt::RegArith { bytes, .. } => {
             state.invalidate_all();
             *cursor += bytes.len() as u64;
         }
@@ -1696,7 +1697,8 @@ fn annotate_in_seq(stmts: &mut Vec<Stmt>, state: &mut RegState) {
             | Stmt::LocalSet { .. }
             | Stmt::LocalArith { .. }
             | Stmt::LocalCompound { .. }
-            | Stmt::Inc16 { .. } => {
+            | Stmt::Inc16 { .. }
+            | Stmt::RegArith { .. } => {
                 state.invalidate_all();
             }
             Stmt::Save { reg, .. } | Stmt::Restore { reg, .. } => {
@@ -2073,7 +2075,8 @@ fn stmt_total_bytes_at(stmt: &Stmt, cursor: u64) -> usize {
         | Stmt::Move { bytes, .. }
         | Stmt::Inc16 { bytes, .. }
         | Stmt::SehInstall { bytes }
-        | Stmt::SehRestore { bytes } => bytes.len(),
+        | Stmt::SehRestore { bytes }
+        | Stmt::RegArith { bytes, .. } => bytes.len(),
         Stmt::Call {
             bytes,
             direct_target,
@@ -2339,7 +2342,8 @@ fn stmt_bytes_field_mut(stmt: &mut Stmt) -> Option<&mut Vec<u8>> {
         | Stmt::Move { bytes, .. }
         | Stmt::Inc16 { bytes, .. }
         | Stmt::SehInstall { bytes }
-        | Stmt::SehRestore { bytes } => Some(bytes),
+        | Stmt::SehRestore { bytes }
+        | Stmt::RegArith { bytes, .. } => Some(bytes),
         Stmt::IfGoto { .. }
         | Stmt::IfReturn { .. }
         | Stmt::IfBranch { .. }

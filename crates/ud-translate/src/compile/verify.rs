@@ -151,7 +151,8 @@ fn verify_stmts(
             | Stmt::LocalArith { bytes, .. }
             | Stmt::LocalCompound { bytes, .. }
             | Stmt::Move { bytes, .. }
-            | Stmt::Inc16 { bytes, .. } => {
+            | Stmt::Inc16 { bytes, .. }
+            | Stmt::RegArith { bytes, .. } => {
                 *cursor = cursor.saturating_add(bytes.len() as u64);
             }
             Stmt::Call {

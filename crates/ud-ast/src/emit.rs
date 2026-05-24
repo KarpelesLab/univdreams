@@ -557,6 +557,24 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_stmts(out, body, &body_indent);
             writeln!(out, "{indent}}}").unwrap();
         }
+        Stmt::RegArith {
+            dst,
+            op,
+            src,
+            bytes,
+        } => {
+            write!(out, "{indent}").unwrap();
+            emit_move_side(out, dst);
+            write!(out, " {op} ").unwrap();
+            emit_move_side(out, src);
+            if bytes.is_empty() {
+                writeln!(out, ";").unwrap();
+            } else {
+                out.push_str("; [");
+                emit_byte_list(out, bytes);
+                writeln!(out, "]").unwrap();
+            }
+        }
     }
 }
 

@@ -355,7 +355,51 @@ fn lift_semantic_stmt(
         return lift_lddw(insn, text, lddw_pair_bytes);
     }
 
+    // 64-bit ALU ops → Stmt::RegArith.
+    // ALU64 class = 0x07. op nibble lives in high nibble of opcode.
+    if matches!(insn.kind, InsnKind::Alu64) && (insn.opcode & 0x07) == 0x07 {
+        return lift_alu64(insn);
+    }
+
     None
+}
+
+/// Lift `add64 / sub64 / mul64 / lsh64 / rsh64 / or64 / and64
+/// / xor64 / div64 / mod64` (the byte-drop-friendly subset) to
+/// `Stmt::RegArith`. `arsh64` / `neg64` keep their `@asm`
+/// rendering because the canonical `>>=` / unary-minus syntax
+/// would lose the arsh-vs-rsh distinction (need an attribute
+/// marker first).
+fn lift_alu64(insn: &DecodedInsn) -> Option<Stmt> {
+    let op_nibble = insn.opcode >> 4;
+    let op = match op_nibble {
+        0x0 => "+=",
+        0x1 => "-=",
+        0x2 => "*=",
+        0x3 => "/=",
+        0x4 => "|=",
+        0x5 => "&=",
+        0x6 => "<<=",
+        0x7 => ">>=",
+        0x9 => "%=",
+        0xa => "^=",
+        _ => return None, // 0x8 neg, 0xb mov (handled elsewhere),
+                          // 0xc arsh — defer with marker.
+    };
+    let dst = format!("r{}", insn.dst);
+    let src = if (insn.opcode & 0x08) != 0 {
+        format!("r{}", insn.src)
+    } else {
+        #[allow(clippy::cast_sign_loss)]
+        let imm_u32 = insn.imm as u32;
+        format!("0x{imm_u32:x}")
+    };
+    Some(Stmt::RegArith {
+        dst,
+        op: op.into(),
+        src,
+        bytes: insn.bytes.to_vec(),
+    })
 }
 
 /// Lift `ldx{b,h,w,dw} rN, [rM ± off]` into
@@ -816,7 +860,11 @@ fn try_split_then_else(
 fn is_byte_bearing_stmt(stmt: &Stmt) -> bool {
     matches!(
         stmt,
-        Stmt::Asm { .. } | Stmt::Move { .. } | Stmt::Return { .. } | Stmt::Call { .. }
+        Stmt::Asm { .. }
+            | Stmt::Move { .. }
+            | Stmt::Return { .. }
+            | Stmt::Call { .. }
+            | Stmt::RegArith { .. }
     )
 }
 
@@ -828,9 +876,13 @@ fn peek_insn_addr(body: &[Stmt], idx: usize) -> Option<u64> {
     let mut slots_seen = 0u64;
     for j in (0..idx).rev() {
         match &body[j] {
-            Stmt::Asm { bytes, .. } | Stmt::Return { bytes, .. } | Stmt::Call { bytes, .. } => {
-                // 8 bytes = 1 slot; covers everything except
-                // LDDW (which only appears as Move below).
+            Stmt::Asm { bytes, .. }
+            | Stmt::Return { bytes, .. }
+            | Stmt::Call { bytes, .. }
+            | Stmt::RegArith { bytes, .. } => {
+                // 8 bytes = 1 slot for every single-slot BPF
+                // stmt class; LDDW Move is the only multi-slot
+                // case and lives in the Move arm below.
                 slots_seen += bytes.len().max(8) as u64 / 8;
             }
             Stmt::Move { bytes, .. } => {

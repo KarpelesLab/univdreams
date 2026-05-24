@@ -616,6 +616,26 @@ fn lower_stmts_into(
                     out.extend_from_slice(bytes);
                 }
             }
+            Stmt::RegArith {
+                dst,
+                op,
+                src,
+                bytes,
+            } => {
+                if bytes.is_empty() {
+                    let encoded =
+                        arch.encode_arith(dst, op, src)
+                            .map_err(|e| LowerError::ArchEncode {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                                operation: "arith",
+                                message: e.to_string(),
+                            })?;
+                    out.extend_from_slice(&encoded);
+                } else {
+                    out.extend_from_slice(bytes);
+                }
+            }
             Stmt::Return { value, bytes } => {
                 if bytes.is_empty() {
                     let encoded =

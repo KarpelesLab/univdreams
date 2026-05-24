@@ -724,6 +724,29 @@ pub enum Stmt {
         tail_bytes: Vec<u8>,
         body: Vec<Stmt>,
     },
+
+    /// `dst op src;` — a compound-assignment arithmetic stmt
+    /// where `dst` is a register name, `op` is a C-style
+    /// compound operator (`"+="`, `"-="`, `"*="`, `"/="`,
+    /// `"%="`, `"|="`, `"&="`, `"^="`, `"<<="`, `">>="`), and
+    /// `src` is a register or immediate text.
+    ///
+    /// Lifted from arch ALU instructions whose register-only
+    /// shape lets the codec round-trip via `encode_arith`.
+    /// On BPF that's the 64-bit ALU class (add64, lsh64,
+    /// or64, etc.); the framework lets other arches plug in
+    /// the same way.
+    ///
+    /// Round-trip: `bytes` rides pinned by default; the
+    /// decompile-side byte-drop clears `bytes` when
+    /// `arch.encode_arith(dst, op, src)` reproduces them, and
+    /// the lower path regenerates from the textual fields.
+    RegArith {
+        dst: String,
+        op: String,
+        src: String,
+        bytes: Vec<u8>,
+    },
 }
 
 impl Stmt {

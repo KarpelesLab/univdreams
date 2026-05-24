@@ -961,6 +961,16 @@ impl Parser {
                     line: self.peek().line,
                     col: self.peek().col,
                 })?;
+        // Detect compound-assignment forms (`+=`, `-=`, `*=`,
+        // `/=`, `%=`, `|=`, `&=`, `^=`, `<<=`, `>>=`) by
+        // peeking at the token(s) immediately before `Eq`.
+        // The op text is sliced from the source so the
+        // emitter's canonical form (e.g. `r1 += 0x5`) round-
+        // trips.
+        let eq_idx = last_eq_idx.unwrap();
+        let compound_op = detect_compound_op(&self.tokens, eq_idx);
+        let dst_end = compound_op
+            .map_or(last_eq_tok.start, |(prev_idx, _len)| self.tokens[prev_idx].start);
         // Bytes are optional now — when the byte-drop pass clears
         // them at decompile time, the emitter skips the `[]` and
         // lower regenerates from the dst/src text via the arch
@@ -968,7 +978,7 @@ impl Parser {
         let bytes_tok = byte_list_idx
             .filter(|&i| self.tokens[i].start > last_eq_tok.start)
             .map(|i| self.tokens[i].clone());
-        let dst = self.src[stmt_start..last_eq_tok.start].trim().to_string();
+        let dst = self.src[stmt_start..dst_end].trim().to_string();
         let (src, bytes) = if let Some(btok) = bytes_tok {
             let src = self.src[last_eq_tok.end..btok.start].trim().to_string();
             // Advance to the byte list and parse it.
@@ -997,6 +1007,21 @@ impl Parser {
             let src = self.src[last_eq_tok.end..last_tok_end].trim().to_string();
             (src, Vec::new())
         };
+        // Strip a trailing `;` from `src` if present (RegArith
+        // canonical form emits `dst op src;` with the semicolon
+        // inside the captured range).
+        let src = src
+            .strip_suffix(';')
+            .map_or(src.clone(), |s| s.trim().to_string());
+        if let Some((_prev_idx, _len)) = compound_op {
+            let op = self.src[dst_end..last_eq_tok.end].trim().to_string();
+            return Ok(Stmt::RegArith {
+                dst,
+                op,
+                src,
+                bytes,
+            });
+        }
         Ok(Stmt::Move { dst, src, bytes })
     }
 
@@ -1083,7 +1108,18 @@ impl Parser {
         // Bytes are optional: BPF call-sites with a known
         // `direct_target` regenerate via `arch.encode_call` at
         // lower time, so the emitter omits the `[]` block.
-        let bytes = if self.peek().kind == TokenKind::LBracket {
+        // Only consume a following `[` when it's a real byte
+        // list AND on the same line as the call — otherwise
+        // it's the dst of a stx-style Move on the next line
+        // (e.g. `[r6 + 0x60] = r8`).
+        let call_line = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map_or(0, |t| t.line);
+        let bytes = if self.peek().kind == TokenKind::LBracket
+            && self.peek().line == call_line
+            && is_byte_list_block(&self.tokens, self.pos)
+        {
             self.parse_byte_list()?
         } else {
             Vec::new()
@@ -2216,6 +2252,53 @@ impl Parser {
 /// terminated by `]`)? Used by `parse_move_stmt` to distinguish
 /// the trailing byte list from operand-side memory expressions
 /// like `[ebp+8]` or `[1C201030h]`.
+/// Recognise a compound-assignment operator sitting
+/// immediately before the `Eq` token at `eq_idx`. Returns
+/// `Some((first_op_token_idx, total_op_token_count))` when
+/// matched. The op text spans tokens
+/// `[first_op_token_idx, eq_idx + 1)` in source order.
+///
+/// Two-char ops (`+=`, `-=`, `*=`, `/=`, `%=`, `|=`, `&=`,
+/// `^=`): one operator token then `Eq`.
+/// Three-char ops (`<<=`, `>>=`): two same-kind operator
+/// tokens then `Eq`.
+fn detect_compound_op(tokens: &[Token], eq_idx: usize) -> Option<(usize, usize)> {
+    if eq_idx == 0 {
+        return None;
+    }
+    let prev = &tokens[eq_idx - 1];
+    // The op token must be adjacent (no whitespace gap) to
+    // distinguish `r1 += 0x5` from `r1 = +0x5`. Token spans
+    // carry start/end byte offsets; the `Eq`'s start must
+    // equal the previous token's end.
+    let eq_tok = &tokens[eq_idx];
+    if prev.end != eq_tok.start {
+        return None;
+    }
+    // 3-char ops first (need to check 2 prior tokens).
+    if matches!(prev.kind, TokenKind::Lt | TokenKind::Gt) && eq_idx >= 2 {
+        let prev2 = &tokens[eq_idx - 2];
+        if prev2.kind == prev.kind && prev2.end == prev.start {
+            return Some((eq_idx - 2, 3));
+        }
+    }
+    // 2-char ops.
+    if matches!(
+        prev.kind,
+        TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::Pipe
+            | TokenKind::Ampersand
+            | TokenKind::Caret
+    ) {
+        return Some((eq_idx - 1, 2));
+    }
+    None
+}
+
 fn is_byte_list_block(tokens: &[Token], lbracket_idx: usize) -> bool {
     if !matches!(
         tokens.get(lbracket_idx).map(|t| &t.kind),

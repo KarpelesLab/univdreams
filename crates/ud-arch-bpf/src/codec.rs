@@ -216,6 +216,51 @@ impl ArchCodec for BpfCodec {
     fn encode_return(&self, _value: Option<u64>) -> Result<Vec<u8>, ArchError> {
         assemble_bpf("exit").map_err(|e| ArchError::Assemble(e.to_string()))
     }
+
+    /// Encode `dst op src` as a single 64-bit BPF ALU
+    /// instruction. The op string maps to the corresponding
+    /// BPF mnemonic; the src may be a register (`r0`..`r10`)
+    /// or an immediate (`0x<hex>` / decimal).
+    ///
+    /// Returns `Unsupported` for operators outside the lifted
+    /// set (`arsh`, `neg`, 32-bit forms keep their `@asm`
+    /// rendering for now).
+    fn encode_arith(&self, dst: &str, op: &str, src: &str) -> Result<Vec<u8>, ArchError> {
+        let dst = dst.trim();
+        let src = src.trim();
+        if !is_bpf_reg(dst) {
+            return Err(ArchError::Unsupported {
+                arch: self.name(),
+                operation: "arith (non-register dst)",
+            });
+        }
+        if !(is_bpf_reg(src) || is_bpf_imm(src)) {
+            return Err(ArchError::Unsupported {
+                arch: self.name(),
+                operation: "arith (unsupported src shape)",
+            });
+        }
+        let mnemonic = match op {
+            "+=" => "add64",
+            "-=" => "sub64",
+            "*=" => "mul64",
+            "/=" => "div64",
+            "%=" => "mod64",
+            "|=" => "or64",
+            "&=" => "and64",
+            "^=" => "xor64",
+            "<<=" => "lsh64",
+            ">>=" => "rsh64",
+            _ => {
+                return Err(ArchError::Unsupported {
+                    arch: self.name(),
+                    operation: "arith (unsupported op)",
+                });
+            }
+        };
+        assemble_bpf(&format!("{mnemonic} {dst}, {src}"))
+            .map_err(|e| ArchError::Assemble(e.to_string()))
+    }
 }
 
 /// Recognise a BPF general-purpose register name (`r0`..`r10`).

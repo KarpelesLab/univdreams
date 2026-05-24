@@ -303,6 +303,29 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                             }
                         }
                     }
+                    // 1 slot for plain Move, 2 for LDDW Move
+                    // (16 pinned bytes); after byte-drop bytes
+                    // may be empty — assume 1 slot.
+                    let slots = if bytes.is_empty() {
+                        1
+                    } else {
+                        (bytes.len() as u64).max(slot_size) / slot_size
+                    };
+                    *ip = ip.saturating_add(slots * slot_size);
+                }
+                ud_ast::Stmt::RegArith {
+                    dst,
+                    op,
+                    src,
+                    bytes,
+                } => {
+                    if !bytes.is_empty() {
+                        if let Ok(encoded) = arch.encode_arith(dst, op, src) {
+                            if encoded == *bytes {
+                                bytes.clear();
+                            }
+                        }
+                    }
                     *ip = ip.saturating_add(slot_size);
                 }
                 ud_ast::Stmt::Return { value, bytes } => {
