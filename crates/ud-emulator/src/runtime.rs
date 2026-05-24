@@ -1498,6 +1498,73 @@ mod tests {
         }
     }
 
+    /// Phase 3d: `EnterCriticalSection` takes ownership of an
+    /// implicit Mutex keyed by `LPCRITICAL_SECTION`'s guest
+    /// address; recursion increments on re-entry by the same
+    /// thread; `LeaveCriticalSection` decrements and clears
+    /// ownership when the count reaches zero. Exercised through
+    /// the kernel32 thunk dispatch.
+    #[test]
+    fn enter_leave_critical_section_round_trip() {
+        let mut sb = Sandbox::new();
+        // Map a CRITICAL_SECTION scratch region.
+        sb.mmu.map(0x400_0000, 0x1000, Perm::R | Perm::W);
+        let cs = 0x400_0000u32;
+        let enter = sb
+            .registry
+            .resolve("kernel32.dll", "EnterCriticalSection")
+            .unwrap();
+        let leave = sb
+            .registry
+            .resolve("kernel32.dll", "LeaveCriticalSection")
+            .unwrap();
+        // First enter: take ownership, recursion=1.
+        sb.cpu.push32(&mut sb.mmu, cs).unwrap();
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = enter;
+        sb.run_until_sentinel().unwrap();
+        let h = sb.host.scheduler.critical_sections[&cs];
+        match sb.host.scheduler.objects.get(&h).unwrap() {
+            crate::sched::WaitObject::CriticalSection {
+                owner, recursion, ..
+            } => {
+                assert_eq!(*owner, Some(1));
+                assert_eq!(*recursion, 1);
+            }
+            _ => panic!(),
+        }
+        // Re-entry by same thread: recursion=2.
+        sb.cpu.push32(&mut sb.mmu, cs).unwrap();
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = enter;
+        sb.run_until_sentinel().unwrap();
+        match sb.host.scheduler.objects.get(&h).unwrap() {
+            crate::sched::WaitObject::CriticalSection { recursion, .. } => {
+                assert_eq!(*recursion, 2);
+            }
+            _ => panic!(),
+        }
+        // First leave: recursion→1.
+        sb.cpu.push32(&mut sb.mmu, cs).unwrap();
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = leave;
+        sb.run_until_sentinel().unwrap();
+        // Second leave: recursion→0, owner cleared.
+        sb.cpu.push32(&mut sb.mmu, cs).unwrap();
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = leave;
+        sb.run_until_sentinel().unwrap();
+        match sb.host.scheduler.objects.get(&h).unwrap() {
+            crate::sched::WaitObject::CriticalSection {
+                owner, recursion, ..
+            } => {
+                assert_eq!(*owner, None);
+                assert_eq!(*recursion, 0);
+            }
+            _ => panic!(),
+        }
+    }
+
     /// Phase 3b of the scheduler refactor: `CreateThread` mints
     /// a Ready thread, the scheduler context-switches into it
     /// the first time the bootstrap thread yields, and the new

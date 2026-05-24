@@ -304,6 +304,13 @@ pub fn register(registry: &mut Registry) {
         stub_initialize_critical_section as StubFn,
         1,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-tryentercriticalsection
+    registry.register(
+        "kernel32.dll",
+        "TryEnterCriticalSection",
+        stub_try_enter_critical_section as StubFn,
+        1,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-findresourcea
     registry.register(
         "kernel32.dll",
@@ -2376,24 +2383,136 @@ fn stub_disable_thread_library_calls(
     Ok(1)
 }
 
-/// `void EnterCriticalSection(LPCRITICAL_SECTION)`. We are
-/// single-threaded; the section is always free.
+/// `void EnterCriticalSection(LPCRITICAL_SECTION lpcs)`. Takes
+/// ownership of the implicit Mutex-shaped object keyed by
+/// `lpcs`'s guest address; lazily allocates the object on first
+/// touch via [`crate::sched::Scheduler::critical_section_handle`].
+/// If the section is already owned by another thread the caller
+/// yields a `Wait` on the section's handle and the scheduler
+/// blocks it until the owner releases.
 fn stub_enter_critical_section(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("EnterCriticalSection", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    let cur_tid = state.active_tid;
+    let h = state.scheduler.critical_section_handle(p);
+    let take_immediately = matches!(
+        state.scheduler.objects.get(&h),
+        Some(crate::sched::WaitObject::CriticalSection { owner: None, .. })
+    ) || matches!(
+        state.scheduler.objects.get(&h),
+        Some(crate::sched::WaitObject::CriticalSection { owner: Some(o), .. }) if *o == cur_tid
+    );
+    if take_immediately {
+        if let Some(crate::sched::WaitObject::CriticalSection {
+            owner, recursion, ..
+        }) = state.scheduler.objects.get_mut(&h)
+        {
+            if owner.is_some() {
+                *recursion += 1;
+            } else {
+                *owner = Some(cur_tid);
+                *recursion = 1;
+            }
+        }
+        return Ok(0);
+    }
+    // Contended: yield until the section is released.
+    state.yield_requested = Some(crate::sched::YieldRequest::Wait(
+        crate::sched::WaitCondition::Object {
+            handle: h,
+            timeout_after: None,
+        },
+    ));
     Ok(0)
 }
 
-/// `void LeaveCriticalSection(LPCRITICAL_SECTION)`. No-op.
+/// `void LeaveCriticalSection(LPCRITICAL_SECTION lpcs)`.
+/// Decrements the section's recursion count; when it reaches
+/// zero, clears the owner and wakes the first waiter (which
+/// becomes the new owner per
+/// [`crate::sched::consume_signal_if_auto_reset`]).
 fn stub_leave_critical_section(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LeaveCriticalSection", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    // Only act if the section has been touched at least once.
+    let Some(&h) = state.scheduler.critical_sections.get(&p) else {
+        return Ok(0);
+    };
+    let cur_tid = state.active_tid;
+    let release_now =
+        if let Some(crate::sched::WaitObject::CriticalSection {
+            owner, recursion, ..
+        }) = state.scheduler.objects.get_mut(&h)
+        {
+            if *owner != Some(cur_tid) {
+                return Ok(0);
+            }
+            *recursion = recursion.saturating_sub(1);
+            if *recursion == 0 {
+                *owner = None;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+    if release_now {
+        let waiters = crate::sched::waiters_on(&state.threads, h);
+        if let Some(&tid) = waiters.first() {
+            wake_thread(state, tid, h);
+        }
+    }
+    Ok(0)
+}
+
+/// `BOOL TryEnterCriticalSection(LPCRITICAL_SECTION lpcs)`.
+/// Same as `EnterCriticalSection` but returns FALSE
+/// immediately instead of blocking when the section is owned
+/// by another thread.
+fn stub_try_enter_critical_section(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TryEnterCriticalSection", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    let cur_tid = state.active_tid;
+    let h = state.scheduler.critical_section_handle(p);
+    if let Some(crate::sched::WaitObject::CriticalSection {
+        owner, recursion, ..
+    }) = state.scheduler.objects.get_mut(&h)
+    {
+        match *owner {
+            None => {
+                *owner = Some(cur_tid);
+                *recursion = 1;
+                return Ok(1);
+            }
+            Some(o) if o == cur_tid => {
+                *recursion += 1;
+                return Ok(1);
+            }
+            _ => return Ok(0),
+        }
+    }
     Ok(0)
 }
 
