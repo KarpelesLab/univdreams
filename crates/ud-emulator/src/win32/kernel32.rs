@@ -653,6 +653,13 @@ pub fn register(registry: &mut Registry) {
     );
     // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitthread
     registry.register("kernel32.dll", "ExitThread", stub_exit_thread as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-switchtothread
+    registry.register(
+        "kernel32.dll",
+        "SwitchToThread",
+        stub_switch_to_thread as StubFn,
+        0,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setevent
     registry.register("kernel32.dll", "SetEvent", stub_set_event as StubFn, 1);
     // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadpriority
@@ -3603,15 +3610,47 @@ fn wake_thread(state: &mut HostState, tid: u32, handle: u32) {
     }
 }
 
-/// `BOOL SetThreadPriority(HANDLE, int)`. Single-threaded
-/// sandbox: priority changes have no effect, return TRUE.
+/// `BOOL SetThreadPriority(HANDLE hThread, int nPriority)`.
+/// Looks up the Thread WaitObject behind the handle and
+/// updates the target thread's priority. The scheduler picks
+/// higher-priority Ready threads first (Phase 4).
 fn stub_set_thread_priority(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetThreadPriority", t))?;
+    let prio = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("SetThreadPriority", t))? as i32;
+    if let Some(crate::sched::WaitObject::Thread { tid }) = state.scheduler.objects.get(&h) {
+        let tid = *tid;
+        if let Some(t) = state.threads.get_mut(&tid) {
+            t.priority = prio;
+        }
+    }
     Ok(1)
+}
+
+/// `BOOL SwitchToThread(void)`. Voluntarily yields the
+/// current quantum to any Ready peer; returns FALSE when no
+/// other thread was Ready (so we kept running).
+fn stub_switch_to_thread(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let cur_tid = state.active_tid;
+    let has_peer = state
+        .threads
+        .iter()
+        .any(|(tid, t)| *tid != cur_tid && matches!(t.status, crate::sched::ThreadStatus::Ready));
+    if has_peer {
+        state.yield_requested = Some(crate::sched::YieldRequest::Yield);
+        Ok(1)
+    } else {
+        Ok(0)
+    }
 }
 
 /// `DWORD ResumeThread(HANDLE)`. Looks up the Thread wait

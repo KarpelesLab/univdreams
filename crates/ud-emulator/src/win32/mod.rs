@@ -1225,14 +1225,16 @@ fn schedule_next_thread(cpu: &mut Cpu, state: &mut HostState) {
     // priority-aware picking.
     let cur_tid = state.active_tid;
     let next_tid = {
-        let mut candidates: Vec<u32> = state
+        let mut candidates: Vec<(i32, u32)> = state
             .threads
             .iter()
             .filter(|(tid, t)| **tid != cur_tid && matches!(t.status, ThreadStatus::Ready))
-            .map(|(tid, _)| *tid)
+            .map(|(tid, t)| (t.priority, *tid))
             .collect();
-        candidates.sort_unstable();
-        candidates.into_iter().next()
+        // Sort by descending priority then ascending TID for
+        // deterministic round-robin within the same priority.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        candidates.into_iter().next().map(|(_, tid)| tid)
     };
     let cur_is_runnable = matches!(
         state
@@ -1413,6 +1415,32 @@ pub fn run_until_sentinel(
         }
         state.instructions_executed = state.instructions_executed.saturating_add(1);
         state.scheduler.instructions_global = state.scheduler.instructions_global.saturating_add(1);
+        // Quantum-based preemption (Phase 4). Each executed
+        // instruction or stub dispatch counts against the
+        // current thread's quantum. When it hits zero, ask the
+        // scheduler to switch — but only when there is another
+        // Ready thread to switch to, otherwise the current
+        // thread just keeps the floor with a fresh quantum.
+        {
+            let quantum_default = state.scheduler.quantum_default;
+            let cur_tid = state.active_tid;
+            let t = state.cur_thread_mut();
+            if t.quantum_remaining > 0 {
+                t.quantum_remaining -= 1;
+            }
+            let exhausted = t.quantum_remaining == 0;
+            if exhausted {
+                t.quantum_remaining = quantum_default;
+            }
+            if exhausted {
+                let has_peer = state.threads.iter().any(|(tid, ts)| {
+                    *tid != cur_tid && matches!(ts.status, crate::sched::ThreadStatus::Ready)
+                });
+                if has_peer {
+                    state.yield_requested = Some(crate::sched::YieldRequest::Yield);
+                }
+            }
+        }
         if registry.is_thunk(cpu.regs.eip) {
             match dispatch_stub(cpu, mmu, registry, state) {
                 Ok(()) => continue,
