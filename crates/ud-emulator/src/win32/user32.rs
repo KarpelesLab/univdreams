@@ -28,6 +28,29 @@ pub fn register(registry: &mut Registry) {
         stub_dialog_box_param_a as StubFn,
         5,
     );
+    // UTF-16 / indirect-template twins — all auto-accept the
+    // wizard's "Next" button by returning IDOK.
+    registry.register(
+        "user32.dll",
+        "DialogBoxParamW",
+        stub_dialog_box_param_a as StubFn,
+        5,
+    );
+    registry.register(
+        "user32.dll",
+        "DialogBoxIndirectParamA",
+        stub_dialog_box_param_a as StubFn,
+        5,
+    );
+    registry.register(
+        "user32.dll",
+        "DialogBoxIndirectParamW",
+        stub_dialog_box_param_a as StubFn,
+        5,
+    );
+    // MessageBoxW (UTF-16 twin of MessageBoxA — auto-accepts
+    // every popup with IDOK).
+    registry.register("user32.dll", "MessageBoxW", stub_message_box_w as StubFn, 4);
     // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enddialog
     registry.register("user32.dll", "EndDialog", stub_end_dialog as StubFn, 2);
     // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-endpaint
@@ -908,6 +931,53 @@ fn stub_message_box_a(
     eprintln!("[oxideav-vfw MessageBoxA] {caption}: {text}");
     state.message_box_log.push(format!("{caption}: {text}"));
     Ok(IDOK)
+}
+
+/// `int MessageBoxW(HWND, LPCWSTR, LPCWSTR, UINT)`. UTF-16
+/// twin of [`stub_message_box_a`]; logs the (decoded) text +
+/// caption and auto-accepts with `IDOK = 1`.
+fn stub_message_box_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hwnd =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxW", t))?;
+    let p_text =
+        arg_dword(cpu, mmu, 1).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxW", t))?;
+    let p_caption =
+        arg_dword(cpu, mmu, 2).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxW", t))?;
+    let _utype =
+        arg_dword(cpu, mmu, 3).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxW", t))?;
+    let text = if p_text != 0 {
+        read_wide_cstr(mmu, p_text, 4096)
+    } else {
+        String::new()
+    };
+    let caption = if p_caption != 0 {
+        read_wide_cstr(mmu, p_caption, 4096)
+    } else {
+        String::new()
+    };
+    eprintln!("[oxideav-vfw MessageBoxW] {caption}: {text}");
+    state.message_box_log.push(format!("{caption}: {text}"));
+    Ok(IDOK)
+}
+
+/// Read a NUL-terminated UTF-16 string from guest memory.
+/// Used by every `*W` (wide) stub that takes an LPCWSTR.
+fn read_wide_cstr(mmu: &Mmu, mut addr: u32, max_chars: u32) -> String {
+    let mut units = Vec::new();
+    for _ in 0..max_chars {
+        match mmu.load16(addr) {
+            Ok(0) => break,
+            Ok(u) => units.push(u),
+            Err(_) => break,
+        }
+        addr = addr.wrapping_add(2);
+    }
+    String::from_utf16_lossy(&units)
 }
 
 /// `BOOL PostMessageA(HWND, UINT, WPARAM, LPARAM)`. Returns

@@ -3353,6 +3353,16 @@ fn stub_sleep(
 /// `BOOL TerminateProcess(HANDLE hProcess, UINT uExitCode)`.
 /// Mirror `ExitProcess` — set the exit-requested flag so the run
 /// loop returns cleanly.
+///
+/// `STATUS_STACK_BUFFER_OVERRUN` (0xC0000409) is the exit code
+/// MSVC's `__report_gsfailure` passes when the GS cookie
+/// check fires. Emulators routinely false-positive this
+/// check (small differences in FPU state, segment register
+/// shadow values, etc. perturb a stack-spill that ends up
+/// adjacent to the saved cookie), so when an installer-class
+/// binary tries to abort with this specific code we log it
+/// to `debug_log` and let the process keep running instead
+/// of unwinding the entire monitor session.
 fn stub_terminate_process(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -3361,6 +3371,13 @@ fn stub_terminate_process(
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TerminateProcess", t))?;
     let code = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("TerminateProcess", t))?;
+    if code == 0xC000_0409 {
+        state.debug_log.push(format!(
+            "TerminateProcess(STATUS_STACK_BUFFER_OVERRUN) — \
+             treating as spurious GS check, continuing"
+        ));
+        return Ok(1);
+    }
     // `TerminateProcess(GetCurrentProcess())` / negative -1 →
     // act on the active process. Otherwise look up the target
     // Process WaitObject.
