@@ -217,19 +217,21 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
     if let Some(bitness) = bitness {
         drop_regenerable_asm_bytes(&mut items, bitness);
     }
-    if matches!(arch, Arch::Bpf { .. }) {
-        // Build an ad-hoc codec for the byte-drop pass —
-        // mirrors what the compile-side does via
-        // `compile::module::resolve_arch_codec`, but the
-        // decompile pipeline doesn't yet have a parsed
-        // `@module` to resolve through the registry. We
-        // already classified the arch from `e_machine` above,
-        // so construct the codec directly.
-        let Arch::Bpf { variant } = arch else {
-            unreachable!();
-        };
-        let codec = ud_arch_bpf::BpfCodec(variant);
-        drop_regenerable_bytes(&mut items, &codec);
+    // Framework byte-drop: try the codec's `encode_*` methods
+    // against every lifted Stmt's pinned bytes. BPF picks up
+    // Move / Return / Call / RegArith; x86 picks up Move for
+    // the simple `var_X = LITERAL / reg = reg` shapes the
+    // codec models. Anything `Unsupported` keeps its bytes.
+    match arch {
+        Arch::Bpf { variant } => {
+            let codec = ud_arch_bpf::BpfCodec(variant);
+            drop_regenerable_bytes(&mut items, &codec);
+        }
+        Arch::X86 { bitness } => {
+            let codec = ud_arch_x86::X86Codec(bitness);
+            drop_regenerable_bytes(&mut items, &codec);
+        }
+        Arch::Aarch64 => {}
     }
 
     Ok(UdFile { module, items })
