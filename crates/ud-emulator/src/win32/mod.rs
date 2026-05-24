@@ -334,6 +334,10 @@ pub struct ThreadState {
     /// Phase 4 will tick this down; for now it's a placeholder
     /// initialised to the default quantum.
     pub quantum_remaining: u32,
+    /// Lifecycle state — driven by the scheduler.
+    pub status: crate::sched::ThreadStatus,
+    /// Active wait, if `status == Waiting`. Cleared on wake.
+    pub wait: Option<crate::sched::WaitCondition>,
 }
 
 impl Default for ThreadState {
@@ -345,6 +349,8 @@ impl Default for ThreadState {
             tls_slots: BTreeMap::new(),
             parked_cpu: None,
             quantum_remaining: DEFAULT_QUANTUM,
+            status: crate::sched::ThreadStatus::Ready,
+            wait: None,
         }
     }
 }
@@ -455,6 +461,15 @@ pub struct HostState {
     /// (the `ud analyze` JSON output) consume this directly so
     /// they don't have to re-parse the formatted string.
     pub stub_calls: Vec<StubCall>,
+    /// Scheduler-owned wait-object table + global instruction
+    /// clock. Phase 3 of the scheduler refactor.
+    pub scheduler: crate::sched::Scheduler,
+    /// When `Some`, the most recently dispatched stub asked the
+    /// run loop to switch threads. The run loop drains the
+    /// field after every stub return: a `Wait(...)` moves the
+    /// current thread to `Waiting`; `Yield` re-queues it at the
+    /// end of the Ready queue; `Exit { code }` terminates it.
+    pub yield_requested: Option<crate::sched::YieldRequest>,
 }
 
 impl Default for HostState {
@@ -477,6 +492,8 @@ impl Default for HostState {
             trace_stubs: false,
             stub_trace: Vec::new(),
             stub_calls: Vec::new(),
+            scheduler: crate::sched::Scheduler::new(),
+            yield_requested: None,
         }
     }
 }
@@ -1138,6 +1155,65 @@ pub fn dispatch_stub(
 /// and by re-entrant host stubs (notably the `vfw32` surface,
 /// which dispatches the codec's `DriverProc` synchronously
 /// inside an outer `IC*` call).
+/// Process a yield request from a freshly-returned stub. The
+/// active thread transitions to the appropriate scheduler state
+/// (`Waiting` / `Ready` / `Terminated`); the live `Cpu` itself
+/// is not touched here — single-thread Phase 3a always resumes
+/// the same `cpu`. Phase 3b will add the cross-thread context
+/// switch when `CreateThread` actually mints a second thread.
+fn handle_yield(_cpu: &mut Cpu, state: &mut HostState, req: crate::sched::YieldRequest) {
+    use crate::sched::{ThreadStatus, YieldRequest};
+    match req {
+        YieldRequest::Wait(cond) => {
+            let t = state.cur_thread_mut();
+            t.status = ThreadStatus::Waiting;
+            t.wait = Some(cond);
+        }
+        YieldRequest::Yield => {
+            let t = state.cur_thread_mut();
+            t.status = ThreadStatus::Ready;
+        }
+        YieldRequest::Exit { code: _ } => {
+            let t = state.cur_thread_mut();
+            t.status = ThreadStatus::Terminated;
+            t.wait = None;
+        }
+    }
+}
+
+/// Return the active thread's `WaitCondition::Sleep` shape, if
+/// any. Used by [`run_until_sentinel`] to advance the global
+/// clock past a single-thread Sleep without spinning the CPU.
+fn sleep_wait_for(state: &HostState, tid: u32) -> Option<crate::sched::WaitCondition> {
+    let t = state.threads.get(&tid)?;
+    if matches!(t.status, crate::sched::ThreadStatus::Waiting) {
+        if let Some(crate::sched::WaitCondition::Sleep { .. }) = t.wait {
+            return t.wait.clone();
+        }
+    }
+    None
+}
+
+/// Move every `Waiting`-on-Sleep thread whose resume target is
+/// in the past back to `Ready`. Called from
+/// [`run_until_sentinel`] after the global clock advances.
+fn wake_sleep_if_due(state: &mut HostState) {
+    let now = state.scheduler.instructions_global;
+    for t in state.threads.values_mut() {
+        if matches!(t.status, crate::sched::ThreadStatus::Waiting) {
+            if let Some(crate::sched::WaitCondition::Sleep {
+                resume_after_instructions,
+            }) = t.wait
+            {
+                if now >= resume_after_instructions {
+                    t.status = crate::sched::ThreadStatus::Ready;
+                    t.wait = None;
+                }
+            }
+        }
+    }
+}
+
 pub fn run_until_sentinel(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -1150,6 +1226,32 @@ pub fn run_until_sentinel(
     // burn?" without subtracting from a stale snapshot.
     state.instructions_executed = 0;
     loop {
+        // Honour any yield request the most recently dispatched
+        // stub left behind. Phase 3 of the scheduler refactor:
+        // a `Wait`/`Yield`/`Exit` request handed up from a stub
+        // suspends the active thread and resumes the next
+        // `Ready` one. Until Phase 3d ships, only `Sleep` and
+        // `Yield` (single-thread) are observable here — both
+        // resolve as "spin until wake-up" without an actual
+        // context switch.
+        if let Some(req) = state.yield_requested.take() {
+            handle_yield(cpu, state, req);
+            // Single-thread loop body — once the yield is
+            // recorded, fall through to the busy-wait below.
+        }
+        // Drive the sleep wake-ups: if the only blocked thread
+        // is the current one waiting on a Sleep, advance the
+        // global clock until it wakes.
+        if let Some(crate::sched::WaitCondition::Sleep {
+            resume_after_instructions,
+        }) = sleep_wait_for(state, state.active_tid)
+        {
+            state.scheduler.instructions_global = state
+                .scheduler
+                .instructions_global
+                .max(resume_after_instructions);
+            wake_sleep_if_due(state);
+        }
         if state.exit_requested.is_some() {
             // `kernel32!ExitProcess` was called. Force eip to
             // the sentinel so the outer caller's stack-frame
@@ -1175,6 +1277,7 @@ pub fn run_until_sentinel(
             *remaining -= 1;
         }
         state.instructions_executed = state.instructions_executed.saturating_add(1);
+        state.scheduler.instructions_global = state.scheduler.instructions_global.saturating_add(1);
         if registry.is_thunk(cpu.regs.eip) {
             match dispatch_stub(cpu, mmu, registry, state) {
                 Ok(()) => continue,

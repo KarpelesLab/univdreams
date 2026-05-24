@@ -3071,13 +3071,30 @@ fn stub_set_unhandled_exception_filter(
     Ok(0)
 }
 
-/// `void Sleep(DWORD)`. We're synchronous — drop the call.
+/// `void Sleep(DWORD ms)`. Asks the scheduler to suspend the
+/// current thread until `INSTRUCTIONS_PER_MS * ms` more guest
+/// instructions have elapsed. With a single thread, the run
+/// loop fast-forwards the global clock to the wake target so
+/// `Sleep` returns roughly immediately in wall-clock time but
+/// the `tick` / `GetTickCount` chain advances correctly.
 fn stub_sleep(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let ms = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("Sleep", t))?;
+    let now = state.scheduler.instructions_global;
+    let resume_after_instructions =
+        now.saturating_add(u64::from(ms).saturating_mul(crate::sched::INSTRUCTIONS_PER_MS));
+    state.yield_requested = Some(crate::sched::YieldRequest::Wait(
+        crate::sched::WaitCondition::Sleep {
+            resume_after_instructions,
+        },
+    ));
+    // Mirror to the legacy tick counter so `GetTickCount` from
+    // inside the same Sleep run sees a plausible advance.
+    state.tick = state.tick.wrapping_add(ms);
     Ok(0)
 }
 
@@ -5328,6 +5345,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cpu.regs.get32(Reg32::Eax), 0xDEAD_F00D);
+    }
+
+    /// Phase 3a of the scheduler refactor: `Sleep(ms)` parks
+    /// the active thread on a sleep wait, the run loop advances
+    /// the global instruction clock past the wake target, and
+    /// the thread comes back to Ready. With a single thread we
+    /// observe this through state inspection rather than via a
+    /// real context switch.
+    #[test]
+    fn sleep_records_a_wait_on_the_current_thread() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let before = state.scheduler.instructions_global;
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "Sleep",
+            &[100],
+        )
+        .unwrap();
+        // Sleep returns the placeholder 0; the real semantics
+        // are observable via the yield request the stub left
+        // for the run loop.
+        let yr = state.yield_requested.clone().expect("yield was requested");
+        match yr {
+            crate::sched::YieldRequest::Wait(crate::sched::WaitCondition::Sleep {
+                resume_after_instructions,
+            }) => {
+                assert_eq!(
+                    resume_after_instructions,
+                    before.saturating_add(100 * crate::sched::INSTRUCTIONS_PER_MS),
+                );
+            }
+            other => panic!("expected Sleep wait, got {other:?}"),
+        }
+        // Tick mirrors the requested duration so GetTickCount
+        // sees an advance.
+        assert_eq!(state.tick, 100);
     }
 
     /// TLS slots are isolated per thread: a value set on the

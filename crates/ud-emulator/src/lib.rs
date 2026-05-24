@@ -206,6 +206,7 @@ pub mod emulator;
 pub mod ffi;
 pub mod pe;
 pub mod runtime;
+pub mod sched;
 #[cfg(feature = "trace")]
 pub mod trace;
 pub mod win32;
