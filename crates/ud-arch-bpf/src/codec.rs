@@ -1,0 +1,162 @@
+//! `ArchCodec` implementation for BPF (Linux eBPF + Solana SBF
+//! v1 / v2).
+//!
+//! Each codec instance carries a [`BpfVariant`]. The trait
+//! methods that need slot-offset arithmetic compute it from
+//! `(source_ip, target)` then delegate to the existing
+//! `assemble_bpf_*` family.
+//!
+//! `register()` submits one factory that picks a variant from the
+//! parsed module's `arch` field plus its numeric `e_machine`
+//! (`EM_BPF = 247` for Linux eBPF; `EM_SBF = 263` for Solana SBF).
+
+use crate::{
+    assemble_bpf, assemble_bpf_ifblock_cond, assemble_bpf_ja, desymbolize_bpf_text, BpfVariant,
+    INSN_SIZE,
+};
+use ud_arch_codec::{ArchCodec, ArchError, EncodeHints, SwitchSpec};
+
+/// One codec per BPF variant.
+#[derive(Debug, Clone, Copy)]
+pub struct BpfCodec(pub BpfVariant);
+
+impl BpfCodec {
+    /// Linux eBPF (base ISA).
+    pub const LINUX: Self = Self(BpfVariant::Linux);
+    /// Solana sBPFv1.
+    pub const SBF_V1: Self = Self(BpfVariant::Sbfv1);
+    /// Agave sBPFv2.
+    pub const SBF_V2: Self = Self(BpfVariant::Sbfv2);
+}
+
+/// Compute the slot offset for a relative branch: `(target -
+/// next_slot) / 8`. Returns the i16 the BPF encoder expects,
+/// or an `OutOfRange` error if the displacement doesn't fit /
+/// isn't slot-aligned.
+fn slot_offset(source_ip: u64, target: u64) -> Result<i16, ArchError> {
+    let next_slot = source_ip.wrapping_add(INSN_SIZE as u64);
+    #[allow(clippy::cast_possible_wrap)]
+    let delta = (target as i64).wrapping_sub(next_slot as i64);
+    if delta % (INSN_SIZE as i64) != 0 {
+        return Err(ArchError::OutOfRange(format!(
+            "BPF branch displacement {delta} bytes is not slot-aligned"
+        )));
+    }
+    let slots = delta / (INSN_SIZE as i64);
+    i16::try_from(slots).map_err(|_| {
+        ArchError::OutOfRange(format!(
+            "BPF branch displacement {slots} slots overflows i16 (max ±32768)"
+        ))
+    })
+}
+
+impl ArchCodec for BpfCodec {
+    fn name(&self) -> &'static str {
+        match self.0 {
+            BpfVariant::Linux => "bpf-linux",
+            BpfVariant::Sbfv1 => "bpf-sbf-v1",
+            BpfVariant::Sbfv2 => "bpf-sbf-v2",
+        }
+    }
+
+    fn assemble_one(&self, text: &str, _addr: u64) -> Result<Vec<u8>, ArchError> {
+        assemble_bpf(text).map_err(|e| ArchError::Assemble(e.to_string()))
+    }
+
+    fn desymbolize(&self, text: &str, addr: u64) -> String {
+        desymbolize_bpf_text(text, addr, None).unwrap_or_else(|| text.to_string())
+    }
+
+    fn encode_jump(
+        &self,
+        source_ip: u64,
+        target: u64,
+        _hints: EncodeHints,
+    ) -> Result<Vec<u8>, ArchError> {
+        let off = slot_offset(source_ip, target)?;
+        assemble_bpf_ja(off).map_err(|e| ArchError::Assemble(e.to_string()))
+    }
+
+    /// BPF calls today don't have a single canonical form the
+    /// codec can produce from `(source_ip, target)` alone —
+    /// `call_local` vs `call` depends on whether the target is
+    /// intra-program. Lift commits in the pipeline (commit 5
+    /// onward) will narrow this; for now return `Unsupported` so
+    /// pinned bytes carry the call.
+    fn encode_call(
+        &self,
+        _source_ip: u64,
+        _target: u64,
+        _hints: EncodeHints,
+    ) -> Result<Vec<u8>, ArchError> {
+        Err(ArchError::Unsupported {
+            arch: self.name(),
+            operation: "call",
+        })
+    }
+
+    fn encode_cond_jump(
+        &self,
+        cond_text: &str,
+        source_ip: u64,
+        target: u64,
+        _hints: EncodeHints,
+    ) -> Result<Vec<u8>, ArchError> {
+        let off = slot_offset(source_ip, target)?;
+        assemble_bpf_ifblock_cond(cond_text, off).map_err(|e| ArchError::Assemble(e.to_string()))
+    }
+
+    fn encode_switch_dispatch(&self, _spec: &SwitchSpec) -> Result<Vec<u8>, ArchError> {
+        // BPF doesn't model jump-table dispatch as a single
+        // structural form today.
+        Err(ArchError::Unsupported {
+            arch: self.name(),
+            operation: "switch_dispatch",
+        })
+    }
+
+    fn encoded_jump_size(&self, _source_ip: u64, _target: u64, _hints: EncodeHints) -> usize {
+        INSN_SIZE
+    }
+
+    fn encoded_cond_jump_size(&self, _source_ip: u64, _target: u64, _hints: EncodeHints) -> usize {
+        INSN_SIZE
+    }
+
+    fn encoded_call_size(&self, _source_ip: u64, _target: u64, _hints: EncodeHints) -> usize {
+        INSN_SIZE
+    }
+}
+
+/// Register the BPF codec factory with [`ud_arch_codec::registry`].
+///
+/// Variant selection prefers numeric `e_machine` when both signals
+/// are present (more specific); falls back to the friendly `arch`
+/// string. EM_BPF (247) → Linux; EM_SBF (263) → sBPFv1 by default
+/// (sBPFv2 distinction requires e_flags inspection which the
+/// trait doesn't yet surface — out of scope for now).
+pub fn register() {
+    ud_arch_codec::register(factory);
+}
+
+/// `EM_BPF` from the ELF spec (Linux eBPF).
+pub const EM_BPF: u64 = 247;
+/// `EM_SBF` from Solana's ELF extension (sBPFv1 / sBPFv2 — variant
+/// distinction needs `e_flags`).
+pub const EM_SBF: u64 = 263;
+
+fn factory(arch_name: Option<&str>, e_machine: Option<u64>) -> Option<Box<dyn ArchCodec>> {
+    if let Some(em) = e_machine {
+        match em {
+            EM_BPF => return Some(Box::new(BpfCodec(BpfVariant::Linux))),
+            EM_SBF => return Some(Box::new(BpfCodec(BpfVariant::Sbfv1))),
+            _ => {}
+        }
+    }
+    match arch_name {
+        Some("bpf") => Some(Box::new(BpfCodec(BpfVariant::Linux))),
+        Some("sbf" | "sbfv1") => Some(Box::new(BpfCodec(BpfVariant::Sbfv1))),
+        Some("sbfv2") => Some(Box::new(BpfCodec(BpfVariant::Sbfv2))),
+        _ => None,
+    }
+}

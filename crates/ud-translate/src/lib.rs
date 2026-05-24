@@ -36,3 +36,18 @@
 
 pub mod compile;
 pub mod decompile;
+
+/// Register every arch backend the workspace knows about with
+/// [`ud_arch_codec`]'s registry. Call this once at process
+/// startup from any binary that consumes the framework (CLI,
+/// wasm, integration tests).
+///
+/// Re-registering is wasteful but harmless — factories run in
+/// registration order on every lookup, and each factory only
+/// matches its own arch.
+pub fn register_all_arches() {
+    ud_arch_x86::register();
+    ud_arch_aarch64::register();
+    ud_arch_6502::register();
+    ud_arch_bpf::register();
+}

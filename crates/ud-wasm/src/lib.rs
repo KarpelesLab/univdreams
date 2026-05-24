@@ -278,14 +278,18 @@ fn raw_6502_load_addr(bytes: &[u8]) -> Option<u64> {
     }
 }
 
-/// Wire the panic hook once so panics show up in the browser
-/// console with a useful stack trace instead of `unreachable
-/// executed`.
+/// Wire the panic hook AND populate the arch-codec registry once.
+///
+/// Every exported entry point calls this at the top to make sure
+/// both the panic-trace plumbing and the arch dispatch are ready.
+/// `Once::call_once` deduplicates so the registry only grows once
+/// per wasm instance regardless of how many entry points fire.
 fn set_panic_hook() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         console_error_panic_hook::set_once();
+        ud_translate::register_all_arches();
     });
 }
 

@@ -39,9 +39,11 @@ use ud_core::VAddr;
 use ud_ir::{ArchInsn, BasicBlock, Function, Terminator};
 
 mod assemble;
+mod codec;
 pub use assemble::{
     assemble_bpf, assemble_bpf_ifblock_cond, assemble_bpf_ja, desymbolize_bpf_text, AssembleError,
 };
+pub use codec::{register, BpfCodec, EM_BPF, EM_SBF};
 
 /// On-disk size of one BPF instruction slot.
 pub const INSN_SIZE: usize = 8;

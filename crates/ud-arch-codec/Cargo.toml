@@ -1,5 +1,5 @@
 [package]
-name = "ud-arch-6502"
+name = "ud-arch-codec"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,13 +9,10 @@ categories.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "MOS 6502 instruction decoder for univdreams (Apple I / WozMon scope)."
+description = "Arch-codec trait + open registry: the shared interface every univdreams arch backend implements so the compile/decompile pipeline can dispatch generically."
 
 [lints]
 workspace = true
 
 [dependencies]
-ud-core = { version = "0.1.1", path = "../ud-core" }
-ud-ir = { version = "0.1.1", path = "../ud-ir" }
-ud-arch-codec = { version = "0.1.1", path = "../ud-arch-codec" }
 thiserror = "2"

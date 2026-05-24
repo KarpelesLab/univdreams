@@ -20,6 +20,7 @@ ud-ir = { version = "0.1.1", path = "../ud-ir" }
 ud-ast = { version = "0.1.1", path = "../ud-ast" }
 ud-analysis = { version = "0.1.1", path = "../ud-analysis" }
 ud-debug = { version = "0.1.1", path = "../ud-debug" }
+ud-arch-codec = { version = "0.1.1", path = "../ud-arch-codec" }
 ud-arch-x86 = { version = "0.1.1", path = "../ud-arch-x86" }
 ud-arch-aarch64 = { version = "0.1.1", path = "../ud-arch-aarch64" }
 ud-arch-6502 = { version = "0.1.1", path = "../ud-arch-6502" }

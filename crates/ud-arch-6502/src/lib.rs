@@ -15,8 +15,10 @@
 use ud_core::VAddr;
 use ud_ir::ArchInsn;
 
+mod codec;
 mod table;
 
+pub use codec::{register, M6502Codec};
 pub use table::{AddressingMode, Mnemonic, OpInfo};
 
 /// One decoded 6502 instruction.

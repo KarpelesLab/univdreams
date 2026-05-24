@@ -16,6 +16,10 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+mod codec;
+
+pub use codec::{register, Aarch64Codec};
+
 use ud_core::VAddr;
 use ud_ir::{ArchInsn, BasicBlock, Function, Terminator};
 

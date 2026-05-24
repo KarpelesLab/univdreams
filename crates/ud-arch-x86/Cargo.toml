@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 thiserror = "2"
+ud-arch-codec = { version = "0.1.1", path = "../ud-arch-codec" }
 ud-core = { version = "0.1.1", path = "../ud-core" }
 ud-ir = { version = "0.1.1", path = "../ud-ir" }
 iced-x86 = { version = "1", default-features = false, features = [

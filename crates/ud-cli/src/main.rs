@@ -347,6 +347,13 @@ impl InputFormat {
 }
 
 fn main() -> ExitCode {
+    // Populate the arch-codec registry. Every binary that uses
+    // the framework needs this once at startup; calling it
+    // before the CLI parse keeps it out of any subcommand-specific
+    // path so the registry is ready regardless of which command
+    // ran.
+    ud_translate::register_all_arches();
+
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,

@@ -32,6 +32,7 @@ use ud_ir::ArchInsn;
 
 mod assemble;
 mod call_site;
+mod codec;
 mod encode_text;
 mod expr;
 mod lift;
@@ -40,6 +41,7 @@ pub use assemble::{assemble_intel, AssembleError};
 pub use call_site::{
     detect_post_call_spill, identify_call_sites, ArgValue, CallSite, PostCallSpill,
 };
+pub use codec::{register, X86Codec};
 pub use encode_text::{encode_cmp_or_test, encode_head_from_cond_text};
 pub use expr::{try_lift_value_block, ExprRenderCtx, LiftedValueBlock, ValueExpr};
 pub use lift::{lift_function, LiftError};
