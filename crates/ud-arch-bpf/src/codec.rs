@@ -126,6 +126,67 @@ impl ArchCodec for BpfCodec {
     fn encoded_call_size(&self, _source_ip: u64, _target: u64, _hints: EncodeHints) -> usize {
         INSN_SIZE
     }
+
+    /// Encode `dst = src` as one BPF instruction (8 bytes).
+    ///
+    /// Supported shapes today (lifter-emitted forms):
+    ///
+    /// * `("rN", "rM")` → `mov64 rN, rM`
+    /// * `("rN", "0xN")` / `("rN", "<sNN>")` → `mov64 rN, imm32`
+    ///
+    /// Multi-slot moves (LDDW for u64 immediates) and memory
+    /// operands (ldx*/stx*) round-trip through pinned bytes for
+    /// now; expanding `encode_move` is a follow-up.
+    fn encode_move(&self, dst: &str, src: &str) -> Result<Vec<u8>, ArchError> {
+        let dst = dst.trim();
+        let src = src.trim();
+        if !is_bpf_reg(dst) {
+            return Err(ArchError::Unsupported {
+                arch: self.name(),
+                operation: "move (non-register dst)",
+            });
+        }
+        if is_bpf_reg(src) || is_bpf_imm(src) {
+            assemble_bpf(&format!("mov64 {dst}, {src}"))
+                .map_err(|e| ArchError::Assemble(e.to_string()))
+        } else {
+            Err(ArchError::Unsupported {
+                arch: self.name(),
+                operation: "move (unsupported src shape)",
+            })
+        }
+    }
+
+    /// Encode a function return. BPF returns r0 implicitly via
+    /// the `exit` instruction; the `value` field is ignored.
+    fn encode_return(&self, _value: Option<u64>) -> Result<Vec<u8>, ArchError> {
+        assemble_bpf("exit").map_err(|e| ArchError::Assemble(e.to_string()))
+    }
+}
+
+/// Recognise a BPF general-purpose register name (`r0`..`r10`).
+fn is_bpf_reg(s: &str) -> bool {
+    let s = s.trim();
+    if !s.starts_with('r') {
+        return false;
+    }
+    let n = &s[1..];
+    matches!(
+        n,
+        "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10"
+    )
+}
+
+/// Recognise a BPF immediate constant in textual form.
+/// Accepts decimal, `0x`-prefixed hex, and an optional leading
+/// minus sign. Used by `encode_move`'s src classifier.
+fn is_bpf_imm(s: &str) -> bool {
+    let s = s.trim();
+    let s = s.strip_prefix('-').unwrap_or(s);
+    if let Some(hex) = s.strip_prefix("0x") {
+        return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Register the BPF codec factory with [`ud_arch_codec::registry`].

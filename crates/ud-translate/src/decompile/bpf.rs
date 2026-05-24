@@ -57,6 +57,7 @@ const BPF_FP: &str = "r10";
 /// `call <imm>` instruction addresses → imported symbol names
 /// (typically syscalls resolved through `.rel.dyn`).
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_function(
     f: &Function<DecodedInsn>,
     name_at: &HashMap<u64, String>,
@@ -152,7 +153,17 @@ pub fn build_function(
                 &intra_targets,
                 data,
             );
-            body.push(Stmt::asm(text, insn.bytes.to_vec()));
+            // Lift recognized instruction shapes into semantic
+            // Stmt variants. Falls back to `Stmt::Asm` for any
+            // shape the codec can't (yet) regenerate. Round-trip
+            // is preserved either way: bytes ride along on the
+            // chosen variant and the byte-drop pass clears them
+            // only when the codec reproduces them.
+            if let Some(lifted) = lift_semantic_stmt(insn, &text) {
+                body.push(lifted);
+            } else {
+                body.push(Stmt::asm(text, insn.bytes.to_vec()));
+            }
             if let Some(annotation) = call_or_branch_annotation(insn, name_at, &intra_targets) {
                 body.push(Stmt::Comment(annotation));
             }
@@ -229,6 +240,35 @@ pub fn build_function(
         locals: Vec::new(),
         signature,
         body,
+    }
+}
+
+/// Recognise instruction shapes that the BPF arch codec can
+/// re-encode from semantic fields, returning the lifted Stmt
+/// for emission in place of `Stmt::Asm`. Returning `None` keeps
+/// the @asm fallback so anything the codec can't reproduce
+/// stays pinned-bytes (the round-trip-safe default).
+///
+/// Today's coverage:
+/// * `0x95` exit → `Stmt::Return { value: 0, bytes }`
+/// * `0xb7` mov64 reg, imm32 → `Stmt::Move { dst, src, bytes }`
+/// * `0xbf` mov64 reg, reg → `Stmt::Move { dst, src, bytes }`
+fn lift_semantic_stmt(insn: &DecodedInsn, text: &str) -> Option<Stmt> {
+    match insn.opcode {
+        0x95 => Some(Stmt::Return {
+            value: 0,
+            bytes: insn.bytes.to_vec(),
+        }),
+        0xb7 | 0xbf => {
+            let after = text.strip_prefix("mov64 ")?;
+            let (dst, src) = after.split_once(", ")?;
+            Some(Stmt::Move {
+                dst: dst.trim().to_string(),
+                src: src.trim().to_string(),
+                bytes: insn.bytes.to_vec(),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -393,7 +433,7 @@ fn try_match_while(
     // target is some label that *appears in `out_so_far`* —
     // i.e., we've already emitted the loop entry label. This
     // is the back-edge that defines a loop.
-    let last_idx = inner.iter().rposition(|s| matches!(s, Stmt::Asm { .. }))?;
+    let last_idx = inner.iter().rposition(is_byte_bearing_stmt)?;
     let Stmt::Asm { text, bytes } = &inner[last_idx] else {
         return None;
     };
@@ -435,11 +475,17 @@ fn try_split_then_else(
     jcc_addr: u64,
     jcc_by_addr: &HashMap<u64, (u64, Vec<u8>, String, String)>,
 ) -> Option<ThenElseSplit> {
-    // Find the last @asm in `inner` — the candidate tail jmp.
-    let last_asm_idx = inner.iter().rposition(|s| matches!(s, Stmt::Asm { .. }))?;
-    let Stmt::Asm { text, bytes } = &inner[last_asm_idx] else {
+    // The candidate tail jmp must be the LAST byte-bearing
+    // stmt in `inner` — anything after it would be unreachable
+    // code that the wrap silently drops, breaking round-trip
+    // (the lifted Move/Return variants make this a real risk
+    // because they look just like Asm to the size tracker).
+    // Trailing zero-byte Labels are fine.
+    let last_byte_idx = inner.iter().rposition(is_byte_bearing_stmt)?;
+    let Stmt::Asm { text, bytes } = &inner[last_byte_idx] else {
         return None;
     };
+    let last_asm_idx = last_byte_idx;
     let label_hex = text.strip_prefix("ja label_")?;
     let done_addr = u64::from_str_radix(label_hex, 16).ok()?;
     if done_addr <= target {
@@ -484,16 +530,27 @@ fn try_split_then_else(
 /// `Stmt::Label` (within a small window) or fall back to
 /// `None`. Layer-5a's wrap is conservative — when in doubt,
 /// stay unwrapped.
+/// True when `stmt` occupies one or more BPF slots in the
+/// lowered binary. Asm, Move (lifted from mov64), and Return
+/// (lifted from exit) all qualify. Labels are zero-byte
+/// markers and don't.
+fn is_byte_bearing_stmt(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::Asm { .. } | Stmt::Move { .. } | Stmt::Return { .. }
+    )
+}
+
 fn peek_insn_addr(body: &[Stmt], idx: usize) -> Option<u64> {
     // Walk back from `idx` looking for the most recent label.
-    // Each Stmt::Asm advances the cursor by its byte len, and
-    // every BPF slot is 8 bytes — so we count Asms between
-    // here and the last label.
-    let mut asms_seen = 0u64;
+    // Each single-slot BPF stmt advances the cursor by 8 bytes.
+    // Today that's Asm + the lifter-produced Return / Move
+    // variants. Adding more lifts means adding more arms here.
+    let mut slots_seen = 0u64;
     for j in (0..idx).rev() {
         match &body[j] {
-            Stmt::Asm { .. } => asms_seen += 1,
-            Stmt::Label { addr } => return Some(addr + asms_seen * 8),
+            Stmt::Asm { .. } | Stmt::Return { .. } | Stmt::Move { .. } => slots_seen += 1,
+            Stmt::Label { addr } => return Some(addr + slots_seen * 8),
             _ => {}
         }
     }

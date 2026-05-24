@@ -961,31 +961,42 @@ impl Parser {
                     line: self.peek().line,
                     col: self.peek().col,
                 })?;
+        // Bytes are optional now — when the byte-drop pass clears
+        // them at decompile time, the emitter skips the `[]` and
+        // lower regenerates from the dst/src text via the arch
+        // codec.
         let bytes_tok = byte_list_idx
-            .map(|i| self.tokens[i].clone())
-            .ok_or_else(|| ParseError::Expected {
-                expected: "`[bytes]` after assignment source".into(),
-                got: describe(&self.peek().kind),
-                line: self.peek().line,
-                col: self.peek().col,
-            })?;
-        if bytes_tok.start <= last_eq_tok.start {
-            return Err(ParseError::Expected {
-                expected: "`[bytes]` after `=` in assignment".into(),
-                got: describe(&bytes_tok.kind),
-                line: bytes_tok.line,
-                col: bytes_tok.col,
-            });
-        }
+            .filter(|&i| self.tokens[i].start > last_eq_tok.start)
+            .map(|i| self.tokens[i].clone());
         let dst = self.src[stmt_start..last_eq_tok.start].trim().to_string();
-        let src = self.src[last_eq_tok.end..bytes_tok.start]
-            .trim()
-            .to_string();
-        // Advance to the byte list and parse it.
-        while self.pos < self.tokens.len() && self.peek().start < bytes_tok.start {
-            self.bump();
-        }
-        let bytes = self.parse_byte_list()?;
+        let (src, bytes) = if let Some(btok) = bytes_tok {
+            let src = self.src[last_eq_tok.end..btok.start].trim().to_string();
+            // Advance to the byte list and parse it.
+            while self.pos < self.tokens.len() && self.peek().start < btok.start {
+                self.bump();
+            }
+            let bytes = self.parse_byte_list()?;
+            (src, bytes)
+        } else {
+            // src runs from `=` to end-of-line (the last token
+            // on this line that isn't a Comment/Eof/RBrace).
+            let mut last_tok_end = last_eq_tok.end;
+            while self.pos < self.tokens.len() {
+                let tok = self.peek();
+                if tok.line != stmt_line
+                    || matches!(
+                        tok.kind,
+                        TokenKind::Eof | TokenKind::Comment(_) | TokenKind::RBrace
+                    )
+                {
+                    break;
+                }
+                last_tok_end = tok.end;
+                self.bump();
+            }
+            let src = self.src[last_eq_tok.end..last_tok_end].trim().to_string();
+            (src, Vec::new())
+        };
         Ok(Stmt::Move { dst, src, bytes })
     }
 
@@ -1250,7 +1261,14 @@ impl Parser {
             self.parse_until_semicolon()?
         };
         self.expect(&TokenKind::Semicolon, "`;` after `return` value")?;
-        let bytes = self.parse_byte_list()?;
+        // Bytes are optional: BPF's `exit` lifts to
+        // `Stmt::Return` and the byte-drop pass clears them
+        // when the codec reproduces them.
+        let bytes = if self.peek().kind == TokenKind::LBracket {
+            self.parse_byte_list()?
+        } else {
+            Vec::new()
+        };
         // Numeric tail → Stmt::Return; otherwise keep the text as
         // a ReturnExpr.
         if let Some(value) = parse_int_literal(&value_text) {

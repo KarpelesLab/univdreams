@@ -295,6 +295,26 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                     }
                     *ip = ip.saturating_add(slot_size);
                 }
+                ud_ast::Stmt::Move { dst, src, bytes } => {
+                    if !bytes.is_empty() {
+                        if let Ok(encoded) = arch.encode_move(dst, src) {
+                            if encoded == *bytes {
+                                bytes.clear();
+                            }
+                        }
+                    }
+                    *ip = ip.saturating_add(slot_size);
+                }
+                ud_ast::Stmt::Return { value, bytes } => {
+                    if !bytes.is_empty() {
+                        if let Ok(encoded) = arch.encode_return(Some(*value)) {
+                            if encoded == *bytes {
+                                bytes.clear();
+                            }
+                        }
+                    }
+                    *ip = ip.saturating_add(slot_size);
+                }
                 ud_ast::Stmt::IfBlock {
                     cond_text,
                     cond_bytes,

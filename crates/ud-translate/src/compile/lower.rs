@@ -587,8 +587,39 @@ fn lower_stmts_into(
                     out.extend_from_slice(&call_bytes);
                 }
             }
-            Stmt::Return { bytes, .. }
-            | Stmt::Prologue { bytes, .. }
+            Stmt::Move { dst, src, bytes } => {
+                if bytes.is_empty() {
+                    // Bytes dropped at decompile time — ask the
+                    // codec to re-emit.
+                    let encoded =
+                        arch.encode_move(dst, src)
+                            .map_err(|e| LowerError::ArchEncode {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                                operation: "move",
+                                message: e.to_string(),
+                            })?;
+                    out.extend_from_slice(&encoded);
+                } else {
+                    out.extend_from_slice(bytes);
+                }
+            }
+            Stmt::Return { value, bytes } => {
+                if bytes.is_empty() {
+                    let encoded =
+                        arch.encode_return(Some(*value))
+                            .map_err(|e| LowerError::ArchEncode {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                                operation: "return",
+                                message: e.to_string(),
+                            })?;
+                    out.extend_from_slice(&encoded);
+                } else {
+                    out.extend_from_slice(bytes);
+                }
+            }
+            Stmt::Prologue { bytes, .. }
             | Stmt::Epilogue { bytes, .. }
             | Stmt::Save { bytes, .. }
             | Stmt::Restore { bytes, .. }
@@ -599,7 +630,6 @@ fn lower_stmts_into(
             | Stmt::LocalSet { bytes, .. }
             | Stmt::LocalArith { bytes, .. }
             | Stmt::LocalCompound { bytes, .. }
-            | Stmt::Move { bytes, .. }
             | Stmt::Inc16 { bytes, .. } => {
                 out.extend_from_slice(bytes);
             }

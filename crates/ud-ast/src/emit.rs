@@ -249,9 +249,13 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             } else {
                 write!(out, "{indent}return 0x{value:x};").unwrap();
             }
-            out.push_str(" [");
-            emit_byte_list(out, bytes);
-            writeln!(out, "]").unwrap();
+            if bytes.is_empty() {
+                writeln!(out).unwrap();
+            } else {
+                out.push_str(" [");
+                emit_byte_list(out, bytes);
+                writeln!(out, "]").unwrap();
+            }
         }
         Stmt::Prologue {
             kind,
@@ -477,9 +481,14 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             emit_move_side(out, dst);
             out.push_str(" = ");
             emit_move_side(out, src);
-            out.push_str(" [");
-            emit_byte_list(out, bytes);
-            writeln!(out, "]").unwrap();
+            // Omit the `[]` byte list when bytes were dropped at
+            // decompile time — the parser accepts both forms.
+            if !bytes.is_empty() {
+                out.push_str(" [");
+                emit_byte_list(out, bytes);
+                out.push(']');
+            }
+            writeln!(out).unwrap();
         }
         Stmt::Inc16 { lo, hi, bytes } => {
             write!(
