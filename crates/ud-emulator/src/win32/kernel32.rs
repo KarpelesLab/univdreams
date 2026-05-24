@@ -1684,15 +1684,29 @@ fn stub_get_environment_strings(
     Ok(state.environment_strings_ptr)
 }
 
-/// `DWORD GetFileType(HANDLE hFile)`. Returns
-/// `FILE_TYPE_UNKNOWN = 0` for any handle. Codecs typically only
-/// call this for stdin/stdout, which they don't actually use.
+/// `DWORD GetFileType(HANDLE hFile)`. Maps known handle kinds
+/// to their canonical types: VFS-owned handles report
+/// `FILE_TYPE_DISK = 1` so the CRT's `_initstdio` accepts
+/// them as valid stdio targets; standard handles report
+/// `FILE_TYPE_CHAR = 2` (console-style); everything else
+/// reports `FILE_TYPE_UNKNOWN = 0`.
 fn stub_get_file_type(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetFileType", t))?;
+    // STD_INPUT_HANDLE / STD_OUTPUT_HANDLE / STD_ERROR_HANDLE
+    // (negative DWORDs).
+    if matches!(h, 0xFFFF_FFF6 | 0xFFFF_FFF5 | 0xFFFF_FFF4) {
+        return Ok(2); // FILE_TYPE_CHAR
+    }
+    if let Some(vfs) = state.context.vfs.as_ref() {
+        if vfs.owns(h) {
+            return Ok(1); // FILE_TYPE_DISK
+        }
+    }
     Ok(0)
 }
 
@@ -2594,15 +2608,59 @@ fn rsrc_dir_lookup_id(
     None
 }
 
+/// Look up an entry by string name in a PE resource directory.
+/// The PE format stores named entries first (sorted by name);
+/// each entry's `Name` field has the high bit set and the low
+/// 31 bits are an offset (relative to `rsrc_base`) of an
+/// `IMAGE_RESOURCE_DIR_STRING_U`: WORD length + UTF-16 chars
+/// (no NUL terminator).
+fn rsrc_dir_lookup_name(
+    mmu: &Mmu,
+    rsrc_base: u32,
+    dir_va: u32,
+    target: &str,
+) -> Option<(u32, bool)> {
+    let n_named = mmu.load16(dir_va + 12).ok()? as u32;
+    let entries_va = dir_va + 16;
+    let target_upper: Vec<u16> = target.to_ascii_uppercase().encode_utf16().collect();
+    for i in 0..n_named {
+        let e_va = entries_va + i * 8;
+        let name = mmu.load32(e_va).ok()?;
+        if (name & 0x8000_0000) == 0 {
+            continue;
+        }
+        let str_va = rsrc_base + (name & 0x7FFF_FFFF);
+        let len = mmu.load16(str_va).ok()? as u32;
+        if len as usize != target_upper.len() {
+            continue;
+        }
+        let mut matches = true;
+        for j in 0..len {
+            let w = mmu.load16(str_va + 2 + j * 2).ok()?;
+            let upper = (w as u8).to_ascii_uppercase() as u16; // narrow upper-case for ASCII-only names
+            if upper != target_upper[j as usize] {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            let off = mmu.load32(e_va + 4).ok()?;
+            let is_dir = (off & 0x8000_0000) != 0;
+            return Some((off & 0x7FFF_FFFF, is_dir));
+        }
+    }
+    None
+}
+
 /// Resolve a `(hModule, lpName, lpType)` triple to the VA of the
 /// `IMAGE_RESOURCE_DATA_ENTRY` for that resource. Returns `None`
 /// if the module has no resource directory or no matching entry.
 ///
 /// Both `lpName` and `lpType` are interpreted as
 /// `MAKEINTRESOURCE`-style integers when their high 16 bits are
-/// zero (this is how `IR50_32.DLL` invokes us — type 2 = RT_BITMAP,
-/// name 112). Round 12 doesn't yet support string-keyed
-/// resources; if either argument is a pointer, return `None`.
+/// zero, otherwise as pointers to a NUL-terminated ASCII
+/// string (`FindResourceA` contract; the function up-converts
+/// to UTF-16 to match the on-disk format).
 pub(crate) fn find_resource_data_entry(
     state: &HostState,
     mmu: &Mmu,
@@ -2617,21 +2675,25 @@ pub(crate) fn find_resource_data_entry(
         h_module
     };
     let rsrc_base = *state.module_resource_dirs.get(&h)?;
-    // MAKEINTRESOURCE check: high word zero → integer ID. PE
-    // resource tables store integer IDs as the low 31 bits with
-    // the high bit clear. lpName=112 fits in u16; same for lpType.
-    if lp_name & 0xFFFF_0000 != 0 || lp_type & 0xFFFF_0000 != 0 {
-        return None;
-    }
     // Top-level: keyed by type. PE format guarantees the high
     // bit of the offset is set (each top-level entry points to a
     // sub-directory).
-    let (off_type, is_dir) = rsrc_dir_lookup_id(mmu, rsrc_base, rsrc_base, lp_type)?;
+    let (off_type, is_dir) = if lp_type & 0xFFFF_0000 != 0 {
+        let name = read_cstr(mmu, lp_type, 260).ok()?;
+        rsrc_dir_lookup_name(mmu, rsrc_base, rsrc_base, &name)?
+    } else {
+        rsrc_dir_lookup_id(mmu, rsrc_base, rsrc_base, lp_type)?
+    };
     if !is_dir {
         return None;
     }
     // Second-level: keyed by name (or ID).
-    let (off_name, is_dir) = rsrc_dir_lookup_id(mmu, rsrc_base, rsrc_base + off_type, lp_name)?;
+    let (off_name, is_dir) = if lp_name & 0xFFFF_0000 != 0 {
+        let name = read_cstr(mmu, lp_name, 260).ok()?;
+        rsrc_dir_lookup_name(mmu, rsrc_base, rsrc_base + off_type, &name)?
+    } else {
+        rsrc_dir_lookup_id(mmu, rsrc_base, rsrc_base + off_type, lp_name)?
+    };
     if !is_dir {
         return None;
     }
