@@ -269,6 +269,102 @@ fn assemble_call_local(operands: &[&str]) -> Result<Vec<u8>, AssembleError> {
 /// can pass signed slot counts (used by the desymbolised
 /// `call_internal` form, whose imm may be negative when
 /// calling a function earlier in the section).
+/// Encode the jcc instruction that drives an `ifblock` /
+/// `whileblock`'s framing.
+///
+/// `cond_text` is the *inverted* condition the renderer
+/// produces (the body runs when this is true; the jcc takes
+/// the branch when it's false). The mapping back to a BPF
+/// jcc mnemonic mirrors `invert_bpf_cond` in
+/// `decompile/bpf.rs`:
+///
+///   * `!=`  → `jeq`    (jeq takes when ==, body runs when !=)
+///   * `==`  → `jne`
+///   * `<=`  → `jgt`    (the unsigned form; `jsgt` for signed)
+///   * `<`   → `jge`
+///   * `>=`  → `jlt`
+///   * `>`   → `jle`
+///
+/// `slot_offset` is the BPF-relative slot count the jcc
+/// must skip — typically the body's lowered size measured
+/// in 8-byte slots, beyond the slot immediately after the
+/// jcc itself.
+///
+/// Returns the 8-byte encoded slot, or an error if
+/// `cond_text` has an unsupported shape (`jset`,
+/// composite expressions, etc.). The byte-drop pass treats
+/// the error as "keep the original bytes pinned."
+pub fn assemble_bpf_ifblock_cond(
+    cond_text: &str,
+    slot_offset: i16,
+) -> Result<Vec<u8>, AssembleError> {
+    let (lhs, op, rhs) = parse_ifblock_cond(cond_text)?;
+    let mnemonic = match op {
+        "!=" => "jeq",
+        "==" => "jne",
+        "<=" => "jgt",
+        "<" => "jge",
+        ">=" => "jlt",
+        ">" => "jle",
+        _ => return Err(AssembleError::UnknownMnemonic(op.into())),
+    };
+    let offset_text = if slot_offset >= 0 {
+        format!("+0x{slot_offset:x}")
+    } else {
+        format!("-0x{:x}", -i32::from(slot_offset))
+    };
+    assemble_bpf(&format!("{mnemonic} {lhs}, {rhs}, {offset_text}"))
+}
+
+/// Convenience: encode `ja +offset` / `ja -offset`. Used
+/// for `then_tail_jmp` (jumps over an else body) and
+/// `tail_bytes` (back-edge of a while loop). Always 8 bytes.
+pub fn assemble_bpf_ja(slot_offset: i16) -> Result<Vec<u8>, AssembleError> {
+    let offset_text = if slot_offset >= 0 {
+        format!("+0x{slot_offset:x}")
+    } else {
+        format!("-0x{:x}", -i32::from(slot_offset))
+    };
+    assemble_bpf(&format!("ja {offset_text}"))
+}
+
+/// Split an inverted-condition string of the shape
+/// `"rA op rB"` or `"rA op 0xN"` into `(lhs, op, rhs)`.
+/// Returns `Err(NotRecognised)` for any composite form
+/// (`(rA & rB) == 0` for `jset`, multi-clause expressions,
+/// etc.).
+fn parse_ifblock_cond(cond: &str) -> Result<(&str, &str, &str), AssembleError> {
+    let cond = cond.trim();
+    if cond.starts_with('(') {
+        // Composite (jset / nested) — out of scope.
+        return Err(AssembleError::NotRecognised);
+    }
+    // Two-operator ops must come first so the single-char
+    // splits don't grab them: scan for "!=", "==", "<=", ">="
+    // before "<" / ">".
+    for op in ["!=", "==", "<=", ">="] {
+        if let Some(at) = find_top_level_op(cond, op) {
+            let lhs = cond[..at].trim();
+            let rhs = cond[at + op.len()..].trim();
+            return Ok((lhs, op, rhs));
+        }
+    }
+    for op in ["<", ">"] {
+        if let Some(at) = find_top_level_op(cond, op) {
+            let lhs = cond[..at].trim();
+            let rhs = cond[at + op.len()..].trim();
+            return Ok((lhs, op, rhs));
+        }
+    }
+    Err(AssembleError::NotRecognised)
+}
+
+/// `find` that respects single-char op boundaries — won't
+/// match `<` inside `<=` because `<=` is checked first.
+fn find_top_level_op(cond: &str, op: &str) -> Option<usize> {
+    cond.find(op)
+}
+
 /// Helper for `desymbolize_bpf_text`: compute the signed
 /// slot offset between two instruction addresses, expressed
 /// in BPF slot units (8 bytes). Returns `None` when the

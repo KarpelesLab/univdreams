@@ -352,6 +352,32 @@ fn reg_views_intersect(touched: &std::collections::HashSet<&str>, reg64: &str) -
 /// in errors refer to the outermost iteration order, which is enough
 /// to find the bad statement in practice.
 #[allow(clippy::too_many_lines)]
+/// Length the `then_tail_jmp` field will occupy in the
+/// emitted bytes. Empty when both the pinned field is
+/// empty and there's no else-body to jump over (the BPF
+/// lifter omits the `ja` in that case).
+fn then_tail_jmp_len(then_tail_jmp: &[u8], else_body: &[Stmt]) -> u64 {
+    if !then_tail_jmp.is_empty() {
+        then_tail_jmp.len() as u64
+    } else if else_body.is_empty() {
+        0
+    } else {
+        8 // a single BPF `ja` slot
+    }
+}
+
+/// Length of the `tail_bytes` field. Always 8 if present
+/// in the source OR regenerated; empty when explicitly
+/// elided (rare for BPF).
+fn tail_bytes_len(tail_bytes: &[u8]) -> u64 {
+    if tail_bytes.is_empty() {
+        8
+    } else {
+        tail_bytes.len() as u64
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn lower_stmts_into(
     fn_name: &str,
     base_addr: Option<u64>,
@@ -615,26 +641,162 @@ fn lower_stmts_into(
                 out.extend_from_slice(tail_bytes);
             }
             Stmt::IfBlock {
+                cond_text,
                 cond_bytes,
                 then_body,
                 then_tail_jmp,
                 else_body,
-                ..
             } => {
-                out.extend_from_slice(cond_bytes);
-                lower_stmts_into(fn_name, base_addr, then_body, out)?;
-                out.extend_from_slice(then_tail_jmp);
-                lower_stmts_into(fn_name, base_addr, else_body, out)?;
+                // Effective cond_bytes length: 8 when we'll
+                // regenerate, else the pinned length.
+                let cond_len = if cond_bytes.is_empty() {
+                    8
+                } else {
+                    cond_bytes.len()
+                };
+                // Lower bodies to scratch buffers so we know
+                // their sizes before emitting the jcc / ja
+                // that frame them. The scratch lower must see
+                // the *real* base_addr for the start of each
+                // body — otherwise nested PC-relative encodings
+                // (call_local, jcc, etc.) get the wrong IP.
+                let ifblock_ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
+                let then_base = base_addr.map(|a| {
+                    a.saturating_add(out.len() as u64)
+                        .saturating_add(cond_len as u64)
+                });
+                let mut then_buf = Vec::new();
+                lower_stmts_into(fn_name, then_base, then_body, &mut then_buf)?;
+                let then_tail_size = then_tail_jmp_len(then_tail_jmp, else_body);
+                let else_base = base_addr.map(|a| {
+                    a.saturating_add(out.len() as u64)
+                        .saturating_add(cond_len as u64)
+                        .saturating_add(then_buf.len() as u64)
+                        .saturating_add(then_tail_size)
+                });
+                let mut else_buf = Vec::new();
+                lower_stmts_into(fn_name, else_base, else_body, &mut else_buf)?;
+                // Resolve cond_bytes (regenerate when empty).
+                let cb = if cond_bytes.is_empty() {
+                    let then_tail_size = then_tail_jmp_len(then_tail_jmp, else_body);
+                    let skip = then_buf.len() as u64 + then_tail_size;
+                    let offset =
+                        i16::try_from(skip / 8).map_err(|_| LowerError::AsmAssembleFailed {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                            text: format!("ifblock({cond_text})"),
+                            message: format!("body too large for i16 offset ({skip} bytes)"),
+                        })?;
+                    ud_arch_bpf::assemble_bpf_ifblock_cond(cond_text, offset).map_err(|e| {
+                        LowerError::AsmAssembleFailed {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                            text: format!("ifblock({cond_text})"),
+                            message: e.to_string(),
+                        }
+                    })?
+                } else {
+                    cond_bytes.clone()
+                };
+                out.extend_from_slice(&cb);
+                out.extend_from_slice(&then_buf);
+                let ttj = if then_tail_jmp.is_empty() {
+                    if else_body.is_empty() {
+                        Vec::new()
+                    } else {
+                        // Need to emit a `ja` over the else body.
+                        let offset = i16::try_from(else_buf.len() as u64 / 8).map_err(|_| {
+                            LowerError::AsmAssembleFailed {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                                text: format!("ifblock({cond_text}) tail"),
+                                message: "else body too large for i16 offset".into(),
+                            }
+                        })?;
+                        ud_arch_bpf::assemble_bpf_ja(offset).map_err(|e| {
+                            LowerError::AsmAssembleFailed {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                                text: format!("ifblock({cond_text}) tail"),
+                                message: e.to_string(),
+                            }
+                        })?
+                    }
+                } else {
+                    then_tail_jmp.clone()
+                };
+                out.extend_from_slice(&ttj);
+                out.extend_from_slice(&else_buf);
+                let _ = ifblock_ip;
             }
             Stmt::WhileBlock {
+                cond_text,
                 entry_bytes,
                 tail_bytes,
                 body,
-                ..
             } => {
-                out.extend_from_slice(entry_bytes);
-                lower_stmts_into(fn_name, base_addr, body, out)?;
-                out.extend_from_slice(tail_bytes);
+                let entry_ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
+                let entry_len = if entry_bytes.is_empty() {
+                    8
+                } else {
+                    entry_bytes.len()
+                };
+                // Lower body to scratch so we know its size.
+                // Scratch base_addr = real position the body
+                // will occupy = base + out.len() + entry_len.
+                let body_base = base_addr.map(|a| {
+                    a.saturating_add(out.len() as u64)
+                        .saturating_add(entry_len as u64)
+                });
+                let mut body_buf = Vec::new();
+                lower_stmts_into(fn_name, body_base, body, &mut body_buf)?;
+                let eb = if entry_bytes.is_empty() {
+                    let skip = body_buf.len() as u64 + tail_bytes_len(tail_bytes);
+                    let offset =
+                        i16::try_from(skip / 8).map_err(|_| LowerError::AsmAssembleFailed {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                            text: format!("whileblock({cond_text})"),
+                            message: format!("body too large for i16 offset ({skip} bytes)"),
+                        })?;
+                    ud_arch_bpf::assemble_bpf_ifblock_cond(cond_text, offset).map_err(|e| {
+                        LowerError::AsmAssembleFailed {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                            text: format!("whileblock({cond_text})"),
+                            message: e.to_string(),
+                        }
+                    })?
+                } else {
+                    entry_bytes.clone()
+                };
+                out.extend_from_slice(&eb);
+                out.extend_from_slice(&body_buf);
+                let tb = if tail_bytes.is_empty() {
+                    // ja back to entry_ip. Compute now that
+                    // we know the ja's own position.
+                    let ja_ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
+                    #[allow(clippy::cast_possible_wrap)]
+                    let delta = (entry_ip as i64).wrapping_sub((ja_ip as i64).wrapping_add(8));
+                    let offset_slots =
+                        i16::try_from(delta / 8).map_err(|_| LowerError::AsmAssembleFailed {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                            text: format!("whileblock({cond_text}) tail"),
+                            message: "back-edge too far for i16 offset".into(),
+                        })?;
+                    ud_arch_bpf::assemble_bpf_ja(offset_slots).map_err(|e| {
+                        LowerError::AsmAssembleFailed {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                            text: format!("whileblock({cond_text}) tail"),
+                            message: e.to_string(),
+                        }
+                    })?
+                } else {
+                    tail_bytes.clone()
+                };
+                out.extend_from_slice(&tb);
             }
             Stmt::Comment(_) => {}
         }

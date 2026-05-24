@@ -295,26 +295,102 @@ fn drop_regenerable_asm_bytes_bpf(items: &mut [Item]) {
                     *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
                 }
                 ud_ast::Stmt::IfBlock {
+                    cond_text,
                     cond_bytes,
                     then_body,
                     then_tail_jmp,
                     else_body,
-                    ..
                 } => {
-                    *ip = ip.saturating_add(cond_bytes.len() as u64);
+                    // First, try to drop `cond_bytes`. The
+                    // jcc skips when `cond_text` is false,
+                    // landing at the start of the else body
+                    // (or past the then-body when there's
+                    // no else). Its slot-offset = (then_body
+                    // size + then_tail_jmp size) / 8.
+                    if !cond_bytes.is_empty() {
+                        let then_body_size = build_function::lowered_body_size_at(
+                            then_body,
+                            ip.saturating_add(cond_bytes.len() as u64),
+                        );
+                        let skip_bytes = then_body_size + then_tail_jmp.len() as u64;
+                        if let Ok(offset) = i16::try_from(skip_bytes / 8) {
+                            if let Ok(encoded) =
+                                ud_arch_bpf::assemble_bpf_ifblock_cond(cond_text, offset)
+                            {
+                                if encoded == *cond_bytes {
+                                    cond_bytes.clear();
+                                }
+                            }
+                        }
+                    }
+                    // Advance using `lowered_body_size_at`
+                    // again because the post-drop `cond_bytes`
+                    // length might be 0 here. The lower-time
+                    // size of an IfBlock equals the original
+                    // structural framing — pre-drop length —
+                    // so we restore via INSN_SIZE.
+                    *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
                     visit_stmts(then_body, ip);
-                    *ip = ip.saturating_add(then_tail_jmp.len() as u64);
+                    // Try to drop `then_tail_jmp` (a `ja`
+                    // over the else body). slot_offset =
+                    // else_body_size / 8.
+                    if !then_tail_jmp.is_empty() {
+                        let else_size = build_function::lowered_body_size_at(else_body, *ip + 8);
+                        if let Ok(offset) = i16::try_from(else_size / 8) {
+                            if let Ok(encoded) = ud_arch_bpf::assemble_bpf_ja(offset) {
+                                if encoded == *then_tail_jmp {
+                                    then_tail_jmp.clear();
+                                }
+                            }
+                        }
+                        *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
+                    }
                     visit_stmts(else_body, ip);
                 }
                 ud_ast::Stmt::WhileBlock {
+                    cond_text,
                     entry_bytes,
                     body: wb,
                     tail_bytes,
-                    ..
                 } => {
-                    *ip = ip.saturating_add(entry_bytes.len() as u64);
+                    let entry_ip = *ip;
+                    if !entry_bytes.is_empty() {
+                        let body_size = build_function::lowered_body_size_at(
+                            wb,
+                            entry_ip.saturating_add(entry_bytes.len() as u64),
+                        );
+                        let skip_bytes = body_size + tail_bytes.len() as u64;
+                        if let Ok(offset) = i16::try_from(skip_bytes / 8) {
+                            if let Ok(encoded) =
+                                ud_arch_bpf::assemble_bpf_ifblock_cond(cond_text, offset)
+                            {
+                                if encoded == *entry_bytes {
+                                    entry_bytes.clear();
+                                }
+                            }
+                        }
+                    }
+                    *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
+                    let body_start = *ip;
                     visit_stmts(wb, ip);
-                    *ip = ip.saturating_add(tail_bytes.len() as u64);
+                    // `tail_bytes` is a `ja` back to the
+                    // loop header (entry_ip). Slot-offset is
+                    // negative — distance from the ja's next
+                    // slot back to entry_ip.
+                    if !tail_bytes.is_empty() {
+                        let ja_ip = *ip;
+                        #[allow(clippy::cast_possible_wrap)]
+                        let delta = (entry_ip as i64).wrapping_sub((ja_ip as i64).wrapping_add(8));
+                        if let Ok(offset_slots) = i16::try_from(delta / 8) {
+                            if let Ok(encoded) = ud_arch_bpf::assemble_bpf_ja(offset_slots) {
+                                if encoded == *tail_bytes {
+                                    tail_bytes.clear();
+                                }
+                            }
+                        }
+                        *ip = ip.saturating_add(ud_arch_bpf::INSN_SIZE as u64);
+                    }
+                    let _ = body_start;
                 }
                 ud_ast::Stmt::IfBranch {
                     pre_body,
