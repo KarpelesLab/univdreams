@@ -91,13 +91,25 @@ pub struct EncodeHints {
     /// even when rel8 would fit"; on BPF this is ignored (slot
     /// offsets are always one slot wide). `None` = arch picks.
     pub wide: Option<bool>,
+    /// BPF call-convention hint for `encode_call`: `Some(true)`
+    /// requests `call_local` (opcode 0x8d, Linux eBPF style),
+    /// `Some(false)` requests `call_internal` (opcode 0x85
+    /// src=1, Solana sBPF style), `None` defers to the codec's
+    /// default. Lifters that have the original opcode (e.g.
+    /// the byte-drop pass with pinned bytes) set this so the
+    /// regen matches the original encoding exactly. Ignored by
+    /// non-BPF arches.
+    pub bpf_call_local: Option<bool>,
 }
 
 impl EncodeHints {
     /// Convenience: hints with `wide` set.
     #[must_use]
     pub const fn wide(wide: bool) -> Self {
-        Self { wide: Some(wide) }
+        Self {
+            wide: Some(wide),
+            bpf_call_local: None,
+        }
     }
 
     /// Resolve `wide` with a default for arches that need a bool.
@@ -256,6 +268,25 @@ pub trait ArchCodec: Sync + Send + std::fmt::Debug {
     fn encoded_cond_jump_size(&self, source_ip: u64, target: u64, hints: EncodeHints) -> usize;
     /// Predicted size of `encode_call`'s output.
     fn encoded_call_size(&self, source_ip: u64, target: u64, hints: EncodeHints) -> usize;
+
+    /// Whether a `Stmt::Call`'s pinned `bytes` already
+    /// contains the call instruction itself (return true), or
+    /// `bytes` is just the arg-setup prefix and `encode_call`
+    /// regenerates the trailing call (return false).
+    ///
+    /// - x86 strips the trailing 5 bytes of `call rel32` and
+    ///   regenerates them at lower time so an edit that moves
+    ///   the function auto-resolves the new rel32. Returns
+    ///   `false` (the default).
+    /// - BPF has no separate "prefix" — the call IS the
+    ///   single 8-byte instruction. Returns `true`.
+    ///
+    /// Used by the lower path's `Stmt::Call` arm to decide
+    /// whether to append `encode_call` output after the
+    /// pinned bytes.
+    fn direct_call_bytes_contain_call(&self) -> bool {
+        false
+    }
 
     // ---------------------------------------------------------------
     // Data movement (lifted forms — register/memory operands as

@@ -77,22 +77,36 @@ impl ArchCodec for BpfCodec {
         assemble_bpf_ja(off).map_err(|e| ArchError::Assemble(e.to_string()))
     }
 
-    /// BPF calls today don't have a single canonical form the
-    /// codec can produce from `(source_ip, target)` alone —
-    /// `call_local` vs `call` depends on whether the target is
-    /// intra-program. Lift commits in the pipeline (commit 5
-    /// onward) will narrow this; for now return `Unsupported` so
-    /// pinned bytes carry the call.
+    /// Encode an intra-program call. The choice between
+    /// `call_local` (opcode 0x8d, Linux eBPF convention) and
+    /// `call_internal` (opcode 0x85 src=1, Solana sBPF
+    /// convention) is hinted by `EncodeHints::bpf_call_local`:
+    /// `Some(true)` → call_local, `Some(false)` → call_internal,
+    /// `None` → default to call_internal (Solana sBPF, the
+    /// dominant convention in practice; Solana programs
+    /// often carry `e_machine = EM_BPF (247)` despite using
+    /// the sBPF call form, so the EM marker alone can't
+    /// disambiguate). The imm is the slot delta from the
+    /// next slot to the target, signed.
+    ///
+    /// Syscalls (opcode 0x85 src=0, imm = a name hash or -1)
+    /// don't go through this method — they remain pinned in
+    /// `Stmt::Call.bytes` because the imm depends on
+    /// relocation context the codec doesn't carry.
     fn encode_call(
         &self,
-        _source_ip: u64,
-        _target: u64,
-        _hints: EncodeHints,
+        source_ip: u64,
+        target: u64,
+        hints: EncodeHints,
     ) -> Result<Vec<u8>, ArchError> {
-        Err(ArchError::Unsupported {
-            arch: self.name(),
-            operation: "call",
-        })
+        let slots = slot_offset(source_ip, target)?;
+        let imm32 = i32::from(slots);
+        let mnemonic = if hints.bpf_call_local.unwrap_or(false) {
+            "call_local"
+        } else {
+            "call_internal"
+        };
+        assemble_bpf(&format!("{mnemonic} {imm32}")).map_err(|e| ArchError::Assemble(e.to_string()))
     }
 
     fn encode_cond_jump(
@@ -125,6 +139,12 @@ impl ArchCodec for BpfCodec {
 
     fn encoded_call_size(&self, _source_ip: u64, _target: u64, _hints: EncodeHints) -> usize {
         INSN_SIZE
+    }
+
+    /// BPF calls are single 8-byte instructions — pinned
+    /// `Stmt::Call.bytes` (when present) is the complete call.
+    fn direct_call_bytes_contain_call(&self) -> bool {
+        true
     }
 
     /// Encode `dst = src` as one BPF instruction (8 bytes).

@@ -397,9 +397,13 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             if let Some(target) = direct_target {
                 write!(out, " #[target=0x{target:x}]").unwrap();
             }
-            out.push_str(" [");
-            emit_byte_list(out, bytes);
-            writeln!(out, "]").unwrap();
+            if bytes.is_empty() {
+                writeln!(out).unwrap();
+            } else {
+                out.push_str(" [");
+                emit_byte_list(out, bytes);
+                writeln!(out, "]").unwrap();
+            }
         }
         Stmt::IfBranch {
             cond_text,

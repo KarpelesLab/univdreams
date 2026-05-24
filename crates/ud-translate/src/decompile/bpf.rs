@@ -159,46 +159,62 @@ pub fn build_function(
             // is preserved either way: bytes ride along on the
             // chosen variant and the byte-drop pass clears them
             // only when the codec reproduces them.
-            if let Some(lifted) = lift_semantic_stmt(insn, &text) {
-                body.push(lifted);
+            let lifted_to_call = if matches!(insn.kind, InsnKind::Call) {
+                if let Some(args) = call_args.as_ref() {
+                    let lifted = lift_call_stmt(insn, &text, args, name_at, call_site_names);
+                    if let Some(stmt) = lifted {
+                        body.push(stmt);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
             } else {
-                body.push(Stmt::asm(text, insn.bytes.to_vec()));
+                false
+            };
+            if !lifted_to_call {
+                if let Some(lifted) = lift_semantic_stmt(insn, &text) {
+                    body.push(lifted);
+                } else {
+                    body.push(Stmt::asm(text, insn.bytes.to_vec()));
+                }
             }
             if let Some(annotation) = call_or_branch_annotation(insn, name_at, &intra_targets) {
                 body.push(Stmt::Comment(annotation));
             }
-            // Layer-6c / 6c+: format the call site as a
-            // function-call-style comment. For recognised
-            // syscalls we know the arity, so we render only
-            // that many args. For unknown / local calls we
-            // fall back to the generic `args: r1=…` form.
+            // Layer-6c / 6c+: at the call site, surface the
+            // SDK signature + Solana-semantic annotations as
+            // auditor comments. The bare `→ name(args)`
+            // recap that used to live here is now redundant
+            // (the lifted `Stmt::Call` renders the same info
+            // directly) — emit it only when we couldn't lift.
             if matches!(insn.kind, InsnKind::Call) {
                 if let Some(args) = call_args {
                     let callee_name = call_site_names.get(&insn.addr.0).cloned();
-                    let line = if let Some(name) = callee_name {
-                        // Syscall: use the SDK signature
-                        // (already showing types) plus the
-                        // resolved values.
-                        let sig = solana_syscall_signature(&name);
-                        let arity = sig.map_or(5, syscall_arity);
+                    if let Some(name) = &callee_name {
+                        let sig = solana_syscall_signature(name);
                         if let Some(sig_str) = sig {
                             body.push(Stmt::Comment(sig_str.to_string()));
                         }
-                        if let Some(semantic) = solana_semantic_comment(&name, &args) {
+                        if let Some(semantic) = solana_semantic_comment(name, &args) {
                             body.push(Stmt::Comment(semantic));
                         }
-                        format_call_invocation(&name, arity, &args)
-                    } else if let Some(callee) = name_at.get(&call_target(insn)) {
-                        // Local call to a known function. We
-                        // don't know its arity without a
-                        // second pass; render all five slots
-                        // that have resolved values.
-                        format_call_invocation(callee, 5, &args)
-                    } else {
-                        render_call_args(&args).unwrap_or_default()
-                    };
-                    if !line.is_empty() {
-                        body.push(Stmt::Comment(line));
+                    }
+                    if !lifted_to_call {
+                        let line = if let Some(name) = callee_name {
+                            let sig = solana_syscall_signature(&name);
+                            let arity = sig.map_or(5, syscall_arity);
+                            format_call_invocation(&name, arity, &args)
+                        } else if let Some(callee) = name_at.get(&call_target(insn)) {
+                            format_call_invocation(callee, 5, &args)
+                        } else {
+                            render_call_args(&args).unwrap_or_default()
+                        };
+                        if !line.is_empty() {
+                            body.push(Stmt::Comment(line));
+                        }
                     }
                 }
             }
@@ -270,6 +286,102 @@ fn lift_semantic_stmt(insn: &DecodedInsn, text: &str) -> Option<Stmt> {
         }
         _ => None,
     }
+}
+
+/// Recognise a call-site that the codec + lower path can
+/// regenerate as `Stmt::Call` rather than `@asm("call ...")`.
+///
+/// Returns `Some(Stmt::Call)` when the call has a resolved
+/// textual name (either a syscall via the relocation map or a
+/// known intra-program function via `name_at`); falls back to
+/// `None` for hash-only / register-indirect / unknown calls so
+/// they keep their `@asm` rendering.
+///
+/// The args slot array is collapsed to a `Vec<String>` with
+/// `"?"` for unresolved slots and trailing unresolved slots
+/// trimmed (mirrors `format_call_invocation`'s output shape).
+fn lift_call_stmt(
+    insn: &DecodedInsn,
+    text: &str,
+    call_args: &[Option<String>; 5],
+    _name_at: &HashMap<u64, String>,
+    call_site_names: &HashMap<u64, String>,
+) -> Option<Stmt> {
+    // Parse `call <name>` or `call_local <name>` shapes.
+    let (mnem_prefix, rest) = if let Some(r) = text.strip_prefix("call_local ") {
+        ("call_local", r)
+    } else if let Some(r) = text.strip_prefix("call ") {
+        ("call", r)
+    } else {
+        return None;
+    };
+    let _ = mnem_prefix;
+    let name = rest.trim();
+    // Hash-only fallback (`call 0xeca`) means the symbol
+    // resolver didn't map it — keep as @asm so the audit
+    // signal isn't lost.
+    if name.starts_with("0x") || name.is_empty() {
+        return None;
+    }
+
+    // Direct-target classification:
+    //
+    // - If the call site is registered as a syscall in
+    //   `call_site_names` (relocation-derived imports like
+    //   `sol_log_`, `abort`, etc.), `direct_target` is None
+    //   — the imm carries a relocation hash the codec can't
+    //   reproduce from `(source_ip, target)` alone, so the
+    //   pinned bytes are the source of truth.
+    // - Otherwise opcode-driven:
+    //   - 0x8d (Linux call_local) → intra-program target.
+    //   - 0x85 src=1 (Solana sBPF intra-program) → target.
+    //   - 0x85 src=0 (Linux helper) → no target.
+    let src_nibble = (insn.bytes[1] >> 4) & 0x0f;
+    let direct_target = if call_site_names.contains_key(&insn.addr.0) {
+        None
+    } else {
+        match (insn.opcode, src_nibble) {
+            (0x8d, _) | (0x85, 1) => Some(call_target(insn)),
+            _ => None,
+        }
+    };
+
+    // Pick arity from the syscall signature (if known) or
+    // default to 5 for local calls.
+    let arity = if let Some(callee) = call_site_names.get(&insn.addr.0) {
+        super::idioms::solana_syscall_signature(callee).map_or(5, syscall_arity)
+    } else {
+        // Local call to a known function or unknown callee: we
+        // don't have an arity signature, so render up to 5
+        // slots (matches the comment-rendering convention).
+        5
+    };
+    let args = call_args_vec(call_args, arity);
+
+    Some(Stmt::Call {
+        name: name.to_string(),
+        args,
+        bytes: insn.bytes.to_vec(),
+        direct_target,
+    })
+}
+
+/// Collapse the tracker's `[Option<String>; 5]` slot array
+/// into a `Vec<String>` ready for `Stmt::Call.args`. Trailing
+/// unresolved slots are trimmed; interior `None` becomes `"_"`
+/// (underscore — lexes as an ident so the parser round-trips,
+/// reads like Rust's "ignore" placeholder).
+fn call_args_vec(args: &[Option<String>; 5], arity: usize) -> Vec<String> {
+    let n = arity.min(5);
+    let mut parts: Vec<String> = args
+        .iter()
+        .take(n)
+        .map(|s| s.clone().unwrap_or_else(|| "_".into()))
+        .collect();
+    while parts.last().is_some_and(|s| s == "_") {
+        parts.pop();
+    }
+    parts
 }
 
 /// Walk the flat body and wrap forward `jcc → body → label`
@@ -531,25 +643,28 @@ fn try_split_then_else(
 /// `None`. Layer-5a's wrap is conservative — when in doubt,
 /// stay unwrapped.
 /// True when `stmt` occupies one or more BPF slots in the
-/// lowered binary. Asm, Move (lifted from mov64), and Return
-/// (lifted from exit) all qualify. Labels are zero-byte
-/// markers and don't.
+/// lowered binary. Asm, Move (lifted from mov64), Return
+/// (lifted from exit), and Call (lifted from call /
+/// call_local) all qualify. Labels are zero-byte markers
+/// and don't.
 fn is_byte_bearing_stmt(stmt: &Stmt) -> bool {
     matches!(
         stmt,
-        Stmt::Asm { .. } | Stmt::Move { .. } | Stmt::Return { .. }
+        Stmt::Asm { .. } | Stmt::Move { .. } | Stmt::Return { .. } | Stmt::Call { .. }
     )
 }
 
 fn peek_insn_addr(body: &[Stmt], idx: usize) -> Option<u64> {
     // Walk back from `idx` looking for the most recent label.
     // Each single-slot BPF stmt advances the cursor by 8 bytes.
-    // Today that's Asm + the lifter-produced Return / Move
-    // variants. Adding more lifts means adding more arms here.
+    // Today that's Asm + the lifter-produced Return / Move /
+    // Call variants. Adding more lifts means adding more arms.
     let mut slots_seen = 0u64;
     for j in (0..idx).rev() {
         match &body[j] {
-            Stmt::Asm { .. } | Stmt::Return { .. } | Stmt::Move { .. } => slots_seen += 1,
+            Stmt::Asm { .. } | Stmt::Return { .. } | Stmt::Move { .. } | Stmt::Call { .. } => {
+                slots_seen += 1;
+            }
             Stmt::Label { addr } => return Some(addr + slots_seen * 8),
             _ => {}
         }

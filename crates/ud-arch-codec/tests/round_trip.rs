@@ -101,7 +101,10 @@ fn unknown_arch_errors() {
     init_registry();
     let err = ud_arch_codec::for_arch(Some("riscv64"), None).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("riscv64"), "error message names the arch: {msg}");
+    assert!(
+        msg.contains("riscv64"),
+        "error message names the arch: {msg}"
+    );
 }
 
 #[test]

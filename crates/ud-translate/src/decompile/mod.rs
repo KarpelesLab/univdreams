@@ -315,6 +315,50 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                     }
                     *ip = ip.saturating_add(slot_size);
                 }
+                ud_ast::Stmt::Call {
+                    bytes,
+                    direct_target,
+                    ..
+                } => {
+                    // Byte-drop is supported only for intra-
+                    // program calls (direct_target is set
+                    // AND the codec considers the bytes the
+                    // complete instruction). Syscalls keep
+                    // their pinned bytes — the imm carries a
+                    // relocation hash the codec can't
+                    // reproduce without external context.
+                    if !bytes.is_empty() && arch.direct_call_bytes_contain_call() {
+                        if let Some(target) = *direct_target {
+                            // BPF has two intra-program call
+                            // shapes (0x8d Linux call_local
+                            // vs 0x85 src=1 Solana sBPF
+                            // call_internal). The codec's
+                            // default regen at lower time is
+                            // call_internal, so only drop
+                            // bytes when the original ALSO
+                            // used call_internal — call_local
+                            // sites keep their pinned bytes
+                            // so the lower-time regen doesn't
+                            // silently switch encodings.
+                            // Storing the original encoding
+                            // in the AST is a follow-up if
+                            // call_local sites become more
+                            // common in real fixtures.
+                            if bytes.first() == Some(&0x85) {
+                                if let Ok(encoded) = arch.encode_call(
+                                    *ip,
+                                    target,
+                                    ud_arch_codec::EncodeHints::default(),
+                                ) {
+                                    if encoded == *bytes {
+                                        bytes.clear();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    *ip = ip.saturating_add(slot_size);
+                }
                 ud_ast::Stmt::IfBlock {
                     cond_text,
                     cond_bytes,

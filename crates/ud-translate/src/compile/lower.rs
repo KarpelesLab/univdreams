@@ -566,25 +566,37 @@ fn lower_stmts_into(
             } => {
                 out.extend_from_slice(bytes);
                 if let Some(target) = direct_target {
-                    let func_addr = base_addr.ok_or_else(|| LowerError::GotoNeedsAddress {
-                        fn_name: fn_name.to_string(),
-                        stmt_index: i,
-                    })?;
-                    let call_ip = func_addr.checked_add(out.len() as u64).ok_or_else(|| {
-                        LowerError::GotoNeedsAddress {
+                    // For x86, bytes is the arg-setup prefix
+                    // and we always append the regenerated
+                    // `call rel32`. For BPF, bytes (when
+                    // present) already contains the full
+                    // 8-byte call — append encode_call only
+                    // when bytes was empty (byte-drop cleared
+                    // it). The codec's
+                    // `direct_call_bytes_contain_call` flag
+                    // distinguishes the two conventions.
+                    let need_append = bytes.is_empty() || !arch.direct_call_bytes_contain_call();
+                    if need_append {
+                        let func_addr = base_addr.ok_or_else(|| LowerError::GotoNeedsAddress {
                             fn_name: fn_name.to_string(),
                             stmt_index: i,
-                        }
-                    })?;
-                    let call_bytes = arch
-                        .encode_call(call_ip, *target, EncodeHints::default())
-                        .map_err(|e| LowerError::ArchEncode {
-                            fn_name: fn_name.to_string(),
-                            stmt_index: i,
-                            operation: "call",
-                            message: e.to_string(),
                         })?;
-                    out.extend_from_slice(&call_bytes);
+                        let call_ip = func_addr.checked_add(out.len() as u64).ok_or_else(|| {
+                            LowerError::GotoNeedsAddress {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                            }
+                        })?;
+                        let call_bytes = arch
+                            .encode_call(call_ip, *target, EncodeHints::default())
+                            .map_err(|e| LowerError::ArchEncode {
+                                fn_name: fn_name.to_string(),
+                                stmt_index: i,
+                                operation: "call",
+                                message: e.to_string(),
+                            })?;
+                        out.extend_from_slice(&call_bytes);
+                    }
                 }
             }
             Stmt::Move { dst, src, bytes } => {

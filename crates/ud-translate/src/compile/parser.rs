@@ -1080,7 +1080,14 @@ impl Parser {
             ("target", ud_ast::AttrValue::Int(n)) => Some(*n),
             _ => None,
         });
-        let bytes = self.parse_byte_list()?;
+        // Bytes are optional: BPF call-sites with a known
+        // `direct_target` regenerate via `arch.encode_call` at
+        // lower time, so the emitter omits the `[]` block.
+        let bytes = if self.peek().kind == TokenKind::LBracket {
+            self.parse_byte_list()?
+        } else {
+            Vec::new()
+        };
         Ok(Stmt::Call {
             name,
             args,
