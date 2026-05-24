@@ -5726,18 +5726,32 @@ fn stub_duplicate_handle(
 }
 
 /// `HANDLE OpenEventA(DWORD dwDesiredAccess, BOOL bInheritHandle,
-/// LPCSTR lpName)`. The named-event registry across processes
-/// is rarely used by installers we drive; we report
-/// `ERROR_FILE_NOT_FOUND` (= 2) on failure path by returning
-/// NULL, which the caller treats as "no such event — create one".
+/// LPCSTR lpName)`. Mints a synthetic auto-reset Event
+/// WaitObject (signaled by default) for any requested name.
+/// Installer-class binaries that use `OpenEventA` to wait on
+/// a parent-process handshake see the event resolve
+/// immediately so the helper proceeds.
 fn stub_open_event_a(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    state.last_error = 2; // ERROR_FILE_NOT_FOUND
-    Ok(0)
+    let _access = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("OpenEventA", t))?;
+    let _inherit = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("OpenEventA", t))?;
+    let p_name = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("OpenEventA", t))?;
+    let name = if p_name != 0 {
+        read_cstr(mmu, p_name, 260).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    state.debug_log.push(format!("OpenEventA(name={name:?})"));
+    Ok(state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Event {
+            signaled: true,
+            manual_reset: false,
+        }))
 }
 
 /// `HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle,
