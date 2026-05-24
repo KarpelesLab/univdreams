@@ -282,7 +282,21 @@ pub struct ProcessState {
     /// per-thread [`ThreadState::tls_slots`]. Phase 2 of the
     /// scheduler refactor.
     pub next_tls_slot: u32,
+    /// Bottom of the thread-stack pool. `CreateThread` carves
+    /// stacks from `[bottom, top)` walking down from
+    /// `next_thread_stack_top`. Both are `0` when no pool has
+    /// been configured — `CreateThread` reports an
+    /// `InvalidArgument` error in that case.
+    pub thread_stack_pool_bottom: u32,
+    /// Next available stack-top for the next `CreateThread`.
+    /// Decrements by [`THREAD_STACK_SIZE`] per spawned thread.
+    pub next_thread_stack_top: u32,
 }
+
+/// Default per-thread stack size, in bytes. 64 KiB matches the
+/// typical Win32 reserve size; many codec / installer threads
+/// use only a few hundred bytes.
+pub const THREAD_STACK_SIZE: u32 = 0x0001_0000;
 
 impl ProcessState {
     /// Construct a fresh process with the heap arena at
@@ -570,6 +584,16 @@ impl HostState {
     pub fn with_const_arena(mut self, start: u32, end: u32) -> Self {
         self.process.const_arena_cursor = start;
         self.process.const_arena_end = end;
+        self
+    }
+
+    /// Configure the thread-stack pool. `CreateThread` carves
+    /// per-thread stacks from the top of this region walking
+    /// downward. `[bottom, top)` must already be mapped R+W in
+    /// the MMU.
+    pub fn with_thread_stack_pool(mut self, bottom: u32, top: u32) -> Self {
+        self.process.thread_stack_pool_bottom = bottom;
+        self.process.next_thread_stack_top = top;
         self
     }
 
@@ -1156,12 +1180,12 @@ pub fn dispatch_stub(
 /// which dispatches the codec's `DriverProc` synchronously
 /// inside an outer `IC*` call).
 /// Process a yield request from a freshly-returned stub. The
-/// active thread transitions to the appropriate scheduler state
-/// (`Waiting` / `Ready` / `Terminated`); the live `Cpu` itself
-/// is not touched here — single-thread Phase 3a always resumes
-/// the same `cpu`. Phase 3b will add the cross-thread context
-/// switch when `CreateThread` actually mints a second thread.
-fn handle_yield(_cpu: &mut Cpu, state: &mut HostState, req: crate::sched::YieldRequest) {
+/// active thread transitions to the requested scheduler state,
+/// then the run loop picks the next `Ready` thread via
+/// [`schedule_next_thread`]. The live `Cpu` is parked into the
+/// previous active thread's `parked_cpu` slot and the new
+/// thread's parked Cpu replaces it.
+fn handle_yield(cpu: &mut Cpu, state: &mut HostState, req: crate::sched::YieldRequest) {
     use crate::sched::{ThreadStatus, YieldRequest};
     match req {
         YieldRequest::Wait(cond) => {
@@ -1173,25 +1197,95 @@ fn handle_yield(_cpu: &mut Cpu, state: &mut HostState, req: crate::sched::YieldR
             let t = state.cur_thread_mut();
             t.status = ThreadStatus::Ready;
         }
-        YieldRequest::Exit { code: _ } => {
+        YieldRequest::Exit { code } => {
             let t = state.cur_thread_mut();
             t.status = ThreadStatus::Terminated;
             t.wait = None;
+            // Signal any pending `WaitForSingleObject` against
+            // this thread's Thread WaitObject. (Phase 3c will
+            // implement the wake side; here we just mark the
+            // state machine so Phase 3c's wake-up sees a
+            // terminated thread).
+            let _ = code;
         }
     }
+    schedule_next_thread(cpu, state);
 }
 
-/// Return the active thread's `WaitCondition::Sleep` shape, if
-/// any. Used by [`run_until_sentinel`] to advance the global
-/// clock past a single-thread Sleep without spinning the CPU.
-fn sleep_wait_for(state: &HostState, tid: u32) -> Option<crate::sched::WaitCondition> {
-    let t = state.threads.get(&tid)?;
-    if matches!(t.status, crate::sched::ThreadStatus::Waiting) {
-        if let Some(crate::sched::WaitCondition::Sleep { .. }) = t.wait {
-            return t.wait.clone();
+/// Park the live `Cpu` into the current thread and resume the
+/// next `Ready` thread (if one exists). When no other Ready
+/// thread is available, restores the current thread's CPU
+/// unchanged — the run loop continues with the same thread
+/// (which is fine for single-thread Sleep behaviour: the clock
+/// fast-forward at the top of the loop wakes the same thread).
+fn schedule_next_thread(cpu: &mut Cpu, state: &mut HostState) {
+    use crate::sched::ThreadStatus;
+    // Pick the next runnable thread other than the current
+    // one — round-robin by TID order. Phase 4 will add
+    // priority-aware picking.
+    let cur_tid = state.active_tid;
+    let next_tid = {
+        let mut candidates: Vec<u32> = state
+            .threads
+            .iter()
+            .filter(|(tid, t)| **tid != cur_tid && matches!(t.status, ThreadStatus::Ready))
+            .map(|(tid, _)| *tid)
+            .collect();
+        candidates.sort_unstable();
+        candidates.into_iter().next()
+    };
+    let cur_is_runnable = matches!(
+        state
+            .threads
+            .get(&cur_tid)
+            .map(|t| t.status)
+            .unwrap_or(ThreadStatus::Terminated),
+        ThreadStatus::Ready | ThreadStatus::Running
+    );
+    let Some(next_tid) = next_tid else {
+        // No other Ready thread. If the current is still
+        // runnable, just keep going. Otherwise the run loop's
+        // sleep-clock fast-forward will wake it; if that
+        // doesn't apply we'd deadlock — but Phase 3b only
+        // exposes Sleep, so this path is fine.
+        if cur_is_runnable {
+            state.cur_thread_mut().status = ThreadStatus::Running;
         }
+        return;
+    };
+    // Park the live CPU into the current thread.
+    let parked = std::mem::take(cpu);
+    if let Some(t) = state.threads.get_mut(&cur_tid) {
+        t.parked_cpu = Some(parked);
     }
-    None
+    // Restore the next thread's parked CPU into the live one.
+    if let Some(t) = state.threads.get_mut(&next_tid) {
+        if let Some(c) = t.parked_cpu.take() {
+            *cpu = c;
+        }
+        t.status = ThreadStatus::Running;
+    }
+    state.active_tid = next_tid;
+}
+
+/// Earliest `resume_after_instructions` across every
+/// Sleep-waiting thread, or `None` if no thread is sleeping.
+fn earliest_sleep_resume(state: &HostState) -> Option<u64> {
+    state
+        .threads
+        .values()
+        .filter_map(|t| {
+            if matches!(t.status, crate::sched::ThreadStatus::Waiting) {
+                if let Some(crate::sched::WaitCondition::Sleep {
+                    resume_after_instructions,
+                }) = t.wait
+                {
+                    return Some(resume_after_instructions);
+                }
+            }
+            None
+        })
+        .min()
 }
 
 /// Move every `Waiting`-on-Sleep thread whose resume target is
@@ -1236,21 +1330,38 @@ pub fn run_until_sentinel(
         // context switch.
         if let Some(req) = state.yield_requested.take() {
             handle_yield(cpu, state, req);
-            // Single-thread loop body — once the yield is
-            // recorded, fall through to the busy-wait below.
         }
-        // Drive the sleep wake-ups: if the only blocked thread
-        // is the current one waiting on a Sleep, advance the
-        // global clock until it wakes.
-        if let Some(crate::sched::WaitCondition::Sleep {
-            resume_after_instructions,
-        }) = sleep_wait_for(state, state.active_tid)
-        {
-            state.scheduler.instructions_global = state
-                .scheduler
-                .instructions_global
-                .max(resume_after_instructions);
-            wake_sleep_if_due(state);
+        // Scheduler nudge: when the active thread isn't
+        // runnable (Terminated / Waiting because no other
+        // Ready thread could be picked at yield time), look
+        // for any thread sleeping on a Sleep wait. The
+        // earliest wake target fast-forwards the global
+        // clock; `wake_sleep_if_due` then moves matching
+        // threads back to Ready, and `schedule_next_thread`
+        // switches into one of them.
+        let active_runnable = matches!(
+            state.cur_thread().status,
+            crate::sched::ThreadStatus::Ready | crate::sched::ThreadStatus::Running
+        );
+        if !active_runnable {
+            if let Some(earliest) = earliest_sleep_resume(state) {
+                state.scheduler.instructions_global =
+                    state.scheduler.instructions_global.max(earliest);
+                wake_sleep_if_due(state);
+                schedule_next_thread(cpu, state);
+            }
+            // Active thread still not runnable AND no Ready
+            // peer was found — the run is done. Return so the
+            // outer host caller observes a clean exit rather
+            // than a busy spin.
+            if !matches!(
+                state.cur_thread().status,
+                crate::sched::ThreadStatus::Ready | crate::sched::ThreadStatus::Running
+            ) {
+                cpu.regs.eip = RET_SENTINEL;
+                return Ok(());
+            }
+            state.cur_thread_mut().status = crate::sched::ThreadStatus::Running;
         }
         if state.exit_requested.is_some() {
             // `kernel32!ExitProcess` was called. Force eip to
@@ -1260,7 +1371,31 @@ pub fn run_until_sentinel(
             return Ok(());
         }
         if cpu.regs.eip == RET_SENTINEL {
-            return Ok(());
+            // The active thread has run off the end of its
+            // top-level callable. If it's the bootstrap thread
+            // (TID 1), the entire run is done. Otherwise, mark
+            // the thread Terminated and switch to the next
+            // Ready one.
+            if state.active_tid == 1 {
+                return Ok(());
+            }
+            state.cur_thread_mut().status = crate::sched::ThreadStatus::Terminated;
+            schedule_next_thread(cpu, state);
+            // After the switch the live CPU points at the next
+            // thread; if no other was Ready, we're back on the
+            // bootstrap thread and `schedule_next_thread`
+            // left the live CPU untouched — so we'll re-enter
+            // this branch and return.
+            if state.active_tid == 1
+                && matches!(
+                    state.cur_thread().status,
+                    crate::sched::ThreadStatus::Ready | crate::sched::ThreadStatus::Running
+                )
+                && cpu.regs.eip == RET_SENTINEL
+            {
+                return Ok(());
+            }
+            continue;
         }
         // Optional instruction budget — both instruction steps
         // and stub dispatches are counted as one "step" each,
@@ -1290,7 +1425,21 @@ pub fn run_until_sentinel(
         }
         match cpu.step(mmu) {
             Ok(StepOk::Continued) => continue,
-            Ok(StepOk::Halted) => return Ok(()),
+            Ok(StepOk::Halted) => {
+                // The active thread executed a `ret` whose
+                // popped address was `RET_SENTINEL`. For the
+                // bootstrap thread that's the run's exit; for
+                // any other thread it means the thread proc
+                // returned, so we mark it Terminated and let
+                // the scheduler pick the next runnable peer.
+                if state.active_tid == 1 {
+                    return Ok(());
+                }
+                cpu.regs.eip = RET_SENTINEL;
+                state.cur_thread_mut().status = crate::sched::ThreadStatus::Terminated;
+                schedule_next_thread(cpu, state);
+                continue;
+            }
             Err(t) => {
                 let e: crate::Error = t.into();
                 #[cfg(feature = "trace")]

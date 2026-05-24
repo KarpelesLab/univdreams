@@ -40,6 +40,14 @@ const STACK_BOTTOM: u32 = 0x9000_0000;
 const STACK_SIZE: u32 = 0x0010_0000; // 1 MiB
 const STACK_TOP: u32 = STACK_BOTTOM + STACK_SIZE;
 
+/// Thread-stack arena. `CreateThread` carves a 64 KiB region
+/// out of this pool per spawned thread, walking down from the
+/// top. 0x8000_0000 .. 0x9000_0000 = 256 MiB → ~4096 aux
+/// threads, plenty for codec / installer corpora.
+const THREAD_STACK_POOL_BOTTOM: u32 = 0x8000_0000;
+const THREAD_STACK_POOL_SIZE: u32 = 0x1000_0000; // 256 MiB
+const THREAD_STACK_POOL_TOP: u32 = THREAD_STACK_POOL_BOTTOM + THREAD_STACK_POOL_SIZE;
+
 /// Thread Environment Block — Windows places its TEB at
 /// `0x7FFD_E000` historically. We map a 4 KiB page here and
 /// stage the SEH chain head (`FS:[0]`) to `0xFFFF_FFFF` ("end of
@@ -151,6 +159,14 @@ impl Sandbox {
         mmu.map(DATA_IMPORT_BASE, DATA_IMPORT_REGION_SIZE, Perm::R | Perm::W);
         // Stack (R+W)
         mmu.map(STACK_BOTTOM, STACK_SIZE, Perm::R | Perm::W);
+        // Thread-stack pool (R+W). `CreateThread` carves
+        // 64 KiB stacks out of the top of this pool, walking
+        // down with each thread.
+        mmu.map(
+            THREAD_STACK_POOL_BOTTOM,
+            THREAD_STACK_POOL_SIZE,
+            Perm::R | Perm::W,
+        );
         // Stub-thunk region (R-only, zeroed). The run loop
         // detects `eip == thunk_addr` via `Registry::is_thunk`
         // *before* hitting the MMU, so execution still routes
@@ -184,7 +200,8 @@ impl Sandbox {
         }
 
         let mut host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
-            .with_const_arena(CONST_ARENA_START, CONST_ARENA_END);
+            .with_const_arena(CONST_ARENA_START, CONST_ARENA_END)
+            .with_thread_stack_pool(THREAD_STACK_POOL_BOTTOM, THREAD_STACK_POOL_TOP);
 
         // Pre-register the system DLLs whose stub registries we
         // ship as "loaded modules". Real Windows always has these
@@ -1337,5 +1354,69 @@ mod tests {
         sb.cpu.regs.eip = thunk;
         sb.run_until_sentinel().unwrap();
         assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 0xDEAD_BEEF);
+    }
+
+    /// Phase 3b of the scheduler refactor: `CreateThread` mints
+    /// a Ready thread, the scheduler context-switches into it
+    /// the first time the bootstrap thread yields, and the new
+    /// thread runs to its own RET_SENTINEL where it
+    /// terminates. Verifies both halves of the round trip.
+    #[test]
+    fn create_thread_spawns_a_real_runnable_thread() {
+        let mut sb = Sandbox::new();
+        // Map a code page for the synthetic thread proc.
+        sb.mmu.map(0x1000, 0x1000, Perm::R | Perm::X);
+        // Thread proc: `mov eax, 0x42; ret 4` (stdcall, one arg
+        // consumed; eax = exit code).
+        let proc_va = 0x1010u32;
+        let proc_code: [u8; 8] = [
+            0xb8, 0x42, 0x00, 0x00, 0x00, // mov eax, 0x42
+            0xc2, 0x04, 0x00, // ret 4
+        ];
+        sb.mmu.write_initializer(proc_va, &proc_code).unwrap();
+        // Drive CreateThread via the kernel32 thunk so we exercise
+        // the same code path a real codec would.
+        let create_thread = sb.registry.resolve("kernel32.dll", "CreateThread").unwrap();
+        // Push args right-to-left: (attrs, stack, start, param,
+        // flags, p_tid) = (0, 0, proc_va, 0xCAFE, 0, 0).
+        for &a in [0u32, 0, proc_va, 0xCAFE, 0, 0].iter().rev() {
+            sb.cpu.push32(&mut sb.mmu, a).unwrap();
+        }
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = create_thread;
+        sb.run_until_sentinel().unwrap();
+        let thread_handle = sb.cpu.regs.get32(Reg32::Eax);
+        assert!(thread_handle >= crate::sched::WAIT_OBJECT_HANDLE_BASE);
+        // The new thread is in the table, Ready, with its CPU
+        // parked. TID 2 (bootstrap is 1).
+        let t = sb.host.threads.get(&2).expect("new thread present");
+        assert!(matches!(t.status, crate::sched::ThreadStatus::Ready));
+        assert!(t.parked_cpu.is_some());
+        assert_ne!(
+            t.parked_cpu.as_ref().unwrap().regs.esp(),
+            0,
+            "stack was carved from the pool"
+        );
+
+        // Bootstrap now Sleeps — the scheduler must context
+        // switch into the new thread, run it to its
+        // RET_SENTINEL, mark it Terminated, and then come
+        // back to the bootstrap (which wakes after the sleep
+        // clock advances).
+        let sleep_thunk = sb.registry.resolve("kernel32.dll", "Sleep").unwrap();
+        // Sleep(1ms)
+        sb.cpu.push32(&mut sb.mmu, 1u32).unwrap();
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = sleep_thunk;
+        sb.run_until_sentinel().unwrap();
+        // After the run, the new thread should have ran to
+        // completion (status Terminated, eax = 0x42 on its
+        // parked CPU if any).
+        let t = sb.host.threads.get(&2).expect("new thread still present");
+        assert!(
+            matches!(t.status, crate::sched::ThreadStatus::Terminated),
+            "expected thread 2 Terminated, got {:?}",
+            t.status
+        );
     }
 }

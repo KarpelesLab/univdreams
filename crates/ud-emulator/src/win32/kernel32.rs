@@ -644,6 +644,8 @@ pub fn register(registry: &mut Registry) {
         stub_create_thread as StubFn,
         6,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitthread
+    registry.register("kernel32.dll", "ExitThread", stub_exit_thread as StubFn, 1);
     // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setevent
     registry.register("kernel32.dll", "SetEvent", stub_set_event as StubFn, 1);
     // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadpriority
@@ -3256,24 +3258,25 @@ fn stub_create_event_a(
 /// LPVOID lpParameter, DWORD dwCreationFlags,
 /// LPDWORD lpThreadId)`.
 ///
-/// Single-threaded sandbox semantics: invoke the start routine
-/// synchronously (stdcall, one parameter) using
-/// [`crate::win32::call_guest`], then return a non-zero
-/// pseudo-HANDLE. If the caller passed `lpThreadId`, write a
-/// pseudo-thread-id (the same numeric value as the handle).
+/// Mints a fresh [`crate::win32::ThreadState`] with its own CPU
+/// register file + stack region, parks the CPU on the start
+/// routine (one stdcall argument: `lpParameter`, RET_SENTINEL
+/// as the return-to address), marks the thread `Ready`, and
+/// hands back a Thread `WaitObject` handle. The scheduler
+/// switches into the new thread the next time the current one
+/// yields or hits a `Wait*` / quantum boundary.
 ///
-/// `dwCreationFlags & CREATE_SUSPENDED (0x4)` is honoured by
-/// returning *without* running the start address; a paired
-/// `ResumeThread` does nothing in our model. This mirrors the
-/// MSDN contract closely enough for codec init, which only
-/// uses the suspend bit to set thread priority before letting
-/// the thread run.
+/// `CREATE_SUSPENDED` (0x0000_0004) parks the thread in
+/// `Suspended` state instead — `ResumeThread` moves it to
+/// `Ready`.
 fn stub_create_thread(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    registry: &Registry,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    use crate::emulator::isa_int::RET_SENTINEL;
+    use crate::sched::{ThreadStatus, WaitObject};
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateThread", t))?;
     let _stack = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateThread", t))?;
@@ -3281,19 +3284,72 @@ fn stub_create_thread(
     let param = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateThread", t))?;
     let flags = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CreateThread", t))?;
     let p_tid = arg_dword(cpu, mmu, 5).map_err(|t| trap_to_win32("CreateThread", t))?;
-
-    state.tick = state.tick.wrapping_add(1);
-    let handle = 0xCAFE_C000u32.wrapping_add(state.tick);
+    if start == 0 {
+        return Ok(0);
+    }
+    // Reserve the next slot in the thread-stack arena.
+    let arena_top = state.cur_process().next_thread_stack_top;
+    let arena_bottom = state.cur_process().thread_stack_pool_bottom;
+    if arena_top == 0 || arena_top.saturating_sub(arena_bottom) < crate::win32::THREAD_STACK_SIZE {
+        return Err(Win32Error::InvalidArgument {
+            stub: "CreateThread",
+            reason:
+                "thread-stack pool exhausted (configure with HostState::with_thread_stack_pool)"
+                    .into(),
+        });
+    }
+    let stack_top = arena_top;
+    state.cur_process_mut().next_thread_stack_top = stack_top - crate::win32::THREAD_STACK_SIZE;
+    // Build the new thread's CPU state.
+    let mut new_cpu = Cpu::new();
+    new_cpu.regs.set_esp(stack_top - 0x10); // small guard
+    new_cpu.regs.eip = start;
+    // stdcall: one DWORD argument (lpParameter). Push param +
+    // RET_SENTINEL so a plain RET inside the start routine
+    // returns to the sentinel, which the run loop catches as
+    // "thread done".
+    new_cpu
+        .push32(mmu, param)
+        .map_err(|t| trap_to_win32("CreateThread", t))?;
+    new_cpu
+        .push32(mmu, RET_SENTINEL)
+        .map_err(|t| trap_to_win32("CreateThread", t))?;
+    // Allocate a TID + register the thread.
+    let tid = state.next_tid;
+    state.next_tid = state.next_tid.wrapping_add(1);
+    let pid = state.cur_thread().pid;
+    let mut t = crate::win32::ThreadState::new(tid, pid);
+    t.parked_cpu = Some(new_cpu);
+    t.status = if (flags & CREATE_SUSPENDED) != 0 {
+        ThreadStatus::Suspended
+    } else {
+        ThreadStatus::Ready
+    };
+    state.threads.insert(tid, t);
+    // Mint a Thread wait object for parent-side
+    // WaitForSingleObject. Phase 3c wires this into Wait*; for
+    // now we just hand back the handle.
+    let handle = state.scheduler.insert_object(WaitObject::Thread { tid });
     if p_tid != 0 {
-        mmu.store32(p_tid, handle)
+        mmu.store32(p_tid, tid)
             .map_err(|t| trap_to_win32("CreateThread", t))?;
     }
-    if start != 0 && (flags & CREATE_SUSPENDED) == 0 {
-        // stdcall: one DWORD argument. The thread proc returns
-        // its exit code in eax; we discard it.
-        let _ = crate::win32::call_guest(cpu, mmu, registry, state, start, &[param]);
-    }
     Ok(handle)
+}
+
+/// `void ExitThread(DWORD dwExitCode)`. Marks the current
+/// thread `Terminated` and asks the scheduler to switch. Never
+/// returns (the run loop catches the yield request and the
+/// next thread runs in place of this one).
+fn stub_exit_thread(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ExitThread", t))?;
+    state.yield_requested = Some(crate::sched::YieldRequest::Exit { code });
+    Ok(0)
 }
 
 /// `BOOL SetEvent(HANDLE)`. Single-threaded sandbox: the event
@@ -3318,17 +3374,29 @@ fn stub_set_thread_priority(
     Ok(1)
 }
 
-/// `DWORD ResumeThread(HANDLE)`. Single-threaded sandbox: thread
-/// is already "running" (we ran it synchronously inside
-/// `CreateThread`), so resume returns the previous suspend count
-/// 0. Real `ResumeThread` returns `(DWORD)-1` on failure but
-/// codecs don't check.
+/// `DWORD ResumeThread(HANDLE)`. Looks up the Thread wait
+/// object behind the handle; if the corresponding thread is
+/// `Suspended`, moves it to `Ready`. Returns the previous
+/// suspend count (always 0 or 1 in our model).
 fn stub_resume_thread(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    use crate::sched::{ThreadStatus, WaitObject};
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ResumeThread", t))?;
+    let tid = match state.scheduler.objects.get(&h) {
+        Some(WaitObject::Thread { tid }) => *tid,
+        _ => return Ok(0xFFFF_FFFF),
+    };
+    let Some(t) = state.threads.get_mut(&tid) else {
+        return Ok(0xFFFF_FFFF);
+    };
+    if matches!(t.status, ThreadStatus::Suspended) {
+        t.status = ThreadStatus::Ready;
+        return Ok(1);
+    }
     Ok(0)
 }
 
