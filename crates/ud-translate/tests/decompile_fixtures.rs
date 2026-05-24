@@ -170,8 +170,12 @@ fn count_function_bytes_as_insns(items: &[Item]) -> usize {
             match item {
                 Item::Function(f) => {
                     let ip = f.addr.or(cursor);
-                    let bytes =
-                        ud_translate::compile::lower_function_bytes_at(f, ip).expect("lower");
+                    let bytes = ud_translate::compile::lower_function_bytes_at(
+                        f,
+                        ip,
+                        &ud_arch_x86::X86Codec::BITS64,
+                    )
+                    .expect("lower");
                     let insns = ud_arch_x86::decode(ud_arch_x86::Bitness::Bits64, &bytes, 0)
                         .expect("decode");
                     *n += insns.len();

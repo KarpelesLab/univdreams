@@ -94,7 +94,7 @@ fn source_round_trip_byte_identity_per_section() {
                 continue;
             }
         };
-        let lowered = match lower_sections(&ast) {
+        let lowered = match lower_sections(&ast, &ud_arch_x86::X86Codec::BITS64) {
             Ok(l) => l,
             Err(e) => {
                 failures.push(format!("{}: lower: {e}", fixture.display()));

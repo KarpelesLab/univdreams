@@ -19,8 +19,11 @@ mod lower_macho;
 mod lower_pe;
 mod lower_raw;
 mod lower_wasm;
+mod module;
 mod parser;
 mod verify;
+
+pub use module::resolve_arch_codec;
 
 pub use lower::{
     lower_function_bytes, lower_function_bytes_at, lower_functions, lower_section_bytes,

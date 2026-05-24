@@ -16,6 +16,7 @@
 use ud_ast::{Field, Item, Module, UdFile, Value};
 
 use crate::compile::lower::lower_function_bytes;
+use crate::compile::module::resolve_arch_codec;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RawLowerError {
@@ -48,6 +49,15 @@ pub enum RawLowerError {
     FunctionWithoutAddr { name: String },
     #[error(transparent)]
     InnerLower(#[from] crate::compile::lower::LowerError),
+
+    #[error("module arch resolution failed: {0}")]
+    ArchResolve(String),
+}
+
+impl From<ud_arch_codec::ArchError> for RawLowerError {
+    fn from(e: ud_arch_codec::ArchError) -> Self {
+        Self::ArchResolve(e.to_string())
+    }
 }
 
 /// Lower a `.ud` file describing a raw image to its bytes.
@@ -61,6 +71,7 @@ pub fn lower_to_raw(file: &UdFile) -> Result<Vec<u8>, RawLowerError> {
     let file_size = read_int(build, "file_size")?;
     let end = load_addr + file_size;
 
+    let arch = resolve_arch_codec(&file.module)?;
     let mut owned_function_bytes: Vec<Vec<u8>> = Vec::new();
     let mut blocks: Vec<(u64, Vec<u8>)> = Vec::new();
     for item in &file.items {
@@ -70,7 +81,7 @@ pub fn lower_to_raw(file: &UdFile) -> Result<Vec<u8>, RawLowerError> {
                 let addr = f.addr.ok_or_else(|| RawLowerError::FunctionWithoutAddr {
                     name: f.name.clone(),
                 })?;
-                let bytes = lower_function_bytes(f)?;
+                let bytes = lower_function_bytes(f, arch.as_ref())?;
                 owned_function_bytes.push(bytes);
                 let last = owned_function_bytes.last().unwrap();
                 blocks.push((addr, last.clone()));

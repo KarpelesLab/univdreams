@@ -23,6 +23,7 @@ use ud_ast::{Item, Module, UdFile, Value};
 use ud_format::elf::{Ehdr64, Elf64File, ElfClass, Phdr64, Shdr64};
 
 use crate::compile::lower::{lower_section_bytes, LowerError};
+use crate::compile::module::resolve_arch_codec;
 
 /// Errors specific to the ELF lower path.
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +59,15 @@ pub enum ElfLowerError {
 
     #[error(transparent)]
     Lower(#[from] LowerError),
+
+    #[error("module arch resolution failed: {0}")]
+    ArchResolve(String),
+}
+
+impl From<ud_arch_codec::ArchError> for ElfLowerError {
+    fn from(e: ud_arch_codec::ArchError) -> Self {
+        Self::ArchResolve(e.to_string())
+    }
 }
 
 /// Lower a complete `.ud` file to ELF bytes.
@@ -77,11 +87,12 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
     let mut padding = read_padding(build)?;
     let mut file_size = read_int(build, "file_size")?;
 
+    let arch = resolve_arch_codec(&file.module)?;
     // Lower every @section block; index by name.
     let mut by_name: HashMap<String, (u64, Vec<u8>)> = HashMap::new();
     for item in &file.items {
         if let Item::Section { name, addr, items } = item {
-            let bytes = lower_section_bytes(name, *addr, items)?;
+            let bytes = lower_section_bytes(name, *addr, items, arch.as_ref())?;
             if by_name.insert(name.clone(), (*addr, bytes)).is_some() {
                 return Err(ElfLowerError::DuplicateSection {
                     section: name.clone(),

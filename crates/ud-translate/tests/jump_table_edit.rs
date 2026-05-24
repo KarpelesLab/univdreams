@@ -34,7 +34,7 @@ fn editing_a_case_target_changes_only_that_slot_gcc_pie() {
             },
         ],
     }];
-    let before = lower_section_bytes(".rodata", 0x2000, &items_before).unwrap();
+    let before = lower_section_bytes(".rodata", 0x2000, &items_before, &ud_arch_x86::X86Codec::BITS64).unwrap();
     assert_eq!(before.len(), 12);
 
     let items_after = vec![Item::JumpTable {
@@ -56,7 +56,7 @@ fn editing_a_case_target_changes_only_that_slot_gcc_pie() {
             },
         ],
     }];
-    let after = lower_section_bytes(".rodata", 0x2000, &items_after).unwrap();
+    let after = lower_section_bytes(".rodata", 0x2000, &items_after, &ud_arch_x86::X86Codec::BITS64).unwrap();
 
     // Cases 0 and 2 unchanged; case 1 (bytes 4..8) differs.
     assert_eq!(&before[..4], &after[..4]);
@@ -84,7 +84,7 @@ fn editing_a_case_target_changes_only_that_slot_msvc() {
             },
         ],
     }];
-    let before = lower_section_bytes(".rdata", 0x40_2000, &items_before).unwrap();
+    let before = lower_section_bytes(".rdata", 0x40_2000, &items_before, &ud_arch_x86::X86Codec::BITS64).unwrap();
 
     let items_after = vec![Item::JumpTable {
         addr: 0x40_2000,
@@ -100,7 +100,7 @@ fn editing_a_case_target_changes_only_that_slot_msvc() {
             },
         ],
     }];
-    let after = lower_section_bytes(".rdata", 0x40_2000, &items_after).unwrap();
+    let after = lower_section_bytes(".rdata", 0x40_2000, &items_after, &ud_arch_x86::X86Codec::BITS64).unwrap();
 
     assert_eq!(&before[..4], &after[..4]);
     assert_eq!(&after[4..8], &[0x00, 0x22, 0x40, 0x00]);

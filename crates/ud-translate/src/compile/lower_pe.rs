@@ -76,6 +76,15 @@ pub enum PeLowerError {
 
     #[error(transparent)]
     InnerLower(#[from] crate::compile::lower::LowerError),
+
+    #[error("module arch resolution failed: {0}")]
+    ArchResolve(String),
+}
+
+impl From<ud_arch_codec::ArchError> for PeLowerError {
+    fn from(e: ud_arch_codec::ArchError) -> Self {
+        Self::ArchResolve(e.to_string())
+    }
 }
 
 /// Lower a `.ud` file describing a PE image to its bytes.
@@ -85,6 +94,7 @@ pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
         return Err(PeLowerError::NotPe { got: format });
     }
 
+    let arch = crate::compile::module::resolve_arch_codec(&file.module)?;
     let build = build_block(&file.module)?;
     let file_size = read_int(build, "file_size")?;
     let section_vaddrs = collect_section_ip_offsets(build);
@@ -144,7 +154,8 @@ pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
                     name: f.name.clone(),
                 })?;
                 let ip_base = file_offset_to_rva(addr, &section_vaddrs);
-                let bytes = crate::compile::lower::lower_function_bytes_at(f, ip_base)?;
+                let bytes =
+                    crate::compile::lower::lower_function_bytes_at(f, ip_base, arch.as_ref())?;
                 placements.push((addr, bytes));
             }
             Item::Comment(_)

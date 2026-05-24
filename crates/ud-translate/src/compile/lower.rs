@@ -15,6 +15,7 @@
 //!   the source language; once `@raw` and `@pad` directives land, the
 //!   top-level `lower_to_bytes` will produce a complete binary image.
 
+use ud_arch_codec::{ArchCodec, ArchError, EncodeHints, SwitchSpec};
 use ud_ast::{AttrValue, Attribute, FnDecl, Item, Stmt, UdFile};
 
 /// Read the `head_bytes` attribute off an `IfBranch`. Returns `None`
@@ -136,6 +137,17 @@ pub enum LowerError {
 
     #[error("unknown jump_table dispatch `{dispatch}` (expected `gcc_pie_rel32` or `msvc_va32`)")]
     UnknownJumpTableDispatch { dispatch: String },
+
+    #[error(
+        "function `{fn_name}` body index {stmt_index}: arch codec failed to encode \
+         {operation}: {message}"
+    )]
+    ArchEncode {
+        fn_name: String,
+        stmt_index: usize,
+        operation: &'static str,
+        message: String,
+    },
 }
 
 /// Lower one [`FnDecl`] to its byte sequence.
@@ -147,8 +159,8 @@ pub enum LowerError {
 /// matches the rendering side: the emitter omits @prologue /
 /// @epilogue when their structured params equal the auto-default
 /// for the function's profile.
-pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
-    lower_function_bytes_at(f, f.addr)
+pub fn lower_function_bytes(f: &FnDecl, arch: &dyn ArchCodec) -> Result<Vec<u8>, LowerError> {
+    lower_function_bytes_at(f, f.addr, arch)
 }
 
 /// Same as [`lower_function_bytes`] but with an explicit
@@ -157,7 +169,11 @@ pub fn lower_function_bytes(f: &FnDecl) -> Result<Vec<u8>, LowerError> {
 /// pipeline, which uses file offsets) pass the function's true
 /// virtual address here so `Stmt::Switch` (and any other
 /// PC-relative encoders) compute correctly.
-pub fn lower_function_bytes_at(f: &FnDecl, ip_base: Option<u64>) -> Result<Vec<u8>, LowerError> {
+pub fn lower_function_bytes_at(
+    f: &FnDecl,
+    ip_base: Option<u64>,
+    arch: &dyn ArchCodec,
+) -> Result<Vec<u8>, LowerError> {
     let mut out = Vec::new();
     let has_prologue = matches!(f.body.first(), Some(Stmt::Prologue { .. }));
     let has_epilogue = matches!(f.body.last(), Some(Stmt::Epilogue { .. }));
@@ -193,7 +209,7 @@ pub fn lower_function_bytes_at(f: &FnDecl, ip_base: Option<u64>) -> Result<Vec<u
     // offsets as `func_ip + out.len()`, so the auto-emitted
     // prologue's bytes (already in `out`) naturally shift the
     // body cursor.
-    lower_stmts_into(&f.name, ip_base, &f.body, &mut out)?;
+    lower_stmts_into(&f.name, ip_base, &f.body, &mut out, arch)?;
     if !has_epilogue && regen_epi {
         let suffix = auto_epilogue_bytes(f);
         out.extend_from_slice(&suffix);
@@ -383,6 +399,7 @@ fn lower_stmts_into(
     base_addr: Option<u64>,
     stmts: &[Stmt],
     out: &mut Vec<u8>,
+    arch: &dyn ArchCodec,
 ) -> Result<(), LowerError> {
     for (i, stmt) in stmts.iter().enumerate() {
         match stmt {
@@ -390,54 +407,26 @@ fn lower_stmts_into(
                 if bytes.is_empty() {
                     // Bytes were dropped at decompile time
                     // because the canonical text re-assembles to
-                    // them exactly. Re-encode now. We try the
-                    // x86 assembler first (covers the historical
-                    // path with RIP-relative forms; the IP we
-                    // feed it is the statement's cursor
-                    // position). If that fails, we fall back to
-                    // the BPF assembler — BPF instructions are
-                    // arch-disjoint from x86 mnemonics, so the
-                    // two paths can't both succeed on the same
-                    // text. If both fail we surface the BPF
-                    // error as the user-facing message, since
-                    // BPF is the path most likely to expand its
-                    // coverage soon.
+                    // them exactly. Ask the arch codec to
+                    // re-encode; if the raw text fails, retry
+                    // after a desymbolise pass (BPF's
+                    // label_<hex> / sub_<hex> resolver, identity
+                    // on other arches).
                     let ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
-                    let encoded =
-                        ud_arch_x86::assemble_intel(ud_arch_x86::Bitness::Bits64, text, ip)
-                            .or_else(|_x86_err| ud_arch_bpf::assemble_bpf(text))
-                            .or_else(|bpf_err| {
-                                // BPF-symbolic forms: try the
-                                // de-symboliser before giving up.
-                                // It rewrites `call sub_<hex>`
-                                // and `jXX …, label_<hex>` to
-                                // numeric forms the BPF
-                                // assembler can encode.
-                                // At lower time we don't
-                                // have the original opcode
-                                // bytes (the .ud carries only
-                                // text). Default to the Solana
-                                // sBPF call encoding — that's
-                                // the dominant case; Linux
-                                // BPF-to-BPF programs always
-                                // edit their @asm with the
-                                // explicit `call_local`
-                                // mnemonic.
-                                if let Some(desym) =
-                                    ud_arch_bpf::desymbolize_bpf_text(text, ip, None)
-                                {
-                                    if desym != *text {
-                                        return ud_arch_bpf::assemble_bpf(&desym);
-                                    }
-                                }
-                                Err(bpf_err)
-                            })
-                            .map_err(|bpf_err| LowerError::AsmAssembleFailed {
-                                fn_name: fn_name.to_string(),
-                                stmt_index: i,
-                                text: text.clone(),
-                                message: bpf_err.to_string(),
-                            })?;
+                    let encoded = arch.assemble_one(text, ip).or_else(|first_err| {
+                        let desym = arch.desymbolize(text, ip);
+                        if desym == *text {
+                            Err(first_err)
+                        } else {
+                            arch.assemble_one(&desym, ip)
+                        }
+                    });
+                    let encoded = encoded.map_err(|e| LowerError::AsmAssembleFailed {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                        text: text.clone(),
+                        message: e.to_string(),
+                    })?;
                     out.extend_from_slice(&encoded);
                 } else {
                     out.extend_from_slice(bytes);
@@ -450,13 +439,6 @@ fn lower_stmts_into(
                 dispatch,
                 table_va,
             } => {
-                if dispatch != "msvc-jmp-table" {
-                    return Err(LowerError::UnsupportedSwitchDispatch {
-                        fn_name: fn_name.to_string(),
-                        stmt_index: i,
-                        dispatch: dispatch.clone(),
-                    });
-                }
                 let func_addr = base_addr.ok_or_else(|| LowerError::SwitchNeedsAddress {
                     fn_name: fn_name.to_string(),
                     stmt_index: i,
@@ -467,17 +449,26 @@ fn lower_stmts_into(
                         stmt_index: i,
                     }
                 })?;
-                let bytes = ud_arch_x86::encode_msvc_jmp_table_dispatch(
+                let spec = SwitchSpec {
                     selector,
-                    cases.len(),
-                    *default_addr,
-                    *table_va,
+                    cases,
+                    default_addr: *default_addr,
+                    dispatch,
+                    table_va: *table_va,
                     cmp_ip,
-                )
-                .map_err(|e| LowerError::SwitchEncode {
-                    fn_name: fn_name.to_string(),
-                    stmt_index: i,
-                    source: e,
+                };
+                let bytes = arch.encode_switch_dispatch(&spec).map_err(|e| match e {
+                    ArchError::Unsupported { .. } => LowerError::UnsupportedSwitchDispatch {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                        dispatch: dispatch.clone(),
+                    },
+                    other => LowerError::ArchEncode {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                        operation: "switch_dispatch",
+                        message: other.to_string(),
+                    },
                 })?;
                 out.extend_from_slice(&bytes);
             }
@@ -492,13 +483,13 @@ fn lower_stmts_into(
                         stmt_index: i,
                     }
                 })?;
-                let bytes =
-                    ud_arch_x86::encode_jmp(source_ip, *target_addr, *wide).map_err(|e| {
-                        LowerError::GotoEncode {
-                            fn_name: fn_name.to_string(),
-                            stmt_index: i,
-                            source: e,
-                        }
+                let bytes = arch
+                    .encode_jump(source_ip, *target_addr, EncodeHints::wide(*wide))
+                    .map_err(|e| LowerError::ArchEncode {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                        operation: "jump",
+                        message: e.to_string(),
                     })?;
                 out.extend_from_slice(&bytes);
             }
@@ -520,11 +511,18 @@ fn lower_stmts_into(
                         stmt_index: i,
                     }
                 })?;
-                let jcc = ud_arch_x86::encode_jcc(jcc_ip, *target_addr, *cond_code, *wide)
-                    .map_err(|e| LowerError::GotoEncode {
+                let jcc = arch
+                    .encode_cond_jump_with_code(
+                        *cond_code,
+                        jcc_ip,
+                        *target_addr,
+                        EncodeHints::wide(*wide),
+                    )
+                    .map_err(|e| LowerError::ArchEncode {
                         fn_name: fn_name.to_string(),
                         stmt_index: i,
-                        source: e,
+                        operation: "cond_jump_with_code",
+                        message: e.to_string(),
                     })?;
                 out.extend_from_slice(&jcc);
             }
@@ -546,11 +544,18 @@ fn lower_stmts_into(
                         stmt_index: i,
                     }
                 })?;
-                let jcc = ud_arch_x86::encode_jcc(jcc_ip, *target_addr, *cond_code, *wide)
-                    .map_err(|e| LowerError::GotoEncode {
+                let jcc = arch
+                    .encode_cond_jump_with_code(
+                        *cond_code,
+                        jcc_ip,
+                        *target_addr,
+                        EncodeHints::wide(*wide),
+                    )
+                    .map_err(|e| LowerError::ArchEncode {
                         fn_name: fn_name.to_string(),
                         stmt_index: i,
-                        source: e,
+                        operation: "cond_jump_with_code",
+                        message: e.to_string(),
                     })?;
                 out.extend_from_slice(&jcc);
             }
@@ -571,13 +576,13 @@ fn lower_stmts_into(
                             stmt_index: i,
                         }
                     })?;
-                    let call_bytes =
-                        ud_arch_x86::encode_call_rel32(call_ip, *target).map_err(|e| {
-                            LowerError::GotoEncode {
-                                fn_name: fn_name.to_string(),
-                                stmt_index: i,
-                                source: e,
-                            }
+                    let call_bytes = arch
+                        .encode_call(call_ip, *target, EncodeHints::default())
+                        .map_err(|e| LowerError::ArchEncode {
+                            fn_name: fn_name.to_string(),
+                            stmt_index: i,
+                            operation: "call",
+                            message: e.to_string(),
                         })?;
                     out.extend_from_slice(&call_bytes);
                 }
@@ -621,11 +626,11 @@ fn lower_stmts_into(
                 if let Some(head_bytes) = head_bytes_attr(attrs) {
                     out.extend_from_slice(head_bytes);
                 }
-                lower_stmts_into(fn_name, base_addr, pre_body, out)?;
+                lower_stmts_into(fn_name, base_addr, pre_body, out, arch)?;
                 out.extend_from_slice(cond_bytes);
-                lower_stmts_into(fn_name, base_addr, then_body, out)?;
+                lower_stmts_into(fn_name, base_addr, then_body, out, arch)?;
                 if let Some(else_body) = else_body {
-                    lower_stmts_into(fn_name, base_addr, else_body, out)?;
+                    lower_stmts_into(fn_name, base_addr, else_body, out, arch)?;
                 }
             }
             Stmt::Loop {
@@ -637,7 +642,7 @@ fn lower_stmts_into(
                 if let Some(jmp_bytes) = entry_jmp_bytes {
                     out.extend_from_slice(jmp_bytes);
                 }
-                lower_stmts_into(fn_name, base_addr, body, out)?;
+                lower_stmts_into(fn_name, base_addr, body, out, arch)?;
                 out.extend_from_slice(tail_bytes);
             }
             Stmt::IfBlock {
@@ -666,7 +671,7 @@ fn lower_stmts_into(
                         .saturating_add(cond_len as u64)
                 });
                 let mut then_buf = Vec::new();
-                lower_stmts_into(fn_name, then_base, then_body, &mut then_buf)?;
+                lower_stmts_into(fn_name, then_base, then_body, &mut then_buf, arch)?;
                 let then_tail_size = then_tail_jmp_len(then_tail_jmp, else_body);
                 let else_base = base_addr.map(|a| {
                     a.saturating_add(out.len() as u64)
@@ -675,7 +680,7 @@ fn lower_stmts_into(
                         .saturating_add(then_tail_size)
                 });
                 let mut else_buf = Vec::new();
-                lower_stmts_into(fn_name, else_base, else_body, &mut else_buf)?;
+                lower_stmts_into(fn_name, else_base, else_body, &mut else_buf, arch)?;
                 // Resolve cond_bytes (regenerate when empty).
                 let cb = if cond_bytes.is_empty() {
                     let then_tail_size = then_tail_jmp_len(then_tail_jmp, else_body);
@@ -749,7 +754,7 @@ fn lower_stmts_into(
                         .saturating_add(entry_len as u64)
                 });
                 let mut body_buf = Vec::new();
-                lower_stmts_into(fn_name, body_base, body, &mut body_buf)?;
+                lower_stmts_into(fn_name, body_base, body, &mut body_buf, arch)?;
                 let eb = if entry_bytes.is_empty() {
                     let skip = body_buf.len() as u64 + tail_bytes_len(tail_bytes);
                     let offset =
@@ -809,9 +814,12 @@ fn lower_stmts_into(
 /// Walks both top-level items and items nested inside `@section`
 /// blocks. Returns one [`LoweredFunction`] per [`Item::Function`] in
 /// source order. Non-function items are skipped silently.
-pub fn lower_functions(file: &UdFile) -> Result<Vec<LoweredFunction>, LowerError> {
+pub fn lower_functions(
+    file: &UdFile,
+    arch: &dyn ArchCodec,
+) -> Result<Vec<LoweredFunction>, LowerError> {
     let mut out = Vec::new();
-    walk_functions(&file.items, None, &mut out)?;
+    walk_functions(&file.items, None, &mut out, arch)?;
     Ok(out)
 }
 
@@ -827,6 +835,7 @@ fn walk_functions(
     items: &[Item],
     section_cursor: Option<u64>,
     out: &mut Vec<LoweredFunction>,
+    arch: &dyn ArchCodec,
 ) -> Result<(), LowerError> {
     let mut cursor = section_cursor;
     for item in items {
@@ -837,7 +846,7 @@ fn walk_functions(
                     (None, Some(c)) => Some(c),
                     (None, None) => None,
                 };
-                let bytes = lower_function_bytes_at(f, ip)?;
+                let bytes = lower_function_bytes_at(f, ip, arch)?;
                 if let Some(c) = cursor.as_mut() {
                     let placement = f.addr.unwrap_or(*c);
                     *c = placement.saturating_add(bytes.len() as u64);
@@ -852,7 +861,7 @@ fn walk_functions(
                 addr,
                 items: nested,
                 ..
-            } => walk_functions(nested, Some(*addr), out)?,
+            } => walk_functions(nested, Some(*addr), out, arch)?,
             Item::Raw { addr, bytes } => {
                 if let Some(c) = cursor.as_mut() {
                     *c = (*addr).saturating_add(bytes.len() as u64);
@@ -988,6 +997,7 @@ pub fn lower_section_bytes(
     name: &str,
     section_addr: u64,
     items: &[Item],
+    arch: &dyn ArchCodec,
 ) -> Result<Vec<u8>, LowerError> {
     let mut out = Vec::new();
     let mut cursor = section_addr;
@@ -1014,7 +1024,7 @@ pub fn lower_section_bytes(
                 lower_jump_table_bytes(*addr, dispatch, entries)?,
             ),
             Item::Function(f) => {
-                let bytes = lower_function_bytes_at(f, Some(cursor))?;
+                let bytes = lower_function_bytes_at(f, Some(cursor), arch)?;
                 (f.addr, bytes)
             }
             Item::Section { name: nested, .. } => {
@@ -1052,11 +1062,14 @@ pub fn lower_section_bytes(
 
 /// Lower every `@section` block in `file` to its bytes. Returns one
 /// [`LoweredSection`] per top-level section, in source order.
-pub fn lower_sections(file: &UdFile) -> Result<Vec<LoweredSection>, LowerError> {
+pub fn lower_sections(
+    file: &UdFile,
+    arch: &dyn ArchCodec,
+) -> Result<Vec<LoweredSection>, LowerError> {
     let mut out = Vec::new();
     for item in &file.items {
         if let Item::Section { name, addr, items } = item {
-            let bytes = lower_section_bytes(name, *addr, items)?;
+            let bytes = lower_section_bytes(name, *addr, items, arch)?;
             out.push(LoweredSection {
                 name: name.clone(),
                 addr: *addr,
@@ -1070,10 +1083,18 @@ pub fn lower_sections(file: &UdFile) -> Result<Vec<LoweredSection>, LowerError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ud_arch_x86::X86Codec;
     use ud_ast::{FnDecl, Module, Stmt};
 
     fn empty_module() -> Module {
         Module { fields: vec![] }
+    }
+
+    /// Default codec used by tests — historically every test in
+    /// this file lowered x86_64 fixtures, so X86Codec::BITS64 is
+    /// the right default.
+    fn arch() -> X86Codec {
+        X86Codec::BITS64
     }
 
     #[test]
@@ -1089,7 +1110,7 @@ mod tests {
                 Stmt::asm("ret", vec![0xc3]),
             ],
         };
-        let bytes = lower_function_bytes(&f).unwrap();
+        let bytes = lower_function_bytes(&f, &arch()).unwrap();
         assert_eq!(bytes, vec![0xf3, 0x0f, 0x1e, 0xfa, 0xc3]);
     }
 
@@ -1110,7 +1131,7 @@ mod tests {
                 else_body: Some(vec![Stmt::asm("nop", vec![0x90])]),
             }],
         };
-        let bytes = lower_function_bytes(&f).unwrap();
+        let bytes = lower_function_bytes(&f, &arch()).unwrap();
         // cond_bytes + then bytes + else bytes
         assert_eq!(bytes, vec![0x83, 0xf8, 0x00, 0x74, 0x01, 0xc3, 0x90]);
     }
@@ -1132,7 +1153,7 @@ mod tests {
                 else_body: None,
             }],
         };
-        let bytes = lower_function_bytes(&f).unwrap();
+        let bytes = lower_function_bytes(&f, &arch()).unwrap();
         // Only cond_bytes + then bytes; no else bytes.
         assert_eq!(bytes, vec![0x48, 0x85, 0xc0, 0x74, 0x02, 0xff, 0xd0]);
     }
@@ -1150,7 +1171,7 @@ mod tests {
                 Stmt::Comment("block: 0x1001".into()),
             ],
         };
-        assert_eq!(lower_function_bytes(&f).unwrap(), vec![0xc3]);
+        assert_eq!(lower_function_bytes(&f, &arch()).unwrap(), vec![0xc3]);
     }
 
     #[test]
@@ -1167,7 +1188,7 @@ mod tests {
             signature: None,
             body: vec![Stmt::asm_text("ret")],
         };
-        assert_eq!(lower_function_bytes(&f).unwrap(), vec![0xc3]);
+        assert_eq!(lower_function_bytes(&f, &arch()).unwrap(), vec![0xc3]);
     }
 
     #[test]
@@ -1183,7 +1204,7 @@ mod tests {
             signature: None,
             body: vec![Stmt::asm_text("completely-fake-insn")],
         };
-        let err = lower_function_bytes(&f).unwrap_err();
+        let err = lower_function_bytes(&f, &arch()).unwrap_err();
         assert!(
             matches!(err, LowerError::AsmAssembleFailed { .. }),
             "got: {err:?}"
@@ -1206,7 +1227,7 @@ mod tests {
                 bytes: vec![0x90, 0x90],
             },
         ];
-        let bytes = lower_section_bytes(".text", 0x1000, &items).unwrap();
+        let bytes = lower_section_bytes(".text", 0x1000, &items, &arch()).unwrap();
         assert_eq!(bytes, vec![0xc3, 0x90, 0x90]);
     }
 
@@ -1230,7 +1251,7 @@ mod tests {
                 bytes: vec![0x90],
             },
         ];
-        let bytes = lower_section_bytes(".text", 0x1000, &items).unwrap();
+        let bytes = lower_section_bytes(".text", 0x1000, &items, &arch()).unwrap();
         let mut expected = vec![0xc3];
         expected.extend(std::iter::repeat(0u8).take(15));
         expected.push(0x90);
@@ -1249,7 +1270,7 @@ mod tests {
                 bytes: vec![0xdd],
             },
         ];
-        let err = lower_section_bytes(".text", 0x1000, &items).unwrap_err();
+        let err = lower_section_bytes(".text", 0x1000, &items, &arch()).unwrap_err();
         assert!(matches!(err, LowerError::SectionOverlap { .. }));
     }
 
@@ -1262,7 +1283,7 @@ mod tests {
                 bytes: vec![0xaa],
             },
         ];
-        let bytes = lower_section_bytes(".x", 0x1000, &items).unwrap();
+        let bytes = lower_section_bytes(".x", 0x1000, &items, &arch()).unwrap();
         assert_eq!(bytes, vec![0xaa]);
     }
 
@@ -1339,7 +1360,7 @@ mod tests {
                 }),
             ],
         };
-        let lowered = lower_functions(&file).unwrap();
+        let lowered = lower_functions(&file, &arch()).unwrap();
         assert_eq!(lowered.len(), 2);
         assert_eq!(lowered[0].name, "a");
         assert_eq!(lowered[0].addr, Some(0x1000));

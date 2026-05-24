@@ -108,7 +108,7 @@ fn source_round_trip_byte_identity_per_function() {
         };
 
         // Lower every parsed function to bytes; compare with original slice.
-        let lowered = match lower_functions(&ast) {
+        let lowered = match lower_functions(&ast, &ud_arch_x86::X86Codec::BITS64) {
             Ok(l) => l,
             Err(e) => {
                 failures.push(format!("{}: lower: {e}", fixture.display()));

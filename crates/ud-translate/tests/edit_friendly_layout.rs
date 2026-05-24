@@ -99,7 +99,7 @@ fn nop_insertion_auto_shifts_later_functions() {
     let baseline_section_bytes: Vec<u8> = match &ast.items[sec_idx] {
         Item::Section {
             name, addr, items, ..
-        } => lower_section_bytes(name, *addr, items).expect("baseline section lower"),
+        } => lower_section_bytes(name, *addr, items, &ud_arch_x86::X86Codec::BITS64).expect("baseline section lower"),
         _ => unreachable!(),
     };
 
@@ -132,7 +132,7 @@ fn nop_insertion_auto_shifts_later_functions() {
     let edited_section_bytes: Vec<u8> = match &ast.items[sec_idx] {
         Item::Section {
             name, addr, items, ..
-        } => lower_section_bytes(name, *addr, items).expect("edited section lower"),
+        } => lower_section_bytes(name, *addr, items, &ud_arch_x86::X86Codec::BITS64).expect("edited section lower"),
         _ => unreachable!(),
     };
 

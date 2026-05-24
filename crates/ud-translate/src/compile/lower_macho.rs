@@ -60,6 +60,15 @@ pub enum MachoLowerError {
 
     #[error(transparent)]
     InnerLower(#[from] crate::compile::lower::LowerError),
+
+    #[error("module arch resolution failed: {0}")]
+    ArchResolve(String),
+}
+
+impl From<ud_arch_codec::ArchError> for MachoLowerError {
+    fn from(e: ud_arch_codec::ArchError) -> Self {
+        Self::ArchResolve(e.to_string())
+    }
 }
 
 /// Lower a `.ud` file describing a Mach-O image to its bytes.
@@ -69,6 +78,7 @@ pub fn lower_to_macho(file: &UdFile) -> Result<Vec<u8>, MachoLowerError> {
         return Err(MachoLowerError::NotMacho { got: format });
     }
 
+    let arch = crate::compile::module::resolve_arch_codec(&file.module)?;
     let build = build_block(&file.module)?;
     let header = read_header(build)?;
     let commands = read_commands(build)?;
@@ -92,7 +102,7 @@ pub fn lower_to_macho(file: &UdFile) -> Result<Vec<u8>, MachoLowerError> {
                 let addr = f.addr.ok_or_else(|| MachoLowerError::FunctionWithoutAddr {
                     name: f.name.clone(),
                 })?;
-                let bytes = crate::compile::lower::lower_function_bytes(f)?;
+                let bytes = crate::compile::lower::lower_function_bytes(f, arch.as_ref())?;
                 raws.push((addr, bytes));
             }
             Item::Comment(_)
