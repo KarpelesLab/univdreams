@@ -1589,6 +1589,7 @@ fn stub_exit_process(
 ) -> Result<u32, Win32Error> {
     let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ExitProcess", t))?;
     state.exit_requested = Some(code);
+    state.cur_process_mut().exit_code = Some(code);
     Ok(0)
 }
 
@@ -3265,9 +3266,44 @@ fn stub_terminate_process(
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TerminateProcess", t))?;
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TerminateProcess", t))?;
     let code = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("TerminateProcess", t))?;
-    state.exit_requested = Some(code);
+    // `TerminateProcess(GetCurrentProcess())` / negative -1 →
+    // act on the active process. Otherwise look up the target
+    // Process WaitObject.
+    let target_pid = if h == 0xFFFF_FFFF {
+        state.active_pid
+    } else if let Some(crate::sched::WaitObject::Process { pid }) = state.scheduler.objects.get(&h)
+    {
+        *pid
+    } else {
+        state.active_pid
+    };
+    if let Some(p) = state.processes.get_mut(&target_pid) {
+        p.exit_code = Some(code);
+    }
+    // Wake every waiter whose wait references the Process
+    // WaitObject for this PID.
+    let process_handles: Vec<u32> = state
+        .scheduler
+        .objects
+        .iter()
+        .filter_map(|(handle, obj)| match obj {
+            crate::sched::WaitObject::Process { pid } if *pid == target_pid => Some(*handle),
+            _ => None,
+        })
+        .collect();
+    for h in process_handles {
+        for tid in crate::sched::waiters_on(&state.threads, h) {
+            if let Some(t) = state.threads.get_mut(&tid) {
+                t.status = crate::sched::ThreadStatus::Ready;
+                t.wait = None;
+            }
+        }
+    }
+    if target_pid == state.active_pid {
+        state.exit_requested = Some(code);
+    }
     Ok(1)
 }
 
@@ -3372,11 +3408,11 @@ fn stub_wait_for_single_object(
             .get(tid)
             .map(|t| matches!(t.status, crate::sched::ThreadStatus::Terminated))
             .unwrap_or(true),
-        Some(crate::sched::WaitObject::Process { pid: _ }) => {
-            // Phase 5 wires this up properly. Until then, treat
-            // unknown process state as already-signaled.
-            true
-        }
+        Some(crate::sched::WaitObject::Process { pid }) => state
+            .processes
+            .get(pid)
+            .map(|p| p.exit_code.is_some())
+            .unwrap_or(true),
         Some(obj) => crate::sched::object_is_signaled(obj),
         None => false,
     };
@@ -5139,33 +5175,125 @@ fn stub_release_mutex(
     Ok(1)
 }
 
-/// `BOOL CreateProcessA(...)`. The installer occasionally spawns
-/// a helper (verifier, rollback agent). The sandbox can't actually
-/// fork — we report failure with `ERROR_FILE_NOT_FOUND` so the
-/// caller falls into its single-process fallback path.
+/// `BOOL CreateProcessA(LPCSTR lpApplicationName,
+/// LPSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
+/// LPSECURITY_ATTRIBUTES lpThreadAttributes,
+/// BOOL bInheritHandles, DWORD dwCreationFlags,
+/// LPVOID lpEnvironment, LPCSTR lpCurrentDirectory,
+/// LPSTARTUPINFO lpStartupInfo,
+/// LPPROCESS_INFORMATION lpProcessInformation)`.
+///
+/// Phase 5b semantics: every `CreateProcessA` call succeeds.
+/// The "child" is a synthetic ProcessState pre-marked
+/// `Terminated` with exit code 0 (Phase 5c will optionally
+/// load + run a real PE when the target EXE is in the VFS).
+/// `WaitForSingleObject` on the returned process handle
+/// observes the signaled state immediately;
+/// `GetExitCodeProcess` reports the recorded exit code.
+///
+/// The PROCESS_INFORMATION struct is filled with synthetic
+/// handles + the child PID/TID so the caller's outer
+/// "spawn-and-wait" RAII wrapper proceeds.
 fn stub_create_process_a(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    state.last_error = ERROR_FILE_NOT_FOUND;
-    Ok(0)
+    use crate::sched::{ThreadStatus, WaitObject};
+    let p_app = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    let p_cmd = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    let _attrs_p = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    let _attrs_t = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    let _inh = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    let _flags = arg_dword(cpu, mmu, 5).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    let _env = arg_dword(cpu, mmu, 6).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    let _cwd = arg_dword(cpu, mmu, 7).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    let _si = arg_dword(cpu, mmu, 8).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    let pi = arg_dword(cpu, mmu, 9).map_err(|t| trap_to_win32("CreateProcessA", t))?;
+
+    // Record the would-be child for the install-monitor's
+    // benefit. Even though we don't execute the binary, the
+    // call argument tells the analyst what the installer
+    // wanted to spawn.
+    let app = if p_app != 0 {
+        read_cstr(mmu, p_app, 260).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let cmd = if p_cmd != 0 {
+        read_cstr(mmu, p_cmd, 4096).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    state
+        .debug_log
+        .push(format!("CreateProcessA(app={app:?}, cmd={cmd:?})"));
+
+    // Mint a synthetic, pre-Terminated child process so any
+    // outer Wait*/GetExitCodeProcess resolves immediately.
+    let parent_pid = state.cur_thread().pid;
+    let child_pid = state.next_pid;
+    state.next_pid = state.next_pid.wrapping_add(1);
+    let child_tid = state.next_tid;
+    state.next_tid = state.next_tid.wrapping_add(1);
+    let child_proc = crate::win32::ProcessState {
+        pid: child_pid,
+        parent_pid,
+        exit_code: Some(0),
+        ..crate::win32::ProcessState::default()
+    };
+    state.processes.insert(child_pid, child_proc);
+    let mut child_thread = crate::win32::ThreadState::new(child_tid, child_pid);
+    child_thread.status = ThreadStatus::Terminated;
+    state.threads.insert(child_tid, child_thread);
+    let h_process = state
+        .scheduler
+        .insert_object(WaitObject::Process { pid: child_pid });
+    let h_thread = state
+        .scheduler
+        .insert_object(WaitObject::Thread { tid: child_tid });
+
+    if pi != 0 {
+        // PROCESS_INFORMATION layout (winbase.h):
+        //   HANDLE hProcess;        // +0x00
+        //   HANDLE hThread;         // +0x04
+        //   DWORD  dwProcessId;     // +0x08
+        //   DWORD  dwThreadId;      // +0x0C
+        mmu.store32(pi, h_process)
+            .map_err(|t| trap_to_win32("CreateProcessA", t))?;
+        mmu.store32(pi + 4, h_thread)
+            .map_err(|t| trap_to_win32("CreateProcessA", t))?;
+        mmu.store32(pi + 8, child_pid)
+            .map_err(|t| trap_to_win32("CreateProcessA", t))?;
+        mmu.store32(pi + 12, child_tid)
+            .map_err(|t| trap_to_win32("CreateProcessA", t))?;
+    }
+    Ok(1)
 }
 
 /// `BOOL GetExitCodeProcess(HANDLE hProcess, LPDWORD lpExitCode)`.
-/// Always reports `STILL_ACTIVE = 259` so callers that block on
-/// the spawned process don't observe a misleading 0 exit code.
+/// Looks up the Process WaitObject behind the handle and
+/// reports the process's recorded exit code, or
+/// `STILL_ACTIVE = 259` while the process is still running.
 fn stub_get_exit_code_process(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    _state: &mut HostState,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetExitCodeProcess", t))?;
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetExitCodeProcess", t))?;
     let p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetExitCodeProcess", t))?;
+    let code = match state.scheduler.objects.get(&h) {
+        Some(crate::sched::WaitObject::Process { pid }) => state
+            .processes
+            .get(pid)
+            .and_then(|proc| proc.exit_code)
+            .unwrap_or(259),
+        _ => 259,
+    };
     if p != 0 {
-        mmu.store32(p, 259)
+        mmu.store32(p, code)
             .map_err(|t| trap_to_win32("GetExitCodeProcess", t))?;
     }
     Ok(1)

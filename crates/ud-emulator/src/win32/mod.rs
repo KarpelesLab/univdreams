@@ -173,6 +173,23 @@ pub struct HicEntry {
 /// stays on [`HostState`].
 #[derive(Default)]
 pub struct ProcessState {
+    /// Synthetic process identifier. `1` for the bootstrap
+    /// process; `CreateProcessA` mints monotonically
+    /// increasing values.
+    pub pid: u32,
+    /// PID of the process that called `CreateProcessA` to spawn
+    /// this one. `0` for the bootstrap (no parent).
+    pub parent_pid: u32,
+    /// Image base where the process's primary PE is mapped.
+    /// Each process gets a unique base so child PEs don't
+    /// collide with the parent — `0x00400000` for the bootstrap,
+    /// `0x10000000` / `0x20000000` / … for spawned children.
+    pub image_base: u32,
+    /// Exit code reported by `ExitProcess` / `TerminateProcess`
+    /// on this process; `None` while the process is still
+    /// running. Wakes any `WaitForSingleObject` on the process
+    /// handle when set.
+    pub exit_code: Option<u32>,
     /// Heap allocations keyed by guest address.
     pub heap: BTreeMap<u32, Vec<u8>>,
     /// Cursor for the next heap allocation. Walks through a
@@ -305,6 +322,7 @@ impl ProcessState {
     #[must_use]
     pub fn new(heap_start: u32, heap_end: u32) -> Self {
         ProcessState {
+            pid: 1,
             heap_cursor: heap_start,
             heap_arena_end: heap_end,
             process_heap_handle: 0xDEAD_BEEF,
@@ -402,10 +420,20 @@ pub const DEFAULT_QUANTUM: u32 = 10_000;
 /// Phase 5 of the scheduler refactor (`CreateProcessA` spawning
 /// a real child PE) without churning every Win32 stub today.
 pub struct HostState {
-    /// Active process. Phase 5 will swap this for a process
-    /// table + an `active_pid` cursor; until then there is
-    /// always exactly one.
-    pub process: ProcessState,
+    /// Process table keyed by PID. The bootstrap process has
+    /// `pid = 1`; `CreateProcessA` mints children with
+    /// monotonically increasing PIDs. The
+    /// [`std::ops::Deref`] / [`std::ops::DerefMut`] impls on
+    /// `HostState` resolve `state.heap` / `state.modules` /
+    /// etc. through the *active* process, so stub bodies
+    /// continue to compile unchanged.
+    pub processes: BTreeMap<u32, ProcessState>,
+    /// PID of the currently-running process — points into
+    /// [`Self::processes`]. The scheduler updates this when
+    /// switching threads across process boundaries.
+    pub active_pid: u32,
+    /// Cursor for the next `CreateProcessA` to mint a PID.
+    pub next_pid: u32,
     /// Thread table keyed by TID. Phase 2 of the scheduler
     /// refactor: there is always at least one thread, with
     /// `tid = 1`, owning the live `Cpu` on `Sandbox`. Phase 3
@@ -490,8 +518,14 @@ impl Default for HostState {
     fn default() -> Self {
         let mut threads = BTreeMap::new();
         threads.insert(1, ThreadState::new(1, 1));
+        let mut processes = BTreeMap::new();
+        let mut p = ProcessState::default();
+        p.pid = 1;
+        processes.insert(1, p);
         HostState {
-            process: ProcessState::default(),
+            processes,
+            active_pid: 1,
+            next_pid: 2,
             threads,
             active_tid: 1,
             next_tid: 2,
@@ -515,13 +549,17 @@ impl Default for HostState {
 impl std::ops::Deref for HostState {
     type Target = ProcessState;
     fn deref(&self) -> &ProcessState {
-        &self.process
+        self.processes
+            .get(&self.active_pid)
+            .expect("active_pid must always point to a live process")
     }
 }
 
 impl std::ops::DerefMut for HostState {
     fn deref_mut(&mut self) -> &mut ProcessState {
-        &mut self.process
+        self.processes
+            .get_mut(&self.active_pid)
+            .expect("active_pid must always point to a live process")
     }
 }
 
@@ -536,26 +574,38 @@ impl HostState {
     /// to set it up if those stubs are exercised. Tests that
     /// don't use them can leave it at zero.
     pub fn new(heap_start: u32, heap_end: u32) -> Self {
-        HostState {
-            process: ProcessState::new(heap_start, heap_end),
-            ..HostState::default()
-        }
+        let mut s = HostState::default();
+        s.processes
+            .insert(1, ProcessState::new(heap_start, heap_end));
+        s
     }
 
-    /// Borrow the active process. Phase 5 will use `active_pid`
-    /// to pick from a process table; until then this returns
-    /// the singleton.
+    /// Borrow the active process. Resolved through
+    /// [`Self::active_pid`].
     #[must_use]
     pub fn cur_process(&self) -> &ProcessState {
-        &self.process
+        self.processes
+            .get(&self.active_pid)
+            .expect("active_pid must always point to a live process")
     }
 
     /// Mutable borrow of the active process. Pair to
-    /// [`Self::cur_process`]. Prefer over the auto-deref when
-    /// the call site needs to make the per-process scope
-    /// explicit (audits, future merge conflicts).
+    /// [`Self::cur_process`]; same invariant.
     pub fn cur_process_mut(&mut self) -> &mut ProcessState {
-        &mut self.process
+        self.processes
+            .get_mut(&self.active_pid)
+            .expect("active_pid must always point to a live process")
+    }
+
+    /// Borrow a process by PID, if it exists.
+    #[must_use]
+    pub fn process(&self, pid: u32) -> Option<&ProcessState> {
+        self.processes.get(&pid)
+    }
+
+    /// Mutable borrow of a process by PID.
+    pub fn process_mut(&mut self, pid: u32) -> Option<&mut ProcessState> {
+        self.processes.get_mut(&pid)
     }
 
     /// Borrow the currently-running thread. Falls back to the
@@ -582,8 +632,9 @@ impl HostState {
     /// (the arena bytes are written via `write_initializer`,
     /// so any page perms suffice as long as the page is mapped).
     pub fn with_const_arena(mut self, start: u32, end: u32) -> Self {
-        self.process.const_arena_cursor = start;
-        self.process.const_arena_end = end;
+        let p = self.cur_process_mut();
+        p.const_arena_cursor = start;
+        p.const_arena_end = end;
         self
     }
 
@@ -592,8 +643,9 @@ impl HostState {
     /// downward. `[bottom, top)` must already be mapped R+W in
     /// the MMU.
     pub fn with_thread_stack_pool(mut self, bottom: u32, top: u32) -> Self {
-        self.process.thread_stack_pool_bottom = bottom;
-        self.process.next_thread_stack_top = top;
+        let p = self.cur_process_mut();
+        p.thread_stack_pool_bottom = bottom;
+        p.next_thread_stack_top = top;
         self
     }
 
