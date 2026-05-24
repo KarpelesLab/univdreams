@@ -1356,6 +1356,148 @@ mod tests {
         assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 0xDEAD_BEEF);
     }
 
+    /// Phase 3c of the scheduler refactor: `WaitForSingleObject`
+    /// on an unsignalled auto-reset Event parks the calling
+    /// thread; `SetEvent` from a peer wakes exactly one waiter.
+    /// We exercise this directly through state mutation rather
+    /// than spawning guest threads (the kernel32 thunk path is
+    /// covered by the spawn test below).
+    #[test]
+    fn wait_for_single_object_blocks_until_set_event() {
+        let mut sb = Sandbox::new();
+        // Mint an auto-reset Event, initially unsignalled.
+        let h = sb
+            .host
+            .scheduler
+            .insert_object(crate::sched::WaitObject::Event {
+                signaled: false,
+                manual_reset: false,
+            });
+        // Inject a second thread parked on a wait for the event.
+        let mut t2 = crate::win32::ThreadState::new(2, 1);
+        t2.parked_cpu = Some(crate::emulator::Cpu::new());
+        t2.status = crate::sched::ThreadStatus::Waiting;
+        t2.wait = Some(crate::sched::WaitCondition::Object {
+            handle: h,
+            timeout_after: None,
+        });
+        sb.host.threads.insert(2, t2);
+
+        // Bootstrap drives SetEvent via the kernel32 thunk.
+        let set_event = sb.registry.resolve("kernel32.dll", "SetEvent").unwrap();
+        sb.cpu.push32(&mut sb.mmu, h).unwrap();
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = set_event;
+        sb.run_until_sentinel().unwrap();
+
+        // Thread 2 should be back to Ready with no wait.
+        let t = sb.host.threads.get(&2).unwrap();
+        assert!(
+            matches!(t.status, crate::sched::ThreadStatus::Ready),
+            "expected thread 2 Ready, got {:?}",
+            t.status
+        );
+        assert!(t.wait.is_none(), "wait condition must be cleared");
+        // Auto-reset: the signal is consumed by the wake.
+        match sb.host.scheduler.objects.get(&h).unwrap() {
+            crate::sched::WaitObject::Event { signaled, .. } => assert!(!*signaled),
+            _ => panic!(),
+        }
+    }
+
+    /// Mutex round-trip: contention parks the second caller,
+    /// `ReleaseMutex` from the holder wakes them and transfers
+    /// ownership.
+    #[test]
+    fn mutex_transfers_ownership_on_release() {
+        let mut sb = Sandbox::new();
+        // Mint a Mutex owned by tid 1 (the bootstrap).
+        let h = sb
+            .host
+            .scheduler
+            .insert_object(crate::sched::WaitObject::Mutex {
+                owner: Some(1),
+                recursion: 1,
+            });
+        // Inject thread 2 waiting on the mutex.
+        let mut t2 = crate::win32::ThreadState::new(2, 1);
+        t2.parked_cpu = Some(crate::emulator::Cpu::new());
+        t2.status = crate::sched::ThreadStatus::Waiting;
+        t2.wait = Some(crate::sched::WaitCondition::Object {
+            handle: h,
+            timeout_after: None,
+        });
+        sb.host.threads.insert(2, t2);
+
+        // Bootstrap calls ReleaseMutex.
+        let release = sb.registry.resolve("kernel32.dll", "ReleaseMutex").unwrap();
+        sb.cpu.push32(&mut sb.mmu, h).unwrap();
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = release;
+        sb.run_until_sentinel().unwrap();
+        assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 1, "release succeeds");
+
+        // Ownership transferred to thread 2; thread 2 Ready.
+        match sb.host.scheduler.objects.get(&h).unwrap() {
+            crate::sched::WaitObject::Mutex { owner, recursion } => {
+                assert_eq!(*owner, Some(2));
+                assert_eq!(*recursion, 1);
+            }
+            _ => panic!(),
+        }
+        let t = sb.host.threads.get(&2).unwrap();
+        assert!(matches!(t.status, crate::sched::ThreadStatus::Ready));
+    }
+
+    /// Semaphore round-trip: `ReleaseSemaphore(N)` wakes up to
+    /// N waiters and bumps the count.
+    #[test]
+    fn semaphore_release_wakes_waiters_and_bumps_count() {
+        let mut sb = Sandbox::new();
+        let h = sb
+            .host
+            .scheduler
+            .insert_object(crate::sched::WaitObject::Semaphore { count: 0, max: 10 });
+        // Two waiters.
+        for tid in [2u32, 3u32] {
+            let mut t = crate::win32::ThreadState::new(tid, 1);
+            t.parked_cpu = Some(crate::emulator::Cpu::new());
+            t.status = crate::sched::ThreadStatus::Waiting;
+            t.wait = Some(crate::sched::WaitCondition::Object {
+                handle: h,
+                timeout_after: None,
+            });
+            sb.host.threads.insert(tid, t);
+        }
+        // Bootstrap releases 2.
+        let release = sb
+            .registry
+            .resolve("kernel32.dll", "ReleaseSemaphore")
+            .unwrap();
+        sb.mmu.map(0x500_0000, 0x1000, Perm::R | Perm::W);
+        let p_prev = 0x500_0000u32;
+        sb.cpu.push32(&mut sb.mmu, p_prev).unwrap();
+        sb.cpu.push32(&mut sb.mmu, 2u32).unwrap();
+        sb.cpu.push32(&mut sb.mmu, h).unwrap();
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = release;
+        sb.run_until_sentinel().unwrap();
+        assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 1);
+        // Previous count was 0.
+        assert_eq!(sb.mmu.load32(p_prev).unwrap(), 0);
+        // Both waiters woke; each consumed one count → net count = 0.
+        match sb.host.scheduler.objects.get(&h).unwrap() {
+            crate::sched::WaitObject::Semaphore { count, .. } => {
+                assert_eq!(*count, 0, "both waiters consumed their signals");
+            }
+            _ => panic!(),
+        }
+        for tid in [2u32, 3u32] {
+            let t = sb.host.threads.get(&tid).unwrap();
+            assert!(matches!(t.status, crate::sched::ThreadStatus::Ready));
+        }
+    }
+
     /// Phase 3b of the scheduler refactor: `CreateThread` mints
     /// a Ready thread, the scheduler context-switches into it
     /// the first time the bootstrap thread yields, and the new

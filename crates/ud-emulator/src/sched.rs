@@ -242,6 +242,32 @@ pub fn object_is_signaled(obj: &WaitObject) -> bool {
     }
 }
 
+/// Iterate over every thread that is currently waiting on the
+/// given handle (either as a single-object wait or as one of
+/// the handles in a multi-object wait). Used by signal-side
+/// stubs (`SetEvent`, `ReleaseMutex`, `ReleaseSemaphore`, …)
+/// to find waiters to wake.
+///
+/// Returns TIDs in sorted order so wake-up is deterministic
+/// across runs.
+pub fn waiters_on(
+    threads: &std::collections::BTreeMap<u32, crate::win32::ThreadState>,
+    handle: u32,
+) -> Vec<u32> {
+    let mut out: Vec<u32> = threads
+        .iter()
+        .filter(|(_, t)| matches!(t.status, ThreadStatus::Waiting))
+        .filter(|(_, t)| match &t.wait {
+            Some(WaitCondition::Object { handle: h, .. }) => *h == handle,
+            Some(WaitCondition::Multiple { handles, .. }) => handles.contains(&handle),
+            _ => false,
+        })
+        .map(|(tid, _)| *tid)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 /// Take the side effect implied by a successful wait. For an
 /// auto-reset Event the signal flips back off; for a Semaphore
 /// the count drops; for a Mutex / CriticalSection ownership

@@ -1142,7 +1142,7 @@ pub fn register(registry: &mut Registry) {
     registry.register(
         "kernel32.dll",
         "ReleaseMutex",
-        stub_returns_true as StubFn,
+        stub_release_mutex as StubFn,
         1,
     );
     // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessa
@@ -2336,16 +2336,23 @@ fn stub_create_file_mapping_a(
     Ok(addr)
 }
 
-/// `HANDLE CreateSemaphoreA(...)`. Returns a non-zero pseudo
-/// handle so the codec's RAII wrappers don't bail on NULL. We
-/// don't actually model semaphores.
+/// `HANDLE CreateSemaphoreA(LPSECURITY_ATTRIBUTES,
+/// LONG lInitialCount, LONG lMaximumCount, LPCSTR lpName)`.
+/// Mints a Semaphore WaitObject seeded with the supplied
+/// initial count and maximum.
 fn stub_create_semaphore_a(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(0xC0DE_5E3A) // pseudo-handle
+    let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateSemaphoreA", t))?;
+    let init = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateSemaphoreA", t))?;
+    let max = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateSemaphoreA", t))?;
+    let _name = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateSemaphoreA", t))?;
+    Ok(state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Semaphore { count: init, max }))
 }
 
 /// `void DeleteCriticalSection(LPCRITICAL_SECTION)`. No-op.
@@ -3017,13 +3024,36 @@ fn stub_raise_exception(
     Ok(0)
 }
 
-/// `BOOL ReleaseSemaphore(HANDLE, LONG, LPLONG)`. No-op success.
+/// `BOOL ReleaseSemaphore(HANDLE hSemaphore, LONG lReleaseCount,
+/// LPLONG lpPreviousCount)`. Adds `lReleaseCount` to the
+/// semaphore's count (clamped against `max`), writes the prior
+/// count through `lpPreviousCount`, and wakes up to
+/// `lReleaseCount` waiters in TID order.
 fn stub_release_semaphore(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ReleaseSemaphore", t))?;
+    let release = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("ReleaseSemaphore", t))?;
+    let lp_prev = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("ReleaseSemaphore", t))?;
+    let Some(crate::sched::WaitObject::Semaphore { count, max }) =
+        state.scheduler.objects.get_mut(&h)
+    else {
+        return Ok(0);
+    };
+    let prev = *count;
+    *count = count.saturating_add(release).min(*max);
+    if lp_prev != 0 {
+        mmu.store32(lp_prev, prev)
+            .map_err(|t| trap_to_win32("ReleaseSemaphore", t))?;
+    }
+    // Wake up to `release` waiters.
+    let waiters = crate::sched::waiters_on(&state.threads, h);
+    for tid in waiters.into_iter().take(release as usize) {
+        wake_thread(state, tid, h);
+    }
     Ok(1)
 }
 
@@ -3184,15 +3214,69 @@ fn stub_unmap_view_of_file(
     Ok(1)
 }
 
-/// `DWORD WaitForSingleObject(HANDLE, DWORD)`. Return
-/// `WAIT_OBJECT_0` (= 0) — the object is "signaled" immediately.
-/// Single-threaded sandbox: any wait succeeds without blocking.
+/// `DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)`.
+/// Returns `WAIT_OBJECT_0` (= 0) immediately if the object is
+/// signaled; otherwise asks the scheduler to suspend the
+/// current thread until it signals (or the timeout expires).
+///
+/// `dwMilliseconds = INFINITE (0xFFFF_FFFF)` waits forever.
+/// Any handle that isn't registered with the scheduler is
+/// treated as "signaled" so codec corpora that pass synthetic
+/// non-WaitObject handles still get the historical
+/// pass-through behaviour.
 fn stub_wait_for_single_object(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WaitForSingleObject", t))?;
+    let ms = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WaitForSingleObject", t))?;
+    if !state.scheduler.objects.contains_key(&h) {
+        // Unknown handle — fail-soft: report signaled, matching
+        // the pre-Phase-3c contract.
+        return Ok(0);
+    }
+    let cur_tid = state.active_tid;
+    // Resolve "is it signaled?" — Thread / Process objects
+    // also signal on Terminated.
+    let signaled = match state.scheduler.objects.get(&h) {
+        Some(crate::sched::WaitObject::Thread { tid }) => state
+            .threads
+            .get(tid)
+            .map(|t| matches!(t.status, crate::sched::ThreadStatus::Terminated))
+            .unwrap_or(true),
+        Some(crate::sched::WaitObject::Process { pid: _ }) => {
+            // Phase 5 wires this up properly. Until then, treat
+            // unknown process state as already-signaled.
+            true
+        }
+        Some(obj) => crate::sched::object_is_signaled(obj),
+        None => false,
+    };
+    if signaled {
+        if let Some(obj) = state.scheduler.objects.get_mut(&h) {
+            crate::sched::consume_signal_if_auto_reset(obj, cur_tid);
+        }
+        return Ok(0);
+    }
+    // Block — record the wait with optional timeout.
+    let timeout_after = if ms == 0xFFFF_FFFF {
+        None
+    } else {
+        Some(
+            state
+                .scheduler
+                .instructions_global
+                .saturating_add(u64::from(ms).saturating_mul(crate::sched::INSTRUCTIONS_PER_MS)),
+        )
+    };
+    state.yield_requested = Some(crate::sched::YieldRequest::Wait(
+        crate::sched::WaitCondition::Object {
+            handle: h,
+            timeout_after,
+        },
+    ));
     Ok(0)
 }
 
@@ -3234,11 +3318,9 @@ fn stub_lstrlen_a(
 // ====================================================================
 
 /// `HANDLE CreateEventA(LPSECURITY_ATTRIBUTES lpEventAttributes,
-/// BOOL bManualReset, BOOL bInitialState, LPCSTR lpName)`. The
-/// codec only uses the returned HANDLE as an opaque key for
-/// `SetEvent` / `WaitForSingleObject`. We return a non-zero
-/// pseudo-handle (`0xCAFE_E001` + a tick-driven offset) so
-/// every distinct call site sees a fresh value.
+/// BOOL bManualReset, BOOL bInitialState, LPCSTR lpName)`.
+/// Mints an `Event` WaitObject with the supplied
+/// manual-reset / initial-state pair and hands back its handle.
 fn stub_create_event_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -3246,11 +3328,15 @@ fn stub_create_event_a(
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateEventA", t))?;
-    let _manual = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateEventA", t))?;
-    let _init = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateEventA", t))?;
+    let manual = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateEventA", t))?;
+    let init = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateEventA", t))?;
     let _name = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateEventA", t))?;
-    state.tick = state.tick.wrapping_add(1);
-    Ok(0xCAFE_E000u32.wrapping_add(state.tick))
+    Ok(state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Event {
+            signaled: init != 0,
+            manual_reset: manual != 0,
+        }))
 }
 
 /// `HANDLE CreateThread(LPSECURITY_ATTRIBUTES lpThreadAttributes,
@@ -3352,15 +3438,50 @@ fn stub_exit_thread(
     Ok(0)
 }
 
-/// `BOOL SetEvent(HANDLE)`. Single-threaded sandbox: the event
-/// is "signaled" but no one is waiting on it. Return TRUE.
+/// `BOOL SetEvent(HANDLE)`. Marks the Event WaitObject signaled
+/// and moves every Waiting thread back to Ready (manual-reset)
+/// or just the first waiter in TID order (auto-reset, which
+/// also clears the signal again per
+/// [`crate::sched::consume_signal_if_auto_reset`]).
 fn stub_set_event(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetEvent", t))?;
+    let Some(crate::sched::WaitObject::Event {
+        signaled,
+        manual_reset,
+    }) = state.scheduler.objects.get_mut(&h)
+    else {
+        return Ok(0);
+    };
+    *signaled = true;
+    let manual = *manual_reset;
+    let waiters = crate::sched::waiters_on(&state.threads, h);
+    if manual {
+        for tid in waiters {
+            wake_thread(state, tid, h);
+        }
+    } else if let Some(&tid) = waiters.first() {
+        wake_thread(state, tid, h);
+    }
     Ok(1)
+}
+
+/// Helper used by signal-side stubs: move `tid` from Waiting to
+/// Ready, clear its wait condition, and take the side effect
+/// implied by signal consumption (auto-reset Event, Mutex
+/// ownership transfer, Semaphore decrement) against `handle`.
+fn wake_thread(state: &mut HostState, tid: u32, handle: u32) {
+    if let Some(obj) = state.scheduler.objects.get_mut(&handle) {
+        crate::sched::consume_signal_if_auto_reset(obj, tid);
+    }
+    if let Some(t) = state.threads.get_mut(&tid) {
+        t.status = crate::sched::ThreadStatus::Ready;
+        t.wait = None;
+    }
 }
 
 /// `BOOL SetThreadPriority(HANDLE, int)`. Single-threaded
@@ -3579,62 +3700,131 @@ fn stub_set_error_mode(
     Ok(0)
 }
 
-/// `BOOL ResetEvent(HANDLE hEvent)`. Single-threaded emulator
-/// has no real event objects; return 1 (success).
+/// `BOOL ResetEvent(HANDLE hEvent)`. Clears the Event
+/// WaitObject's signaled flag. Pending waiters stay parked
+/// (only signal transitions wake them).
 fn stub_reset_event(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    _state: &mut HostState,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ResetEvent", t))?;
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ResetEvent", t))?;
+    if let Some(crate::sched::WaitObject::Event { signaled, .. }) =
+        state.scheduler.objects.get_mut(&h)
+    {
+        *signaled = false;
+    }
     Ok(1)
 }
 
 /// `DWORD WaitForMultipleObjects(DWORD nCount, const HANDLE *lpHandles,
-/// BOOL bWaitAll, DWORD dwMilliseconds)`. Always returns
-/// `WAIT_OBJECT_0 = 0` — everything is "ready" in our
-/// single-threaded sandbox.
+/// BOOL bWaitAll, DWORD dwMilliseconds)`. Returns
+/// `WAIT_OBJECT_0 + n` for the first signaled handle when
+/// `bWaitAll = FALSE`; with `bWaitAll = TRUE` it parks the
+/// caller until every handle has signaled. Unknown handles
+/// (not in the scheduler) are treated as "already signaled" —
+/// preserves the pre-Phase-3c fail-soft pass-through.
 fn stub_wait_for_multiple_objects(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    _state: &mut HostState,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _ncount = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
-    let _phandles =
+    let n = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
+    let p_handles =
         arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
-    let _waitall =
+    let wait_all =
         arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
-    let _ms = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
+    let ms = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
+    if n == 0 || p_handles == 0 {
+        return Ok(0);
+    }
+    let mut handles = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        handles.push(
+            mmu.load32(p_handles + i * 4)
+                .map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?,
+        );
+    }
+    let signaled_now: Vec<bool> = handles
+        .iter()
+        .map(|h| match state.scheduler.objects.get(h) {
+            Some(obj) => crate::sched::object_is_signaled(obj),
+            None => true,
+        })
+        .collect();
+    let cur_tid = state.active_tid;
+    if wait_all != 0 {
+        if signaled_now.iter().all(|x| *x) {
+            for h in &handles {
+                if let Some(obj) = state.scheduler.objects.get_mut(h) {
+                    crate::sched::consume_signal_if_auto_reset(obj, cur_tid);
+                }
+            }
+            return Ok(0);
+        }
+    } else if let Some(idx) = signaled_now.iter().position(|x| *x) {
+        if let Some(obj) = state.scheduler.objects.get_mut(&handles[idx]) {
+            crate::sched::consume_signal_if_auto_reset(obj, cur_tid);
+        }
+        return Ok(idx as u32);
+    }
+    let timeout_after = if ms == 0xFFFF_FFFF {
+        None
+    } else {
+        Some(
+            state
+                .scheduler
+                .instructions_global
+                .saturating_add(u64::from(ms).saturating_mul(crate::sched::INSTRUCTIONS_PER_MS)),
+        )
+    };
+    state.yield_requested = Some(crate::sched::YieldRequest::Wait(
+        crate::sched::WaitCondition::Multiple {
+            handles,
+            wait_all: wait_all != 0,
+            timeout_after,
+        },
+    ));
     Ok(0)
 }
 
 /// `HANDLE CreateEventW(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCWSTR)`.
-/// Returns a synthetic non-NULL handle. Codecs use this to
-/// coordinate between threads — we don't model threads, but the
-/// codec just needs a non-zero handle to signal/wait on.
+/// UTF-16 twin of [`stub_create_event_a`].
 fn stub_create_event_w(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    state.tick = state.tick.wrapping_add(1);
-    Ok(0xE000_0000u32.wrapping_add(state.tick))
+    let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateEventW", t))?;
+    let manual = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateEventW", t))?;
+    let init = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateEventW", t))?;
+    let _name = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateEventW", t))?;
+    Ok(state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Event {
+            signaled: init != 0,
+            manual_reset: manual != 0,
+        }))
 }
 
 /// `HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES, LONG, LONG, LPCWSTR)`.
-/// Synthetic handle like [`stub_create_event_w`]; the codec
-/// gets a non-NULL value, releases/waits are no-ops.
+/// UTF-16 twin of [`stub_create_semaphore_a`].
 fn stub_create_semaphore_w(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    state.tick = state.tick.wrapping_add(1);
-    Ok(0xE100_0000u32.wrapping_add(state.tick))
+    let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateSemaphoreW", t))?;
+    let init = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateSemaphoreW", t))?;
+    let max = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateSemaphoreW", t))?;
+    let _name = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateSemaphoreW", t))?;
+    Ok(state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Semaphore { count: init, max }))
 }
 
 /// `void GetLocalTime(LPSYSTEMTIME)`. Writes a 16-byte
@@ -4735,16 +4925,60 @@ fn stub_dos_date_time_to_file_time(
 }
 
 /// `HANDLE CreateMutexA(LPSECURITY_ATTRIBUTES, BOOL bInitialOwner,
-/// LPCSTR lpName)`. We don't model mutexes; hand back a non-zero
-/// synthetic handle so the installer's RAII wrapper doesn't bail.
+/// LPCSTR lpName)`. Mints a Mutex WaitObject. If
+/// `bInitialOwner` is TRUE the calling thread becomes the
+/// owner immediately.
 fn stub_create_mutex_a(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    state.next_hic = state.next_hic.wrapping_add(1);
-    Ok(0x6A00_0000 | state.next_hic)
+    let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateMutexA", t))?;
+    let init_owner = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateMutexA", t))?;
+    let _name = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateMutexA", t))?;
+    let owner = if init_owner != 0 {
+        Some(state.active_tid)
+    } else {
+        None
+    };
+    let recursion = if init_owner != 0 { 1 } else { 0 };
+    Ok(state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Mutex { owner, recursion }))
+}
+
+/// `BOOL ReleaseMutex(HANDLE)`. Decrements the recursion count;
+/// when it reaches zero, clears the owner and wakes the first
+/// pending waiter (which then becomes the new owner). Returns
+/// FALSE if the caller isn't the current owner.
+fn stub_release_mutex(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ReleaseMutex", t))?;
+    let cur_tid = state.active_tid;
+    let Some(crate::sched::WaitObject::Mutex { owner, recursion }) =
+        state.scheduler.objects.get_mut(&h)
+    else {
+        return Ok(0);
+    };
+    if *owner != Some(cur_tid) {
+        return Ok(0);
+    }
+    *recursion = recursion.saturating_sub(1);
+    if *recursion == 0 {
+        *owner = None;
+        // Wake the first waiter (consume_signal_if_auto_reset
+        // will transfer ownership to them).
+        let waiters = crate::sched::waiters_on(&state.threads, h);
+        if let Some(&tid) = waiters.first() {
+            wake_thread(state, tid, h);
+        }
+    }
+    Ok(1)
 }
 
 /// `BOOL CreateProcessA(...)`. The installer occasionally spawns
