@@ -1243,6 +1243,22 @@ pub fn register(registry: &mut Registry) {
         stub_write_console_w as StubFn,
         5,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-duplicatehandle
+    registry.register(
+        "kernel32.dll",
+        "DuplicateHandle",
+        stub_duplicate_handle as StubFn,
+        7,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-openeventa
+    registry.register("kernel32.dll", "OpenEventA", stub_open_event_a as StubFn, 3);
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
+    registry.register(
+        "kernel32.dll",
+        "OpenProcess",
+        stub_open_process as StubFn,
+        3,
+    );
 }
 
 // ----- Heap ----------------------------------------------------------
@@ -5666,6 +5682,76 @@ fn stub_write_console_w(
             .map_err(|t| trap_to_win32("WriteConsoleW", t))?;
     }
     Ok(1)
+}
+
+/// `BOOL DuplicateHandle(HANDLE hSourceProcessHandle,
+/// HANDLE hSourceHandle, HANDLE hTargetProcessHandle,
+/// LPHANDLE lpTargetHandle, DWORD dwDesiredAccess,
+/// BOOL bInheritHandle, DWORD dwOptions)`. Writes the source
+/// handle through `lpTargetHandle` (no actual cross-process
+/// duplication; the shared-MMU model has each handle visible
+/// to every process anyway) and returns TRUE.
+fn stub_duplicate_handle(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _sp = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("DuplicateHandle", t))?;
+    let h_src = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("DuplicateHandle", t))?;
+    let _tp = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("DuplicateHandle", t))?;
+    let p_tgt = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("DuplicateHandle", t))?;
+    if p_tgt != 0 {
+        mmu.store32(p_tgt, h_src)
+            .map_err(|t| trap_to_win32("DuplicateHandle", t))?;
+    }
+    Ok(1)
+}
+
+/// `HANDLE OpenEventA(DWORD dwDesiredAccess, BOOL bInheritHandle,
+/// LPCSTR lpName)`. The named-event registry across processes
+/// is rarely used by installers we drive; we report
+/// `ERROR_FILE_NOT_FOUND` (= 2) on failure path by returning
+/// NULL, which the caller treats as "no such event — create one".
+fn stub_open_event_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state.last_error = 2; // ERROR_FILE_NOT_FOUND
+    Ok(0)
+}
+
+/// `HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle,
+/// DWORD dwProcessId)`. Looks up the PID in the process table;
+/// returns the existing Process WaitObject handle if found, or
+/// a fresh one minted on the fly. Failure returns NULL.
+fn stub_open_process(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _access = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("OpenProcess", t))?;
+    let _inherit = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("OpenProcess", t))?;
+    let pid = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("OpenProcess", t))?;
+    if !state.processes.contains_key(&pid) {
+        state.last_error = 87; // ERROR_INVALID_PARAMETER
+        return Ok(0);
+    }
+    // Re-use an existing Process handle for the PID if one
+    // exists; otherwise mint a fresh one.
+    for (h, obj) in &state.scheduler.objects {
+        if let crate::sched::WaitObject::Process { pid: p } = obj {
+            if *p == pid {
+                return Ok(*h);
+            }
+        }
+    }
+    Ok(state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Process { pid }))
 }
 
 #[cfg(test)]

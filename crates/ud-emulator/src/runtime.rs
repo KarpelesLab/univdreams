@@ -346,6 +346,24 @@ impl Sandbox {
         self.host.rand_state = seed;
     }
 
+    /// Override the value `kernel32!GetCommandLineA` returns to
+    /// the guest. The string is stashed (NUL-terminated) in the
+    /// host's const arena and a pointer to it is parked at
+    /// `command_line_ptr`. Installer-class binaries consult
+    /// this to pick up `/quiet`, `/qn`, `/S` and similar
+    /// silent-install flags.
+    pub fn set_command_line(&mut self, cmdline: &str) -> Result<(), crate::Error> {
+        let mut bytes = cmdline.as_bytes().to_vec();
+        bytes.push(0);
+        let addr = self
+            .host
+            .arena_const_alloc(bytes.len() as u32)
+            .map_err(crate::Error::Win32)?;
+        self.mmu.write_initializer(addr, &bytes)?;
+        self.host.command_line_ptr = addr;
+        Ok(())
+    }
+
     /// Read the current `msvcrt!rand` LCG state.
     ///
     /// Reflects whatever the host or the guest last wrote: a

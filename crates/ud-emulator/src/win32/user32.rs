@@ -736,15 +736,20 @@ fn stub_end_paint(
 const IDOK: u32 = 1;
 const IDCANCEL: u32 = 2;
 
-/// `INT_PTR DialogBoxParamA(...)`. Return `IDCANCEL` (user
-/// cancelled the dialog without us showing it).
+/// `INT_PTR DialogBoxParamA(...)`. Returns `IDOK` so installer
+/// "Next / OK / Continue" buttons auto-advance the wizard.
+/// Headless analysis: the dialog is never rendered, but the
+/// caller's `INT_PTR result` switch treats IDOK as "user
+/// accepted" — pushing through the standard
+/// welcome / EULA / install-path / progress flow.
 fn stub_dialog_box_param_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(IDCANCEL)
+    let _ = IDCANCEL;
+    Ok(IDOK)
 }
 
 /// `BOOL EndDialog(HWND hDlg, INT_PTR nResult)`. Returns TRUE.
@@ -1079,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn dialog_box_param_a_returns_idcancel() {
+    fn dialog_box_param_a_returns_idok_for_auto_advance() {
         let (mut cpu, mut mmu, registry, mut state) = make_env();
         call(
             &mut cpu,
@@ -1091,7 +1096,9 @@ mod tests {
             &[0, 0, 0, 0, 0],
         )
         .unwrap();
-        assert_eq!(cpu.regs.get32(Reg32::Eax), IDCANCEL);
+        // Auto-accept ("clicked Next") so installer wizards
+        // headless-advance through their pages.
+        assert_eq!(cpu.regs.get32(Reg32::Eax), IDOK);
     }
 
     #[test]

@@ -128,6 +128,29 @@ enum Command {
         /// touched up to the first unimplemented API.
         #[arg(long)]
         monitor: bool,
+
+        /// In monitor mode, override `GetCommandLineA`'s
+        /// return value with this string. Use to pass
+        /// installer-specific silent / quiet flags
+        /// (`/S` for InstallShield, `/qn` or `/quiet` for
+        /// MSI, …) so the installer skips its UI and runs
+        /// non-interactively.
+        ///
+        /// The string is prefixed with the input PE's filename
+        /// so the installer sees `argv[0] = setup.exe` and
+        /// `argv[1..] = <flags>`, matching how Windows
+        /// formats the real `GetCommandLineA` output.
+        #[arg(long)]
+        args: Option<String>,
+
+        /// In monitor mode, after the run finishes write every
+        /// file the guest produced in the virtual filesystem
+        /// to this host directory. Useful for chain-loading
+        /// extracted child binaries (e.g. an installer's
+        /// embedded MSI / admin EXE) through a follow-up
+        /// `ud analyze --monitor` pass.
+        #[arg(long)]
+        dump_vfs: Option<PathBuf>,
     },
 
     /// Video for Windows codec tools — drive a codec DLL
@@ -564,9 +587,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             max_instructions,
             json,
             monitor,
+            args,
+            dump_vfs,
         } => {
             if monitor {
-                monitor_install(&input, max_instructions, json)
+                monitor_install(
+                    &input,
+                    max_instructions,
+                    json,
+                    args.as_deref(),
+                    dump_vfs.as_deref(),
+                )
             } else {
                 analyze(&input, max_instructions, json)
             }
@@ -1224,7 +1255,13 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
 /// for a real installer is large; this is the harness that
 /// makes the next-step obvious.
 #[allow(clippy::too_many_lines)]
-fn monitor_install(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result<()> {
+fn monitor_install(
+    input: &Path,
+    max_instructions: u64,
+    as_json: bool,
+    extra_args: Option<&str>,
+    dump_vfs: Option<&Path>,
+) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     if !ud_format::pe::is_pe(&bytes) {
         anyhow::bail!(
@@ -1256,6 +1293,19 @@ fn monitor_install(input: &Path, max_instructions: u64, as_json: bool) -> anyhow
     let (image, unresolved) = sandbox
         .load_fail_soft(stem, &bytes)
         .with_context(|| format!("fail-soft load {}", input.display()))?;
+
+    // Stage the command line so GetCommandLineA returns a
+    // plausible argv. The exe name is the input PE's
+    // filename; everything after the first space is `--args`.
+    let exe_name = input
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("setup.exe");
+    let command_line = match extra_args {
+        Some(args) if !args.is_empty() => format!("\"{exe_name}\" {args}"),
+        _ => format!("\"{exe_name}\""),
+    };
+    sandbox.set_command_line(&command_line)?;
 
     let entry_result = sandbox.call_entry_point(&image);
     let stub_calls = std::mem::take(&mut sandbox.host.stub_calls);
@@ -1303,6 +1353,32 @@ fn monitor_install(input: &Path, max_instructions: u64, as_json: bool) -> anyhow
                 .collect()
         })
         .unwrap_or_default();
+
+    // Optional: dump every VFS file to a host directory so the
+    // analyst can chain-load extracted child binaries through
+    // a follow-up `ud analyze --monitor`. Paths are sanitised
+    // (drive letters / forward-slash separators preserved as
+    // subdirectories under `dump_root`).
+    if let Some(dump_root) = dump_vfs {
+        if let Some(vfs) = ctx.vfs.as_ref() {
+            std::fs::create_dir_all(dump_root)
+                .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
+            for (vpath, _) in vfs.list() {
+                if vpath.ends_with("/.dir") {
+                    continue;
+                }
+                let safe = sanitise_vfs_path(vpath);
+                let out = dump_root.join(safe);
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                if let Some(data) = vfs.read(vpath) {
+                    std::fs::write(&out, data)
+                        .with_context(|| format!("write VFS dump file {}", out.display()))?;
+                }
+            }
+        }
+    }
     let registry_writes: Vec<RegistryEntry> = ctx
         .registry
         .as_ref()
@@ -1392,6 +1468,28 @@ struct RegistryEntry {
     key: String,
     name: String,
     value: String,
+}
+
+/// Sanitise a virtual filesystem path into a host-safe
+/// relative pathname for `--dump-vfs`. Drive letters become
+/// directory prefixes (`c:` → `c`), backslashes become
+/// forward slashes, and any other suspect characters are
+/// stripped so a hostile installer can't write outside the
+/// dump root.
+fn sanitise_vfs_path(vpath: &str) -> std::path::PathBuf {
+    let mut out = String::with_capacity(vpath.len());
+    for ch in vpath.chars() {
+        match ch {
+            ':' => out.push('_'),
+            '\\' => out.push('/'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    // Strip absolute markers — the dump root acts as the
+    // anchor.
+    let stripped = out.trim_start_matches('/').to_string();
+    std::path::PathBuf::from(stripped)
 }
 
 impl MonitorReport {
