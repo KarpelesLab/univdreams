@@ -7,6 +7,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ### Added
 - BPF if-then-else + while-loop detection. The `wrap_if_blocks`

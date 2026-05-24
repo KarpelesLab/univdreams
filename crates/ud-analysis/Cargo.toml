@@ -16,8 +16,8 @@ workspace = true
 
 [dependencies]
 ud-core = { version = "0.1.1", path = "../ud-core" }
-ud-arch-bpf = { version = "0.1.1", path = "../ud-arch-bpf" }
-ud-format = { version = "0.1.1", path = "../ud-format" }
+ud-arch-bpf = { version = "0.1.5", path = "../ud-arch-bpf" }
+ud-format = { version = "0.1.5", path = "../ud-format" }
 ud-signatures = { version = "0.1.1", path = "../ud-signatures" }
 gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
 thiserror = "2"
