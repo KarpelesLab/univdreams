@@ -19,12 +19,52 @@ use crate::win32::Registry;
 const IMAGE_ORDINAL_FLAG32: u32 = 0x8000_0000;
 
 /// Walk the import descriptors, resolve every named import, and
-/// patch the IAT.
+/// patch the IAT. Strict mode: unknown imports return
+/// [`PeError::UnknownImportFunction`]. Use [`resolve_with`] for
+/// fail-soft handling.
+///
+/// `registry` is `&mut` so the fail-soft path in
+/// [`resolve_with`] can install fallback thunks; strict mode
+/// never mutates it.
 pub fn resolve(
     mmu: &mut Mmu,
     parsed: &Parsed,
     image_base: u32,
-    registry: &Registry,
+    registry: &mut Registry,
+) -> Result<(), PeError> {
+    resolve_with(mmu, parsed, image_base, registry, ResolveMode::Strict, None)
+}
+
+/// PE-import resolution mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveMode {
+    /// Strict: any unknown import is a hard load-time error.
+    /// Default — what the codec path wants.
+    Strict,
+    /// Fail-soft: unknown imports get a fallback thunk that
+    /// raises `Trap::UnresolvedImport` on first call. Loading
+    /// succeeds even when the host doesn't know every API the
+    /// binary lists; execution halts at the first call to an
+    /// unimplemented import, naming it precisely.
+    ///
+    /// Intended for the install-monitor workflow on EXEs whose
+    /// IAT is wider than the codec-class stub registry covers.
+    FailSoft,
+}
+
+/// Like [`resolve`] but with explicit mode + optional sink for
+/// "added a fail-soft thunk" callbacks. When `unresolved` is
+/// `Some(&mut vec)` and mode is `FailSoft`, every unknown
+/// import is appended to the vec so the caller can log the set
+/// up-front (useful for a one-shot "this is what's missing"
+/// summary before running).
+pub fn resolve_with(
+    mmu: &mut Mmu,
+    parsed: &Parsed,
+    image_base: u32,
+    registry: &mut Registry,
+    mode: ResolveMode,
+    mut unresolved: Option<&mut Vec<(String, String)>>,
 ) -> Result<(), PeError> {
     let dir = parsed.optional.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if dir.virtual_address == 0 || dir.size == 0 {
@@ -65,7 +105,7 @@ pub fn resolve(
             if entry == 0 {
                 break;
             }
-            let thunk = if (entry & IMAGE_ORDINAL_FLAG32) != 0 {
+            let (import_name, resolved) = if (entry & IMAGE_ORDINAL_FLAG32) != 0 {
                 // Import-by-ordinal. Many system DLLs (notably
                 // `oleaut32.dll`, `ws2_32.dll`) export functions
                 // by ordinal only — no name. We resolve them
@@ -75,23 +115,30 @@ pub fn resolve(
                 // key (see `Registry::register`).
                 let ord = entry & 0xFFFF;
                 let name = format!("@{ord}");
-                registry
-                    .resolve(&dll_lower, &name)
-                    .ok_or(PeError::UnknownImportFunction {
-                        dll: dll_lower.clone(),
-                        name,
-                    })?
+                let r = registry.resolve(&dll_lower, &name);
+                (name, r)
             } else {
                 // Import-by-name: low 31 bits are an RVA to an
                 // IMAGE_IMPORT_BY_NAME (Hint:WORD; Name:ASCIIZ).
                 let by_name = image_base.wrapping_add(entry & 0x7FFF_FFFF);
                 let name = read_cstr(mmu, by_name.wrapping_add(2))?;
-                registry
-                    .resolve(&dll_lower, &name)
-                    .ok_or(PeError::UnknownImportFunction {
+                let r = registry.resolve(&dll_lower, &name);
+                (name, r)
+            };
+            let thunk = match (resolved, mode) {
+                (Some(addr), _) => addr,
+                (None, ResolveMode::Strict) => {
+                    return Err(PeError::UnknownImportFunction {
                         dll: dll_lower.clone(),
-                        name,
-                    })?
+                        name: import_name,
+                    });
+                }
+                (None, ResolveMode::FailSoft) => {
+                    if let Some(sink) = unresolved.as_mut() {
+                        sink.push((dll_lower.clone(), import_name.clone()));
+                    }
+                    registry.register_unknown_fallback(&dll_lower, &import_name)
+                }
             };
             mmu.store32(iat.wrapping_add(4 * i), thunk)?;
             i = i.wrapping_add(1);

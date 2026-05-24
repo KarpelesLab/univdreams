@@ -300,9 +300,15 @@ impl Sandbox {
         self.host.rand_state
     }
 
-    /// Load a PE32 DLL from `bytes`, mapping it into the
+    /// Load a PE32 image from `bytes`, mapping it into the
     /// sandbox's MMU. The returned [`Image`] holds the entry
     /// point + export table.
+    ///
+    /// Strict-resolution: any IAT entry the
+    /// [`crate::win32::Registry`] doesn't satisfy is a hard
+    /// load-time error. Use [`Sandbox::load_fail_soft`] for
+    /// EXEs whose import list exceeds the codec-class stub
+    /// surface (installers, GUI apps, etc.).
     pub fn load(&mut self, name: &str, bytes: &[u8]) -> Result<Image, crate::Error> {
         let mut loader = Loader::new(&mut self.mmu, &mut self.registry, &mut self.host);
         let img = loader.load(name, bytes)?;
@@ -317,6 +323,35 @@ impl Sandbox {
             .modules
             .insert(name.to_ascii_lowercase(), img.image_base);
         Ok(img)
+    }
+
+    /// Load a PE32 image in fail-soft import-resolution mode.
+    /// Imports the codec-class stub registry doesn't satisfy
+    /// get a trap-on-call fallback thunk so the load succeeds.
+    /// Returns the loaded [`Image`] plus the list of
+    /// `(dll, name)` pairs that received a fallback — i.e.
+    /// the set of APIs the operator now knows the binary uses
+    /// but we don't yet stub.
+    ///
+    /// Intended for the install-monitor workflow: load
+    /// QuickTimeInstaller.exe with fail-soft, drive the entry
+    /// point, watch the trap stream for the next missing API.
+    pub fn load_fail_soft(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(Image, Vec<(String, String)>), crate::Error> {
+        let mut options = crate::pe::LoadOptions {
+            imports: crate::pe::imports::ResolveMode::FailSoft,
+            fail_soft_log: Some(Vec::new()),
+        };
+        let mut loader = Loader::new(&mut self.mmu, &mut self.registry, &mut self.host);
+        let img = loader.load_with_options(name, bytes, &mut options)?;
+        self.host.primary_module_base = img.image_base;
+        self.host
+            .modules
+            .insert(name.to_ascii_lowercase(), img.image_base);
+        Ok((img, options.fail_soft_log.unwrap_or_default()))
     }
 
     /// Synchronously call `DllMain(hModule, fdwReason, lpvReserved)`
@@ -389,6 +424,31 @@ impl Sandbox {
             &mut self.host,
             target,
             args,
+        )
+    }
+
+    /// Call the image's PE entry point (`AddressOfEntryPoint`).
+    /// For an EXE this is the CRT startup, which expects no
+    /// arguments and never returns under normal Windows
+    /// semantics (it calls `ExitProcess`). Here it runs until
+    /// the runtime returns to the synthetic `RET_SENTINEL` or
+    /// hits a trap (e.g. unresolved import, instruction limit).
+    pub fn call_entry_point(&mut self, image: &Image) -> Result<u32, crate::Error> {
+        if image.entry_point == 0 {
+            return Err(crate::Error::Win32(
+                crate::win32::Win32Error::InvalidArgument {
+                    stub: "call_entry_point",
+                    reason: format!("no PE entry point in {:?}", image.name),
+                },
+            ));
+        }
+        call_guest(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            image.entry_point,
+            &[],
         )
     }
 

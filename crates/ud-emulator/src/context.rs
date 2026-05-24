@@ -386,6 +386,17 @@ impl VirtualRegistry {
             .and_then(|k| k.values.get(&name.to_ascii_lowercase()))
     }
 
+    /// Iterate every `(key_path, value_name, value)` triple in
+    /// the virtual registry. Suitable for "what did the guest
+    /// write?" reports.
+    pub fn all_values(&self) -> impl Iterator<Item = (&str, &str, &RegistryValue)> {
+        self.keys.iter().flat_map(|(key_path, key)| {
+            key.values
+                .iter()
+                .map(move |(name, value)| (key_path.as_str(), name.as_str(), value))
+        })
+    }
+
     /// True iff the named key exists.
     #[must_use]
     pub fn contains_key(&self, key_path: &str) -> bool {

@@ -566,6 +566,43 @@ impl Registry {
         self.by_name.get(&key).copied()
     }
 
+    /// Register a fail-soft fallback thunk for an import we
+    /// don't have a stub for. The thunk's stub function looks
+    /// itself up in the registry and raises
+    /// [`crate::emulator::Trap::UnresolvedImport`] carrying
+    /// the (dll, name) pair on first call.
+    ///
+    /// The PE loader's fail-soft mode installs one of these
+    /// for every unresolved IAT entry so loading succeeds and
+    /// execution proceeds until the first unknown API actually
+    /// gets called. That's a much better signal than failing
+    /// at load time: the trap names the specific function to
+    /// implement next, and reveals which import paths are
+    /// reachable from the entry point.
+    pub fn register_unknown_fallback(&mut self, dll: &str, name: &str) -> u32 {
+        let key = (dll.to_ascii_lowercase(), name.to_string());
+        if let Some(addr) = self.by_name.get(&key) {
+            return *addr;
+        }
+        let thunk_addr = THUNK_BASE.wrapping_add(self.next_slot.wrapping_mul(THUNK_STRIDE));
+        self.next_slot += 1;
+        self.by_name.insert(key.clone(), thunk_addr);
+        // arg_dwords=0 is wrong for most stdcall APIs but
+        // doesn't matter — the stub traps before returning so
+        // dispatch_stub never reaches the stack-cleanup path.
+        self.by_thunk.insert(
+            thunk_addr,
+            StubEntry {
+                dll: key.0,
+                name: key.1,
+                func: stub_unresolved_fallback,
+                arg_dwords: 0,
+                thunk_addr,
+            },
+        );
+        thunk_addr
+    }
+
     /// True iff `addr` is a registered thunk address.
     pub fn is_thunk(&self, addr: u32) -> bool {
         self.by_thunk.contains_key(&addr)
@@ -788,6 +825,26 @@ pub fn read_cstr_local(mmu: &Mmu, mut addr: u32, max: u32) -> Result<String, Win
         addr = addr.wrapping_add(1);
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Stub function used by [`Registry::register_unknown_fallback`].
+/// Looks up its own (dll, name) by reverse-resolving the entry
+/// EIP against the registry and raises a
+/// [`Win32Error::UnknownImport`] that the runtime surfaces as
+/// `Trap::UnresolvedImport`. Execution halts on first call —
+/// the operator sees the precise import to implement next.
+fn stub_unresolved_fallback(
+    cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let addr = cpu.regs.eip;
+    let (dll, name) = registry
+        .entry(addr)
+        .map(|e| (e.dll.clone(), e.name.clone()))
+        .unwrap_or_else(|| ("<unknown>".to_string(), format!("@{addr:#010x}")));
+    Err(Win32Error::UnknownImport { dll, name })
 }
 
 /// Dispatch a stub call. The runtime wires this into the executor

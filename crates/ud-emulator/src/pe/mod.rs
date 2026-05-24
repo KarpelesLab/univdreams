@@ -161,6 +161,26 @@ impl Image {
     }
 }
 
+/// PE loader options.
+#[derive(Debug, Default, Clone)]
+pub struct LoadOptions {
+    /// Strict (default) vs fail-soft import resolution. Fail-
+    /// soft installs a trap thunk for every unknown import so
+    /// loading succeeds and execution proceeds until the first
+    /// unimplemented API actually gets called.
+    pub imports: imports::ResolveMode,
+    /// When fail-soft is on, every unresolved (dll, name) is
+    /// pushed here for the caller to log. Ignored in strict
+    /// mode (every miss is already a load-time error).
+    pub fail_soft_log: Option<Vec<(String, String)>>,
+}
+
+impl Default for imports::ResolveMode {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
 /// PE loader entry point.
 pub struct Loader<'a> {
     mmu: &'a mut Mmu,
@@ -181,6 +201,19 @@ impl<'a> Loader<'a> {
     /// starts at offset 0 in `bytes`; `name` is recorded for
     /// diagnostics + module-handle lookups.
     pub fn load(&mut self, name: &str, bytes: &[u8]) -> Result<Image, PeError> {
+        self.load_with_options(name, bytes, &mut LoadOptions::default())
+    }
+
+    /// Variant of [`Loader::load`] with explicit options.
+    /// `fail_soft_log` in `options` is populated with the
+    /// `(dll, name)` of every import that received a fallback
+    /// thunk.
+    pub fn load_with_options(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        options: &mut LoadOptions,
+    ) -> Result<Image, PeError> {
         let parsed = header::parse(bytes)?;
 
         // Map sections: each section gets at least VirtualSize
@@ -202,7 +235,14 @@ impl<'a> Loader<'a> {
         }
 
         // Resolve imports.
-        imports::resolve(self.mmu, &parsed, load_base, self.registry)?;
+        imports::resolve_with(
+            self.mmu,
+            &parsed,
+            load_base,
+            self.registry,
+            options.imports,
+            options.fail_soft_log.as_mut(),
+        )?;
 
         // Build export table.
         let exports = exports::parse_exports(&parsed, bytes, load_base)?;

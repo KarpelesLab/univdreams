@@ -114,6 +114,20 @@ enum Command {
         /// downstream analysis tooling.
         #[arg(long)]
         json: bool,
+
+        /// Run in install-monitor mode: load the PE in fail-
+        /// soft import-resolution mode (unknown imports get a
+        /// trap-on-call thunk instead of failing at load) and
+        /// drive the PE's entry point rather than `DllMain`.
+        /// Suitable for EXEs / installers whose import surface
+        /// exceeds the codec-class stub registry.
+        ///
+        /// The trap stream + side-effect log (virtual FS /
+        /// registry writes captured through the existing
+        /// `Context` layer) surfaces what the installer
+        /// touched up to the first unimplemented API.
+        #[arg(long)]
+        monitor: bool,
     },
 
     /// Video for Windows codec tools — drive a codec DLL
@@ -549,7 +563,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             input,
             max_instructions,
             json,
-        } => analyze(&input, max_instructions, json),
+            monitor,
+        } => {
+            if monitor {
+                monitor_install(&input, max_instructions, json)
+            } else {
+                analyze(&input, max_instructions, json)
+            }
+        }
         Command::Solana {
             program_id,
             rpc,
@@ -1190,6 +1211,240 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
         report.write_text(input);
     }
     Ok(())
+}
+
+/// Install-monitor mode (`ud analyze --monitor`): load the PE
+/// in fail-soft import-resolution mode, attach an empty
+/// virtual filesystem + virtual registry, drive the PE entry
+/// point, and report the trap stream + captured side effects.
+///
+/// Iterative discovery loop: each run names the first
+/// unimplemented Win32 API the binary reaches. Implement it,
+/// re-run, push the boundary further. The set of stubs needed
+/// for a real installer is large; this is the harness that
+/// makes the next-step obvious.
+#[allow(clippy::too_many_lines)]
+fn monitor_install(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result<()> {
+    let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    if !ud_format::pe::is_pe(&bytes) {
+        anyhow::bail!(
+            "ud analyze --monitor requires a PE32 binary; {} is not a PE",
+            input.display()
+        );
+    }
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("input");
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.trace_stubs = true;
+    sandbox.host.instruction_budget = Some(max_instructions);
+    // Attach empty side-effect captures. Win32 stubs that
+    // back onto the Context (CreateFile / Reg* / etc.)
+    // record their writes here so the report can summarise
+    // what the installer touched.
+    sandbox
+        .context_mut()
+        .vfs
+        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+    sandbox
+        .context_mut()
+        .registry
+        .get_or_insert_with(ud_emulator::context::VirtualRegistry::new);
+
+    let (image, unresolved) = sandbox
+        .load_fail_soft(stem, &bytes)
+        .with_context(|| format!("fail-soft load {}", input.display()))?;
+
+    let entry_result = sandbox.call_entry_point(&image);
+    let stub_calls = std::mem::take(&mut sandbox.host.stub_calls);
+    let instructions_executed = sandbox.host.instructions_executed;
+
+    let outcome = match &entry_result {
+        Ok(ret) => EntryOutcome::Returned { value: *ret },
+        Err(e) => EntryOutcome::Trapped {
+            message: e.to_string(),
+        },
+    };
+
+    let win32_calls: Vec<Win32Call> = stub_calls
+        .into_iter()
+        .map(|c| Win32Call {
+            dll: c.dll,
+            name: c.name,
+            args: c.args,
+            return_value: c.ret,
+            call_site_eip: c.call_site_eip,
+        })
+        .collect();
+
+    let mut by_func: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for c in &win32_calls {
+        *by_func.entry(format!("{}!{}", c.dll, c.name)).or_default() += 1;
+    }
+    let win32_calls_by_function: Vec<Win32CallCount> = by_func
+        .into_iter()
+        .map(|(function, count)| Win32CallCount { function, count })
+        .collect();
+
+    // Side-effect capture: virtual FS writes + virtual
+    // registry writes accumulated during the run.
+    let ctx = sandbox.context();
+    let vfs_writes: Vec<VfsEntry> = ctx
+        .vfs
+        .as_ref()
+        .map(|vfs| {
+            vfs.list()
+                .map(|(path, len)| VfsEntry {
+                    path: path.to_string(),
+                    bytes: len,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let registry_writes: Vec<RegistryEntry> = ctx
+        .registry
+        .as_ref()
+        .map(|reg| {
+            reg.all_values()
+                .map(|(key, name, value)| RegistryEntry {
+                    key: key.to_string(),
+                    name: name.to_string(),
+                    value: format!("{value:?}"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let unresolved_imports: Vec<UnresolvedImport> = unresolved
+        .into_iter()
+        .map(|(dll, name)| UnresolvedImport { dll, name })
+        .collect();
+
+    let report = MonitorReport {
+        input: input.display().to_string(),
+        image_base: image.image_base,
+        entry_point: image.entry_point,
+        outcome,
+        instructions_executed,
+        instruction_budget: max_instructions,
+        unresolved_imports,
+        win32_calls,
+        win32_calls_by_function,
+        vfs_writes,
+        registry_writes,
+    };
+
+    if as_json {
+        let s = serde_json::to_string_pretty(&report)?;
+        println!("{s}");
+    } else {
+        report.write_text();
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct MonitorReport {
+    input: String,
+    image_base: u32,
+    entry_point: u32,
+    outcome: EntryOutcome,
+    instructions_executed: u64,
+    instruction_budget: u64,
+    /// Imports the host doesn't have stubs for. Each entry
+    /// got a fallback trap-on-call thunk so loading
+    /// succeeded; if execution reached one of these it shows
+    /// up in `outcome` as a trap naming the function.
+    unresolved_imports: Vec<UnresolvedImport>,
+    win32_calls: Vec<Win32Call>,
+    win32_calls_by_function: Vec<Win32CallCount>,
+    /// Files the guest wrote through `CreateFileA` /
+    /// `WriteFile` etc. routed to the attached VFS.
+    vfs_writes: Vec<VfsEntry>,
+    /// Registry values the guest set through `RegSetValueEx`
+    /// etc. routed to the attached VirtualRegistry.
+    registry_writes: Vec<RegistryEntry>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "status")]
+enum EntryOutcome {
+    Returned { value: u32 },
+    Trapped { message: String },
+}
+
+#[derive(serde::Serialize)]
+struct UnresolvedImport {
+    dll: String,
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct VfsEntry {
+    path: String,
+    bytes: usize,
+}
+
+#[derive(serde::Serialize)]
+struct RegistryEntry {
+    key: String,
+    name: String,
+    value: String,
+}
+
+impl MonitorReport {
+    fn write_text(&self) {
+        println!("install-monitor report for {}", self.input);
+        println!("  image base: {:#010x}", self.image_base);
+        println!("  entry point: {:#010x}", self.entry_point);
+        println!(
+            "  instructions executed: {} (budget {})",
+            self.instructions_executed, self.instruction_budget
+        );
+        match &self.outcome {
+            EntryOutcome::Returned { value } => {
+                println!("  entry returned: {value:#010x}");
+            }
+            EntryOutcome::Trapped { message } => {
+                println!("  entry trapped: {message}");
+            }
+        }
+        println!(
+            "  unresolved-import fallbacks installed: {}",
+            self.unresolved_imports.len()
+        );
+        if !self.unresolved_imports.is_empty() {
+            let mut by_dll: std::collections::BTreeMap<&str, Vec<&str>> =
+                std::collections::BTreeMap::new();
+            for u in &self.unresolved_imports {
+                by_dll.entry(u.dll.as_str()).or_default().push(&u.name);
+            }
+            for (dll, mut names) in by_dll {
+                names.sort_unstable();
+                println!("    {} ({} unstubbed):", dll, names.len());
+                for n in names.iter().take(10) {
+                    println!("      {n}");
+                }
+                if names.len() > 10 {
+                    println!("      … and {} more", names.len() - 10);
+                }
+            }
+        }
+        println!("  Win32 calls: {}", self.win32_calls.len());
+        for c in self.win32_calls_by_function.iter().take(20) {
+            println!("    {} ×{}", c.function, c.count);
+        }
+        println!("  VFS writes: {}", self.vfs_writes.len());
+        for e in self.vfs_writes.iter().take(20) {
+            println!("    {} ({} bytes)", e.path, e.bytes);
+        }
+        println!("  Registry writes: {}", self.registry_writes.len());
+        for e in self.registry_writes.iter().take(20) {
+            println!("    {}\\{} = {}", e.key, e.name, e.value);
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
