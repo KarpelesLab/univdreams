@@ -969,8 +969,9 @@ impl Parser {
         // trips.
         let eq_idx = last_eq_idx.unwrap();
         let compound_op = detect_compound_op(&self.tokens, eq_idx);
-        let dst_end = compound_op
-            .map_or(last_eq_tok.start, |(prev_idx, _len)| self.tokens[prev_idx].start);
+        let dst_end = compound_op.map_or(last_eq_tok.start, |(prev_idx, _len)| {
+            self.tokens[prev_idx].start
+        });
         // Bytes are optional now — when the byte-drop pass clears
         // them at decompile time, the emitter skips the `[]` and
         // lower regenerates from the dst/src text via the arch
