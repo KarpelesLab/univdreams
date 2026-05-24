@@ -1,0 +1,52 @@
+name: release-plz
+
+on:
+  push:
+    branches: [master]
+
+# Don't run two release jobs concurrently — release-plz mutates
+# the repo (release PRs, tags) and crates.io.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Open / update a release PR that bumps the workspace version
+  # and refreshes CHANGELOG.md based on the conventional commits
+  # since the last tag. Merge the PR to trigger the publish job.
+  release-pr:
+    name: release-plz release PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Publish every workspace member to crates.io after the release
+  # PR is merged. The action skips this step until a release-PR
+  # merge produces a new tag.
+  release:
+    name: release-plz publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

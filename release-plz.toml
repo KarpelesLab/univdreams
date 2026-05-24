@@ -1,0 +1,58 @@
+# release-plz configuration.
+# https://release-plz.dev/docs/config
+
+[workspace]
+# Keep every workspace crate at the same version. A version bump
+# on one crate bumps them all — matches the project's "unified
+# workspace version" convention in `Cargo.toml::workspace.package`.
+dependencies_update = true
+
+# One CHANGELOG.md at the repo root, shared across all crates.
+# Matches the existing layout (see /CHANGELOG.md).
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+
+# Open a GitHub release with the rendered changelog when the
+# release PR is merged. Tag format mirrors the workspace version.
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+
+# Allow release-plz to open release PRs on every relevant push;
+# squash + merge to ship.
+release_always = false
+
+# Don't publish per-crate sub-tags (`crate-name-v0.1.5`). With a
+# unified workspace version, the single `v0.1.5` tag is the
+# canonical release marker.
+publish_no_verify = false
+
+[changelog]
+# Keep-a-changelog-flavored sections; conventional-commit prefixes
+# map to the standard groups.
+header = """# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+"""
+
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^add", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Changed" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^change", group = "Changed" },
+  { message = "^remove", group = "Removed" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^test", skip = true },
+  { message = "^chore", skip = true },
+  { message = "^style", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^fmt", skip = true },
+  { message = "^build", skip = true },
+]
