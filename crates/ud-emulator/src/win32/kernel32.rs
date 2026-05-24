@@ -2588,14 +2588,16 @@ fn stub_get_current_process(
     Ok(0xFFFF_FFFF)
 }
 
-/// `DWORD GetCurrentThreadId(void)`. Synthetic 1 (single thread).
+/// `DWORD GetCurrentThreadId(void)`. Returns the scheduler's
+/// active TID. The bootstrap thread is `1`; subsequent
+/// `CreateThread` calls mint monotonically increasing values.
 fn stub_get_current_thread_id(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
-    _state: &mut HostState,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(1)
+    Ok(state.active_tid)
 }
 
 /// `LPWCH GetEnvironmentStringsW(void)`. We hand back the same
@@ -3094,49 +3096,62 @@ fn stub_terminate_process(
     Ok(1)
 }
 
-/// `DWORD TlsAlloc(void)`. Return a synthetic TLS index. TLS in
-/// our single-threaded sandbox is just a key/value map keyed by
-/// index; we use small integers and store via the host state's
-/// debug-log channel for visibility.
+/// `DWORD TlsAlloc(void)`. Mints a fresh process-scoped TLS slot
+/// index. The slot's value is stored per-thread (see
+/// [`ThreadState::tls_slots`]); calling threads start with the
+/// slot reading back zero.
 fn stub_tls_alloc(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    // tick doubles as a monotonic counter for TLS index minting.
-    state.tick = state.tick.wrapping_add(1);
-    Ok(state.tick)
+    let proc_ = state.cur_process_mut();
+    let slot = proc_.next_tls_slot;
+    proc_.next_tls_slot = proc_.next_tls_slot.wrapping_add(1);
+    Ok(slot)
 }
 
-/// `BOOL TlsFree(DWORD)`. No-op success.
+/// `BOOL TlsFree(DWORD)`. Removes the slot from every thread's
+/// TLS map (releasing whatever value was stored). Returns TRUE
+/// even when the slot was never assigned in any thread.
 fn stub_tls_free(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let idx = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TlsFree", t))?;
+    for t in state.threads.values_mut() {
+        t.tls_slots.remove(&idx);
+    }
     Ok(1)
 }
 
-/// `LPVOID TlsGetValue(DWORD)`. Always returns NULL — codecs use
-/// this for per-thread caches we don't model.
+/// `LPVOID TlsGetValue(DWORD)`. Reads the current thread's TLS
+/// slot. Slots that were never assigned read back zero — matching
+/// the MSDN "indeterminate, but typically NULL" contract.
 fn stub_tls_get_value(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(0)
+    let idx = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TlsGetValue", t))?;
+    Ok(state.cur_thread().tls_slots.get(&idx).copied().unwrap_or(0))
 }
 
-/// `BOOL TlsSetValue(DWORD, LPVOID)`. No-op success.
+/// `BOOL TlsSetValue(DWORD, LPVOID)`. Writes the current thread's
+/// TLS slot.
 fn stub_tls_set_value(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let idx = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TlsSetValue", t))?;
+    let value = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("TlsSetValue", t))?;
+    state.cur_thread_mut().tls_slots.insert(idx, value);
     Ok(1)
 }
 
@@ -3348,15 +3363,16 @@ fn stub_get_profile_int_a(
 
 // ----- Corpus-driven additions --------------------------------------
 
-/// `DWORD GetCurrentProcessId(void)`. Synthetic 1 — codecs use
-/// the PID as a poor man's hash seed or as a TLS-store key.
+/// `DWORD GetCurrentProcessId(void)`. Returns the PID owning
+/// the active thread (`1` for the bootstrap process; Phase 5
+/// will mint child PIDs).
 fn stub_get_current_process_id(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
-    _state: &mut HostState,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(1)
+    Ok(state.cur_thread().pid)
 }
 
 /// `void GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)`.
@@ -5242,5 +5258,144 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cpu.regs.get32(Reg32::Eax), 0, "should return FALSE");
+    }
+
+    /// Phase 2 of the scheduler refactor: `TlsAlloc` returns
+    /// distinct process-scoped slot indices, and `TlsSetValue` /
+    /// `TlsGetValue` round-trip a value through the current
+    /// thread's `tls_slots` map.
+    #[test]
+    fn tls_alloc_set_get_value_round_trip() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        // First TlsAlloc mints slot 0.
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "TlsAlloc",
+            &[],
+        )
+        .unwrap();
+        let slot = cpu.regs.get32(Reg32::Eax);
+        // Second TlsAlloc mints slot 1 — the cursor is sticky.
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "TlsAlloc",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), slot + 1);
+
+        // Fresh slot reads back zero.
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "TlsGetValue",
+            &[slot],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0);
+
+        // Set + get the value back.
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "TlsSetValue",
+            &[slot, 0xDEAD_F00D],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 1);
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "TlsGetValue",
+            &[slot],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0xDEAD_F00D);
+    }
+
+    /// TLS slots are isolated per thread: a value set on the
+    /// active thread is invisible after the scheduler switches
+    /// `active_tid` to a different thread (single-process model).
+    #[test]
+    fn tls_value_is_isolated_per_thread() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        // Mint a slot + set a value on the bootstrap thread.
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "TlsAlloc",
+            &[],
+        )
+        .unwrap();
+        let slot = cpu.regs.get32(Reg32::Eax);
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "TlsSetValue",
+            &[slot, 0x1234],
+        )
+        .unwrap();
+
+        // Inject a second thread + switch the scheduler to it.
+        // (Phase 3 will add CreateThread for guests; here we
+        // just exercise the state directly to verify the
+        // isolation property.)
+        state
+            .threads
+            .insert(2, crate::win32::ThreadState::new(2, 1));
+        state.active_tid = 2;
+
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "TlsGetValue",
+            &[slot],
+        )
+        .unwrap();
+        assert_eq!(
+            cpu.regs.get32(Reg32::Eax),
+            0,
+            "the second thread must see a fresh (zero) slot"
+        );
+
+        // Switch back: bootstrap thread still has its value.
+        state.active_tid = 1;
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "TlsGetValue",
+            &[slot],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0x1234);
     }
 }

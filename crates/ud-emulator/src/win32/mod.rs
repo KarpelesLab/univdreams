@@ -276,6 +276,12 @@ pub struct ProcessState {
     /// rand  = (state >> 16) & 0x7FFF
     /// ```
     pub rand_state: u32,
+    /// Cursor for the next `TlsAlloc` slot. Slot indices are
+    /// process-scoped (each `TlsAlloc` mints a fresh integer)
+    /// but the *values* stored at those indices live in
+    /// per-thread [`ThreadState::tls_slots`]. Phase 2 of the
+    /// scheduler refactor.
+    pub next_tls_slot: u32,
 }
 
 impl ProcessState {
@@ -295,6 +301,72 @@ impl ProcessState {
     }
 }
 
+/// Per-thread emulator state. Phase 2 of the scheduler refactor:
+/// the live `Cpu` in [`crate::Sandbox`] continues to drive
+/// execution, but every thread-local Win32 surface (TLS slots,
+/// priority, parked CPU register file from past quanta) lives
+/// here. Phase 3 will swap the live `Cpu` value with
+/// `ThreadState::parked_cpu` on context switch.
+///
+/// The `parked_cpu` field is `None` for the currently-running
+/// thread (its register file lives on `Sandbox::cpu`) and
+/// `Some(cpu)` for any thread that has been suspended,
+/// preempted, or is waiting on a synchronization object.
+pub struct ThreadState {
+    /// Synthetic thread identifier. The first thread is `1`;
+    /// `CreateThread` mints monotonically increasing values.
+    pub tid: u32,
+    /// Owning process. For Phase 2 every thread maps to
+    /// process `1`.
+    pub pid: u32,
+    /// Windows thread priority axis. Default is
+    /// `THREAD_PRIORITY_NORMAL = 0`. Range `-15..15` for the
+    /// realtime / idle extremes.
+    pub priority: i32,
+    /// Map of TLS slot → value, set by `TlsSetValue` and read
+    /// by `TlsGetValue`. Slot indices come from
+    /// [`ProcessState::next_tls_slot`].
+    pub tls_slots: BTreeMap<u32, u32>,
+    /// Parked register file. Phase 3 will populate this when
+    /// the scheduler swaps out the live `Cpu`.
+    pub parked_cpu: Option<Cpu>,
+    /// Quantum remaining for the scheduler's current slice.
+    /// Phase 4 will tick this down; for now it's a placeholder
+    /// initialised to the default quantum.
+    pub quantum_remaining: u32,
+}
+
+impl Default for ThreadState {
+    fn default() -> Self {
+        ThreadState {
+            tid: 0,
+            pid: 0,
+            priority: 0,
+            tls_slots: BTreeMap::new(),
+            parked_cpu: None,
+            quantum_remaining: DEFAULT_QUANTUM,
+        }
+    }
+}
+
+impl ThreadState {
+    /// Construct a fresh thread bound to the given process.
+    #[must_use]
+    pub fn new(tid: u32, pid: u32) -> Self {
+        ThreadState {
+            tid,
+            pid,
+            ..ThreadState::default()
+        }
+    }
+}
+
+/// Default scheduler quantum, in guest instructions. Phase 4
+/// will start consulting this; until then the value is purely
+/// informational so `ThreadState::quantum_remaining` has a
+/// sensible initial value.
+pub const DEFAULT_QUANTUM: u32 = 10_000;
+
 /// The host-side state every stub may read or mutate.
 ///
 /// This is the "operating system" of the sandbox — the heap, the
@@ -309,15 +381,30 @@ impl ProcessState {
 /// / etc. continue to compile unchanged. The split prepares
 /// Phase 5 of the scheduler refactor (`CreateProcessA` spawning
 /// a real child PE) without churning every Win32 stub today.
-#[derive(Default)]
 pub struct HostState {
     /// Active process. Phase 5 will swap this for a process
     /// table + an `active_pid` cursor; until then there is
     /// always exactly one.
     pub process: ProcessState,
+    /// Thread table keyed by TID. Phase 2 of the scheduler
+    /// refactor: there is always at least one thread, with
+    /// `tid = 1`, owning the live `Cpu` on `Sandbox`. Phase 3
+    /// will populate more entries when `CreateThread` mints a
+    /// real thread, and the scheduler will move the live `Cpu`
+    /// in/out of `parked_cpu` here on context switch.
+    pub threads: BTreeMap<u32, ThreadState>,
+    /// TID of the currently-executing thread — points into
+    /// [`Self::threads`]. Phase 3 will mutate this on context
+    /// switch.
+    pub active_tid: u32,
+    /// Cursor for the next `CreateThread` to mint a TID. Stays
+    /// monotonic across the lifetime of the sandbox.
+    pub next_tid: u32,
     /// Last error code (`SetLastError` / `GetLastError`). Phase
-    /// 2 will move this to per-thread storage; it stays here
-    /// for now so the single-thread baseline is unchanged.
+    /// 6 will mirror this through the per-thread TIB at
+    /// FS:[0x34] so guest code reading it directly sees the
+    /// per-thread value. For now (single thread) the field on
+    /// HostState is the source of truth.
     pub last_error: u32,
     /// Lazily-allocated guest address of the C-CRT `errno` cell.
     /// `None` until the first call to `msvcrt::_errno`, then
@@ -370,6 +457,30 @@ pub struct HostState {
     pub stub_calls: Vec<StubCall>,
 }
 
+impl Default for HostState {
+    fn default() -> Self {
+        let mut threads = BTreeMap::new();
+        threads.insert(1, ThreadState::new(1, 1));
+        HostState {
+            process: ProcessState::default(),
+            threads,
+            active_tid: 1,
+            next_tid: 2,
+            last_error: 0,
+            errno_cell: None,
+            tick: 0,
+            debug_log: Vec::new(),
+            message_box_log: Vec::new(),
+            instruction_budget: None,
+            instructions_executed: 0,
+            context: crate::context::Context::default(),
+            trace_stubs: false,
+            stub_trace: Vec::new(),
+            stub_calls: Vec::new(),
+        }
+    }
+}
+
 impl std::ops::Deref for HostState {
     type Target = ProcessState;
     fn deref(&self) -> &ProcessState {
@@ -414,6 +525,24 @@ impl HostState {
     /// explicit (audits, future merge conflicts).
     pub fn cur_process_mut(&mut self) -> &mut ProcessState {
         &mut self.process
+    }
+
+    /// Borrow the currently-running thread. Falls back to the
+    /// bootstrap thread (`tid = 1`) on the freshly-constructed
+    /// state.
+    #[must_use]
+    pub fn cur_thread(&self) -> &ThreadState {
+        self.threads
+            .get(&self.active_tid)
+            .expect("active_tid must always point to a live thread (Default initialises tid 1)")
+    }
+
+    /// Mutable borrow of the currently-running thread. Pair to
+    /// [`Self::cur_thread`]; same invariant.
+    pub fn cur_thread_mut(&mut self) -> &mut ThreadState {
+        self.threads
+            .get_mut(&self.active_tid)
+            .expect("active_tid must always point to a live thread (Default initialises tid 1)")
     }
 
     /// Configure the const-arena (region for canned read-only
