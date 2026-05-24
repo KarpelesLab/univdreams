@@ -108,7 +108,28 @@ pub fn build_function(
     let mut tracker = RegTracker::new_at_entry(arity);
     let mut body = Vec::new();
     for block in &f.blocks {
-        for insn in &block.insns {
+        let mut idx = 0;
+        while idx < block.insns.len() {
+            let insn = &block.insns[idx];
+            // LDDW lift consumes the next slot too — peek
+            // ahead for an LddwSecondHalf companion so the
+            // emitted `Stmt::Move` covers all 16 bytes.
+            let mut consumed_extra = 0usize;
+            let lddw_pair_bytes: Option<Vec<u8>> = if matches!(insn.kind, InsnKind::Lddw) {
+                block
+                    .insns
+                    .get(idx + 1)
+                    .filter(|next| matches!(next.kind, InsnKind::LddwSecondHalf))
+                    .map(|next| {
+                        let mut b = Vec::with_capacity(16);
+                        b.extend_from_slice(&insn.bytes);
+                        b.extend_from_slice(&next.bytes);
+                        consumed_extra = 1;
+                        b
+                    })
+            } else {
+                None
+            };
             // Emit a `label_<addr>:` marker before every
             // instruction that's a known jump target.
             if intra_targets.contains(&insn.addr.0) {
@@ -175,10 +196,27 @@ pub fn build_function(
                 false
             };
             if !lifted_to_call {
-                if let Some(lifted) = lift_semantic_stmt(insn, &text) {
+                if let Some(lifted) = lift_semantic_stmt(insn, &text, lddw_pair_bytes.as_deref()) {
                     body.push(lifted);
                 } else {
                     body.push(Stmt::asm(text, insn.bytes.to_vec()));
+                    // If we peeked a LddwSecondHalf to make a
+                    // 16-byte Move but the lift declined, emit
+                    // the continuation as its own Asm so its
+                    // bytes survive.
+                    if let Some(cont) = block.insns.get(idx + 1) {
+                        if consumed_extra > 0 {
+                            let cont_text = render_text(
+                                cont,
+                                variant,
+                                name_at,
+                                call_site_names,
+                                &intra_targets,
+                                data,
+                            );
+                            body.push(Stmt::asm(cont_text, cont.bytes.to_vec()));
+                        }
+                    }
                 }
             }
             if let Some(annotation) = call_or_branch_annotation(insn, name_at, &intra_targets) {
@@ -220,8 +258,17 @@ pub fn build_function(
             }
             // Apply this instruction's effect on the tracker
             // *after* snapshotting (so the next insn sees the
-            // new state).
+            // new state). When LDDW consumed its
+            // continuation, apply the continuation's effect
+            // too (no-op for the tracker but keeps state
+            // consistent with the linear instruction stream).
             tracker.apply(insn, data);
+            if consumed_extra > 0 {
+                if let Some(cont) = block.insns.get(idx + 1) {
+                    tracker.apply(cont, data);
+                }
+            }
+            idx += 1 + consumed_extra;
         }
     }
     // Layer-5a: detect forward `jcc -> body -> label` patterns
@@ -265,26 +312,145 @@ pub fn build_function(
 /// the @asm fallback so anything the codec can't reproduce
 /// stays pinned-bytes (the round-trip-safe default).
 ///
-/// Today's coverage:
-/// * `0x95` exit → `Stmt::Return { value: 0, bytes }`
-/// * `0xb7` mov64 reg, imm32 → `Stmt::Move { dst, src, bytes }`
-/// * `0xbf` mov64 reg, reg → `Stmt::Move { dst, src, bytes }`
-fn lift_semantic_stmt(insn: &DecodedInsn, text: &str) -> Option<Stmt> {
-    match insn.opcode {
-        0x95 => Some(Stmt::Return {
+/// `lddw_pair_bytes` is `Some(16)` when the caller paired a
+/// `Lddw` insn with its `LddwSecondHalf` continuation so the
+/// emitted `Stmt::Move` covers both slots; otherwise `None`.
+fn lift_semantic_stmt(
+    insn: &DecodedInsn,
+    text: &str,
+    lddw_pair_bytes: Option<&[u8]>,
+) -> Option<Stmt> {
+    // exit → Stmt::Return
+    if insn.opcode == 0x95 {
+        return Some(Stmt::Return {
             value: 0,
             bytes: insn.bytes.to_vec(),
-        }),
-        0xb7 | 0xbf => {
-            let after = text.strip_prefix("mov64 ")?;
-            let (dst, src) = after.split_once(", ")?;
-            Some(Stmt::Move {
-                dst: dst.trim().to_string(),
-                src: src.trim().to_string(),
-                bytes: insn.bytes.to_vec(),
-            })
-        }
-        _ => None,
+        });
+    }
+
+    // mov64 reg, reg/imm → Stmt::Move
+    if matches!(insn.opcode, 0xb7 | 0xbf) {
+        let after = text.strip_prefix("mov64 ")?;
+        let (dst, src) = after.split_once(", ")?;
+        return Some(Stmt::Move {
+            dst: dst.trim().to_string(),
+            src: src.trim().to_string(),
+            bytes: insn.bytes.to_vec(),
+        });
+    }
+
+    // ldx / stx → Stmt::Move with sized memory operand.
+    // BPF Load class = 0x01, Store class = 0x03 (STX);
+    // size bits live in opcode bits 3..4 (0x18 / 0x00 / 0x08 / 0x10).
+    let class = insn.opcode & 0x07;
+    if matches!(insn.kind, InsnKind::Load) && class == 0x01 {
+        return lift_load(insn, text);
+    }
+    if matches!(insn.kind, InsnKind::Store) && class == 0x03 {
+        return lift_store(insn, text);
+    }
+
+    // lddw rN, imm64 → Stmt::Move covering both slots.
+    if matches!(insn.kind, InsnKind::Lddw) {
+        return lift_lddw(insn, text, lddw_pair_bytes);
+    }
+
+    None
+}
+
+/// Lift `ldx{b,h,w,dw} rN, [rM ± off]` into
+/// `Stmt::Move { dst: "rN", src: "[rM ± off]:uNN", bytes }`.
+fn lift_load(insn: &DecodedInsn, text: &str) -> Option<Stmt> {
+    // Strip the `ldx` prefix and the size letter to find the
+    // rendered operands.
+    let rest = text.strip_prefix("ldx")?;
+    // rest starts with size letter ("b", "h", "w", or "dw"),
+    // then space, then "rN, [...]".
+    let (size_letter, after) = split_size_letter(rest)?;
+    let (dst, mem) = after.trim_start().split_once(", ")?;
+    let mem = mem.trim();
+    // Append the `:uNN` suffix only when the size differs
+    // from the default `:u64` (dw). Keeps the canonical form
+    // suffix-free for the common case.
+    let src = if size_letter == "dw" {
+        mem.to_string()
+    } else {
+        format!("{mem}:u{}", bits_for_size_letter(size_letter))
+    };
+    Some(Stmt::Move {
+        dst: dst.trim().to_string(),
+        src,
+        bytes: insn.bytes.to_vec(),
+    })
+}
+
+/// Lift `stx{b,h,w,dw} [rM ± off], rN` into
+/// `Stmt::Move { dst: "[rM ± off]:uNN", src: "rN", bytes }`.
+fn lift_store(insn: &DecodedInsn, text: &str) -> Option<Stmt> {
+    let rest = text.strip_prefix("stx")?;
+    let (size_letter, after) = split_size_letter(rest)?;
+    let (mem, src) = after.trim_start().split_once(", ")?;
+    let mem = mem.trim();
+    let dst = if size_letter == "dw" {
+        mem.to_string()
+    } else {
+        format!("{mem}:u{}", bits_for_size_letter(size_letter))
+    };
+    Some(Stmt::Move {
+        dst,
+        src: src.trim().to_string(),
+        bytes: insn.bytes.to_vec(),
+    })
+}
+
+/// Lift `lddw rN, 0x<imm>` into a 16-byte `Stmt::Move`.
+/// Returns `None` for the string-resolved form
+/// (`lddw rN, "literal" @0xADDR`) — that surface keeps its
+/// audit-friendly `@asm` rendering until the codec learns
+/// to round-trip string literals.
+fn lift_lddw(_insn: &DecodedInsn, text: &str, pair_bytes: Option<&[u8]>) -> Option<Stmt> {
+    // Need the full 16-byte pair; reject orphan LDDWs (no
+    // continuation peeked).
+    let bytes = pair_bytes?.to_vec();
+    if bytes.len() != 16 {
+        return None;
+    }
+    let rest = text.strip_prefix("lddw ")?;
+    let (dst, rhs) = rest.split_once(", ")?;
+    let rhs = rhs.trim();
+    // Reject the string-resolved form for now.
+    if rhs.starts_with('"') || rhs.contains(" @0x") {
+        return None;
+    }
+    // `:u64` suffix tells `encode_move` to pick LDDW over
+    // `mov64 reg, imm32`.
+    let src = format!("{rhs}:u64");
+    Some(Stmt::Move {
+        dst: dst.trim().to_string(),
+        src,
+        bytes,
+    })
+}
+
+/// Split a leading size letter (`b` / `h` / `w` / `dw`) off
+/// the front of a string, returning the letter and the rest.
+fn split_size_letter(s: &str) -> Option<(&str, &str)> {
+    if let Some(after) = s.strip_prefix("dw") {
+        return Some(("dw", after));
+    }
+    let b = s.as_bytes();
+    if !b.is_empty() && matches!(b[0], b'b' | b'h' | b'w') {
+        return Some((&s[..1], &s[1..]));
+    }
+    None
+}
+
+fn bits_for_size_letter(letter: &str) -> u32 {
+    match letter {
+        "b" => 8,
+        "h" => 16,
+        "w" => 32,
+        _ => 64, // "dw" or unrecognised — default to 64 (BPF `dw`).
     }
 }
 
@@ -662,8 +828,20 @@ fn peek_insn_addr(body: &[Stmt], idx: usize) -> Option<u64> {
     let mut slots_seen = 0u64;
     for j in (0..idx).rev() {
         match &body[j] {
-            Stmt::Asm { .. } | Stmt::Return { .. } | Stmt::Move { .. } | Stmt::Call { .. } => {
-                slots_seen += 1;
+            Stmt::Asm { bytes, .. } | Stmt::Return { bytes, .. } | Stmt::Call { bytes, .. } => {
+                // 8 bytes = 1 slot; covers everything except
+                // LDDW (which only appears as Move below).
+                slots_seen += bytes.len().max(8) as u64 / 8;
+            }
+            Stmt::Move { bytes, .. } => {
+                // LDDW Move is 16 bytes (2 slots); regular
+                // Move is 8 bytes (1 slot). Use bytes.len()
+                // when present, else assume 1 slot.
+                if bytes.is_empty() {
+                    slots_seen += 1;
+                } else {
+                    slots_seen += (bytes.len() as u64) / 8;
+                }
             }
             Stmt::Label { addr } => return Some(addr + slots_seen * 8),
             _ => {}

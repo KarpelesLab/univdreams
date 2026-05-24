@@ -147,34 +147,68 @@ impl ArchCodec for BpfCodec {
         true
     }
 
-    /// Encode `dst = src` as one BPF instruction (8 bytes).
+    /// Encode `dst = src` as one BPF instruction.
     ///
-    /// Supported shapes today (lifter-emitted forms):
+    /// Supported shapes:
     ///
-    /// * `("rN", "rM")` → `mov64 rN, rM`
-    /// * `("rN", "0xN")` / `("rN", "<sNN>")` → `mov64 rN, imm32`
+    /// * `("rN", "rM")` → `mov64 rN, rM` (8 bytes)
+    /// * `("rN", "0xN")` → `mov64 rN, imm32` (8 bytes)
+    /// * `("rN", "[rM ± off]")` (optional `:uNN` suffix) →
+    ///   `ldxdw / ldxw / ldxh / ldxb rN, [rM ± off]` (8 bytes)
+    /// * `("[rN ± off]", "rM")` (optional `:uNN` suffix on dst) →
+    ///   `stxdw / stxw / stxh / stxb [rN ± off], rM` (8 bytes)
+    /// * `("rN", "0x<imm>:u64")` → `lddw rN, 0x<imm>` (16 bytes,
+    ///   two BPF slots — the second being a zero-opcode
+    ///   continuation slot carrying the high 32 bits)
     ///
-    /// Multi-slot moves (LDDW for u64 immediates) and memory
-    /// operands (ldx*/stx*) round-trip through pinned bytes for
-    /// now; expanding `encode_move` is a follow-up.
+    /// The `:u<bits>` size suffix on a memory operand picks the
+    /// access width (`:u8 / :u16 / :u32 / :u64`); the bare
+    /// `[rN ± off]` form defaults to `:u64` (BPF `dw`).
     fn encode_move(&self, dst: &str, src: &str) -> Result<Vec<u8>, ArchError> {
         let dst = dst.trim();
         let src = src.trim();
-        if !is_bpf_reg(dst) {
-            return Err(ArchError::Unsupported {
-                arch: self.name(),
-                operation: "move (non-register dst)",
-            });
+        // Strip optional `:u<bits>` suffix from each side;
+        // remember the size and which side carried it (the
+        // memory operand always carries the suffix when
+        // present).
+        let (dst_core, dst_size) = split_size_suffix(dst);
+        let (src_core, src_size) = split_size_suffix(src);
+
+        // LDDW: register dst, 64-bit immediate src.
+        if is_bpf_reg(dst_core) && (src_size == Some(64) || is_lddw_imm(src_core)) {
+            let imm_str = src_core.trim();
+            return assemble_bpf(&format!("lddw {dst_core}, {imm_str}"))
+                .map_err(|e| ArchError::Assemble(e.to_string()));
         }
-        if is_bpf_reg(src) || is_bpf_imm(src) {
-            assemble_bpf(&format!("mov64 {dst}, {src}"))
-                .map_err(|e| ArchError::Assemble(e.to_string()))
-        } else {
-            Err(ArchError::Unsupported {
-                arch: self.name(),
-                operation: "move (unsupported src shape)",
-            })
+
+        // ldx: register dst, [memory] src.
+        if is_bpf_reg(dst_core) && is_bracket_mem(src_core) {
+            let bits = src_size.unwrap_or(64);
+            let suffix = size_suffix_for_bits(bits)?;
+            let mem = desymbolize_mem(src_core);
+            return assemble_bpf(&format!("ldx{suffix} {dst_core}, {mem}"))
+                .map_err(|e| ArchError::Assemble(e.to_string()));
         }
+
+        // stx: [memory] dst, register src.
+        if is_bracket_mem(dst_core) && is_bpf_reg(src_core) {
+            let bits = dst_size.unwrap_or(64);
+            let suffix = size_suffix_for_bits(bits)?;
+            let mem = desymbolize_mem(dst_core);
+            return assemble_bpf(&format!("stx{suffix} {mem}, {src_core}"))
+                .map_err(|e| ArchError::Assemble(e.to_string()));
+        }
+
+        // mov64: register dst, register or imm32 src.
+        if is_bpf_reg(dst_core) && (is_bpf_reg(src_core) || is_bpf_imm(src_core)) {
+            return assemble_bpf(&format!("mov64 {dst_core}, {src_core}"))
+                .map_err(|e| ArchError::Assemble(e.to_string()));
+        }
+
+        Err(ArchError::Unsupported {
+            arch: self.name(),
+            operation: "move (unrecognised operand shape)",
+        })
     }
 
     /// Encode a function return. BPF returns r0 implicitly via
@@ -195,6 +229,71 @@ fn is_bpf_reg(s: &str) -> bool {
         n,
         "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10"
     )
+}
+
+/// Recognise a `[...]` memory operand (BPF ldx / stx form).
+/// The contents aren't validated here — the underlying
+/// assembler's `parse_mem` does that.
+fn is_bracket_mem(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with('[') && s.ends_with(']')
+}
+
+/// Rewrite a memory operand's symbolic stack-slot reference
+/// (`[local_<hex>]` or `[arg_<hex>]`) back to the
+/// `[r10 ± 0x<hex>]` form `parse_mem` accepts. The shared
+/// `desymbolize_bpf_text` does the same for `@asm` lines —
+/// this routes a single operand through that helper rather
+/// than reimplementing the rewrite.
+fn desymbolize_mem(operand: &str) -> String {
+    desymbolize_bpf_text(operand, 0, None).unwrap_or_else(|| operand.to_string())
+}
+
+/// Strip an optional trailing `:uNN` size suffix from a Move
+/// operand. Returns the operand without the suffix plus the
+/// parsed bit width (`Some(8/16/32/64)`) when one was found.
+fn split_size_suffix(s: &str) -> (&str, Option<u32>) {
+    let s = s.trim();
+    if let Some(idx) = s.rfind(":u") {
+        let suffix = &s[idx + 2..];
+        if let Ok(n) = suffix.parse::<u32>() {
+            if matches!(n, 8 | 16 | 32 | 64) {
+                return (s[..idx].trim_end(), Some(n));
+            }
+        }
+    }
+    (s, None)
+}
+
+/// Map a `:uNN` width to the BPF ldx/stx mnemonic suffix.
+fn size_suffix_for_bits(bits: u32) -> Result<&'static str, ArchError> {
+    match bits {
+        8 => Ok("b"),
+        16 => Ok("h"),
+        32 => Ok("w"),
+        64 => Ok("dw"),
+        _ => Err(ArchError::OutOfRange(format!(
+            "unsupported memory access width :u{bits}"
+        ))),
+    }
+}
+
+/// Detect a 64-bit-only immediate (i.e. one that requires LDDW
+/// rather than `mov64 reg, imm32`): explicit `0x` literal whose
+/// value exceeds u32::MAX, OR explicit `:u64` suffix on the src
+/// (handled by the caller). Returns `false` for small hex
+/// constants that fit `mov64 reg, imm`.
+fn is_lddw_imm(s: &str) -> bool {
+    let s = s.trim();
+    let s = s.strip_prefix('-').unwrap_or(s);
+    if let Some(hex) = s.strip_prefix("0x") {
+        if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+        u64::from_str_radix(hex, 16).is_ok_and(|v| v > u64::from(u32::MAX))
+    } else {
+        false
+    }
 }
 
 /// Recognise a BPF immediate constant in textual form.
