@@ -1710,17 +1710,28 @@ fn stub_get_file_type(
     Ok(0)
 }
 
-/// `DWORD GetLastError(void)` — returns `state.last_error`.
+/// `DWORD GetLastError(void)` — reads the per-thread
+/// LastError. Mirrored through `fs:[0x34]` on the active
+/// thread's TIB so guest code that reads the TIB directly
+/// observes the same value (Phase 6).
 fn stub_get_last_error(
     _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    mmu: &mut Mmu,
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let tib = state.cur_thread().tib_addr;
+    if tib != 0 {
+        if let Ok(v) = mmu.load32(tib + 0x34) {
+            return Ok(v);
+        }
+    }
     Ok(state.last_error)
 }
 
-/// `void SetLastError(DWORD dwErrCode)` — writes `state.last_error`.
+/// `void SetLastError(DWORD dwErrCode)` — writes the per-thread
+/// LastError. Mirrored through `fs:[0x34]` on the active
+/// thread's TIB.
 fn stub_set_last_error(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -1729,6 +1740,10 @@ fn stub_set_last_error(
 ) -> Result<u32, Win32Error> {
     let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetLastError", t))?;
     state.last_error = code;
+    let tib = state.cur_thread().tib_addr;
+    if tib != 0 {
+        let _ = mmu.store32(tib + 0x34, code);
+    }
     Ok(0)
 }
 
@@ -3610,10 +3625,28 @@ fn stub_create_thread(
     }
     let stack_top = arena_top;
     state.cur_process_mut().next_thread_stack_top = stack_top - crate::win32::THREAD_STACK_SIZE;
+    // Reserve a fresh TIB for the new thread. Phase 6 of the
+    // scheduler refactor: each thread gets its own FS-segment
+    // base so the CRT's `fs:[0x34]` LastError / `fs:[0]` SEH
+    // chain head don't collide across threads.
+    let tib_addr = if state.cur_process().tib_pool_bottom != 0 {
+        let addr = state.cur_process().next_tib_addr;
+        state.cur_process_mut().next_tib_addr = addr.wrapping_add(crate::win32::THREAD_TIB_SIZE);
+        // Seed the new TIB: FS:[0] = -1 (no SEH handler) and
+        // FS:[0x18] = self pointer (TIB ABI).
+        let _ = mmu.store32(addr, 0xFFFF_FFFF);
+        let _ = mmu.store32(addr + 0x18, addr);
+        addr
+    } else {
+        0
+    };
     // Build the new thread's CPU state.
     let mut new_cpu = Cpu::new();
     new_cpu.regs.set_esp(stack_top - 0x10); // small guard
     new_cpu.regs.eip = start;
+    if tib_addr != 0 {
+        new_cpu.set_fs_base(tib_addr);
+    }
     // stdcall: one DWORD argument (lpParameter). Push param +
     // RET_SENTINEL so a plain RET inside the start routine
     // returns to the sentinel, which the run loop catches as
@@ -3630,6 +3663,7 @@ fn stub_create_thread(
     let pid = state.cur_thread().pid;
     let mut t = crate::win32::ThreadState::new(tid, pid);
     t.parked_cpu = Some(new_cpu);
+    t.tib_addr = tib_addr;
     t.status = if (flags & CREATE_SUSPENDED) != 0 {
         ThreadStatus::Suspended
     } else {

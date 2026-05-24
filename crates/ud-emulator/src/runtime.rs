@@ -60,6 +60,14 @@ const TEB_SIZE: u32 = 0x0000_1000; // 4 KiB
 /// `EXCEPTION_REGISTRATION_RECORD*` initialiser at FS:[0].
 const SEH_END_OF_CHAIN: u32 = 0xFFFF_FFFF;
 
+/// Per-thread TIB pool. `CreateThread` carves a 4 KiB TIB out
+/// of this pool per spawned thread, walking down from the
+/// top. 256 KiB → 64 aux thread TIBs, well above any plausible
+/// codec / installer thread count.
+const TIB_POOL_BOTTOM: u32 = 0x7FFC_0000;
+const TIB_POOL_SIZE: u32 = 0x0001_E000; // ~120 KiB → 30 TIBs
+const TIB_POOL_TOP: u32 = TIB_POOL_BOTTOM + TIB_POOL_SIZE;
+
 /// One sandbox instance per loaded codec DLL.
 pub struct Sandbox {
     pub mmu: Mmu,
@@ -184,6 +192,10 @@ impl Sandbox {
             .expect("seed TEB FS:[0]");
         mmu.write_initializer(TEB_BASE + 0x18, &TEB_BASE.to_le_bytes())
             .expect("seed TEB FS:[0x18] (self pointer)");
+        // Per-thread TIB pool (R+W). `CreateThread` carves a
+        // fresh TIB out of this pool for each spawned thread,
+        // setting the new thread's FS base to its own TIB.
+        mmu.map(TIB_POOL_BOTTOM, TIB_POOL_SIZE, Perm::R | Perm::W);
         // FS:[0x30] would be the PEB pointer — we leave it 0
         // until a codec actually dereferences it.
 
@@ -201,7 +213,15 @@ impl Sandbox {
 
         let mut host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
             .with_const_arena(CONST_ARENA_START, CONST_ARENA_END)
-            .with_thread_stack_pool(THREAD_STACK_POOL_BOTTOM, THREAD_STACK_POOL_TOP);
+            .with_thread_stack_pool(THREAD_STACK_POOL_BOTTOM, THREAD_STACK_POOL_TOP)
+            .with_tib_pool(TIB_POOL_BOTTOM, TIB_POOL_TOP);
+        // Bootstrap thread's TIB lives at the runtime-owned
+        // TEB_BASE (already mapped + seeded above) — mirror
+        // its address into ThreadState so SetLastError /
+        // GetLastError can also write through `fs:[0x34]`.
+        if let Some(t) = host.threads.get_mut(&1) {
+            t.tib_addr = TEB_BASE;
+        }
 
         // Pre-register the system DLLs whose stub registries we
         // ship as "loaded modules". Real Windows always has these

@@ -308,7 +308,21 @@ pub struct ProcessState {
     /// Next available stack-top for the next `CreateThread`.
     /// Decrements by [`THREAD_STACK_SIZE`] per spawned thread.
     pub next_thread_stack_top: u32,
+    /// Bottom of the per-thread TIB (Thread Information Block)
+    /// pool. `CreateThread` carves a 4 KiB TIB region per
+    /// spawned thread. Phase 6 of the scheduler refactor.
+    pub tib_pool_bottom: u32,
+    /// Next available TIB base. Increments by
+    /// [`THREAD_TIB_SIZE`] per spawned thread.
+    pub next_tib_addr: u32,
 }
+
+/// Per-thread TIB size, in bytes. Real Windows uses a much
+/// larger TEB (~4 KiB minimum); we only need enough room for
+/// the handful of fields installer / codec CRTs actually
+/// touch (SEH chain head at 0x00, self pointer at 0x18,
+/// LastError at 0x34, …).
+pub const THREAD_TIB_SIZE: u32 = 0x0000_1000;
 
 /// Default per-thread stack size, in bytes. 64 KiB matches the
 /// typical Win32 reserve size; many codec / installer threads
@@ -370,6 +384,12 @@ pub struct ThreadState {
     pub status: crate::sched::ThreadStatus,
     /// Active wait, if `status == Waiting`. Cleared on wake.
     pub wait: Option<crate::sched::WaitCondition>,
+    /// Per-thread TIB (Thread Information Block) base — guest
+    /// VA the thread's CPU references via FS:[0]. `0` for the
+    /// bootstrap thread (which uses the runtime's shared
+    /// `TEB_BASE`); `CreateThread` carves a fresh page out of
+    /// the per-process TIB pool for each new thread.
+    pub tib_addr: u32,
 }
 
 impl Default for ThreadState {
@@ -383,6 +403,7 @@ impl Default for ThreadState {
             quantum_remaining: DEFAULT_QUANTUM,
             status: crate::sched::ThreadStatus::Ready,
             wait: None,
+            tib_addr: 0,
         }
     }
 }
@@ -646,6 +667,19 @@ impl HostState {
         let p = self.cur_process_mut();
         p.thread_stack_pool_bottom = bottom;
         p.next_thread_stack_top = top;
+        self
+    }
+
+    /// Configure the per-thread TIB pool. `CreateThread` carves
+    /// 4 KiB TIB regions out of `[bottom, top)` walking upward.
+    /// Both ends must already be mapped R+W in the MMU. The
+    /// bootstrap thread continues to use the runtime's shared
+    /// `TEB_BASE`; only spawned threads consume this pool.
+    pub fn with_tib_pool(mut self, bottom: u32, top: u32) -> Self {
+        let p = self.cur_process_mut();
+        p.tib_pool_bottom = bottom;
+        p.next_tib_addr = bottom;
+        let _ = top; // explicit upper bound is informational
         self
     }
 
