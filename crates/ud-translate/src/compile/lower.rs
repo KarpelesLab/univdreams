@@ -684,21 +684,21 @@ fn lower_stmts_into(
                 // Resolve cond_bytes (regenerate when empty).
                 let cb = if cond_bytes.is_empty() {
                     let then_tail_size = then_tail_jmp_len(then_tail_jmp, else_body);
-                    let skip = then_buf.len() as u64 + then_tail_size;
-                    let offset =
-                        i16::try_from(skip / 8).map_err(|_| LowerError::AsmAssembleFailed {
-                            fn_name: fn_name.to_string(),
-                            stmt_index: i,
-                            text: format!("ifblock({cond_text})"),
-                            message: format!("body too large for i16 offset ({skip} bytes)"),
-                        })?;
-                    ud_arch_bpf::assemble_bpf_ifblock_cond(cond_text, offset).map_err(|e| {
-                        LowerError::AsmAssembleFailed {
-                            fn_name: fn_name.to_string(),
-                            stmt_index: i,
-                            text: format!("ifblock({cond_text})"),
-                            message: e.to_string(),
-                        }
+                    let cond_target = ifblock_ip
+                        + cond_len as u64
+                        + then_buf.len() as u64
+                        + then_tail_size;
+                    arch.encode_cond_jump(
+                        cond_text,
+                        ifblock_ip,
+                        cond_target,
+                        EncodeHints::default(),
+                    )
+                    .map_err(|e| LowerError::AsmAssembleFailed {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                        text: format!("ifblock({cond_text})"),
+                        message: e.to_string(),
                     })?
                 } else {
                     cond_bytes.clone()
@@ -709,30 +709,26 @@ fn lower_stmts_into(
                     if else_body.is_empty() {
                         Vec::new()
                     } else {
-                        // Need to emit a `ja` over the else body.
-                        let offset = i16::try_from(else_buf.len() as u64 / 8).map_err(|_| {
-                            LowerError::AsmAssembleFailed {
-                                fn_name: fn_name.to_string(),
-                                stmt_index: i,
-                                text: format!("ifblock({cond_text}) tail"),
-                                message: "else body too large for i16 offset".into(),
-                            }
-                        })?;
-                        ud_arch_bpf::assemble_bpf_ja(offset).map_err(|e| {
-                            LowerError::AsmAssembleFailed {
+                        // Emit a `ja` over the else body.
+                        let ttj_ip = base_addr
+                            .map_or(0, |a| a.saturating_add(out.len() as u64));
+                        let jmp_size =
+                            arch.encoded_jump_size(ttj_ip, ttj_ip, EncodeHints::default())
+                                as u64;
+                        let jmp_target = ttj_ip + jmp_size + else_buf.len() as u64;
+                        arch.encode_jump(ttj_ip, jmp_target, EncodeHints::default())
+                            .map_err(|e| LowerError::AsmAssembleFailed {
                                 fn_name: fn_name.to_string(),
                                 stmt_index: i,
                                 text: format!("ifblock({cond_text}) tail"),
                                 message: e.to_string(),
-                            }
-                        })?
+                            })?
                     }
                 } else {
                     then_tail_jmp.clone()
                 };
                 out.extend_from_slice(&ttj);
                 out.extend_from_slice(&else_buf);
-                let _ = ifblock_ip;
             }
             Stmt::WhileBlock {
                 cond_text,
@@ -756,21 +752,20 @@ fn lower_stmts_into(
                 let mut body_buf = Vec::new();
                 lower_stmts_into(fn_name, body_base, body, &mut body_buf, arch)?;
                 let eb = if entry_bytes.is_empty() {
-                    let skip = body_buf.len() as u64 + tail_bytes_len(tail_bytes);
-                    let offset =
-                        i16::try_from(skip / 8).map_err(|_| LowerError::AsmAssembleFailed {
-                            fn_name: fn_name.to_string(),
-                            stmt_index: i,
-                            text: format!("whileblock({cond_text})"),
-                            message: format!("body too large for i16 offset ({skip} bytes)"),
-                        })?;
-                    ud_arch_bpf::assemble_bpf_ifblock_cond(cond_text, offset).map_err(|e| {
-                        LowerError::AsmAssembleFailed {
-                            fn_name: fn_name.to_string(),
-                            stmt_index: i,
-                            text: format!("whileblock({cond_text})"),
-                            message: e.to_string(),
-                        }
+                    let tail_size = tail_bytes_len(tail_bytes);
+                    let cond_target =
+                        entry_ip + entry_len as u64 + body_buf.len() as u64 + tail_size;
+                    arch.encode_cond_jump(
+                        cond_text,
+                        entry_ip,
+                        cond_target,
+                        EncodeHints::default(),
+                    )
+                    .map_err(|e| LowerError::AsmAssembleFailed {
+                        fn_name: fn_name.to_string(),
+                        stmt_index: i,
+                        text: format!("whileblock({cond_text})"),
+                        message: e.to_string(),
                     })?
                 } else {
                     entry_bytes.clone()
@@ -778,19 +773,9 @@ fn lower_stmts_into(
                 out.extend_from_slice(&eb);
                 out.extend_from_slice(&body_buf);
                 let tb = if tail_bytes.is_empty() {
-                    // ja back to entry_ip. Compute now that
-                    // we know the ja's own position.
+                    // `ja` back to entry_ip from the current cursor.
                     let ja_ip = base_addr.map_or(0, |a| a.saturating_add(out.len() as u64));
-                    #[allow(clippy::cast_possible_wrap)]
-                    let delta = (entry_ip as i64).wrapping_sub((ja_ip as i64).wrapping_add(8));
-                    let offset_slots =
-                        i16::try_from(delta / 8).map_err(|_| LowerError::AsmAssembleFailed {
-                            fn_name: fn_name.to_string(),
-                            stmt_index: i,
-                            text: format!("whileblock({cond_text}) tail"),
-                            message: "back-edge too far for i16 offset".into(),
-                        })?;
-                    ud_arch_bpf::assemble_bpf_ja(offset_slots).map_err(|e| {
+                    arch.encode_jump(ja_ip, entry_ip, EncodeHints::default()).map_err(|e| {
                         LowerError::AsmAssembleFailed {
                             fn_name: fn_name.to_string(),
                             stmt_index: i,
