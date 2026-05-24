@@ -16,6 +16,6 @@ workspace = true
 
 [dependencies]
 ud-core = { version = "0.1.1", path = "../ud-core" }
-ud-ir = { version = "0.1.1", path = "../ud-ir" }
-ud-arch-codec = { version = "0.1.1", path = "../ud-arch-codec" }
+ud-ir = { version = "0.1.5", path = "../ud-ir" }
+ud-arch-codec = { version = "0.1.5", path = "../ud-arch-codec" }
 thiserror = "2"

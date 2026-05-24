@@ -18,7 +18,7 @@ workspace = true
 thiserror = "2"
 
 [dev-dependencies]
-ud-arch-x86 = { version = "0.1.1", path = "../ud-arch-x86" }
-ud-arch-bpf = { version = "0.1.1", path = "../ud-arch-bpf" }
-ud-arch-aarch64 = { version = "0.1.1", path = "../ud-arch-aarch64" }
-ud-arch-6502 = { version = "0.1.1", path = "../ud-arch-6502" }
+ud-arch-x86 = { version = "0.1.5", path = "../ud-arch-x86" }
+ud-arch-bpf = { version = "0.1.5", path = "../ud-arch-bpf" }
+ud-arch-aarch64 = { version = "0.1.5", path = "../ud-arch-aarch64" }
+ud-arch-6502 = { version = "0.1.5", path = "../ud-arch-6502" }
