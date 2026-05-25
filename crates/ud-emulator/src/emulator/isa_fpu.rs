@@ -284,6 +284,15 @@ fn dispatch_reg_form(
                     cpu.fpu.push(0.0);
                     Ok(StepOk::Continued)
                 }
+                (6, 0) => {
+                    // F2XM1 (D9 F0) — ST(0) := 2^ST(0) - 1, for
+                    // ST(0) in [-1, +1]. Used by QuickTime music
+                    // synthesis (envelope curves) and other code
+                    // that builds exp tables.
+                    let v = cpu.fpu.st(0);
+                    cpu.fpu.set_st(0, v.exp2() - 1.0);
+                    Ok(StepOk::Continued)
+                }
                 (6, 1) => {
                     // FYL2X (D9 F1) — ST(1) := ST(1) * log2(ST(0)),
                     // then pop. After pop the new ST(0) holds the

@@ -212,6 +212,66 @@ pub fn resolve_strict(
     Ok(())
 }
 
+/// Walk the import directory of `bytes` and return the unique
+/// set of DLL names referenced (preserving discovery order).
+/// Operates on the raw file bytes — no MMU needed. Used by
+/// the VFS-DLL-fallback resolver in [`crate::Sandbox::load_with_deps`]
+/// to identify which dependent DLLs to pre-load from the VFS
+/// before the primary PE is mapped.
+pub fn list_imported_dlls(parsed: &Parsed, bytes: &[u8]) -> Result<Vec<String>, PeError> {
+    let dir = parsed.optional.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if dir.virtual_address == 0 || dir.size == 0 {
+        return Ok(Vec::new());
+    }
+    let rva_to_off = |rva: u32| -> Option<u32> {
+        for s in &parsed.sections {
+            let start = s.virtual_address;
+            let span = s.virtual_size.max(s.size_of_raw_data);
+            let end = start.checked_add(span)?;
+            if rva >= start && rva < end {
+                let delta = rva - start;
+                if delta < s.size_of_raw_data {
+                    return Some(s.pointer_to_raw_data + delta);
+                }
+                return None;
+            }
+        }
+        None
+    };
+    let mut off = rva_to_off(dir.virtual_address).ok_or(PeError::DirectoryOutOfRange {
+        name: "IMPORT",
+        rva: dir.virtual_address,
+        size: dir.size,
+    })? as usize;
+    let mut out = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    loop {
+        if off + 20 > bytes.len() {
+            break;
+        }
+        let orig = super::header::read_u32(bytes, off)?;
+        let name_rva = super::header::read_u32(bytes, off + 12)?;
+        let first = super::header::read_u32(bytes, off + 16)?;
+        if orig == 0 && first == 0 && name_rva == 0 {
+            break;
+        }
+        if let Some(name_off) = rva_to_off(name_rva) {
+            let no = name_off as usize;
+            let mut end = no;
+            while end < bytes.len() && bytes[end] != 0 {
+                end += 1;
+            }
+            let name = String::from_utf8_lossy(&bytes[no..end]).into_owned();
+            let lc = name.to_ascii_lowercase();
+            if seen.insert(lc) {
+                out.push(name);
+            }
+        }
+        off += 20;
+    }
+    Ok(out)
+}
+
 fn read_cstr(mmu: &Mmu, mut addr: u32) -> Result<String, PeError> {
     let mut bytes = Vec::new();
     for _ in 0..1024 {

@@ -4601,6 +4601,23 @@ mod tests {
         );
     }
 
+    /// `D9 F0` = F2XM1 → ST(0) := 2^ST(0) − 1. QuickTime's
+    /// music synth (`quicktimemusic.qtx`) uses this in its
+    /// envelope-curve table builder; without the branch, the
+    /// codec's DllMain trapped on the first instruction past
+    /// CRT init.
+    #[test]
+    fn fpu_f2xm1_computes_two_pow_x_minus_one() {
+        let (mut cpu, mut mmu) = make();
+        // D9 E8  fld1               (push 1.0)
+        // D9 F0  f2xm1              (st0 = 2^1 - 1 = 1.0)
+        // C3
+        write_code(&mut mmu, 0x1000, &[0xD9, 0xE8, 0xD9, 0xF0, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        let v = cpu.fpu.st(0);
+        assert!((v - 1.0).abs() < 1e-9, "2^1 - 1 = 1, got {v}");
+    }
+
     /// Round-10: REP MOVSW under 0x66. Each step copies a word
     /// (2 bytes), advancing ESI/EDI by 2.
     #[test]

@@ -951,13 +951,54 @@ pub fn register(registry: &mut Registry) {
         stub_load_library_ex_a as StubFn,
         3,
     );
-    // SetEnvironmentVariableA — no-op success.
+    // SetEnvironmentVariableA / W — no-op success.
     registry.register(
         "kernel32.dll",
         "SetEnvironmentVariableA",
         stub_returns_true as StubFn,
         2,
     );
+    registry.register(
+        "kernel32.dll",
+        "SetEnvironmentVariableW",
+        stub_returns_true as StubFn,
+        2,
+    );
+    // CreateMutexW — UTF-16 twin of CreateMutexA.
+    registry.register(
+        "kernel32.dll",
+        "CreateMutexW",
+        stub_create_mutex_w as StubFn,
+        3,
+    );
+    // Find-file enumeration surface — codec plugins use it to
+    // discover sibling .qtx / .qts modules in their install
+    // directory at DllMain.
+    registry.register(
+        "kernel32.dll",
+        "FindFirstFileA",
+        stub_find_first_file_a as StubFn,
+        2,
+    );
+    registry.register(
+        "kernel32.dll",
+        "FindFirstFileW",
+        stub_find_first_file_w as StubFn,
+        2,
+    );
+    registry.register(
+        "kernel32.dll",
+        "FindNextFileA",
+        stub_find_next_file_a as StubFn,
+        2,
+    );
+    registry.register(
+        "kernel32.dll",
+        "FindNextFileW",
+        stub_find_next_file_w as StubFn,
+        2,
+    );
+    registry.register("kernel32.dll", "FindClose", stub_find_close as StubFn, 1);
     // Console surface — codecs that link a console-subsystem
     // config tool. All no-op success.
     registry.register(
@@ -5356,6 +5397,10 @@ fn stub_create_directory_a(
 
 /// `BOOL DeleteFileA(LPCSTR lpFileName)`. Removes from the VFS
 /// when present; reports success even without a VFS attached.
+/// In analyst mode (`HostState.preserve_deletes`) the call is
+/// logged + reported successful but the file stays in the
+/// VFS — installer-class binaries that delete their temp dir
+/// after `msiexec` returns don't drop the extracted bundle.
 fn stub_delete_file_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -5368,6 +5413,12 @@ fn stub_delete_file_a(
         return Ok(0);
     }
     let name = read_cstr(mmu, p_name, 260)?;
+    if state.preserve_deletes {
+        state.debug_log.push(format!(
+            "DeleteFileA({name:?}) — preserved (--preserve-deletes)"
+        ));
+        return Ok(1);
+    }
     if let Some(vfs) = state.context.vfs.as_mut() {
         vfs.remove(&name);
     }
@@ -5482,7 +5533,8 @@ fn stub_dos_date_time_to_file_time(
 /// `HANDLE CreateMutexA(LPSECURITY_ATTRIBUTES, BOOL bInitialOwner,
 /// LPCSTR lpName)`. Mints a Mutex WaitObject. If
 /// `bInitialOwner` is TRUE the calling thread becomes the
-/// owner immediately.
+/// owner immediately. Named mutexes deduplicate through the
+/// scheduler's named-object registry.
 fn stub_create_mutex_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -5491,16 +5543,57 @@ fn stub_create_mutex_a(
 ) -> Result<u32, Win32Error> {
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateMutexA", t))?;
     let init_owner = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateMutexA", t))?;
-    let _name = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateMutexA", t))?;
-    let owner = if init_owner != 0 {
+    let p_name = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateMutexA", t))?;
+    let name = if p_name != 0 {
+        read_cstr(mmu, p_name, 260).ok()
+    } else {
+        None
+    };
+    create_mutex(state, &name, init_owner != 0)
+}
+
+/// UTF-16 twin of [`stub_create_mutex_a`].
+fn stub_create_mutex_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateMutexW", t))?;
+    let init_owner = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateMutexW", t))?;
+    let p_name = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateMutexW", t))?;
+    let name = if p_name != 0 {
+        Some(super::read_wide_cstr_local(mmu, p_name, 260))
+    } else {
+        None
+    };
+    create_mutex(state, &name, init_owner != 0)
+}
+
+fn create_mutex(
+    state: &mut HostState,
+    name: &Option<String>,
+    init_owner: bool,
+) -> Result<u32, Win32Error> {
+    if let Some(n) = name {
+        if let Some(h) = state.scheduler.lookup_named(n) {
+            state.last_error = 183; // ERROR_ALREADY_EXISTS
+            return Ok(h);
+        }
+    }
+    let owner = if init_owner {
         Some(state.active_tid)
     } else {
         None
     };
-    let recursion = if init_owner != 0 { 1 } else { 0 };
-    Ok(state
+    let recursion = if init_owner { 1 } else { 0 };
+    let h = state
         .scheduler
-        .insert_object(crate::sched::WaitObject::Mutex { owner, recursion }))
+        .insert_object(crate::sched::WaitObject::Mutex { owner, recursion });
+    if let Some(n) = name {
+        state.scheduler.register_named(n, h);
+    }
+    Ok(h)
 }
 
 /// `BOOL ReleaseMutex(HANDLE)`. Decrements the recursion count;
@@ -5894,7 +5987,10 @@ fn stub_local_file_time_to_file_time(
 }
 
 /// `BOOL RemoveDirectoryA(LPCSTR lpPathName)`. Drops the
-/// directory marker from the VFS; success either way.
+/// directory marker from the VFS; success either way. With
+/// `HostState.preserve_deletes` set the call is a logged
+/// no-op so post-install rollback doesn't reach into the
+/// captured install bundle.
 fn stub_remove_directory_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -5907,6 +6003,12 @@ fn stub_remove_directory_a(
         return Ok(0);
     }
     let name = read_cstr(mmu, p_name, 260)?;
+    if state.preserve_deletes {
+        state.debug_log.push(format!(
+            "RemoveDirectoryA({name:?}) — preserved (--preserve-deletes)"
+        ));
+        return Ok(1);
+    }
     let marker = format!("{}\\.dir", name.trim_end_matches(['\\', '/']));
     if let Some(vfs) = state.context.vfs.as_mut() {
         vfs.remove(&marker);
@@ -6199,6 +6301,295 @@ fn stub_open_process(
     Ok(state
         .scheduler
         .insert_object(crate::sched::WaitObject::Process { pid }))
+}
+
+// ============================================================
+// Find-file enumeration (FindFirstFile / FindNextFile / FindClose)
+// ============================================================
+
+/// Size of the `WIN32_FIND_DATAA` struct in bytes (per
+/// `MinHook.h` / MSDN's "WIN32_FIND_DATA structure").
+const WIN32_FIND_DATA_A_SIZE: u32 = 320;
+/// Size of the `WIN32_FIND_DATAW` struct in bytes — same
+/// layout but with WCHARs in the name fields, doubling
+/// the cFileName + cAlternateFileName widths.
+const WIN32_FIND_DATA_W_SIZE: u32 = 320 + 260 + 14;
+
+/// Glob a VFS path list against a Win32 wildcard pattern.
+/// Supports `*` (any string) and `?` (any one char). The
+/// pattern is treated as a basename within the directory
+/// portion of the path; the directory portion matches
+/// case-insensitively against the literal text.
+fn vfs_glob(state: &crate::win32::HostState, pattern: &str) -> Vec<String> {
+    let Some(vfs) = state.context.vfs.as_ref() else {
+        return Vec::new();
+    };
+    // Split pattern into (dir, base). Backslashes and forward
+    // slashes are both honoured as separators (the underlying
+    // VFS normalises to `/` internally).
+    let normalised = pattern.replace('\\', "/").to_ascii_lowercase();
+    let (dir, base) = match normalised.rsplit_once('/') {
+        Some((d, b)) => (d.to_string(), b.to_string()),
+        None => (String::new(), normalised.clone()),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (vpath, _) in vfs.list() {
+        let lower = vpath.to_ascii_lowercase();
+        let (v_dir, v_base) = match lower.rsplit_once('/') {
+            Some((d, b)) => (d.to_string(), b.to_string()),
+            None => (String::new(), lower.clone()),
+        };
+        if !dir.is_empty() && v_dir != dir {
+            continue;
+        }
+        // Skip the `.dir` markers we use to record empty
+        // directories — they're an implementation detail of
+        // CreateDirectoryA, not real files.
+        if v_base == ".dir" {
+            continue;
+        }
+        if glob_match(&base, &v_base) {
+            out.push(vpath.to_string());
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Tiny `*` / `?` wildcard matcher. The pattern is
+/// lowercased; the candidate name is too. Empty pattern only
+/// matches an empty name. `*.*` matches any name (Windows
+/// quirk).
+fn glob_match(pattern: &str, name: &str) -> bool {
+    if pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+    let p = pattern.as_bytes();
+    let n = name.as_bytes();
+    fn matches(p: &[u8], n: &[u8]) -> bool {
+        if p.is_empty() {
+            return n.is_empty();
+        }
+        if p[0] == b'*' {
+            for skip in 0..=n.len() {
+                if matches(&p[1..], &n[skip..]) {
+                    return true;
+                }
+            }
+            false
+        } else if !n.is_empty() && (p[0] == b'?' || p[0] == n[0]) {
+            matches(&p[1..], &n[1..])
+        } else {
+            false
+        }
+    }
+    matches(p, n)
+}
+
+/// Stuff a [`crate::win32::FindHandle`] into the per-process
+/// find table and return its handle. Returns
+/// `INVALID_HANDLE_VALUE` when no matches were captured.
+fn open_find_enum(state: &mut HostState, matches: Vec<String>) -> u32 {
+    if matches.is_empty() {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return INVALID_HANDLE_VALUE;
+    }
+    let idx = state.cur_process().next_find_handle;
+    state.cur_process_mut().next_find_handle = idx.wrapping_add(1);
+    let handle = crate::win32::FIND_HANDLE_BASE.wrapping_add(idx);
+    let fh = crate::win32::FindHandle { matches, cursor: 0 };
+    state.cur_process_mut().find_handles.insert(handle, fh);
+    handle
+}
+
+/// Write one `WIN32_FIND_DATAA` record at `addr`. `is_wide`
+/// switches the cFileName encoding; the other fields are
+/// identical between A and W.
+fn write_find_data(
+    mmu: &mut Mmu,
+    addr: u32,
+    vpath: &str,
+    size: u64,
+    is_wide: bool,
+) -> Result<(), Win32Error> {
+    // Zero the struct first (320 bytes for A, 580 for W).
+    let total = if is_wide {
+        WIN32_FIND_DATA_W_SIZE
+    } else {
+        WIN32_FIND_DATA_A_SIZE
+    };
+    for i in 0..total {
+        mmu.store8(addr.wrapping_add(i), 0)
+            .map_err(|t| trap_to_win32("FindFirstFile", t))?;
+    }
+    // FILE_ATTRIBUTE_NORMAL = 0x80
+    mmu.store32(addr, 0x80)
+        .map_err(|t| trap_to_win32("FindFirstFile", t))?;
+    // nFileSizeHigh @ +28, nFileSizeLow @ +32
+    mmu.store32(addr + 28, (size >> 32) as u32)
+        .map_err(|t| trap_to_win32("FindFirstFile", t))?;
+    mmu.store32(addr + 32, size as u32)
+        .map_err(|t| trap_to_win32("FindFirstFile", t))?;
+    // cFileName @ +44, MAX_PATH = 260 chars
+    let basename = vpath.rsplit(['\\', '/']).next().unwrap_or(vpath);
+    if is_wide {
+        let units: Vec<u16> = basename.encode_utf16().collect();
+        for (i, u) in units.iter().take(259).enumerate() {
+            mmu.store16(addr + 44 + (i as u32) * 2, *u)
+                .map_err(|t| trap_to_win32("FindFirstFile", t))?;
+        }
+    } else {
+        let bytes = basename.as_bytes();
+        for (i, b) in bytes.iter().take(259).enumerate() {
+            mmu.store8(addr + 44 + i as u32, *b)
+                .map_err(|t| trap_to_win32("FindFirstFile", t))?;
+        }
+    }
+    Ok(())
+}
+
+/// `HANDLE FindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData)`.
+/// Globs the VFS against the pattern, stamps the first match
+/// into `lpFindFileData`, and returns a find handle a sibling
+/// `FindNextFileA` can walk through the rest.
+fn stub_find_first_file_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("FindFirstFileA", t))?;
+    let p_data = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("FindFirstFileA", t))?;
+    if p_name == 0 {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(INVALID_HANDLE_VALUE);
+    }
+    let pattern = read_cstr(mmu, p_name, 260)?;
+    let matches = vfs_glob(state, &pattern);
+    if matches.is_empty() {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(INVALID_HANDLE_VALUE);
+    }
+    let first = matches[0].clone();
+    let size = state
+        .context
+        .vfs
+        .as_ref()
+        .and_then(|v| v.read(&first))
+        .map(|b| b.len() as u64)
+        .unwrap_or(0);
+    if p_data != 0 {
+        write_find_data(mmu, p_data, &first, size, false)?;
+    }
+    let mut matches = matches;
+    matches.drain(..1);
+    Ok(open_find_enum(state, matches))
+}
+
+/// UTF-16 twin of [`stub_find_first_file_a`].
+fn stub_find_first_file_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("FindFirstFileW", t))?;
+    let p_data = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("FindFirstFileW", t))?;
+    if p_name == 0 {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(INVALID_HANDLE_VALUE);
+    }
+    let pattern = super::read_wide_cstr_local(mmu, p_name, 260);
+    let matches = vfs_glob(state, &pattern);
+    if matches.is_empty() {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(INVALID_HANDLE_VALUE);
+    }
+    let first = matches[0].clone();
+    let size = state
+        .context
+        .vfs
+        .as_ref()
+        .and_then(|v| v.read(&first))
+        .map(|b| b.len() as u64)
+        .unwrap_or(0);
+    if p_data != 0 {
+        write_find_data(mmu, p_data, &first, size, true)?;
+    }
+    let mut matches = matches;
+    matches.drain(..1);
+    Ok(open_find_enum(state, matches))
+}
+
+/// `BOOL FindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData)`.
+/// Advances the enumeration; returns FALSE +
+/// `ERROR_NO_MORE_FILES = 18` when exhausted.
+fn stub_find_next_file_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    find_next_file(cpu, mmu, state, false)
+}
+
+/// UTF-16 twin of [`stub_find_next_file_a`].
+fn stub_find_next_file_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    find_next_file(cpu, mmu, state, true)
+}
+
+fn find_next_file(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    is_wide: bool,
+) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("FindNextFile", t))?;
+    let p_data = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("FindNextFile", t))?;
+    let next = state
+        .cur_process_mut()
+        .find_handles
+        .get_mut(&h)
+        .and_then(|fh| {
+            let n = fh.matches.get(fh.cursor).cloned()?;
+            fh.cursor += 1;
+            Some(n)
+        });
+    let Some(next) = next else {
+        state.last_error = 18; // ERROR_NO_MORE_FILES
+        return Ok(0);
+    };
+    let size = state
+        .context
+        .vfs
+        .as_ref()
+        .and_then(|v| v.read(&next))
+        .map(|b| b.len() as u64)
+        .unwrap_or(0);
+    if p_data != 0 {
+        write_find_data(mmu, p_data, &next, size, is_wide)?;
+    }
+    Ok(1)
+}
+
+/// `BOOL FindClose(HANDLE hFindFile)`. Drops the enumerator
+/// from the per-process table; returns TRUE either way (we
+/// don't error on close of an unknown handle, matching
+/// real-Windows leniency).
+fn stub_find_close(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("FindClose", t))?;
+    state.cur_process_mut().find_handles.remove(&h);
+    Ok(1)
 }
 
 #[cfg(test)]

@@ -404,6 +404,151 @@ impl Sandbox {
         Ok(img)
     }
 
+    /// VFS-DLL fallback load: walk the primary PE's import
+    /// directory, look up every dependent DLL the host stub
+    /// registry doesn't know about in the sandbox VFS, and
+    /// (recursively) load each one at a fresh image base
+    /// before loading the primary. The dependent DLL's exports
+    /// are registered in the [`Registry`] so subsequent IAT
+    /// resolution against the primary picks them up. Each
+    /// dependent's `DllMain(PROCESS_ATTACH)` is invoked after
+    /// it loads (best-effort: any trap is recorded in
+    /// `host.debug_log` and the load continues).
+    ///
+    /// Returns the primary [`Image`] plus the list of
+    /// `(dll, name)` import pairs that *still* resolved to a
+    /// fail-soft trap thunk after all VFS deps were loaded.
+    /// These name the missing host-side APIs (e.g. CoreVideo
+    /// internals we haven't shimmed) that the next iteration
+    /// of stub work would target.
+    ///
+    /// Cycle-safe: a `currently_loading` set prevents A→B→A
+    /// from looping. Search order for a dependent DLL is the
+    /// list returned by [`crate::win32::dll_vfs_search_paths`].
+    pub fn load_with_deps(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(Image, Vec<(String, String)>), crate::Error> {
+        let mut loading: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        loading.insert(name.to_ascii_lowercase());
+        self.preload_deps(bytes, &mut loading)?;
+        loading.remove(&name.to_ascii_lowercase());
+        // Now load the primary in fail-soft (anything still
+        // unresolved becomes a trap thunk).
+        self.load_fail_soft(name, bytes)
+    }
+
+    /// Recursive helper: walk `bytes`'s import directory, for
+    /// each not-yet-loaded, non-stub DLL look it up in the VFS,
+    /// load it at a fresh image base in fail-soft mode, register
+    /// its exports, then invoke its `DllMain(PROCESS_ATTACH)`.
+    fn preload_deps(
+        &mut self,
+        bytes: &[u8],
+        loading: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), crate::Error> {
+        use crate::pe;
+        let parsed = match pe::header::parse(bytes) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        let imported = pe::imports::list_imported_dlls(&parsed, bytes).unwrap_or_default();
+        for dll in imported {
+            let dll_lc = dll.to_ascii_lowercase();
+            if loading.contains(&dll_lc) {
+                continue; // cycle — already on the load stack
+            }
+            if crate::win32::is_host_stub_dll(&dll_lc) {
+                continue; // kernel32 / user32 / etc. are stubbed
+            }
+            if self.host.modules.contains_key(&dll_lc) {
+                continue; // already loaded
+            }
+            // Look up in VFS.
+            let bytes_dep = {
+                let vfs = match self.host.context.vfs.as_ref() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let mut found: Option<Vec<u8>> = None;
+                for prefix in crate::win32::dll_vfs_search_paths() {
+                    let p = format!("{prefix}{dll_lc}");
+                    if let Some(b) = vfs.read(&p) {
+                        found = Some(b.to_vec());
+                        break;
+                    }
+                }
+                match found {
+                    Some(b) => b,
+                    None => continue,
+                }
+            };
+            // Recurse before loading this one — DFS order.
+            loading.insert(dll_lc.clone());
+            self.preload_deps(&bytes_dep, loading)?;
+            // Pick a fresh image base for this dep.
+            let parsed_dep = pe::header::parse(&bytes_dep)?;
+            let image_size = parsed_dep.optional.size_of_image;
+            let aligned = (image_size + 0xFFFF) & !0xFFFF;
+            let base = self.host.next_dll_image_base;
+            self.host.next_dll_image_base = base.saturating_add(aligned);
+            let mut options = pe::LoadOptions {
+                imports: pe::imports::ResolveMode::FailSoft,
+                fail_soft_log: Some(Vec::new()),
+                target_image_base: Some(base),
+            };
+            let mut loader = Loader::new(&mut self.mmu, &mut self.registry, &mut self.host);
+            let img = match loader.load_with_options(&dll_lc, &bytes_dep, &mut options) {
+                Ok(i) => i,
+                Err(e) => {
+                    self.host
+                        .debug_log
+                        .push(format!("vfs-dll {dll_lc}: load failed: {e}"));
+                    loading.remove(&dll_lc);
+                    continue;
+                }
+            };
+            // Register the dep's exports so the primary's IAT
+            // can patch through. Same dll-name normalisation
+            // the import resolver uses.
+            for (export_name, rva) in &img.exports {
+                let addr = img.image_base.wrapping_add(*rva);
+                self.registry
+                    .register_guest_export(&dll_lc, export_name, addr);
+            }
+            self.host
+                .loaded_dll_exports
+                .insert(img.image_base, img.exports.clone());
+            self.host.modules.insert(dll_lc.clone(), img.image_base);
+            self.host
+                .debug_log
+                .push(format!("vfs-dll {dll_lc}: loaded at {base:#010x}"));
+            // Invoke DllMain. Skip data-only DLLs (no DllMain
+            // export AND AddressOfEntryPoint == 0 — common for
+            // ICU resource bundles and similar). Errors from
+            // dep DllMain don't abort the parent load: most QT
+            // codecs reach their Component Manager entry without
+            // ever calling the framework DLL's TLS-touching
+            // init paths, so a half-init dep is often workable.
+            let has_dll_main = img.exports.contains_key("DllMain");
+            let has_entry = parsed_dep.optional.address_of_entry_point != 0;
+            if has_dll_main || has_entry {
+                if let Err(e) = self.call_dll_main(&img, DLL_PROCESS_ATTACH) {
+                    self.host
+                        .debug_log
+                        .push(format!("vfs-dll {dll_lc}: DllMain trapped: {e}"));
+                }
+            } else {
+                self.host
+                    .debug_log
+                    .push(format!("vfs-dll {dll_lc}: data-only DLL, no DllMain"));
+            }
+            loading.remove(&dll_lc);
+        }
+        Ok(())
+    }
+
     /// Load a PE32 image in fail-soft import-resolution mode.
     /// Imports the codec-class stub registry doesn't satisfy
     /// get a trap-on-call fallback thunk so the load succeeds.

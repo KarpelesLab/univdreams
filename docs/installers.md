@@ -133,7 +133,65 @@ the parent gave msiexec a path that wasn't in our VFS (typically a basename mism
 
 Running below the budget needed for the full install sometimes captures *more* state than completing it does — installers routinely delete their temp dirs at the end of a successful install. The QuickTime extraction's peak is around 2.2 B instructions (after extraction, before `RemoveDirectoryA` rollback). The full install runs to ~2.24 B before hitting a CRT epilogue.
 
-If you want to inspect the MSI extraction without losing it to cleanup, run with `--max-instructions 2_200_000_000` and dump the VFS at that point.
+`--preserve-deletes` (on by default in `--monitor`) silently ignores `DeleteFileA` / `RemoveDirectoryA` so the post-install rollback can't drop the extracted MSIs or the synthesised install tree. Pass `--preserve-deletes=false` to get real semantics. If you want to inspect a mid-run state without waiting for the full budget, capping `--max-instructions` to just before the rollback step also works.
+
+### 6. Chaining .msi files
+
+After step 1, the dump directory contains every `.msi` the installer extracted (`appleapplicationsupport.msi`, `applesoftwareupdate.msi`, etc. for QuickTime). Point `ud analyze --monitor` at each one to install it through the host-side MSI walker without re-running the parent installer:
+
+```
+$ ud analyze --monitor /tmp/qt_dump/ixp051.tmp/appleapplicationsupport.msi \
+    --dump-vfs /tmp/aas
+```
+
+This is what unblocks Apple-framework-dependent codecs: `coreaudiotoolbox.dll` / `corevideo.dll` / `cfnetwork.dll` come out of AAS's CAB into `c:/common files/apple/apple application support/`. The MSI auto-detect path (compound-document magic) skips PE-load entirely and calls into `win32::msiexec` directly.
+
+### 7. Loading the extracted codecs
+
+```
+$ ud analyze /tmp/qt_dump/c_/program\ files/quicktime/qtsystem/corevideo.qtx \
+    --fail-soft --json
+```
+
+`--fail-soft` is the codec/DLL-equivalent of monitor mode: imports the host doesn't yet have stubs for (Apple's CoreVideo, CoreAudioToolbox, CFNetwork) get a trap-on-call fallback thunk instead of failing at load time. `DllMain` still runs, the trace records every Win32 call the codec makes during init, and the first call into an un-stubbed Apple API names that API precisely. All 25 QuickTime `.qtx` codecs load + `DllMain` returns TRUE through this path with the current stub set.
+
+### 8. Resolving codec dependencies from a staged install
+
+For codecs whose import surface includes Apple framework DLLs (`coreaudiotoolbox.dll`, `corevideo.dll`, `cfnetwork.dll`, etc.) we have a real DLL on disk that we'd rather link against than stub:
+
+```
+$ ud analyze /tmp/qt_dump/c_/program\ files/quicktime/qtsystem/corevideo.qtx \
+    --vfs-deps \
+    --stage-vfs /tmp/qt_dump \
+    --stage-vfs /tmp/aas
+```
+
+`--stage-vfs <dir>` mounts a `--dump-vfs` directory back into the sandbox VFS (the `c_/path/file` → `c:/path/file` mapping is symmetric). `--vfs-deps` then walks the primary PE's import descriptors and, for any dependent DLL the host stub registry doesn't satisfy, looks it up under the standard search paths (`c:/program files/quicktime/qtsystem/`, `c:/common files/apple/apple application support/`, `c:/windows/system32/`, …), loads it at a fresh image base, registers its exports against the IAT, and calls its `DllMain(PROCESS_ATTACH)` before returning to the primary load. Cycle-safe.
+
+### 9. Calling codec component-dispatch entries
+
+QuickTime codecs are *Components* — they expose a single `*_ComponentDispatch` entry whose first argument is a `ComponentParameters` struct (selector + paramSize + params) and whose second is a Mac OS Memory Manager Handle for the per-instance storage block.
+
+```
+$ ud qtcodec dispatch \
+    /tmp/qt_dump/c_/program\ files/quicktime/qtsystem/quicktimeauthoring.qtx \
+    --export RPZA_CDComponentDispatch \
+    --selector=-4 \
+    --stage-vfs /tmp/qt_dump --stage-vfs /tmp/aas
+```
+
+`kComponentVersionSelect` (selector `-4`) returns the codec's version as a `ComponentResult` (32-bit signed). Across the 25 extracted QuickTime codecs, 21 of the 25 dispatch the system selectors `[-1, -2, -3, -4]` cleanly under this driver; the four exceptions are codecs whose first export is an audio-unit entry point (different ABI, returns `paramErr = -50`) or a callback-getter (not a Component Manager dispatch).
+
+For codec-specific selectors that need per-instance state, pass `--storage <bytes>` to mint a zero-initialised Mac OS Handle and hand its address to the codec. Concretely:
+
+```
+$ ud qtcodec dispatch ...quicktimeauthoring.qtx \
+    --export RPZA_CDComponentDispatch \
+    --selector=5 --storage 256 \
+    --stage-vfs /tmp/qt_dump --stage-vfs /tmp/aas
+```
+
+Driving a *full decompression sequence* (kImageCodecPreDecompress → kImageCodecBandDecompress → kImageCodecReleaseBufferData) needs a working Mac OS Memory Manager + Component Manager + ICM under the codec. The codecs call those subsystems via trap-dispatch tables that QuickTime.dll wires up (`CVInstallTraps`, `CAInstallTraps`, …). Loading `quicktime.qts` (the 12 MB QT engine) with `--vfs-deps` initialises far enough to expose its 129-strong export table; getting its trap dispatcher to a state the codecs can call into is the next iteration.
 
 ## Custom install logic — the `InstallSink` trait
 

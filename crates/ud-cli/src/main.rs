@@ -151,6 +151,51 @@ enum Command {
         /// `ud analyze --monitor` pass.
         #[arg(long)]
         dump_vfs: Option<PathBuf>,
+
+        /// In monitor mode, silently ignore `DeleteFileA` and
+        /// `RemoveDirectoryA` so the post-install rollback
+        /// some installers do (cleanup of temp-dir MSIs after
+        /// msiexec returns) doesn't drop the extracted
+        /// bundle. Defaults to ON because that's almost
+        /// always what an analyst running `--monitor` wants;
+        /// pass `--preserve-deletes=false` to get true
+        /// semantics.
+        #[arg(long, default_value_t = true)]
+        preserve_deletes: bool,
+
+        /// Load the PE in fail-soft import-resolution mode
+        /// even outside `--monitor`. Useful for codecs whose
+        /// import surface includes dependent DLLs (Apple's
+        /// CoreVideo / CoreAudioToolbox, etc.) that the host
+        /// stub registry doesn't yet cover — the DLL still
+        /// loads and `DllMain` still runs; calls into the
+        /// unimplemented import trap on first use, naming
+        /// the missing API. Off by default to keep the
+        /// codec-class strict-load guarantee for samples that
+        /// fit the registered surface.
+        #[arg(long)]
+        fail_soft: bool,
+
+        /// Mount one or more host directories into the sandbox
+        /// VFS before load. Each `<dir>` is walked recursively;
+        /// every file is staged under the path derived from the
+        /// directory layout (e.g. a `--dump-vfs <dir>` output
+        /// can be passed back here verbatim to re-mount the
+        /// previous install's c:/ tree). Combine with
+        /// `--vfs-deps` to resolve codec dependencies from the
+        /// staged install.
+        #[arg(long, value_name = "DIR")]
+        stage_vfs: Vec<PathBuf>,
+
+        /// Walk the primary PE's imports and pre-load every
+        /// dependent DLL the host stub registry doesn't know
+        /// about from the sandbox VFS (recursively, with cycle
+        /// detection). Pair with `--stage-vfs` to seed the
+        /// VFS from a previous `--dump-vfs` directory. Each
+        /// dependent's `DllMain(PROCESS_ATTACH)` runs after it
+        /// loads. Implies `--fail-soft`.
+        #[arg(long)]
+        vfs_deps: bool,
     },
 
     /// Video for Windows codec tools — drive a codec DLL
@@ -159,6 +204,18 @@ enum Command {
     Vfw {
         #[command(subcommand)]
         command: VfwCommand,
+    },
+
+    /// QuickTime codec tools — drive a `.qtx` codec through
+    /// its `*_ComponentDispatch` entry point. The codec is
+    /// loaded with VFS-DLL fallback (so Apple framework deps
+    /// resolve from a staged install tree) and a synthetic
+    /// `ComponentParameters` is pushed for the requested
+    /// selector. See `ud qtcodec --help` for the per-command
+    /// list.
+    Qtcodec {
+        #[command(subcommand)]
+        command: QtcodecCommand,
     },
 
     /// Fetch a Solana on-chain program by its base58 ID and
@@ -192,6 +249,64 @@ enum Command {
         /// Where to write the `.ud` source. Defaults to stdout.
         #[arg(short, long)]
         out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum QtcodecCommand {
+    /// Invoke a single selector on a QuickTime component's
+    /// `*_ComponentDispatch` entry. Loads the codec with
+    /// VFS-DLL fallback, calls `DllMain(PROCESS_ATTACH)`,
+    /// builds a `ComponentParameters` struct in guest memory,
+    /// and dispatches with `storage = NULL`. Use this to
+    /// probe simple selectors (kComponentVersionSelect = -4,
+    /// kComponentCanDoSelect = -3, etc.) before driving a
+    /// full open/decompress sequence.
+    Dispatch {
+        /// Codec `.qtx` (or any PE32 DLL with a
+        /// `*_ComponentDispatch` export).
+        codec: PathBuf,
+
+        /// Name of the `*_ComponentDispatch` export to call
+        /// (e.g. `RPZA_CDComponentDispatch`).
+        #[arg(long)]
+        export: String,
+
+        /// Selector value (the `what` field of
+        /// `ComponentParameters`). Encoded as a signed 16-bit
+        /// integer for the negative system selectors.
+        #[arg(long, default_value_t = -4)]
+        selector: i16,
+
+        /// Optional u32 parameter words placed after the
+        /// 4-byte ComponentParameters header (low-to-high on
+        /// the param slot). `paramSize` is set to
+        /// `params.len() * 4`. Accepts decimal or `0x`-prefixed
+        /// hex.
+        #[arg(long, value_name = "U32", value_parser = parse_u32)]
+        param: Vec<u32>,
+
+        /// Mint a synthetic Mac OS Memory Manager `Handle` of
+        /// this byte size and pass its address as the codec's
+        /// `storage` argument. A Handle is a `Ptr*` — a pointer
+        /// to a pointer to the storage block. Zero (the
+        /// default) passes a NULL handle, which works for the
+        /// system selectors (kComponentVersionSelect, etc) but
+        /// causes a NULL-deref the moment the codec touches
+        /// per-instance state.
+        #[arg(long, default_value_t = 0, value_parser = parse_u32)]
+        storage: u32,
+
+        /// Mount these host directories into the sandbox VFS
+        /// before load — typically the `--dump-vfs` output
+        /// directories from a prior install. See `ud analyze
+        /// --stage-vfs`.
+        #[arg(long, value_name = "DIR")]
+        stage_vfs: Vec<PathBuf>,
+
+        /// Cap the run at this many guest instructions.
+        #[arg(long, default_value_t = 100_000_000)]
+        max_instructions: u64,
     },
 }
 
@@ -589,6 +704,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             monitor,
             args,
             dump_vfs,
+            preserve_deletes,
+            fail_soft,
+            stage_vfs,
+            vfs_deps,
         } => {
             if monitor {
                 monitor_install(
@@ -597,9 +716,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     json,
                     args.as_deref(),
                     dump_vfs.as_deref(),
+                    preserve_deletes,
                 )
             } else {
-                analyze(&input, max_instructions, json)
+                analyze(
+                    &input,
+                    max_instructions,
+                    json,
+                    fail_soft || vfs_deps,
+                    &stage_vfs,
+                    vfs_deps,
+                )
             }
         }
         Command::Solana {
@@ -674,6 +801,25 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 max_instructions,
             ),
         },
+        Command::Qtcodec { command } => match command {
+            QtcodecCommand::Dispatch {
+                codec,
+                export,
+                selector,
+                param,
+                storage,
+                stage_vfs,
+                max_instructions,
+            } => qtcodec_dispatch(
+                &codec,
+                &export,
+                selector,
+                &param,
+                storage,
+                &stage_vfs,
+                max_instructions,
+            ),
+        },
     }
 }
 
@@ -708,6 +854,141 @@ fn derive_default_fcc(p: &Path) -> String {
 const ICMODE_DECOMPRESS: u32 = 1;
 const ICMODE_COMPRESS: u32 = 2;
 const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
+
+/// Scratch address in the heap arena, chosen so it's above
+/// any reasonable codec allocation made during DllMain. The
+/// heap allocator grows up from 0x60000000; this gives the
+/// codec ~250 MiB before the scratch slot collides.
+const QTCODEC_SCRATCH: u32 = 0x6FFE_0000;
+
+fn parse_u32(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(rest, 16).map_err(|e| e.to_string())
+    } else {
+        s.parse::<u32>().map_err(|e| e.to_string())
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn qtcodec_dispatch(
+    codec: &Path,
+    export: &str,
+    selector: i16,
+    params: &[u32],
+    storage_size: u32,
+    stage_vfs: &[PathBuf],
+    max_instructions: u64,
+) -> anyhow::Result<()> {
+    let bytes = std::fs::read(codec).with_context(|| format!("read {}", codec.display()))?;
+    let stem = codec
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("codec");
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.trace_stubs = true;
+    sandbox.host.instruction_budget = Some(max_instructions);
+    sandbox
+        .context_mut()
+        .vfs
+        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+    for dir in stage_vfs {
+        let n = stage_dir_into_vfs(sandbox.context_mut(), dir)
+            .with_context(|| format!("stage {}", dir.display()))?;
+        eprintln!("staged {n} files from {}", dir.display());
+    }
+
+    let (image, _unresolved) = sandbox
+        .load_with_deps(stem, &bytes)
+        .with_context(|| format!("load_with_deps {}", codec.display()))?;
+    eprintln!("loaded {} at {:#010x}", stem, image.image_base);
+
+    // DllMain is best-effort. Many QT codecs return TRUE
+    // unconditionally; some trap on first call into an Apple
+    // framework DLL. Keep going either way.
+    match sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH) {
+        Ok(v) => eprintln!("DllMain returned {v:#x}"),
+        Err(e) => eprintln!("DllMain trapped: {e}"),
+    }
+
+    // Build ComponentParameters at the scratch address. Layout
+    // (Mac OS pascal compiler, packed):
+    //   u8  flags
+    //   u8  paramSize
+    //   i16 what
+    //   u32 params[0..paramSize/4]
+    let cp_addr = QTCODEC_SCRATCH;
+    let param_bytes: u8 = u8::try_from(params.len() * 4).unwrap_or(u8::MAX);
+    let what_bits: u16 = u16::from_le_bytes(selector.to_le_bytes());
+    sandbox
+        .mmu
+        .store8(cp_addr, 0)
+        .map_err(|e| anyhow::anyhow!("write CP flags: {e}"))?;
+    sandbox
+        .mmu
+        .store8(cp_addr + 1, param_bytes)
+        .map_err(|e| anyhow::anyhow!("write CP paramSize: {e}"))?;
+    sandbox
+        .mmu
+        .store16(cp_addr + 2, what_bits)
+        .map_err(|e| anyhow::anyhow!("write CP what: {e}"))?;
+    for (i, w) in params.iter().enumerate() {
+        sandbox
+            .mmu
+            .store32(cp_addr + 4 + u32::try_from(i).unwrap_or(0) * 4, *w)
+            .map_err(|e| anyhow::anyhow!("write CP param {i}: {e}"))?;
+    }
+
+    let storage: u32 = if storage_size == 0 {
+        0
+    } else {
+        // Mint a Mac-style Handle: a u32 (master pointer) at
+        // `handle_addr` whose value is the address of a
+        // zero-initialised `storage_size`-byte data block.
+        let handle_addr = QTCODEC_SCRATCH + 0x0001_0000;
+        let data_addr = handle_addr + 4;
+        sandbox
+            .mmu
+            .store32(handle_addr, data_addr)
+            .map_err(|e| anyhow::anyhow!("write handle master: {e}"))?;
+        for off in 0..storage_size {
+            sandbox
+                .mmu
+                .store8(data_addr + off, 0)
+                .map_err(|e| anyhow::anyhow!("zero storage[{off}]: {e}"))?;
+        }
+        eprintln!(
+            "minted handle at {handle_addr:#x} → {storage_size}-byte block at {data_addr:#x}"
+        );
+        handle_addr
+    };
+    let storage_label = if storage == 0 {
+        "NULL".to_string()
+    } else {
+        format!("{storage:#x}")
+    };
+    eprintln!(
+        "calling {export}(cp={cp_addr:#x} selector={selector}, params={params:?}, storage={storage_label})"
+    );
+    match sandbox.call_export(&image, export, &[cp_addr, storage]) {
+        Ok(ret) => {
+            #[allow(clippy::cast_possible_wrap)]
+            let signed = ret as i32;
+            println!("{export}: ret = {ret:#010x} ({signed})");
+        }
+        Err(e) => {
+            eprintln!("{export}: trapped: {e}");
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    }
+    // Surface the debug log so the caller sees what VFS-DLLs
+    // were loaded and which stubs were missing.
+    for line in &sandbox.host.debug_log {
+        eprintln!("  {line}");
+    }
+    Ok(())
+}
 
 #[allow(clippy::too_many_lines)]
 fn vfw_probe(
@@ -1120,7 +1401,14 @@ fn solana_cmd(
 }
 
 #[allow(clippy::too_many_lines)]
-fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result<()> {
+fn analyze(
+    input: &Path,
+    max_instructions: u64,
+    as_json: bool,
+    fail_soft: bool,
+    stage_vfs: &[PathBuf],
+    vfs_deps: bool,
+) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     if !ud_format::pe::is_pe(&bytes) {
         anyhow::bail!(
@@ -1136,8 +1424,23 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
     let mut sandbox = ud_emulator::Sandbox::new();
     sandbox.host.trace_stubs = true;
     sandbox.host.instruction_budget = Some(max_instructions);
+    sandbox
+        .context_mut()
+        .vfs
+        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+    for dir in stage_vfs {
+        let n = stage_dir_into_vfs(sandbox.context_mut(), dir)
+            .with_context(|| format!("stage {}", dir.display()))?;
+        eprintln!("staged {n} files from {}", dir.display());
+    }
 
-    let load_result = sandbox.load(stem, &bytes);
+    let load_result = if vfs_deps {
+        sandbox.load_with_deps(stem, &bytes).map(|(img, _)| img)
+    } else if fail_soft {
+        sandbox.load_fail_soft(stem, &bytes).map(|(img, _)| img)
+    } else {
+        sandbox.load(stem, &bytes)
+    };
     let image = match load_result {
         Ok(img) => img,
         Err(e) => {
@@ -1160,6 +1463,7 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
                     indicators,
                     instructions_executed: 0,
                     instruction_budget: max_instructions,
+                    debug_log: std::mem::take(&mut sandbox.host.debug_log),
                 };
                 let s = serde_json::to_string_pretty(&report)?;
                 println!("{s}");
@@ -1233,6 +1537,7 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
         indicators,
         instructions_executed,
         instruction_budget: max_instructions,
+        debug_log: std::mem::take(&mut sandbox.host.debug_log),
     };
 
     if as_json {
@@ -1254,6 +1559,194 @@ fn analyze(input: &Path, max_instructions: u64, as_json: bool) -> anyhow::Result
 /// re-run, push the boundary further. The set of stubs needed
 /// for a real installer is large; this is the harness that
 /// makes the next-step obvious.
+/// Walk a bare `.msi` file through the install simulator
+/// without spinning up the emulator. Same `--dump-vfs` /
+/// report format as the PE path so an analyst can chain
+/// `ud analyze --monitor` over every MSI extracted from a
+/// previous install run.
+#[allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::needless_lifetimes
+)]
+fn monitor_msi_install(
+    input: &Path,
+    bytes: &[u8],
+    _max_instructions: u64,
+    as_json: bool,
+    extra_args: Option<&str>,
+    dump_vfs: Option<&Path>,
+) -> anyhow::Result<()> {
+    use ud_emulator::win32::msiexec;
+
+    // Parse `KEY=VAL` tokens out of the property-override
+    // string the same way real msiexec would. The leading
+    // `/i path` tokens (if any) are ignored since the
+    // command line is auxiliary metadata here — we already
+    // have the MSI bytes.
+    let cmdline = extra_args.unwrap_or("");
+    let (_op, properties) = msiexec::parse_msiexec_args(cmdline);
+
+    // Recording sink so we can summarise + emit a report
+    // identical in shape to the PE-path one. The dump path
+    // also writes through to VFS / VirtualRegistry so the
+    // disk dump comes out the same.
+    let mut vfs = ud_emulator::context::VirtualFs::new();
+    let mut registry = ud_emulator::context::VirtualRegistry::new();
+    let mut n_files = 0usize;
+    let mut n_dirs = 0usize;
+    let mut n_regs = 0usize;
+    let mut n_bytes = 0u64;
+    let mut n_real_bytes = 0u64;
+    let mut debug_log: Vec<String> = Vec::new();
+
+    struct ReportingSink<'a> {
+        vfs: &'a mut ud_emulator::context::VirtualFs,
+        registry: &'a mut ud_emulator::context::VirtualRegistry,
+        n_files: &'a mut usize,
+        n_dirs: &'a mut usize,
+        n_regs: &'a mut usize,
+        n_bytes: &'a mut u64,
+        n_real_bytes: &'a mut u64,
+        log: &'a mut Vec<String>,
+    }
+    impl msiexec::InstallSink for ReportingSink<'_> {
+        fn emit(&mut self, action: msiexec::InstallAction) -> bool {
+            match action {
+                msiexec::InstallAction::CreateDirectory { path, .. } => {
+                    *self.n_dirs += 1;
+                    let marker = format!("{}\\.dir", path.trim_end_matches(['\\', '/']));
+                    if !self.vfs.contains(&marker) {
+                        self.vfs.insert(&marker, Vec::new());
+                    }
+                }
+                msiexec::InstallAction::WriteFile {
+                    path, size, bytes, ..
+                } => {
+                    *self.n_files += 1;
+                    *self.n_bytes = self.n_bytes.saturating_add(size);
+                    let payload = bytes.unwrap_or_default();
+                    if !payload.is_empty() {
+                        *self.n_real_bytes = self.n_real_bytes.saturating_add(payload.len() as u64);
+                    }
+                    self.vfs.write_path(&path, payload);
+                }
+                msiexec::InstallAction::RegSet {
+                    hive,
+                    key,
+                    name,
+                    value,
+                    ..
+                } => {
+                    *self.n_regs += 1;
+                    let key_path = format!("{}\\{}", hive.short(), key);
+                    use ud_emulator::context::RegistryValue as RV;
+                    let v = match value {
+                        msiexec::RegValue::Empty => RV::Sz(String::new()),
+                        msiexec::RegValue::Sz(s) => RV::Sz(s),
+                        msiexec::RegValue::ExpandSz(s) => RV::ExpandSz(s),
+                        msiexec::RegValue::Dword(d) => RV::Dword(d),
+                        msiexec::RegValue::Binary(b) => RV::Binary(b),
+                        msiexec::RegValue::MultiSz(v) => RV::MultiSz(v),
+                    };
+                    self.registry.set_value(&key_path, &name, v);
+                }
+                msiexec::InstallAction::SnapshotProperties(p) => {
+                    self.log
+                        .push(format!("msiexec: property snapshot ({} entries)", p.len()));
+                }
+                msiexec::InstallAction::Log(s) => self.log.push(format!("msiexec: {s}")),
+            }
+            true
+        }
+    }
+    let mut sink = ReportingSink {
+        vfs: &mut vfs,
+        registry: &mut registry,
+        n_files: &mut n_files,
+        n_dirs: &mut n_dirs,
+        n_regs: &mut n_regs,
+        n_bytes: &mut n_bytes,
+        n_real_bytes: &mut n_real_bytes,
+        log: &mut debug_log,
+    };
+    let options = msiexec::InstallOptions {
+        properties,
+        ..Default::default()
+    };
+    let result = msiexec::process_msi(bytes, &options, &mut sink);
+    let outcome_label = match &result {
+        Ok(_) => format!(
+            "msi walk OK — {n_files} files ({n_real_bytes}/{n_bytes} bytes extracted), \
+             {n_dirs} directories, {n_regs} registry entries"
+        ),
+        Err(e) => format!("msi walk failed: {e}"),
+    };
+    debug_log.push(outcome_label.clone());
+
+    // Side-effect capture + optional disk dump.
+    let vfs_writes: Vec<VfsEntry> = vfs
+        .list()
+        .map(|(p, l)| VfsEntry {
+            path: p.to_string(),
+            bytes: l,
+        })
+        .collect();
+    let registry_writes: Vec<RegistryEntry> = registry
+        .all_values()
+        .map(|(k, n, v)| RegistryEntry {
+            key: k.to_string(),
+            name: n.to_string(),
+            value: format!("{v:?}"),
+        })
+        .collect();
+    if let Some(dump_root) = dump_vfs {
+        std::fs::create_dir_all(dump_root)
+            .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
+        for (vpath, _) in vfs.list() {
+            if vpath.ends_with("/.dir") {
+                continue;
+            }
+            let safe = sanitise_vfs_path(vpath);
+            let out = dump_root.join(safe);
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            if let Some(data) = vfs.read(vpath) {
+                std::fs::write(&out, data)
+                    .with_context(|| format!("write VFS dump file {}", out.display()))?;
+            }
+        }
+    }
+
+    let outcome = match result {
+        Ok(_) => EntryOutcome::Returned { value: 0 },
+        Err(e) => EntryOutcome::Trapped {
+            message: e.to_string(),
+        },
+    };
+    let report = MonitorReport {
+        input: input.display().to_string(),
+        image_base: 0,
+        entry_point: 0,
+        outcome,
+        instructions_executed: 0,
+        instruction_budget: 0,
+        unresolved_imports: Vec::new(),
+        win32_calls: Vec::new(),
+        win32_calls_by_function: Vec::new(),
+        vfs_writes,
+        registry_writes,
+        debug_log,
+    };
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        report.write_text();
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn monitor_install(
     input: &Path,
@@ -1261,11 +1754,31 @@ fn monitor_install(
     as_json: bool,
     extra_args: Option<&str>,
     dump_vfs: Option<&Path>,
+    preserve_deletes: bool,
 ) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    // MSI compound-document magic — when the input is a .msi we
+    // skip PE-load entirely and route through the host-side
+    // MSI walker. Same --dump-vfs / report format on the other
+    // side. Unblocks chained installs (run AppleApplicationSupport.msi
+    // after QuickTime.msi etc. by pointing this command at each
+    // .msi in the previous run's dump folder).
+    let msi_magic = bytes
+        .get(..8)
+        .is_some_and(|h| h == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+    if msi_magic {
+        return monitor_msi_install(
+            input,
+            &bytes,
+            max_instructions,
+            as_json,
+            extra_args,
+            dump_vfs,
+        );
+    }
     if !ud_format::pe::is_pe(&bytes) {
         anyhow::bail!(
-            "ud analyze --monitor requires a PE32 binary; {} is not a PE",
+            "ud analyze --monitor requires a PE32 or MSI binary; {} is neither",
             input.display()
         );
     }
@@ -1277,6 +1790,7 @@ fn monitor_install(
     let mut sandbox = ud_emulator::Sandbox::new();
     sandbox.host.trace_stubs = true;
     sandbox.host.instruction_budget = Some(max_instructions);
+    sandbox.host.preserve_deletes = preserve_deletes;
     // Attach empty side-effect captures. Win32 stubs that
     // back onto the Context (CreateFile / Reg* / etc.)
     // record their writes here so the report can summarise
@@ -1485,6 +1999,69 @@ struct RegistryEntry {
 /// forward slashes, and any other suspect characters are
 /// stripped so a hostile installer can't write outside the
 /// dump root.
+/// Inverse of `sanitise_vfs_path` — walk a host directory
+/// rooted at `dir` and stage every regular file into the
+/// sandbox VFS. The top-level component naming convention is
+/// `<drive>_/<path>` (matching `--dump-vfs`'s output); it
+/// converts back to `<drive>:/<path>` on the VFS side.
+/// Returns the number of files staged.
+fn stage_dir_into_vfs(
+    ctx: &mut ud_emulator::context::Context,
+    dir: &Path,
+) -> anyhow::Result<usize> {
+    let vfs = ctx
+        .vfs
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("VFS not initialised"))?;
+    let mut count = 0;
+    let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut stack = vec![root.clone()];
+    while let Some(cur) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&cur) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(&root) else {
+                continue;
+            };
+            let mut s = String::with_capacity(rel.as_os_str().len() + 1);
+            let mut first = true;
+            for comp in rel.components() {
+                use std::path::Component;
+                if let Component::Normal(os) = comp {
+                    let part = os.to_string_lossy();
+                    if !first {
+                        s.push('/');
+                    }
+                    if first && part.len() == 2 && part.ends_with('_') {
+                        s.push(part.chars().next().unwrap().to_ascii_lowercase());
+                        s.push(':');
+                    } else {
+                        s.push_str(&part);
+                    }
+                    first = false;
+                }
+            }
+            let key = s.to_ascii_lowercase();
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
+            vfs.insert(&key, data);
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn sanitise_vfs_path(vpath: &str) -> std::path::PathBuf {
     let mut out = String::with_capacity(vpath.len());
     for ch in vpath.chars() {
@@ -1575,6 +2152,8 @@ struct AnalyzeReport {
     indicators: Indicators,
     instructions_executed: u64,
     instruction_budget: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    debug_log: Vec<String>,
 }
 
 #[derive(serde::Serialize, Default)]

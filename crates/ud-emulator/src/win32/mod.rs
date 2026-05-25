@@ -316,7 +316,35 @@ pub struct ProcessState {
     /// Next available TIB base. Increments by
     /// [`THREAD_TIB_SIZE`] per spawned thread.
     pub next_tib_addr: u32,
+    /// Live find-file enumerators minted by `FindFirstFileA/W`.
+    /// Each handle owns a cursor + a frozen list of VFS paths
+    /// the find pattern matched so the enumeration stays
+    /// stable even if the VFS mutates mid-enum.
+    pub find_handles: BTreeMap<u32, FindHandle>,
+    /// Cursor for the next `FindFirstFileA` to mint a handle.
+    pub next_find_handle: u32,
 }
+
+/// One live `FindFirstFileA` enumeration. The matching set
+/// is captured at `FindFirstFile` time so a sibling thread
+/// writing into the VFS mid-enum doesn't perturb the
+/// caller's sequence.
+#[derive(Debug, Clone)]
+pub struct FindHandle {
+    /// Resolved matching paths, in deterministic order.
+    pub matches: Vec<String>,
+    /// Next index to return from `FindNextFile`. The cursor
+    /// is bumped after the slot is emitted (so cursor == 0
+    /// before the first `FindNextFile` means there's a
+    /// pending entry from the `FindFirstFile` call).
+    pub cursor: usize,
+}
+
+/// First synthetic find-file handle the per-process table
+/// hands out. Chosen well above every other handle base
+/// (VFS, registry, wait objects) so `CloseHandle` can
+/// disambiguate by numeric value.
+pub const FIND_HANDLE_BASE: u32 = 0x6C00_0000;
 
 /// Per-thread TIB size, in bytes. Real Windows uses a much
 /// larger TEB (~4 KiB minimum); we only need enough room for
@@ -549,6 +577,24 @@ pub struct HostState {
     /// Scheduler-owned wait-object table + global instruction
     /// clock. Phase 3 of the scheduler refactor.
     pub scheduler: crate::sched::Scheduler,
+    /// When `true`, `DeleteFileA` / `RemoveDirectoryA` log
+    /// the attempt and return success without actually
+    /// mutating the VFS. Set by install-monitor harnesses
+    /// so post-msiexec rollback doesn't drop the extracted
+    /// MSI bundle.
+    pub preserve_deletes: bool,
+    /// Image-base cursor for guest-loaded dependent DLLs (the
+    /// VFS-DLL-fallback resolution path). Each VFS load takes
+    /// `align_up(size_of_image, 64 KiB)` from this cursor.
+    /// Distinct from `next_child_image_base`, which carves out
+    /// 256 MiB per *process* spawned via `CreateProcessA`.
+    pub next_dll_image_base: u32,
+    /// Per-image export tables for guest-loaded DLLs. The key is
+    /// the image base; the value is the same `name → RVA` map
+    /// the PE loader's `parse_exports` returns. Kept so a
+    /// subsequent VFS-DLL load can still find a previously
+    /// loaded sibling's exports for IAT patching.
+    pub loaded_dll_exports: BTreeMap<u32, BTreeMap<String, u32>>,
     /// When `Some`, the most recently dispatched stub asked the
     /// run loop to switch threads. The run loop drains the
     /// field after every stub return: a `Wait(...)` moves the
@@ -588,6 +634,9 @@ impl Default for HostState {
             stub_calls: Vec::new(),
             scheduler: crate::sched::Scheduler::new(),
             yield_requested: None,
+            preserve_deletes: false,
+            next_dll_image_base: 0x4000_0000,
+            loaded_dll_exports: BTreeMap::new(),
         }
     }
 }
@@ -831,6 +880,71 @@ pub const DATA_IMPORT_BASE: u32 = 0x7010_0000;
 const DATA_IMPORT_SIZE: u32 = 0x0000_1000;
 const DATA_IMPORT_END: u32 = DATA_IMPORT_BASE + DATA_IMPORT_SIZE;
 
+/// Returns true iff the given DLL name (lowercase, with `.dll`
+/// suffix) is one the host has a stub registry for. The
+/// VFS-DLL-fallback path in [`crate::Sandbox::load_with_deps`]
+/// skips lookups for these — they're always satisfied via
+/// host code regardless of whether a same-named DLL exists in
+/// the VFS.
+#[must_use]
+pub fn is_host_stub_dll(dll_lc: &str) -> bool {
+    matches!(
+        dll_lc,
+        "kernel32.dll"
+            | "user32.dll"
+            | "gdi32.dll"
+            | "msvcrt.dll"
+            | "msvcr80.dll"
+            | "msvcr90.dll"
+            | "msvcr100.dll"
+            | "msvcr110.dll"
+            | "msvcr120.dll"
+            | "ole32.dll"
+            | "oleaut32.dll"
+            | "advapi32.dll"
+            | "comctl32.dll"
+            | "shell32.dll"
+            | "shlwapi.dll"
+            | "winmm.dll"
+            | "version.dll"
+            | "vfw32.dll"
+            | "msi.dll"
+            | "mfplat.dll"
+            | "ws2_32.dll"
+            | "wsock32.dll"
+            | "ntdll.dll"
+            | "imm32.dll"
+            | "rpcrt4.dll"
+            | "secur32.dll"
+            | "crypt32.dll"
+            | "iphlpapi.dll"
+            | "wininet.dll"
+            | "urlmon.dll"
+            | "psapi.dll"
+            | "userenv.dll"
+            | "comdlg32.dll"
+    )
+}
+
+/// Sandbox VFS path prefixes searched (in order) when the
+/// [`crate::Sandbox::load_with_deps`] resolver tries to find a
+/// dependent DLL the host stub registry doesn't satisfy. Paths
+/// are lowercase, forward-slash, no leading slash — the
+/// `format!("{prefix}{dll}")` concatenation produces a key
+/// directly usable with [`crate::context::VirtualFs::read`].
+#[must_use]
+pub fn dll_vfs_search_paths() -> &'static [&'static str] {
+    &[
+        "c:/program files/quicktime/qtsystem/",
+        "c:/program files/quicktime/",
+        "c:/program files/common files/apple/apple application support/",
+        "c:/common files/apple/apple application support/",
+        "c:/windows/system32/",
+        "c:/windows/",
+        "",
+    ]
+}
+
 impl Registry {
     pub fn new() -> Self {
         Registry {
@@ -909,6 +1023,22 @@ impl Registry {
     pub fn resolve(&self, dll: &str, name: &str) -> Option<u32> {
         let key = (dll.to_ascii_lowercase(), name.to_string());
         self.by_name.get(&key).copied()
+    }
+
+    /// Register a *guest-loaded* DLL's export — the IAT slot
+    /// will be patched with `addr` (an absolute guest VA into
+    /// the loaded DLL's `.text`) and the guest jumps straight
+    /// there with no host-side thunk in between. Used by the
+    /// VFS-DLL-fallback path in the PE loader so codecs whose
+    /// import surface includes another guest-loadable DLL
+    /// (e.g. QuickTime's `.qtx` files importing CoreVideo /
+    /// CoreAudioToolbox from `AppleApplicationSupport.msi`)
+    /// can find the real Apple-DLL function rather than a
+    /// fail-soft trap thunk. Idempotent: re-registering the
+    /// same `(dll, name)` leaves the prior address in place.
+    pub fn register_guest_export(&mut self, dll: &str, name: &str, addr: u32) {
+        let key = (dll.to_ascii_lowercase(), name.to_string());
+        self.by_name.entry(key).or_insert(addr);
     }
 
     /// Register a fail-soft fallback thunk for an import we
