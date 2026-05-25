@@ -1283,8 +1283,10 @@ fn qtcodec_list(
     // First load the --stage-vfs trees into a temporary
     // context so we can carry their contents across.
     {
-        let mut tmp_ctx = ud_emulator::context::Context::default();
-        tmp_ctx.vfs = Some(ud_emulator::context::VirtualFs::new());
+        let mut tmp_ctx = ud_emulator::context::Context {
+            vfs: Some(ud_emulator::context::VirtualFs::new()),
+            ..ud_emulator::context::Context::default()
+        };
         for d in stage_vfs {
             let n = stage_dir_into_vfs(&mut tmp_ctx, d)
                 .with_context(|| format!("stage {}", d.display()))?;
