@@ -3088,16 +3088,13 @@ fn stub_get_system_directory_a(
 /// `BOOL GetVersionExA(LPOSVERSIONINFOA)`. Fills in a
 /// Windows XP SP3 shape: 5.1.2600, VER_PLATFORM_WIN32_NT = 2.
 /// Apple's QuickTime 7.x bootstrap checks for NT and refuses
-/// to init on Win9x (platform_id = 1), so the Round-1 Win95
-/// shape blocked InitializeQTML; XP works.
-///
-/// OSVERSIONINFOA layout (148 bytes):
-///   DWORD dwOSVersionInfoSize     (in)
-///   DWORD dwMajorVersion
-///   DWORD dwMinorVersion
-///   DWORD dwBuildNumber
-///   DWORD dwPlatformId
-///   CHAR  szCSDVersion[128]
+/// to init on Win9x. Reads the caller-supplied
+/// `dwOSVersionInfoSize` at offset 0 to distinguish:
+///   * `OSVERSIONINFOA` (148): fills through szCSDVersion.
+///   * `OSVERSIONINFOEXA` (156): also fills the EX tail
+///     (wServicePackMajor/Minor, wSuiteMask, wProductType) —
+///     QT's `qts!_QTMLInitInternals` inspects these to confirm
+///     XP-or-later workstation NT.
 fn stub_get_version_ex_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -3108,7 +3105,9 @@ fn stub_get_version_ex_a(
     if p == 0 {
         return Ok(0);
     }
-    // Skip dwOSVersionInfoSize at offset 0 (caller-supplied).
+    let cb = mmu
+        .load32(p)
+        .map_err(|t| trap_to_win32("GetVersionExA", t))?;
     mmu.store32(p + 4, 5)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwMajorVersion
     mmu.store32(p + 8, 1)
@@ -3117,14 +3116,28 @@ fn stub_get_version_ex_a(
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwBuildNumber
     mmu.store32(p + 16, 2)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwPlatformId (NT)
-                                                          // szCSDVersion: "Service Pack 3"
     let csd = b"Service Pack 3";
     for (i, b) in csd.iter().enumerate() {
         mmu.store8(p + 20 + i as u32, *b)
             .map_err(|t| trap_to_win32("GetVersionExA", t))?;
     }
-    mmu.store8(p + 20 + csd.len() as u32, 0)
-        .map_err(|t| trap_to_win32("GetVersionExA", t))?;
+    for i in csd.len() as u32..128 {
+        mmu.store8(p + 20 + i, 0)
+            .map_err(|t| trap_to_win32("GetVersionExA", t))?;
+    }
+    if cb >= 156 {
+        // OSVERSIONINFOEXA tail at offset 0x94..0x9C.
+        mmu.store16(p + 0x94, 3)
+            .map_err(|t| trap_to_win32("GetVersionExA", t))?; // wServicePackMajor
+        mmu.store16(p + 0x96, 0)
+            .map_err(|t| trap_to_win32("GetVersionExA", t))?; // wServicePackMinor
+        mmu.store16(p + 0x98, 0x0100)
+            .map_err(|t| trap_to_win32("GetVersionExA", t))?; // wSuiteMask
+        mmu.store8(p + 0x9A, 1)
+            .map_err(|t| trap_to_win32("GetVersionExA", t))?; // wProductType = WORKSTATION
+        mmu.store8(p + 0x9B, 0)
+            .map_err(|t| trap_to_win32("GetVersionExA", t))?; // wReserved
+    }
     Ok(1)
 }
 
