@@ -5742,6 +5742,18 @@ fn stub_create_process_a(
     } else {
         String::new()
     };
+    // Recognise the msiexec.exe install path before falling
+    // through to PE-load. Real msiexec needs the full
+    // Windows-Installer COM surface (huge), so we route to a
+    // host-side walker that parses the .msi referenced by
+    // `/i <path>` and synthesises file + registry effects into
+    // the attached VFS / VirtualRegistry.
+    if super::msiexec::is_msiexec_target(&target) {
+        super::msiexec::dispatch_msiexec_install(state, mmu, &target, &cmd);
+        // Then fall through to the synthetic immediate-exit
+        // child so the parent's WaitForSingleObject /
+        // GetExitCodeProcess resolves with ERROR_SUCCESS.
+    }
     let (child_pid, child_tid) = match (!target.is_empty())
         .then(|| try_spawn_child_pe(state, mmu, registry, &target, &cmd))
         .flatten()

@@ -35,6 +35,11 @@ features = ["trace", "trace-exec"]
 
 [dependencies]
 thiserror = "2"
+# Read MSI compound-document tables for the in-emulator
+# msiexec implementation under `win32::msiexec`. Read-only
+# (open() takes Read+Seek; we feed it Cursor<&[u8]> over VFS
+# bytes).
+msi = "0.10"
 
 [dev-dependencies]
 # Fetched-fixture corpus runner (`tests/codec_corpus.rs`).

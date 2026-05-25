@@ -30,6 +30,7 @@ pub mod gdi32;
 pub mod kernel32;
 pub mod mfplat;
 pub mod msi;
+pub mod msiexec;
 pub mod msvcrt;
 pub mod ole32;
 pub mod shell32;
