@@ -487,12 +487,25 @@ impl Sandbox {
             // Recurse before loading this one — DFS order.
             loading.insert(dll_lc.clone());
             self.preload_deps(&bytes_dep, loading)?;
-            // Pick a fresh image base for this dep.
+            // Prefer the PE's preferred image base when it's
+            // free — relocations can subtly break codecs that
+            // store absolute addresses in spots the .reloc
+            // table doesn't cover (Apple's QT framework code
+            // does this in a couple of spots). If the preferred
+            // base would collide with something already mapped,
+            // fall back to a fresh slot from next_dll_image_base.
             let parsed_dep = pe::header::parse(&bytes_dep)?;
+            let preferred = parsed_dep.optional.image_base;
             let image_size = parsed_dep.optional.size_of_image;
             let aligned = (image_size + 0xFFFF) & !0xFFFF;
-            let base = self.host.next_dll_image_base;
-            self.host.next_dll_image_base = base.saturating_add(aligned);
+            let preferred_free = self.mmu.region_is_unmapped(preferred, image_size);
+            let base = if preferred_free {
+                preferred
+            } else {
+                let b = self.host.next_dll_image_base;
+                self.host.next_dll_image_base = b.saturating_add(aligned);
+                b
+            };
             let mut options = pe::LoadOptions {
                 imports: pe::imports::ResolveMode::FailSoft,
                 fail_soft_log: Some(Vec::new()),

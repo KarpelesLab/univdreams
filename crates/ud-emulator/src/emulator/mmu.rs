@@ -158,6 +158,26 @@ impl Mmu {
         self.pages[(addr >> PAGE_SHIFT) as usize].is_some()
     }
 
+    /// True iff every page touched by `[addr, addr+size)` is
+    /// currently unmapped. The VFS-DLL fallback loader uses
+    /// this to decide whether the PE's preferred image base is
+    /// free or whether the dep needs to be rebased.
+    #[must_use]
+    pub fn region_is_unmapped(&self, addr: u32, size: u32) -> bool {
+        if size == 0 {
+            return true;
+        }
+        let first = addr >> PAGE_SHIFT;
+        let last_byte = addr.wrapping_add(size - 1);
+        let last = last_byte >> PAGE_SHIFT;
+        for p in first..=last {
+            if self.pages[p as usize].is_some() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Permissions on the page containing `addr`, or `None` if
     /// unmapped.
     pub fn perm_at(&self, addr: u32) -> Option<Perm> {
