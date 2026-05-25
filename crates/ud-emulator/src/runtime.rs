@@ -778,17 +778,37 @@ impl Sandbox {
                     exports,
                 }
             } else {
-                match self.load_with_deps(&ca.source, &bytes) {
-                    Ok((img, _)) => {
-                        // Best-effort DllMain.
-                        if let Err(e) = self.call_dll_main(&img, crate::DLL_PROCESS_ATTACH) {
-                            self.host.debug_log.push(format!(
-                                "msiexec CA {:?}: {} DllMain trapped: {e}",
-                                ca.name, ca.source
-                            ));
-                        }
-                        img
+                // Install-time DLLs (QTInstallCode, QTMSISupport,
+                // SxsUninstallCA, AppleApplicationSupport_CustomActions)
+                // share Apple's standard 0x10000000 preferred base.
+                // If we let them grab that, qtmlclient.dll has to
+                // rebase later and its absolute-addressed
+                // dispatcher slots break. Force-rebase install
+                // DLLs to next_dll_image_base so the preferred
+                // base stays free for the post-install runtime
+                // bring-up.
+                let parsed = match crate::pe::header::parse(&bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.host.debug_log.push(format!(
+                            "msiexec CA {:?}: parse {:?} failed: {e}",
+                            ca.name, ca.source
+                        ));
+                        continue;
                     }
+                };
+                let image_size = parsed.optional.size_of_image;
+                let aligned = (image_size + 0xFFFF) & !0xFFFF;
+                let install_base = self.host.next_dll_image_base;
+                self.host.next_dll_image_base = install_base.saturating_add(aligned);
+                let mut options = crate::pe::LoadOptions {
+                    imports: crate::pe::imports::ResolveMode::FailSoft,
+                    fail_soft_log: Some(Vec::new()),
+                    target_image_base: Some(install_base),
+                };
+                let mut loader = Loader::new(&mut self.mmu, &mut self.registry, &mut self.host);
+                let img = match loader.load_with_options(&ca.source, &bytes, &mut options) {
+                    Ok(i) => i,
                     Err(e) => {
                         self.host.debug_log.push(format!(
                             "msiexec CA {:?}: load {:?} failed: {e}",
@@ -796,7 +816,29 @@ impl Sandbox {
                         ));
                         continue;
                     }
+                };
+                self.host.primary_module_base = img.image_base;
+                self.host
+                    .modules
+                    .insert(ca.source.to_ascii_lowercase(), img.image_base);
+                self.host
+                    .loaded_dll_exports
+                    .insert(img.image_base, img.exports.clone());
+                for (name, rva) in &img.exports {
+                    self.registry.register_guest_export(
+                        &ca.source,
+                        name,
+                        img.image_base.wrapping_add(*rva),
+                    );
                 }
+                // Best-effort DllMain.
+                if let Err(e) = self.call_dll_main(&img, crate::DLL_PROCESS_ATTACH) {
+                    self.host.debug_log.push(format!(
+                        "msiexec CA {:?}: {} DllMain trapped: {e}",
+                        ca.name, ca.source
+                    ));
+                }
+                img
             };
             let Some(rva) = img.exports.get(&ca.target).copied() else {
                 self.host.debug_log.push(format!(
@@ -811,6 +853,10 @@ impl Sandbox {
                 "msiexec CA {:?}: calling {:?}({:?})",
                 ca.name, ca.target, 1
             ));
+            // Clear sticky exit_requested from the prior CA's
+            // TerminateProcess / ExitProcess so the next
+            // run_until_sentinel doesn't bail immediately.
+            self.host.exit_requested = None;
             match crate::win32::call_guest(
                 &mut self.cpu,
                 &mut self.mmu,

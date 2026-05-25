@@ -1028,14 +1028,39 @@ fn init_qtml(sandbox: &mut ud_emulator::Sandbox) -> u32 {
         eprintln!("init_qtml: qtmlclient!InitializeQTML not in registry — pre-load missed?");
         return u32::MAX;
     };
-    match ud_emulator::win32::call_guest(
+    // Clear any sticky exit_requested left from a prior
+    // call_guest that hit ExitProcess / TerminateProcess —
+    // otherwise run_until_sentinel bails immediately on the
+    // next call without executing a single instruction.
+    sandbox.host.exit_requested = None;
+    let stub_before = sandbox.host.stub_calls.len();
+    let result = ud_emulator::win32::call_guest(
         &mut sandbox.cpu,
         &mut sandbox.mmu,
         &sandbox.registry,
         &mut sandbox.host,
         target,
         &[0],
-    ) {
+    );
+    let calls = &sandbox.host.stub_calls[stub_before..];
+    if !calls.is_empty() {
+        eprintln!("--- {} stub calls during InitializeQTML ---", calls.len());
+        for c in calls.iter().take(40) {
+            let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+            let eip = c.call_site_eip;
+            eprintln!(
+                "  {eip:#010x} {}!{}({}) -> {:#x}",
+                c.dll,
+                c.name,
+                args.join(", "),
+                c.ret
+            );
+        }
+        if calls.len() > 40 {
+            eprintln!("  … ({} more)", calls.len() - 40);
+        }
+    }
+    match result {
         Ok(v) => {
             eprintln!("InitializeQTML(0) = {v:#x}");
             v
@@ -1246,57 +1271,85 @@ fn qtcodec_list(
     let sub_v = fourcc_be(subtype);
     let man_v = fourcc_be(manufacturer);
 
+    // Run any --install-msi installs in a SEPARATE sandbox
+    // first, then copy the post-install VFS + registry into a
+    // fresh sandbox that brings up the QT runtime. Doing both
+    // in the same sandbox leaves residual state (sticky
+    // exit_requested, scheduler-side terminated threads, CRT
+    // globals in install DLLs) that breaks the qtmlclient.dll
+    // bootstrap.
+    let mut staged_vfs = ud_emulator::context::VirtualFs::new();
+    let mut staged_reg = ud_emulator::context::VirtualRegistry::new();
+    // First load the --stage-vfs trees into a temporary
+    // context so we can carry their contents across.
+    {
+        let mut tmp_ctx = ud_emulator::context::Context::default();
+        tmp_ctx.vfs = Some(ud_emulator::context::VirtualFs::new());
+        for d in stage_vfs {
+            let n = stage_dir_into_vfs(&mut tmp_ctx, d)
+                .with_context(|| format!("stage {}", d.display()))?;
+            eprintln!("staged {n} files from {}", d.display());
+        }
+        if let Some(v) = tmp_ctx.vfs.take() {
+            for (p, _) in v.list() {
+                if let Some(b) = v.read(p) {
+                    staged_vfs.insert(p, b.to_vec());
+                }
+            }
+        }
+    }
+    if !install_msi.is_empty() {
+        let mut install_sb = ud_emulator::Sandbox::new();
+        install_sb.host.trace_stubs = true;
+        install_sb.host.instruction_budget = Some(max_instructions);
+        install_sb.context_mut().vfs = Some(staged_vfs.clone());
+        install_sb.context_mut().registry = Some(staged_reg.clone());
+        for msi_path in install_msi {
+            let bytes =
+                std::fs::read(msi_path).with_context(|| format!("read {}", msi_path.display()))?;
+            let stage_key = format!(
+                "c:/temp/install_{}.msi",
+                msi_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("pkg")
+            );
+            if let Some(vfs) = install_sb.context_mut().vfs.as_mut() {
+                vfs.insert(&stage_key, bytes);
+            }
+            let synth_cmd = format!("msiexec.exe /i \"{stage_key}\"");
+            ud_emulator::win32::msiexec::dispatch_msiexec_install(
+                &mut install_sb.host,
+                &mut install_sb.mmu,
+                &stage_key,
+                &synth_cmd,
+            );
+            let pumped = install_sb.pump_pending_msi_install();
+            eprintln!(
+                "installed {} — pumped {pumped} deferred CustomAction(s)",
+                msi_path.display()
+            );
+        }
+        // Carry post-install state into the runtime sandbox.
+        if let Some(v) = install_sb.context().vfs.as_ref() {
+            for (p, _) in v.list() {
+                if let Some(b) = v.read(p) {
+                    staged_vfs.insert(p, b.to_vec());
+                }
+            }
+        }
+        if let Some(r) = install_sb.context().registry.as_ref() {
+            for (k, n, v) in r.all_values() {
+                staged_reg.set_value(k, n, v.clone());
+            }
+        }
+    }
+
     let mut sandbox = ud_emulator::Sandbox::new();
     sandbox.host.trace_stubs = true;
     sandbox.host.instruction_budget = Some(max_instructions);
-    sandbox
-        .context_mut()
-        .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
-    sandbox
-        .context_mut()
-        .registry
-        .get_or_insert_with(ud_emulator::context::VirtualRegistry::new);
-    for d in stage_vfs {
-        let n = stage_dir_into_vfs(sandbox.context_mut(), d)
-            .with_context(|| format!("stage {}", d.display()))?;
-        eprintln!("staged {n} files from {}", d.display());
-    }
-    // Run any --install-msi installs IN THIS SAME SANDBOX
-    // before bringing up the QT runtime. The msiexec walker
-    // synthesises file writes into the VFS, registry writes
-    // into the VirtualRegistry, and queues DLL CustomActions
-    // for the pump step which then runs them via call_guest
-    // (msi.dll stubs route MsiGetProperty/MsiSetProperty/etc.
-    // to the walker's property snapshot). After this loop the
-    // sandbox state reflects what a real Windows install would
-    // have produced for the QT runtime to discover.
-    for msi_path in install_msi {
-        let bytes =
-            std::fs::read(msi_path).with_context(|| format!("read {}", msi_path.display()))?;
-        let stage_key = format!(
-            "c:/temp/install_{}.msi",
-            msi_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("pkg")
-        );
-        if let Some(vfs) = sandbox.context_mut().vfs.as_mut() {
-            vfs.insert(&stage_key, bytes);
-        }
-        let synth_cmd = format!("msiexec.exe /i \"{stage_key}\"");
-        ud_emulator::win32::msiexec::dispatch_msiexec_install(
-            &mut sandbox.host,
-            &mut sandbox.mmu,
-            &stage_key,
-            &synth_cmd,
-        );
-        let pumped = sandbox.pump_pending_msi_install();
-        eprintln!(
-            "installed {} — pumped {pumped} deferred CustomAction(s)",
-            msi_path.display()
-        );
-    }
+    sandbox.context_mut().vfs = Some(staged_vfs);
+    sandbox.context_mut().registry = Some(staged_reg);
     preload_qt_runtime(&mut sandbox);
 
     let init_rc = init_qtml(&mut sandbox);
