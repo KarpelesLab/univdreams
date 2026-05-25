@@ -138,6 +138,31 @@ pub enum InstallAction {
     /// the structured actions above (unresolved references,
     /// skipped tables, malformed rows).
     Log(String),
+    /// A `CustomAction` table row's effective execution.
+    /// Property-set / directory-set CAs (types 35, 50, 51) are
+    /// executed inline by the walker; this variant surfaces
+    /// the *DLL-call* + *EXE-call* + *script* shapes (types
+    /// 1/17 DLL, 2/18 EXE, 5/6/21/22/25/26 scripts) for the
+    /// sink to dispatch into a full execution sandbox.
+    CustomAction {
+        /// `CustomAction.Action` primary key.
+        name: String,
+        /// `CustomAction.Type` (bottom 6 bits are the action
+        /// kind, high bits are flags — deferred / rollback /
+        /// commit / no-impersonate).
+        action_type: i32,
+        /// `CustomAction.Source` — meaning depends on
+        /// `action_type`: Binary-table key (DLL), File-table
+        /// key (installed DLL), property name, etc.
+        source: String,
+        /// `CustomAction.Target` — meaning depends on
+        /// `action_type`: function name (DLL), formatted
+        /// string (set/error), command line (EXE).
+        target: String,
+        /// `Condition` column from `InstallExecuteSequence`
+        /// (already evaluated true by the walker).
+        condition: String,
+    },
 }
 
 /// Windows registry hive root, in canonical form.
@@ -301,6 +326,110 @@ pub fn process_msi(
     // would leave them as `[Property]` placeholders.
     seed_default_properties(&mut properties);
 
+    // ------------------------------------------------------------
+    // CustomAction + InstallExecuteSequence — run the
+    // property-set / directory-set CAs (types 35, 50, 51) inline
+    // BEFORE the file / registry walk so subsequent
+    // `[Property]` substitutions see their effects. DLL / EXE
+    // / script CAs are surfaced via `InstallAction::CustomAction`
+    // for the sink to dispatch into a full execution sandbox.
+    //
+    // Sequence order matters: actions with negative `Sequence`
+    // numbers and a NULL/empty condition are termination
+    // actions; otherwise we run in ascending-sequence order.
+    // Conditions are evaluated with a *very* simple expression
+    // engine — see `eval_condition` — that handles the common
+    // patterns in the Apple installers (negated property checks,
+    // AND/OR chains, equality vs literal). Unknown / malformed
+    // conditions are treated as TRUE so we err on running more
+    // actions rather than fewer.
+    // ------------------------------------------------------------
+    let custom_actions = if pkg.has_table("CustomAction") {
+        let rows = pkg
+            .select_rows(msi::Select::table("CustomAction"))
+            .map_err(|e| Error::Schema(format!("CustomAction select: {e}")))?;
+        let mut m: BTreeMap<String, (i32, String, String)> = BTreeMap::new();
+        for row in rows {
+            let name = row[0].as_str().unwrap_or("").to_string();
+            let ty = row[1].as_int().unwrap_or(0);
+            let source = row[2].as_str().unwrap_or("").to_string();
+            let target = row[3].as_str().unwrap_or("").to_string();
+            if !name.is_empty() {
+                m.insert(name, (ty, source, target));
+            }
+        }
+        m
+    } else {
+        BTreeMap::new()
+    };
+    let mut sequence: Vec<(i32, String, String)> = Vec::new();
+    if pkg.has_table("InstallExecuteSequence") {
+        let rows = pkg
+            .select_rows(msi::Select::table("InstallExecuteSequence"))
+            .map_err(|e| Error::Schema(format!("InstallExecuteSequence select: {e}")))?;
+        for row in rows {
+            let name = row[0].as_str().unwrap_or("").to_string();
+            let cond = row[1].as_str().unwrap_or("").to_string();
+            let seq = row[2].as_int().unwrap_or(0);
+            if !name.is_empty() {
+                sequence.push((seq, name, cond));
+            }
+        }
+        sequence.sort_by_key(|t| t.0);
+    }
+    for (seq, name, cond) in &sequence {
+        if *seq <= 0 {
+            continue; // termination action — skip in install walk
+        }
+        if !eval_condition(cond, &properties) {
+            continue;
+        }
+        let Some((ty, source, target)) = custom_actions.get(name) else {
+            continue; // standard MSI action — handled by the table walks below
+        };
+        let kind = (*ty) & 0x3F;
+        match kind {
+            // 51 = msidbCustomActionTypeTextData: property set
+            // (Source = property name, Target = formatted value).
+            51 => {
+                let value = expand_properties(target, &properties, false)
+                    .unwrap_or_else(|_| target.clone());
+                properties.insert(source.clone(), value);
+            }
+            // 35 = msidbCustomActionTypeDirectorySet: same shape
+            // as 51 but the assignment target is a Directory id.
+            // We treat it identically (the directory walk later
+            // honours Property-namespace overrides).
+            35 => {
+                let value = expand_properties(target, &properties, false)
+                    .unwrap_or_else(|_| target.clone());
+                properties.insert(source.clone(), value);
+            }
+            // DLL / EXE / script CAs go to the sink.
+            1 | 2 | 17 | 18 | 5 | 6 | 21 | 22 | 25 | 26 => {
+                if !sink.emit(InstallAction::CustomAction {
+                    name: name.clone(),
+                    action_type: *ty,
+                    source: source.clone(),
+                    target: target.clone(),
+                    condition: cond.clone(),
+                }) {
+                    return Ok(properties);
+                }
+            }
+            _ => {
+                // Unknown / unsupported (e.g. 19 = error,
+                // 23 = nested install, 37 = nested dir).
+                // Log and continue.
+                if !sink.emit(InstallAction::Log(format!(
+                    "CA {name:?}: unsupported action type {ty} ({kind:#x})"
+                ))) {
+                    return Ok(properties);
+                }
+            }
+        }
+    }
+
     if !sink.emit(InstallAction::SnapshotProperties(properties.clone())) {
         return Ok(properties);
     }
@@ -343,6 +472,19 @@ pub fn process_msi(
         }) {
             return Ok(properties);
         }
+    }
+    // Inject resolved directory ids into the property namespace
+    // so registry / file `[DirId]` references substitute the
+    // same way real MSI does. Real Windows-Installer puts
+    // properties + directory ids + component states + feature
+    // states all into one formatting namespace; we only need
+    // directories to unblock the QT case (registry references
+    // `[QuickTimeComponentsFolder]` etc.).
+    for (id, path) in &resolved_dirs {
+        // Don't clobber an explicit Property-table value with
+        // the same name — that would override a CA's prior
+        // property set.
+        properties.entry(id.clone()).or_insert_with(|| path.clone());
     }
 
     // ------------------------------------------------------------
@@ -563,6 +705,108 @@ fn seed_default_properties(props: &mut BTreeMap<String, String>) {
 /// Walk the parent chain for `id`, resolving each `DefaultDir`
 /// token against the property namespace. Caches via
 /// `resolved`. Roots (parent empty or `TARGETDIR`) terminate
+/// Evaluate a tiny subset of the Windows-Installer condition
+/// expression language. The full grammar is fairly involved
+/// (CONDITION = expression ; expression = symbol | term | ...
+/// — see the MSI SDK), but the Apple QT installer uses a small
+/// vocabulary:
+///
+///   * `Installed` / `NOT Installed`
+///   * `PROP=value` / `PROP<>value` / `PROP="value"`
+///   * `PROP` (truthy if set + non-empty)
+///   * `NOT PROP`
+///   * `expr AND expr` / `expr OR expr`
+///   * `(expr)`
+///   * Feature operators (`$X=2`, `?X>2`) — treated as TRUE so
+///     feature-state-gated actions don't get suppressed.
+///
+/// Unknown / malformed conditions return TRUE so we err toward
+/// running more actions. This is a *very* permissive evaluator;
+/// it is NOT a substitute for the real expression engine.
+fn eval_condition(cond: &str, props: &BTreeMap<String, String>) -> bool {
+    let s = cond.trim();
+    if s.is_empty() {
+        return true;
+    }
+    // OR has the lowest precedence.
+    if let Some((l, r)) = split_top_level(s, " OR ") {
+        return eval_condition(l, props) || eval_condition(r, props);
+    }
+    if let Some((l, r)) = split_top_level(s, " AND ") {
+        return eval_condition(l, props) && eval_condition(r, props);
+    }
+    // Parenthesised group.
+    if s.starts_with('(') && s.ends_with(')') {
+        return eval_condition(&s[1..s.len() - 1], props);
+    }
+    // NOT.
+    if let Some(rest) = s.strip_prefix("NOT ") {
+        return !eval_condition(rest, props);
+    }
+    // Feature / Component state operators ($Foo, ?Foo, &Foo, !Foo) —
+    // treat as TRUE since we don't model feature state.
+    if matches!(s.chars().next(), Some('$' | '?' | '&' | '!')) {
+        return true;
+    }
+    // PROP=value / PROP<>value / PROP="value"
+    for (op, expect_eq) in [("<>", false), ("=", true)] {
+        if let Some((lhs, rhs)) = s.split_once(op) {
+            let l = lookup(lhs.trim(), props);
+            let r = lookup_or_literal(rhs.trim(), props);
+            let eq = l.eq_ignore_ascii_case(&r);
+            return if expect_eq { eq } else { !eq };
+        }
+    }
+    // Bare property name — truthy if set + non-empty.
+    !lookup(s, props).is_empty()
+}
+
+/// Split `s` at the first top-level (not inside parens or quotes)
+/// occurrence of `sep`.
+fn split_top_level<'a>(s: &'a str, sep: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth: i32 = 0;
+    let mut in_quote = false;
+    let bytes = s.as_bytes();
+    let sep_bytes = sep.as_bytes();
+    let mut i = 0;
+    while i + sep_bytes.len() <= bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            in_quote = !in_quote;
+        } else if !in_quote {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth = depth.saturating_sub(1);
+            } else if depth == 0 && bytes[i..i + sep_bytes.len()] == *sep_bytes {
+                return Some((&s[..i], &s[i + sep_bytes.len()..]));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn lookup(name: &str, props: &BTreeMap<String, String>) -> String {
+    props.get(name).cloned().unwrap_or_default()
+}
+
+fn lookup_or_literal(s: &str, props: &BTreeMap<String, String>) -> String {
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        return s[1..s.len() - 1].to_string();
+    }
+    // Numeric literal stays as-is; otherwise treat as property lookup if defined.
+    if s.chars()
+        .all(|c| c.is_ascii_digit() || c == '-' || c == '+')
+    {
+        return s.to_string();
+    }
+    if let Some(v) = props.get(s) {
+        return v.clone();
+    }
+    s.to_string()
+}
+
 /// the walk; the `TARGETDIR` default `[ProgramFilesFolder]\…`
 /// is resolved through the property namespace.
 fn resolve_dir(
@@ -1081,6 +1325,17 @@ impl InstallSink for EmulatorInstallSink<'_> {
             }
             InstallAction::Log(line) => {
                 self.log.push(format!("msiexec: {line}"));
+            }
+            InstallAction::CustomAction {
+                name,
+                action_type,
+                source,
+                target,
+                ..
+            } => {
+                self.log.push(format!(
+                    "msiexec: skipped CA {name:?} type={action_type:#x} src={source:?} tgt={target:?}"
+                ));
             }
         }
         true

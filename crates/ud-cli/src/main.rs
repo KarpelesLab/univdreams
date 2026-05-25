@@ -2208,6 +2208,17 @@ fn monitor_msi_install(
                         .push(format!("msiexec: property snapshot ({} entries)", p.len()));
                 }
                 msiexec::InstallAction::Log(s) => self.log.push(format!("msiexec: {s}")),
+                msiexec::InstallAction::CustomAction {
+                    name,
+                    action_type,
+                    source,
+                    target,
+                    ..
+                } => {
+                    self.log.push(format!(
+                        "msiexec: skipped CA {name:?} type={action_type:#x} src={source:?} tgt={target:?}"
+                    ));
+                }
             }
             true
         }
