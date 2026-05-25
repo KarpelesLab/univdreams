@@ -1420,6 +1420,42 @@ fn qtcodec_list(
             c.dll, c.name, c.ret
         );
     }
+    // Try OpenADefaultComponent — sometimes triggers the
+    // component scan as a side effect.
+    if let Some(target) = sandbox
+        .registry
+        .resolve("qtmlclient.dll", "OpenADefaultComponent")
+    {
+        let stub_before = sandbox.host.stub_calls.len();
+        sandbox.host.exit_requested = None;
+        match ud_emulator::win32::call_guest(
+            &mut sandbox.cpu,
+            &mut sandbox.mmu,
+            &sandbox.registry,
+            &mut sandbox.host,
+            target,
+            &[ty_v, sub_v],
+        ) {
+            Ok(v) => println!("OpenADefaultComponent({ty:?}, {subtype:?}) = {v:#x}"),
+            Err(e) => eprintln!("OpenADefaultComponent trapped: {e}"),
+        }
+        let calls = &sandbox.host.stub_calls[stub_before..];
+        eprintln!(
+            "--- {} stub calls during OpenADefaultComponent ---",
+            calls.len()
+        );
+        for c in calls.iter().take(20) {
+            let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+            let eip = c.call_site_eip;
+            eprintln!(
+                "  {eip:#010x} {}!{}({}) -> {:#x}",
+                c.dll,
+                c.name,
+                args.join(", "),
+                c.ret
+            );
+        }
+    }
     // Also try FindNextComponent which may lazily scan
     if let Some(target) = sandbox
         .registry
