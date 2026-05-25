@@ -7,6 +7,105 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
+
+## [0.2.0](https://github.com/KarpelesLab/univdreams/compare/v0.1.5...v0.2.0) - 2026-05-25
+
+### Added
+
+- *(emulator)* wine-style msiexec inside win32 — synthesises MSI installs
+- *(monitor)* expose debug_log in MonitorReport + log Phase 5c fallback
+- *(emulator)* IPC — named events + anonymous & named pipes
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 # Changelog
 
 All notable changes to this project are documented in this file.
