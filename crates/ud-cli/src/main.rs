@@ -1037,6 +1037,7 @@ fn fourcc_be(s: &str) -> u32 {
     u32::from_be_bytes(b)
 }
 
+#[allow(clippy::too_many_lines)]
 fn qtcodec_list(
     ty: &str,
     subtype: &str,
@@ -1086,7 +1087,7 @@ fn qtcodec_list(
     for (i, w) in words.iter().enumerate() {
         sandbox
             .mmu
-            .store32(desc_addr + (i as u32) * 4, *w)
+            .store32(desc_addr + u32::try_from(i).unwrap_or(0) * 4, *w)
             .map_err(|e| anyhow::anyhow!("write CD[{i}]: {e}"))?;
     }
     eprintln!(
