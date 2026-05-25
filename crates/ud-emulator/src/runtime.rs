@@ -692,6 +692,140 @@ impl Sandbox {
         )
     }
 
+    /// Pump any deferred MSI CustomActions that the msiexec
+    /// walker queued during a previous `CreateProcessA(msiexec.exe)`
+    /// dispatch. For each pending DLL CA: load the Binary-table
+    /// DLL bytes into the sandbox at a fresh image base, set
+    /// up an `MsiSession` so the msi.dll stubs can answer
+    /// property queries against the walker's snapshot, and
+    /// call the CA's named export with `MSIHANDLE = 1`.
+    /// EXE / script CAs are logged + skipped (unsupported).
+    ///
+    /// Returns the number of CAs successfully executed (CAs
+    /// that trapped or returned non-zero are counted as
+    /// attempted; the failure is captured in `host.debug_log`).
+    pub fn pump_pending_msi_install(&mut self) -> usize {
+        let Some(pending) = self.host.pending_msi_install.take() else {
+            return 0;
+        };
+        // Set up the in-process MSI session with our property
+        // snapshot. The MSIHANDLE is just an opaque token; we
+        // use 1 since there's at most one install at a time.
+        self.host.msi_session = Some(crate::win32::MsiSession {
+            handle: 1,
+            properties: pending.properties.clone(),
+            target_paths: pending
+                .properties
+                .iter()
+                .filter(|(k, _)| k.chars().next().is_some_and(char::is_uppercase))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        });
+        let mut executed = 0;
+        for ca in pending.actions {
+            // Only DLL CAs of type 1 (immediate) / 0xC01 (deferred)
+            // and similar in-process DLL shapes are runnable here.
+            let kind = ca.action_type & 0x3F;
+            if kind != 1 && kind != 17 {
+                self.host.debug_log.push(format!(
+                    "msiexec CA {:?}: skipped, type {:#x} (kind {:#x}) not a DLL CA",
+                    ca.name, ca.action_type, kind
+                ));
+                continue;
+            }
+            // For kind == 1 the Source column is a Binary-table
+            // key, for kind == 17 it's a File-table key. We
+            // only have Binary streams cached here.
+            let Some(bytes) = pending.binaries.get(&ca.source).cloned() else {
+                self.host.debug_log.push(format!(
+                    "msiexec CA {:?}: Binary {:?} not in table, skipping",
+                    ca.name, ca.source
+                ));
+                continue;
+            };
+            // Load the DLL at a fresh image base. We register
+            // the loaded bytes against `ca.source` so subsequent
+            // CAs that reference the same binary share the load.
+            let dll_key = ca.source.to_ascii_lowercase();
+            let img = if let Some(&base) = self.host.modules.get(&dll_key) {
+                // Already loaded — synthesise an Image from the
+                // cached exports.
+                let exports = self
+                    .host
+                    .loaded_dll_exports
+                    .get(&base)
+                    .cloned()
+                    .unwrap_or_default();
+                crate::pe::Image {
+                    name: ca.source.clone(),
+                    image_base: base,
+                    entry_point: base,
+                    size_of_image: 0,
+                    sections: Vec::new(),
+                    exports,
+                }
+            } else {
+                match self.load_with_deps(&ca.source, &bytes) {
+                    Ok((img, _)) => {
+                        // Best-effort DllMain.
+                        if let Err(e) = self.call_dll_main(&img, crate::DLL_PROCESS_ATTACH) {
+                            self.host.debug_log.push(format!(
+                                "msiexec CA {:?}: {} DllMain trapped: {e}",
+                                ca.name, ca.source
+                            ));
+                        }
+                        img
+                    }
+                    Err(e) => {
+                        self.host.debug_log.push(format!(
+                            "msiexec CA {:?}: load {:?} failed: {e}",
+                            ca.name, ca.source
+                        ));
+                        continue;
+                    }
+                }
+            };
+            let Some(rva) = img.exports.get(&ca.target).copied() else {
+                self.host.debug_log.push(format!(
+                    "msiexec CA {:?}: export {:?} not in {:?}",
+                    ca.name, ca.target, ca.source
+                ));
+                continue;
+            };
+            let entry = img.image_base.wrapping_add(rva);
+            // Call the CA's entry with MSIHANDLE = 1.
+            self.host.debug_log.push(format!(
+                "msiexec CA {:?}: calling {:?}({:?})",
+                ca.name, ca.target, 1
+            ));
+            match crate::win32::call_guest(
+                &mut self.cpu,
+                &mut self.mmu,
+                &self.registry,
+                &mut self.host,
+                entry,
+                &[1],
+            ) {
+                Ok(rc) => {
+                    let signed = rc as i32;
+                    self.host.debug_log.push(format!(
+                        "msiexec CA {:?}: {:?} returned {rc:#x} ({signed})",
+                        ca.name, ca.target
+                    ));
+                    executed += 1;
+                }
+                Err(e) => {
+                    self.host.debug_log.push(format!(
+                        "msiexec CA {:?}: {:?} trapped: {e}",
+                        ca.name, ca.target
+                    ));
+                }
+            }
+        }
+        self.host.msi_session = None;
+        executed
+    }
+
     /// Generic stdcall guest-call helper. Resolves `name` against
     /// `image`'s export table, pushes `args` right-to-left + the
     /// `RET_SENTINEL`, and runs until the callee returns.

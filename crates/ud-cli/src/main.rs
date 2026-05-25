@@ -2216,7 +2216,13 @@ fn monitor_msi_install(
                     ..
                 } => {
                     self.log.push(format!(
-                        "msiexec: skipped CA {name:?} type={action_type:#x} src={source:?} tgt={target:?}"
+                        "msiexec: queued CA {name:?} type={action_type:#x} src={source:?} tgt={target:?}"
+                    ));
+                }
+                msiexec::InstallAction::BinaryStream { name, bytes } => {
+                    self.log.push(format!(
+                        "msiexec: captured Binary {name:?} ({} bytes)",
+                        bytes.len()
                     ));
                 }
             }
@@ -2385,6 +2391,22 @@ fn monitor_install(
     sandbox.set_command_line(&command_line)?;
 
     let entry_result = sandbox.call_entry_point(&image);
+    // After the installer's entry returns, drain any MSI
+    // CustomActions the msiexec walker queued during a
+    // `CreateProcessA(msiexec.exe)` dispatch. The walker
+    // doesn't have Sandbox-level Cpu/Registry access during
+    // a stub call, so it stashes pending DLL/EXE/script CAs
+    // in HostState and we pump them here where we DO have the
+    // Sandbox. CA effects (registry writes, component
+    // registrations) land in the same VirtualFs /
+    // VirtualRegistry the installer touched.
+    let pumped = sandbox.pump_pending_msi_install();
+    if pumped > 0 {
+        sandbox
+            .host
+            .debug_log
+            .push(format!("msiexec: pumped {pumped} deferred CustomAction(s)"));
+    }
     let stub_calls = std::mem::take(&mut sandbox.host.stub_calls);
     let instructions_executed = sandbox.host.instructions_executed;
 

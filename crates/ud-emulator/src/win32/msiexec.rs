@@ -163,6 +163,19 @@ pub enum InstallAction {
         /// (already evaluated true by the walker).
         condition: String,
     },
+    /// One row of the MSI's `Binary` table — name + raw
+    /// (typically PE) bytes. The walker emits these BEFORE
+    /// the first `CustomAction` so a sink that wants to
+    /// execute DLL CAs has the DLL bytes cached by the time
+    /// the CA's `Source` references them.
+    BinaryStream {
+        /// `Binary.Name` primary key (the value the
+        /// `CustomAction.Source` column references for
+        /// type 1 / 257 / 3073).
+        name: String,
+        /// Raw bytes of the embedded stream.
+        bytes: Vec<u8>,
+    },
 }
 
 /// Windows registry hive root, in canonical form.
@@ -432,6 +445,36 @@ pub fn process_msi(
 
     if !sink.emit(InstallAction::SnapshotProperties(properties.clone())) {
         return Ok(properties);
+    }
+
+    // ------------------------------------------------------------
+    // Binary table — embedded streams referenced by DLL / EXE /
+    // script CustomActions. Surface them as `BinaryStream` so
+    // the sink can cache the bytes ahead of a DLL CA dispatch.
+    // ------------------------------------------------------------
+    if pkg.has_table("Binary") {
+        let rows: Vec<_> = pkg
+            .select_rows(msi::Select::table("Binary"))
+            .map_err(|e| Error::Schema(format!("Binary select: {e}")))?
+            .collect();
+        let names: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r[0].as_str().map(str::to_string))
+            .collect();
+        for name in &names {
+            let stream_name = format!("Binary.{name}");
+            let mut bytes = Vec::new();
+            if let Ok(mut s) = pkg.read_stream(&stream_name) {
+                use std::io::Read;
+                let _ = s.read_to_end(&mut bytes);
+            }
+            if !sink.emit(InstallAction::BinaryStream {
+                name: name.clone(),
+                bytes,
+            }) {
+                return Ok(properties);
+            }
+        }
     }
 
     // ------------------------------------------------------------
@@ -1265,6 +1308,29 @@ struct EmulatorInstallSink<'a> {
     /// smaller when some entries fell back to zero-byte
     /// markers.
     n_real_bytes: u64,
+    /// Binary-table streams captured during the walk. Keyed by
+    /// `Binary.Name`. DLL CAs reference these by name through
+    /// `CustomAction.Source`.
+    binaries: BTreeMap<String, Vec<u8>>,
+    /// Final property snapshot the walker emitted via
+    /// `SnapshotProperties` — used to seed the `MsiSession`
+    /// when the deferred DLL CAs run after the walk.
+    properties_snapshot: BTreeMap<String, String>,
+    /// Pending DLL / EXE / script CA dispatches collected
+    /// during the walk. Executed AFTER the walk so the file
+    /// install + registry writes are visible to the CA via
+    /// the VFS / VirtualRegistry it touches through msi.dll.
+    pending_cas: Vec<PendingCustomAction>,
+}
+
+/// Captured DLL/EXE/script CustomAction awaiting execution.
+#[derive(Debug, Clone)]
+pub struct PendingCustomAction {
+    pub name: String,
+    pub action_type: i32,
+    pub source: String,
+    pub target: String,
+    pub condition: String,
 }
 
 impl InstallSink for EmulatorInstallSink<'_> {
@@ -1322,20 +1388,35 @@ impl InstallSink for EmulatorInstallSink<'_> {
                     "msiexec: property snapshot ({} entries)",
                     props.len()
                 ));
+                self.properties_snapshot = props;
             }
             InstallAction::Log(line) => {
                 self.log.push(format!("msiexec: {line}"));
+            }
+            InstallAction::BinaryStream { name, bytes } => {
+                self.log.push(format!(
+                    "msiexec: captured Binary {name:?} ({} bytes)",
+                    bytes.len()
+                ));
+                self.binaries.insert(name, bytes);
             }
             InstallAction::CustomAction {
                 name,
                 action_type,
                 source,
                 target,
-                ..
+                condition,
             } => {
                 self.log.push(format!(
-                    "msiexec: skipped CA {name:?} type={action_type:#x} src={source:?} tgt={target:?}"
+                    "msiexec: queued CA {name:?} type={action_type:#x} src={source:?} tgt={target:?}"
                 ));
+                self.pending_cas.push(PendingCustomAction {
+                    name,
+                    action_type,
+                    source,
+                    target,
+                    condition,
+                });
             }
         }
         true
@@ -1403,6 +1484,9 @@ pub fn dispatch_msiexec_install(
         n_regs: 0,
         n_bytes: 0,
         n_real_bytes: 0,
+        binaries: BTreeMap::new(),
+        properties_snapshot: BTreeMap::new(),
+        pending_cas: Vec::new(),
     };
     let result = process_msi(&bytes, &options, &mut sink);
     let dirs = sink.n_dirs;
@@ -1410,6 +1494,9 @@ pub fn dispatch_msiexec_install(
     let regs = sink.n_regs;
     let bytes_total = sink.n_bytes;
     let real_bytes = sink.n_real_bytes;
+    let binaries = std::mem::take(&mut sink.binaries);
+    let properties_snapshot = std::mem::take(&mut sink.properties_snapshot);
+    let pending_cas = std::mem::take(&mut sink.pending_cas);
     for line in sink.log {
         state.debug_log.push(line);
     }
@@ -1423,6 +1510,43 @@ pub fn dispatch_msiexec_install(
             .debug_log
             .push(format!("msiexec /i {msi_path:?} — walk failed: {e}")),
     }
+    // Deferred DLL/EXE/script CustomAction execution.
+    // `dispatch_msiexec_install` only has access to `&mut HostState`
+    // + `&mut Mmu`; we don't have the Cpu/Registry needed for a
+    // full guest-call here. Stash the pending CAs in HostState
+    // so the outer driver (which DOES have a Sandbox) can pump
+    // them after `CreateProcessA(msiexec.exe)` returns.
+    if !pending_cas.is_empty() || !binaries.is_empty() {
+        state.pending_msi_install = Some(PendingMsiInstall {
+            binaries,
+            properties: properties_snapshot,
+            actions: pending_cas,
+        });
+        state.debug_log.push(format!(
+            "msiexec /i {msi_path:?} — queued {} pending CustomAction(s) for deferred execution",
+            state
+                .pending_msi_install
+                .as_ref()
+                .map_or(0, |q| q.actions.len())
+        ));
+    }
+}
+
+/// State the msiexec walker hands off to the outer Sandbox-side
+/// driver. `dispatch_msiexec_install` runs with `&mut HostState
+/// + &mut Mmu` only — not enough to call into guest code. The
+/// driver picks this up after `CreateProcessA(msiexec.exe)`
+/// returns, then loops each pending CA through a real guest
+/// `call_guest` with the Sandbox's full register/registry
+/// access.
+#[derive(Debug, Default, Clone)]
+pub struct PendingMsiInstall {
+    /// `Binary.Name → bytes` map for DLL/EXE/script CAs.
+    pub binaries: BTreeMap<String, Vec<u8>>,
+    /// Resolved property map at walk completion.
+    pub properties: BTreeMap<String, String>,
+    /// CAs to run in the order the walker queued them.
+    pub actions: Vec<PendingCustomAction>,
 }
 
 /// Look the MSI bytes up in the VFS. Tries a few path

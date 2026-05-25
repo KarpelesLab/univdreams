@@ -595,6 +595,23 @@ pub struct HostState {
     /// subsequent VFS-DLL load can still find a previously
     /// loaded sibling's exports for IAT patching.
     pub loaded_dll_exports: BTreeMap<u32, BTreeMap<String, u32>>,
+    /// Active MSI session — `Some` while a DLL CustomAction is
+    /// running and the msi.dll stub set needs to answer
+    /// `MsiGetProperty` / `MsiSetProperty` / etc. against an
+    /// in-process property map. `None` outside CA execution
+    /// (the msi.dll stubs return error codes in that case).
+    /// The session is set up by the msiexec walker before
+    /// invoking the DLL CA's entry point and torn down after.
+    pub msi_session: Option<MsiSession>,
+    /// Pending DLL/EXE/script CustomActions handed off from
+    /// `msiexec::dispatch_msiexec_install` for the outer
+    /// Sandbox-side driver to execute after
+    /// `CreateProcessA(msiexec.exe)` returns. The walker can
+    /// only do the table walks + property/directory CA work
+    /// (no Cpu/Registry access); guest-code CA dispatch
+    /// happens in `Sandbox::pump_pending_msi_install` once
+    /// the parent process resumes.
+    pub pending_msi_install: Option<crate::win32::msiexec::PendingMsiInstall>,
     /// When `Some`, the most recently dispatched stub asked the
     /// run loop to switch threads. The run loop drains the
     /// field after every stub return: a `Wait(...)` moves the
@@ -637,6 +654,8 @@ impl Default for HostState {
             preserve_deletes: false,
             next_dll_image_base: 0x4000_0000,
             loaded_dll_exports: BTreeMap::new(),
+            msi_session: None,
+            pending_msi_install: None,
         }
     }
 }
@@ -879,6 +898,32 @@ pub struct DataImport {
 pub const DATA_IMPORT_BASE: u32 = 0x7010_0000;
 const DATA_IMPORT_SIZE: u32 = 0x0000_1000;
 const DATA_IMPORT_END: u32 = DATA_IMPORT_BASE + DATA_IMPORT_SIZE;
+
+/// In-process MSI install session — set on [`HostState`] while
+/// a DLL CustomAction is running so the msi.dll stub set can
+/// answer `MsiGetProperty` / `MsiSetProperty` / etc. against
+/// the walker's property map. The walker sets `handle` to a
+/// caller-supplied non-zero token (we use 1 since there's
+/// only ever one active install in our sandbox); the msi.dll
+/// stubs verify the caller's hInstall matches before serving
+/// the request.
+#[derive(Debug, Default, Clone)]
+pub struct MsiSession {
+    /// Token the DLL CA was invoked with. msi.dll stubs check
+    /// the caller's `hInstall` argument against this; mismatch
+    /// returns ERROR_INVALID_HANDLE.
+    pub handle: u32,
+    /// Property namespace, mutable across the CA's lifetime.
+    /// `MsiGetProperty(handle, name, ...)` reads from here;
+    /// `MsiSetProperty(handle, name, value)` writes back.
+    pub properties: BTreeMap<String, String>,
+    /// Resolved directory paths injected into the property
+    /// namespace by the walker. Kept separately so
+    /// `MsiGetTargetPath` (which is supposed to consult the
+    /// directory table specifically) can serve from here
+    /// without lookups falling through to non-directory props.
+    pub target_paths: BTreeMap<String, String>,
+}
 
 /// Returns true iff the given DLL name (lowercase, with `.dll`
 /// suffix) is one the host has a stub registry for. The
