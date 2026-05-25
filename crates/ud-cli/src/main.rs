@@ -254,6 +254,43 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum QtcodecCommand {
+    /// Manually register a QT component by loading its `.qtx`
+    /// and calling `qtmlclient!RegisterComponent` with a
+    /// caller-supplied ComponentDescription pointing at the
+    /// codec's `*_ComponentDispatch` export. After registration
+    /// the component shows up in `CountComponents` /
+    /// `FindNextComponent` and can be opened via
+    /// `OpenComponent`. Use this until our MSI walker runs the
+    /// post-install registration CustomAction.
+    Register {
+        /// Codec `.qtx` to register.
+        codec: PathBuf,
+
+        /// `*_ComponentDispatch` export to use as the entry point.
+        #[arg(long)]
+        export: String,
+
+        /// componentType FourCC (e.g. `imdc`).
+        #[arg(long)]
+        ty: String,
+
+        /// componentSubType FourCC (e.g. `apch`).
+        #[arg(long)]
+        subtype: String,
+
+        /// componentManufacturer FourCC.
+        #[arg(long, default_value = "appl")]
+        manufacturer: String,
+
+        /// Mount these host directories into the sandbox VFS.
+        #[arg(long, value_name = "DIR")]
+        stage_vfs: Vec<PathBuf>,
+
+        /// Cap the run at this many guest instructions.
+        #[arg(long, default_value_t = 1_000_000_000)]
+        max_instructions: u64,
+    },
+
     /// Count the registered QT components matching a
     /// `ComponentDescription { type, subType, manufacturer,
     /// flags, flagsMask }`. Calls InitializeQTML + EnterMovies
@@ -872,6 +909,23 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ),
         },
         Command::Qtcodec { command } => match command {
+            QtcodecCommand::Register {
+                codec,
+                export,
+                ty,
+                subtype,
+                manufacturer,
+                stage_vfs,
+                max_instructions,
+            } => qtcodec_register(
+                &codec,
+                &export,
+                &ty,
+                &subtype,
+                &manufacturer,
+                &stage_vfs,
+                max_instructions,
+            ),
             QtcodecCommand::List {
                 ty,
                 subtype,
@@ -1035,6 +1089,130 @@ fn fourcc_be(s: &str) -> u32 {
     }
     // OSType is Big-Endian — 'imdc' → 0x696d6463
     u32::from_be_bytes(b)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn qtcodec_register(
+    codec: &Path,
+    export: &str,
+    ty: &str,
+    subtype: &str,
+    manufacturer: &str,
+    stage_vfs: &[PathBuf],
+    max_instructions: u64,
+) -> anyhow::Result<()> {
+    let codec_bytes = std::fs::read(codec).with_context(|| format!("read {}", codec.display()))?;
+    let codec_stem = codec
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("codec.qtx");
+
+    let ty_v = fourcc_be(ty);
+    let sub_v = fourcc_be(subtype);
+    let man_v = fourcc_be(manufacturer);
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.trace_stubs = true;
+    sandbox.host.instruction_budget = Some(max_instructions);
+    sandbox
+        .context_mut()
+        .vfs
+        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+    for d in stage_vfs {
+        let n = stage_dir_into_vfs(sandbox.context_mut(), d)
+            .with_context(|| format!("stage {}", d.display()))?;
+        eprintln!("staged {n} files from {}", d.display());
+    }
+    preload_qt_runtime(&mut sandbox);
+
+    let init_rc = init_qtml(&mut sandbox);
+    if init_rc != 0 {
+        anyhow::bail!("InitializeQTML failed: {init_rc:#x}");
+    }
+    if let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "EnterMovies") {
+        match ud_emulator::win32::call_guest(
+            &mut sandbox.cpu,
+            &mut sandbox.mmu,
+            &sandbox.registry,
+            &mut sandbox.host,
+            target,
+            &[],
+        ) {
+            Ok(v) => eprintln!("EnterMovies() = {v:#x}"),
+            Err(e) => eprintln!("EnterMovies() trapped: {e}"),
+        }
+    }
+
+    // Load the codec.
+    let (image, _) = sandbox
+        .load_with_deps(codec_stem, &codec_bytes)
+        .with_context(|| format!("load {}", codec.display()))?;
+    eprintln!("loaded {codec_stem} at {:#010x}", image.image_base);
+    if let Err(e) = sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH) {
+        eprintln!("{codec_stem}: DllMain trapped: {e}");
+    }
+    let Some(entry_rva) = image.exports.get(export) else {
+        anyhow::bail!("codec doesn't export {export}");
+    };
+    let entry_va = image.image_base.wrapping_add(*entry_rva);
+    eprintln!("dispatch entry {export} @ {entry_va:#010x}");
+
+    // ComponentDescription { type, subType, manufacturer,
+    // flags, flagsMask } — 5 dwords.
+    let desc_addr = QTCODEC_SCRATCH + 0x10000;
+    let words = [ty_v, sub_v, man_v, 0, 0];
+    for (i, w) in words.iter().enumerate() {
+        sandbox
+            .mmu
+            .store32(desc_addr + u32::try_from(i).unwrap_or(0) * 4, *w)
+            .map_err(|e| anyhow::anyhow!("write CD[{i}]: {e}"))?;
+    }
+    eprintln!(
+        "ComponentDescription @ {desc_addr:#x}: type={ty_v:#x} subType={sub_v:#x} mfr={man_v:#x}"
+    );
+
+    // Call RegisterComponent(&desc, entry_va, 0, 0, 0, 0)
+    let Some(target) = sandbox
+        .registry
+        .resolve("qtmlclient.dll", "RegisterComponent")
+    else {
+        anyhow::bail!("qtmlclient!RegisterComponent missing");
+    };
+    let result = ud_emulator::win32::call_guest(
+        &mut sandbox.cpu,
+        &mut sandbox.mmu,
+        &sandbox.registry,
+        &mut sandbox.host,
+        target,
+        &[desc_addr, entry_va, 0, 0, 0, 0],
+    );
+    match result {
+        Ok(v) => println!("RegisterComponent = {v:#010x} (component handle)"),
+        Err(e) => {
+            eprintln!("RegisterComponent trapped: {e}");
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    }
+
+    // Now verify with CountComponents
+    let Some(target) = sandbox
+        .registry
+        .resolve("qtmlclient.dll", "CountComponents")
+    else {
+        anyhow::bail!("CountComponents missing");
+    };
+    match ud_emulator::win32::call_guest(
+        &mut sandbox.cpu,
+        &mut sandbox.mmu,
+        &sandbox.registry,
+        &mut sandbox.host,
+        target,
+        &[desc_addr],
+    ) {
+        Ok(v) => println!("CountComponents after register = {v}"),
+        Err(e) => eprintln!("CountComponents trapped: {e}"),
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]

@@ -457,8 +457,45 @@ impl Sandbox {
         loading.insert(name.to_ascii_lowercase());
         self.preload_deps(bytes, &mut loading)?;
         loading.remove(&name.to_ascii_lowercase());
-        // Now load the primary in fail-soft (anything still
-        // unresolved becomes a trap thunk).
+        // Now load the primary in fail-soft. If the PE's
+        // preferred image base collides with something already
+        // mapped (very common for Apple binaries that all hard-
+        // code 0x10000000 / 0x66800000), force a rebased load
+        // at a fresh slot from next_dll_image_base — otherwise
+        // map_sections_at would overwrite the prior occupant's
+        // sections, breaking the previously loaded module.
+        let parsed = crate::pe::header::parse(bytes)?;
+        let preferred = parsed.optional.image_base;
+        let image_size = parsed.optional.size_of_image;
+        if !self.mmu.region_is_unmapped(preferred, image_size) {
+            let aligned = (image_size + 0xFFFF) & !0xFFFF;
+            let base = self.host.next_dll_image_base;
+            self.host.next_dll_image_base = base.saturating_add(aligned);
+            let mut options = crate::pe::LoadOptions {
+                imports: crate::pe::imports::ResolveMode::FailSoft,
+                fail_soft_log: Some(Vec::new()),
+                target_image_base: Some(base),
+            };
+            let mut loader = Loader::new(&mut self.mmu, &mut self.registry, &mut self.host);
+            let img = loader.load_with_options(name, bytes, &mut options)?;
+            self.host.primary_module_base = img.image_base;
+            self.host
+                .modules
+                .insert(name.to_ascii_lowercase(), img.image_base);
+            // Register exports against the canonical name so
+            // GetProcAddress + IAT lookups resolve.
+            for (export_name, rva) in &img.exports {
+                self.registry.register_guest_export(
+                    name,
+                    export_name,
+                    img.image_base.wrapping_add(*rva),
+                );
+            }
+            self.host
+                .loaded_dll_exports
+                .insert(img.image_base, img.exports.clone());
+            return Ok((img, options.fail_soft_log.unwrap_or_default()));
+        }
         self.load_fail_soft(name, bytes)
     }
 
