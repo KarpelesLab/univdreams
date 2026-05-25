@@ -894,11 +894,12 @@ const ICMODE_DECOMPRESS: u32 = 1;
 const ICMODE_COMPRESS: u32 = 2;
 const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
 
-/// Scratch address in the heap arena, chosen so it's above
+/// Scratch address inside the heap arena, chosen so it's above
 /// any reasonable codec allocation made during DllMain. The
-/// heap allocator grows up from 0x60000000; this gives the
-/// codec ~250 MiB before the scratch slot collides.
-const QTCODEC_SCRATCH: u32 = 0x6FFE_0000;
+/// heap allocator grows up from `HEAP_ARENA_START` (0x60000000);
+/// the slot sits just below `HEAP_ARENA_END` (0x66000000) giving
+/// the codec ~95 MiB before the scratch range collides.
+const QTCODEC_SCRATCH: u32 = 0x65FE_0000;
 
 /// Pre-load the QT runtime DLLs (qtmlclient.dll + quicktime.qts)
 /// from the sandbox VFS if present. The codec / app doesn't
@@ -980,7 +981,10 @@ fn qtcodec_call(
         Err(e) => eprintln!("DllMain trapped: {e}"),
     }
     eprintln!("calling {export}({args:?})");
-    match sandbox.call_export(&image, export, args) {
+    sandbox.host.stub_calls.clear();
+    let res = sandbox.call_export(&image, export, args);
+    let calls = std::mem::take(&mut sandbox.host.stub_calls);
+    match res {
         Ok(ret) => {
             #[allow(clippy::cast_possible_wrap)]
             let signed = ret as i32;
@@ -988,8 +992,19 @@ fn qtcodec_call(
         }
         Err(e) => {
             eprintln!("{export}: trapped: {e}");
-            return Err(anyhow::anyhow!("{e}"));
         }
+    }
+    eprintln!("--- {} stub calls during {export} ---", calls.len());
+    for c in &calls {
+        let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+        eprintln!(
+            "  {} {}!{}({}) -> {:#x}",
+            format!("{:#010x}", c.call_site_eip),
+            c.dll,
+            c.name,
+            args.join(", "),
+            c.ret
+        );
     }
     for line in &sandbox.host.debug_log {
         eprintln!("  {line}");

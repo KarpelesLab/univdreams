@@ -1612,13 +1612,28 @@ fn stub_load_library_a(
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadLibraryA", t))?;
     let name = read_cstr(mmu, p, 260)?.to_ascii_lowercase();
-    if let Some(base) = state.modules.get(&name) {
-        return Ok(*base);
+    Ok(lookup_loaded_module(state, &name))
+}
+
+/// Resolve a `LoadLibrary*` request against `state.modules`.
+/// The map is keyed by the canonical lowercase basename that
+/// the loader used at load time (e.g. `quicktime.qts`), but
+/// the guest often calls `LoadLibraryEx*` with a full path
+/// like `C:\Program Files\QuickTime\QtSystem\QuickTime.qts`.
+/// Try the exact-match first, then fall back to the basename
+/// after the last `/` or `\`.
+fn lookup_loaded_module(state: &HostState, name_lc: &str) -> u32 {
+    if let Some(b) = state.modules.get(name_lc) {
+        return *b;
     }
-    // We pretend the module did not load. Many codecs handle
-    // NULL gracefully; the ones that don't will raise a clear
-    // trap downstream.
-    Ok(0)
+    let basename = name_lc
+        .rsplit(|c| c == '\\' || c == '/')
+        .next()
+        .unwrap_or(name_lc);
+    if let Some(b) = state.modules.get(basename) {
+        return *b;
+    }
+    0
 }
 
 /// `FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)`.
@@ -1829,8 +1844,12 @@ fn stub_set_last_error(
 }
 
 /// `DWORD GetModuleFileNameA(HMODULE hModule, LPSTR lpFilename,
-/// DWORD nSize)`. Writes `"oxideav-vfw\0"` into the buffer up to
-/// `nSize`, returns the number of bytes written (excluding NUL).
+/// DWORD nSize)`. Returns a synthetic full-path Win32 executable
+/// path. Apple's qtmlclient/QuickTime.qts bootstrap strips the
+/// filename from this and appends `QtSystem\QuickTime.qts` to
+/// find the QuickTime engine; the path here is shaped to make
+/// that work when the standard QT install tree is staged into
+/// the sandbox VFS via `--stage-vfs`.
 fn stub_get_module_file_name_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -1843,7 +1862,14 @@ fn stub_get_module_file_name_a(
     if dst == 0 || n_size == 0 {
         return Ok(0);
     }
-    let s = b"oxideav-vfw";
+    write_module_file_name_a(mmu, dst, n_size)
+}
+
+/// Shared body for [`stub_get_module_file_name_a`] and the
+/// `kernel32!GetModuleFileNameExA` shim — both write the same
+/// canonical EXE path into the caller's buffer.
+fn write_module_file_name_a(mmu: &mut Mmu, dst: u32, n_size: u32) -> Result<u32, Win32Error> {
+    let s = b"C:\\Program Files\\QuickTime\\QtSystem\\QuickTimePlayer.exe";
     let mut written = 0u32;
     for (i, b) in s.iter().enumerate() {
         if (i as u32) >= n_size.saturating_sub(1) {
@@ -1853,7 +1879,6 @@ fn stub_get_module_file_name_a(
             .map_err(|t| trap_to_win32("GetModuleFileNameA", t))?;
         written = written.saturating_add(1);
     }
-    // Always NUL-terminate (within nSize).
     if n_size > 0 {
         let nul_off = written.min(n_size - 1);
         mmu.store8(dst + nul_off, 0)
@@ -1876,7 +1901,7 @@ fn stub_get_module_handle_a(
         return Ok(state.primary_module_base);
     }
     let name = read_cstr(mmu, p, 260)?.to_ascii_lowercase();
-    Ok(state.modules.get(&name).copied().unwrap_or(0))
+    Ok(lookup_loaded_module(state, &name))
 }
 
 /// `void GetStartupInfoA(LPSTARTUPINFO lpStartupInfo)`. Fills
@@ -3060,8 +3085,11 @@ fn stub_get_system_directory_a(
     Ok(n as u32)
 }
 
-/// `BOOL GetVersionExA(LPOSVERSIONINFOA)`. Fills in a Windows 95
-/// shape: 4.00.0950, VER_PLATFORM_WIN32_WINDOWS = 1.
+/// `BOOL GetVersionExA(LPOSVERSIONINFOA)`. Fills in a
+/// Windows XP SP3 shape: 5.1.2600, VER_PLATFORM_WIN32_NT = 2.
+/// Apple's QuickTime 7.x bootstrap checks for NT and refuses
+/// to init on Win9x (platform_id = 1), so the Round-1 Win95
+/// shape blocked InitializeQTML; XP works.
 ///
 /// OSVERSIONINFOA layout (148 bytes):
 ///   DWORD dwOSVersionInfoSize     (in)
@@ -3081,16 +3109,21 @@ fn stub_get_version_ex_a(
         return Ok(0);
     }
     // Skip dwOSVersionInfoSize at offset 0 (caller-supplied).
-    mmu.store32(p + 4, 4)
+    mmu.store32(p + 4, 5)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwMajorVersion
-    mmu.store32(p + 8, 0)
+    mmu.store32(p + 8, 1)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwMinorVersion
-    mmu.store32(p + 12, 950)
+    mmu.store32(p + 12, 2600)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwBuildNumber
-    mmu.store32(p + 16, 1)
-        .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwPlatformId
-                                                          // szCSDVersion: ""
-    mmu.store8(p + 20, 0)
+    mmu.store32(p + 16, 2)
+        .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwPlatformId (NT)
+                                                          // szCSDVersion: "Service Pack 3"
+    let csd = b"Service Pack 3";
+    for (i, b) in csd.iter().enumerate() {
+        mmu.store8(p + 20 + i as u32, *b)
+            .map_err(|t| trap_to_win32("GetVersionExA", t))?;
+    }
+    mmu.store8(p + 20 + csd.len() as u32, 0)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?;
     Ok(1)
 }
@@ -4380,7 +4413,7 @@ fn stub_get_module_handle_w(
         return Ok(state.primary_module_base);
     }
     let name = read_wcstr(mmu, p, 260)?.to_ascii_lowercase();
-    Ok(state.modules.get(&name).copied().unwrap_or(0))
+    Ok(lookup_loaded_module(state, &name))
 }
 
 /// Read a NUL-terminated wide (UTF-16LE) string from guest
@@ -4665,7 +4698,7 @@ fn stub_load_library_w(
         return Ok(0);
     }
     let name = read_wcstr(mmu, p, 260)?.to_ascii_lowercase();
-    Ok(state.modules.get(&name).copied().unwrap_or(0))
+    Ok(lookup_loaded_module(state, &name))
 }
 
 /// `BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED)`.
@@ -5015,7 +5048,7 @@ fn stub_load_library_ex_a(
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadLibraryExA", t))?;
     let name = read_cstr(mmu, p, 260)?.to_ascii_lowercase();
-    Ok(state.modules.get(&name).copied().unwrap_or(0))
+    Ok(lookup_loaded_module(state, &name))
 }
 
 /// `BOOL WriteConsoleA(HANDLE, const VOID*, DWORD nNumberOfChars,
@@ -5063,7 +5096,7 @@ fn stub_get_module_file_name_w(
     if dst == 0 || n_size == 0 {
         return Ok(0);
     }
-    let s = "oxideav-vfw";
+    let s = "C:\\Program Files\\QuickTime\\QtSystem\\QuickTimePlayer.exe";
     let mut written = 0u32;
     for (i, c) in s.chars().enumerate() {
         if (i as u32) >= n_size.saturating_sub(1) {
@@ -5151,7 +5184,7 @@ fn stub_get_module_handle_ex_a(
         state.primary_module_base
     } else {
         let name = read_cstr(mmu, name_p, 260)?.to_ascii_lowercase();
-        state.modules.get(&name).copied().unwrap_or(0)
+        lookup_loaded_module(state, &name)
     };
     if out != 0 {
         mmu.store32(out, handle)

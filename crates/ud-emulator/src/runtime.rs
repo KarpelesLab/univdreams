@@ -22,8 +22,16 @@ pub const DLL_PROCESS_ATTACH: u32 = 1;
 pub const DLL_PROCESS_DETACH: u32 = 0;
 
 /// Default region the loader can use as the kernel32 heap arena.
+/// Shrunk to the lower 96 MiB of the 0x6000_0000-0x7000_0000
+/// quarter so the upper half stays free for Apple framework DLLs
+/// that hard-code preferred image bases in 0x66XX_XXXX-0x68XX_XXXX
+/// (quicktime.qts at 0x6680_0000, the .qtx codecs at 0x677X_XXXX,
+/// qtcf.dll at 0x6864_0000, AAS CoreVideo / CoreAudioToolbox /
+/// CFNetwork at similar addresses). When the VFS-DLL fallback
+/// loader maps a dependent at its preferred base, the heap arena
+/// no longer collides.
 const HEAP_ARENA_START: u32 = 0x6000_0000;
-const HEAP_ARENA_END: u32 = 0x7000_0000;
+const HEAP_ARENA_END: u32 = 0x6600_0000;
 
 /// Const-arena region — read-only canned strings handed back from
 /// `GetCommandLineA` / `GetEnvironmentStrings` etc.
