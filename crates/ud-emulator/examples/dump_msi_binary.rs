@@ -1,5 +1,9 @@
+//! Extract every stream from an MSI's Binary table to disk — the
+//! place CustomActions of type 1 / 257 / 3073 store their referenced
+//! DLLs (`QTInstallCode.dll`, `QTMSISupport.dll` for QuickTime).
 use std::env;
 use std::io::Read;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let path = &args[1];
@@ -12,7 +16,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("no Binary table");
         return Ok(());
     }
-    // Get name list first
     let q = msi::Select::table("Binary");
     let names: Vec<String> = pkg
         .select_rows(q)?
@@ -26,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     println!("Binary entries: {}", names.len());
     for name in &names {
-        let stream_name = format!("Binary.{}", name);
+        let stream_name = format!("Binary.{name}");
         if let Ok(mut s) = pkg.read_stream(&stream_name) {
             let mut buf = Vec::new();
             s.read_to_end(&mut buf)?;

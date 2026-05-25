@@ -1,4 +1,7 @@
+//! Dump rows from an MSI's Registry table whose joined fields
+//! mention any of a small interest list (codec-related entries).
 use std::env;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let path = &args[1];
@@ -9,14 +12,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rows: Vec<_> = pkg.select_rows(q)?.collect();
     eprintln!("Registry rows: {}", rows.len());
     let mut codec_related = Vec::new();
-    for r in rows.iter() {
+    for r in &rows {
         let mut fields = Vec::new();
         for i in 0..r.len() {
             let v = match &r[i] {
                 msi::Value::Null => "NULL".to_string(),
                 msi::Value::Int(n) => n.to_string(),
                 msi::Value::Str(s) => s.clone(),
-                _ => "<bin>".to_string(),
+                msi::Value::Binary => "<binary>".to_string(),
             };
             fields.push(v);
         }

@@ -1,4 +1,8 @@
+//! Dump MSI CustomAction / InstallExecuteSequence / InstallUISequence
+//! tables — exposes what the official Windows Installer would
+//! execute that our `win32::msiexec` walker skips.
 use std::env;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let path = &args[1];
@@ -24,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     msi::Value::Null => "NULL".to_string(),
                     msi::Value::Int(n) => n.to_string(),
                     msi::Value::Str(s) => format!("{s:?}"),
-                    _ => "<binary>".to_string(),
+                    msi::Value::Binary => "<binary>".to_string(),
                 };
                 fields.push(v);
             }
