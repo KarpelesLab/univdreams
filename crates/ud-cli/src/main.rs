@@ -325,13 +325,12 @@ enum QtcodecCommand {
         stage_vfs: Vec<PathBuf>,
 
         /// Optionally run the install of one or more MSIs
-        /// (`--install-msi /path/to/quicktime.msi`) AFTER
-        /// staging the VFS but BEFORE bringing up the QT
-        /// runtime. The msiexec walker runs in the SAME
-        /// sandbox, pumps deferred DLL CustomActions
-        /// (QuickTimePostInstallMSIProc), then InitializeQTML
-        /// + EnterMovies + CountComponents query observe the
-        /// post-install state.
+        /// before the QT runtime bring-up. The msiexec walker
+        /// runs in the SAME sandbox and pumps deferred DLL
+        /// CustomActions (QuickTimePostInstallMSIProc), so
+        /// the subsequent InitializeQTML / EnterMovies /
+        /// CountComponents calls observe the post-install
+        /// state.
         #[arg(long, value_name = "MSI")]
         install_msi: Vec<PathBuf>,
 
