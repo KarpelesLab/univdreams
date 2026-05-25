@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let q = msi::Select::table("Directory");
     let rows: Vec<_> = pkg.select_rows(q)?.collect();
     println!("Directory rows: {}", rows.len());
-    let filter = args.get(2).map(String::as_str).unwrap_or("");
+    let filter = args.get(2).map_or("", String::as_str);
     for r in &rows {
         let id = r[0].as_str().unwrap_or("");
         let parent = r[1].as_str().unwrap_or("");
