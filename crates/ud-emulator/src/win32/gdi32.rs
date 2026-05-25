@@ -100,6 +100,130 @@ pub fn register(registry: &mut Registry) {
     // `DeleteObject` is a no-op that reports success.
     // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deleteobject
     registry.register("gdi32.dll", "DeleteObject", stub_delete_object as StubFn, 1);
+
+    // ---- QT 3.0-era installer surface --------------------------
+    // The QT3 setup.exe (InstallShield 5-era) uses a lot of GDI
+    // for wizard drawing. Return synthetic handles + accept-or-
+    // ignore semantics; no actual rendering happens.
+    registry.register(
+        "gdi32.dll",
+        "CreateSolidBrush",
+        stub_create_handle as StubFn,
+        1,
+    );
+    registry.register("gdi32.dll", "CreatePen", stub_create_handle as StubFn, 3);
+    registry.register(
+        "gdi32.dll",
+        "CreateBrushIndirect",
+        stub_create_handle as StubFn,
+        1,
+    );
+    registry.register(
+        "gdi32.dll",
+        "CreatePenIndirect",
+        stub_create_handle as StubFn,
+        1,
+    );
+    registry.register("gdi32.dll", "CreateFontA", stub_create_handle as StubFn, 14);
+    registry.register(
+        "gdi32.dll",
+        "CreateFontIndirectA",
+        stub_create_handle as StubFn,
+        1,
+    );
+    registry.register(
+        "gdi32.dll",
+        "CreatePalette",
+        stub_create_handle as StubFn,
+        1,
+    );
+    registry.register("gdi32.dll", "CreateBitmap", stub_create_handle as StubFn, 5);
+    registry.register(
+        "gdi32.dll",
+        "CreateCompatibleBitmap",
+        stub_create_handle as StubFn,
+        3,
+    );
+    registry.register(
+        "gdi32.dll",
+        "CreateDIBitmap",
+        stub_create_handle as StubFn,
+        6,
+    );
+    registry.register(
+        "gdi32.dll",
+        "CreateDIBSection",
+        stub_create_handle as StubFn,
+        6,
+    );
+    registry.register(
+        "gdi32.dll",
+        "CreateRectRgn",
+        stub_create_handle as StubFn,
+        4,
+    );
+    registry.register(
+        "gdi32.dll",
+        "CreatePolygonRgn",
+        stub_create_handle as StubFn,
+        3,
+    );
+    // Drawing primitives — accept + return TRUE.
+    for name in [
+        "TextOutA",
+        "TextOutW",
+        "ExtTextOutA",
+        "ExtTextOutW",
+        "DrawTextA",
+        "DrawTextW",
+        "FillRect",
+        "FrameRect",
+        "InvertRect",
+        "Polygon",
+        "Polyline",
+        "Rectangle",
+        "RoundRect",
+        "Ellipse",
+        "LineTo",
+        "MoveToEx",
+        "SetTextColor",
+        "SetBkColor",
+        "SetBkMode",
+        "SetTextAlign",
+        "SetROP2",
+        "SetMapMode",
+        "SetStretchBltMode",
+        "SetDIBitsToDevice",
+        "SetDIBits",
+        "PatBlt",
+        "StretchBlt",
+        "MaskBlt",
+        "PlgBlt",
+        "TransparentBlt",
+        "RestoreDC",
+        "SaveDC",
+        "IntersectClipRect",
+        "ExcludeClipRect",
+        "OffsetClipRgn",
+        "OffsetRgn",
+        "GetClipBox",
+        "PtInRegion",
+        "RectInRegion",
+        "GetTextExtentPoint32A",
+        "GetTextMetricsA",
+        "GetTextFaceA",
+        "GetBkColor",
+        "GetTextColor",
+        "GetMapMode",
+        "GetStockObject",
+        "RealizePalette",
+        "SelectPalette",
+        "AnimatePalette",
+        "GetPaletteEntries",
+        "SetPaletteEntries",
+    ] {
+        registry.register("gdi32.dll", name, stub_gdi_zero_arg_success as StubFn, 0);
+    }
 }
 
 /// `BOOL DeleteObject(HGDIOBJ ho)`. No-op returning TRUE.
@@ -274,6 +398,31 @@ fn stub_select_object(
 /// the decode path we drive.  We therefore return the caller's
 /// `DestHeight` so any "scanlines > 0 == success" probe sees a
 /// satisfied contract.
+/// Bucket stub for GDI object-creation APIs that mint a fake
+/// HGDIOBJ. Returns a synthetic handle in the 0x6800_xxxx
+/// range, monotonically bumped per call.
+fn stub_create_handle(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let h = 0x6800_0000u32.wrapping_add(state.tick);
+    state.tick = state.tick.wrapping_add(1);
+    Ok(h)
+}
+
+/// Bucket stub for GDI draw/set APIs that have no observable
+/// effect in a headless sandbox. Returns 1 (success / TRUE).
+fn stub_gdi_zero_arg_success(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
 fn stub_stretch_dibits(
     cpu: &mut Cpu,
     mmu: &mut Mmu,

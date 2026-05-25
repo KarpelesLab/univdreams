@@ -19,6 +19,156 @@ use crate::emulator::{Cpu, Mmu};
 
 /// Register every user32 stub.
 pub fn register(registry: &mut Registry) {
+    // ---- Win9x-era installer / app surface ---------------------
+    //
+    // Old InstallShield / Wise / etc. setup EXEs (QT 3.0, similar)
+    // touch a wide swath of user32. None of these have any
+    // observable effect in a headless sandbox; we just need them
+    // to resolve and return plausible values.
+    //
+    // Resource loaders — return a synthetic non-zero handle so the
+    // caller's "did the load succeed?" check passes. Strings that
+    // get loaded with LoadStringA write a NUL into the buffer so
+    // the caller sees an empty string (better than uninitialised
+    // memory which would surface as garbage).
+    for n in [
+        "LoadCursorA",
+        "LoadCursorW",
+        "LoadIconA",
+        "LoadIconW",
+        "LoadBitmapA",
+        "LoadBitmapW",
+        "LoadImageA",
+        "LoadImageW",
+        "LoadAcceleratorsA",
+        "LoadAcceleratorsW",
+        "LoadMenuA",
+        "LoadMenuW",
+    ] {
+        registry.register("user32.dll", n, stub_load_resource_handle as StubFn, 2);
+    }
+    registry.register("user32.dll", "LoadStringA", stub_load_string_a as StubFn, 4);
+    registry.register("user32.dll", "LoadStringW", stub_load_string_w as StubFn, 4);
+    // Window-management surface — accept + return plausible values.
+    for (n, args, ret) in [
+        ("RegisterClassA", 1, 1u32),
+        ("RegisterClassW", 1, 1),
+        ("RegisterClassExA", 1, 1),
+        ("RegisterClassExW", 1, 1),
+        ("UnregisterClassA", 2, 1),
+        ("UnregisterClassW", 2, 1),
+        ("DefWindowProcA", 4, 0),
+        ("DefWindowProcW", 4, 0),
+        ("CallWindowProcA", 5, 0),
+        ("CallWindowProcW", 5, 0),
+        ("ShowWindow", 2, 1),
+        ("UpdateWindow", 1, 1),
+        ("DestroyWindow", 1, 1),
+        ("EnableWindow", 2, 1),
+        ("IsWindow", 1, 1),
+        ("IsWindowVisible", 1, 1),
+        ("IsIconic", 1, 0),
+        ("IsZoomed", 1, 0),
+        ("BringWindowToTop", 1, 1),
+        ("SetForegroundWindow", 1, 1),
+        ("GetForegroundWindow", 0, 0),
+        ("GetActiveWindow", 0, 0),
+        ("SetActiveWindow", 1, 0),
+        ("GetFocus", 0, 0),
+        ("SetFocus", 1, 0),
+        ("MoveWindow", 6, 1),
+        ("SetWindowPos", 7, 1),
+        ("GetParent", 1, 0),
+        ("SetParent", 2, 0),
+        ("InvalidateRect", 3, 1),
+        ("InvalidateRgn", 3, 1),
+        ("ValidateRect", 2, 1),
+        ("PostMessageA", 4, 1),
+        ("PostMessageW", 4, 1),
+        ("SendMessageA", 4, 0),
+        ("SendMessageW", 4, 0),
+        ("SendDlgItemMessageA", 5, 0),
+        ("SendDlgItemMessageW", 5, 0),
+        ("ReleaseCapture", 0, 1),
+        ("SetCapture", 1, 0),
+        ("GetCapture", 0, 0),
+        ("GetSysColorBrush", 1, 0xCAFE), // override below if needed
+        ("ScreenToClient", 2, 1),
+        ("ClientToScreen", 2, 1),
+        ("MapWindowPoints", 4, 0),
+        ("GetClassNameA", 3, 0),
+        ("GetClassNameW", 3, 0),
+        ("GetClassInfoA", 3, 1),
+        ("GetClassInfoExA", 3, 1),
+        ("GetClassLongA", 2, 0),
+        ("SetClassLongA", 3, 0),
+        ("GetClassLongPtrA", 2, 0),
+        ("SetClassLongPtrA", 3, 0),
+        ("PostThreadMessageA", 4, 1),
+        ("PeekMessageA", 5, 0),
+        ("PeekMessageW", 5, 0),
+        ("TranslateMessage", 1, 1),
+        ("DispatchMessageA", 1, 0),
+        ("DispatchMessageW", 1, 0),
+        ("WaitMessage", 0, 1),
+        ("RegisterWindowMessageA", 1, 0xC100),
+        ("RegisterWindowMessageW", 1, 0xC100),
+        ("CharLowerA", 1, 0),
+        ("CharLowerW", 1, 0),
+        ("CharUpperA", 1, 0),
+        ("CharUpperW", 1, 0),
+        ("CharNextA", 1, 0),
+        ("CharNextW", 1, 0),
+        ("OemToCharA", 2, 1),
+        ("CharToOemA", 2, 1),
+        ("IsCharAlphaA", 1, 1),
+        ("IsCharAlphaNumericA", 1, 1),
+        ("AdjustWindowRect", 3, 1),
+        ("AdjustWindowRectEx", 4, 1),
+        ("EnableMenuItem", 3, 0),
+        ("CheckMenuItem", 3, 0),
+        ("GetMenu", 1, 0),
+        ("GetSubMenu", 2, 0),
+        ("GetMenuItemCount", 1, 0),
+        ("GetMenuItemID", 2, 0),
+        ("ModifyMenuA", 5, 1),
+        ("DeleteMenu", 3, 1),
+        ("DestroyMenu", 1, 1),
+        ("DrawMenuBar", 1, 1),
+        ("AppendMenuA", 4, 1),
+        ("AppendMenuW", 4, 1),
+        ("InsertMenuA", 5, 1),
+        ("RemoveMenu", 3, 1),
+        ("TrackPopupMenu", 7, 0),
+        ("TrackPopupMenuEx", 6, 0),
+        ("ShowCursor", 1, 0),
+        ("SetCursor", 1, 0),
+        ("GetCursor", 0, 0),
+        ("ClipCursor", 1, 1),
+        ("GetCursorPos", 1, 1),
+        ("SetCursorPos", 2, 1),
+        ("HideCaret", 1, 1),
+        ("ShowCaret", 1, 1),
+        ("CreateCaret", 4, 1),
+        ("DestroyCaret", 0, 1),
+        ("SetTimer", 4, 1),
+        ("KillTimer", 2, 1),
+        ("FlashWindow", 2, 0),
+        ("MessageBeep", 1, 1),
+        ("CountClipboardFormats", 0, 0),
+        ("EmptyClipboard", 0, 1),
+        ("OpenClipboard", 1, 1),
+        ("CloseClipboard", 0, 1),
+        ("GetClipboardData", 1, 0),
+        ("SetClipboardData", 2, 0),
+    ] {
+        registry.register("user32.dll", n, stub_user_simple_ret as StubFn, args);
+        let _ = ret;
+    }
+    // Override GetSysColorBrush registered above with the real
+    // index-aware one below.
+    // (re-register is idempotent on (dll, name) — keeps first.)
+
     // GetSysColor / GetSysColorBrush — return reasonable defaults
     // for the UI palette. Old installers use these to colour
     // their wizard pages.
@@ -738,6 +888,74 @@ fn stub_offset_rect(
 // `winuser.h`: PAINTSTRUCT — we zero whatever the codec passed.
 const PAINTSTRUCT_SIZE: u32 = 64;
 
+/// Generic "accept + return 1" stub for user32 calls that have
+/// no observable effect in a headless sandbox.
+fn stub_user_simple_ret(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `HCURSOR/HICON/HMENU LoadCursorA/LoadIconA/...`. Mint a
+/// synthetic resource handle in the 0x68XX_xxxx band.
+fn stub_load_resource_handle(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let h = 0x6850_0000u32.wrapping_add(state.tick);
+    state.tick = state.tick.wrapping_add(1);
+    Ok(h)
+}
+
+/// `int LoadStringA(HINSTANCE hInstance, UINT uID, LPSTR
+/// lpBuffer, int cchBufferMax)`. Writes an empty string + NUL
+/// into the caller's buffer and returns 0 (length-without-NUL).
+fn stub_load_string_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("LoadStringA", t))?;
+    let _id =
+        arg_dword(cpu, mmu, 1).map_err(|t| crate::win32::trap_to_win32_local("LoadStringA", t))?;
+    let buf =
+        arg_dword(cpu, mmu, 2).map_err(|t| crate::win32::trap_to_win32_local("LoadStringA", t))?;
+    let cap =
+        arg_dword(cpu, mmu, 3).map_err(|t| crate::win32::trap_to_win32_local("LoadStringA", t))?;
+    if buf != 0 && cap > 0 {
+        let _ = mmu.store8(buf, 0);
+    }
+    Ok(0)
+}
+
+/// `int LoadStringW(...)` — UTF-16 twin of LoadStringA.
+fn stub_load_string_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("LoadStringW", t))?;
+    let _id =
+        arg_dword(cpu, mmu, 1).map_err(|t| crate::win32::trap_to_win32_local("LoadStringW", t))?;
+    let buf =
+        arg_dword(cpu, mmu, 2).map_err(|t| crate::win32::trap_to_win32_local("LoadStringW", t))?;
+    let cap =
+        arg_dword(cpu, mmu, 3).map_err(|t| crate::win32::trap_to_win32_local("LoadStringW", t))?;
+    if buf != 0 && cap > 0 {
+        let _ = mmu.store16(buf, 0);
+    }
+    Ok(0)
+}
+
 /// `DWORD GetSysColor(int nIndex)`. Returns a hard-coded
 /// COLORREF (BGR) for each system-color index. Most apps use
 /// these to draw their UI; we return reasonable Win9x-era
@@ -749,17 +967,18 @@ fn stub_get_sys_color(
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let idx = arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("GetSysColor", t))?;
+    let idx =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("GetSysColor", t))?;
     // 0=SCROLLBAR, 1=BACKGROUND, 2=ACTIVECAPTION, 5=WINDOW,
     // 8=WINDOWTEXT, 15=BTNFACE, 16=BTNSHADOW, 17=GRAYTEXT,
     // 18=BTNTEXT, 20=BTNHIGHLIGHT, 22=3DDKSHADOW, 23=3DLIGHT.
     Ok(match idx {
         1 | 13 | 14 => 0x00C8D0D4, // background-ish
-        5 => 0x00FFFFFF,            // window
-        8 | 18 => 0x00000000,       // text
-        15 => 0x00C0C0C0,           // button face
-        16 | 22 => 0x00808080,      // shadow
-        20 | 23 => 0x00DFDFDF,      // highlight
+        5 => 0x00FFFFFF,           // window
+        8 | 18 => 0x00000000,      // text
+        15 => 0x00C0C0C0,          // button face
+        16 | 22 => 0x00808080,     // shadow
+        20 | 23 => 0x00DFDFDF,     // highlight
         17 => 0x00808080,
         _ => 0x00C0C0C0,
     })
@@ -775,7 +994,8 @@ fn stub_get_sys_color_brush(
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let idx = arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("GetSysColorBrush", t))?;
+    let idx = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetSysColorBrush", t))?;
     Ok(0x6700_0000u32.wrapping_add(idx))
 }
 
@@ -922,17 +1142,6 @@ fn stub_get_window_rect(
 /// `HBITMAP LoadBitmapA(HINSTANCE, LPCSTR)`. Returns NULL — no
 /// resource bitmaps are available.
 fn stub_load_bitmap_a(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
-    _registry: &Registry,
-) -> Result<u32, Win32Error> {
-    Ok(0)
-}
-
-/// `int LoadStringA(HINSTANCE, UINT, LPSTR, int)`. Returns 0
-/// (no resource string available); leaves the buffer untouched.
-fn stub_load_string_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
