@@ -15,4 +15,4 @@ description = "Abstract syntax tree for the .ud source language, with canonical 
 workspace = true
 
 [dependencies]
-ud-arch-x86 = { version = "0.1.5", path = "../ud-arch-x86" }
+ud-arch-x86 = { version = "0.2.0", path = "../ud-arch-x86" }
