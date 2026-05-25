@@ -19,6 +19,16 @@ use crate::emulator::{Cpu, Mmu};
 
 /// Register every user32 stub.
 pub fn register(registry: &mut Registry) {
+    // GetSysColor / GetSysColorBrush — return reasonable defaults
+    // for the UI palette. Old installers use these to colour
+    // their wizard pages.
+    registry.register("user32.dll", "GetSysColor", stub_get_sys_color as StubFn, 1);
+    registry.register(
+        "user32.dll",
+        "GetSysColorBrush",
+        stub_get_sys_color_brush as StubFn,
+        1,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-beginpaint
     registry.register("user32.dll", "BeginPaint", stub_begin_paint as StubFn, 2);
     // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-dialogboxparama
@@ -727,6 +737,47 @@ fn stub_offset_rect(
 
 // `winuser.h`: PAINTSTRUCT — we zero whatever the codec passed.
 const PAINTSTRUCT_SIZE: u32 = 64;
+
+/// `DWORD GetSysColor(int nIndex)`. Returns a hard-coded
+/// COLORREF (BGR) for each system-color index. Most apps use
+/// these to draw their UI; we return reasonable Win9x-era
+/// defaults so background / button-face / window-text aren't
+/// black-on-black.
+fn stub_get_sys_color(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let idx = arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("GetSysColor", t))?;
+    // 0=SCROLLBAR, 1=BACKGROUND, 2=ACTIVECAPTION, 5=WINDOW,
+    // 8=WINDOWTEXT, 15=BTNFACE, 16=BTNSHADOW, 17=GRAYTEXT,
+    // 18=BTNTEXT, 20=BTNHIGHLIGHT, 22=3DDKSHADOW, 23=3DLIGHT.
+    Ok(match idx {
+        1 | 13 | 14 => 0x00C8D0D4, // background-ish
+        5 => 0x00FFFFFF,            // window
+        8 | 18 => 0x00000000,       // text
+        15 => 0x00C0C0C0,           // button face
+        16 | 22 => 0x00808080,      // shadow
+        20 | 23 => 0x00DFDFDF,      // highlight
+        17 => 0x00808080,
+        _ => 0x00C0C0C0,
+    })
+}
+
+/// `HBRUSH GetSysColorBrush(int nIndex)`. We return a fake but
+/// non-zero handle keyed by the index — installers compare for
+/// non-NULL to detect "do I have a brush?" but rarely use it
+/// for actual drawing.
+fn stub_get_sys_color_brush(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let idx = arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("GetSysColorBrush", t))?;
+    Ok(0x6700_0000u32.wrapping_add(idx))
+}
 
 fn stub_begin_paint(
     cpu: &mut Cpu,
