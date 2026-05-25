@@ -177,7 +177,8 @@ Rust. Reasoning, briefly:
 │   ├── architecture.md         # pipeline, IR, how directives preserve info
 │   ├── roadmap.md              # phased milestones, what's done
 │   ├── source-language.md      # the .ud language, directives, examples
-│   └── round-trip-contract.md  # what "identical bytes" means precisely
+│   ├── round-trip-contract.md  # what "identical bytes" means precisely
+│   └── installers.md           # running Win32 installers under `ud analyze --monitor`
 └── crates/
     ├── ud-core/                # shared types: VAddr, Result, byte helpers
     ├── ud-format/              # ELF64 + PE/COFF + thin Mach-O + raw readers + writers (byte-identical)
@@ -260,6 +261,7 @@ If you want the full design and current state:
 2. [docs/round-trip-contract.md](docs/round-trip-contract.md) — what we promise to preserve and at which layer it's tested.
 3. [docs/source-language.md](docs/source-language.md) — directive vocabulary with worked examples.
 4. [docs/roadmap.md](docs/roadmap.md) — what's shipped, what's in progress, what's still ahead.
+5. [docs/installers.md](docs/installers.md) — running Win32 installers under `ud analyze --monitor`; how to extract an installer's payload + capture its install effects (files, registry).
 
 ## License
 
