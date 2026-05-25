@@ -1635,6 +1635,146 @@ mod tests {
     /// address; recursion increments on re-entry by the same
     /// thread; `LeaveCriticalSection` decrements and clears
     /// ownership when the count reaches zero. Exercised through
+    /// IPC: `CreatePipe` mints a read/write handle pair;
+    /// `WriteFile` on the write end stages bytes that
+    /// `ReadFile` on the read end picks up. The two handles
+    /// share an in-memory buffer through the scheduler's
+    /// pipe table; closing the write end drains EOF on the
+    /// reader.
+    #[test]
+    fn create_pipe_write_read_round_trip() {
+        let mut sb = Sandbox::new();
+        // Scratch region for handle outputs + data buffers.
+        sb.mmu.map(0x500_0000, 0x1000, Perm::R | Perm::W);
+        let p_read_h = 0x500_0000u32;
+        let p_write_h = 0x500_0004u32;
+        let p_written = 0x500_0010u32;
+        let p_data_in = 0x500_0020u32; // bytes to write
+        let p_data_out = 0x500_0040u32; // bytes to read into
+        let p_n_read = 0x500_0080u32;
+
+        // CreatePipe(read, write, NULL, 0).
+        let create_pipe = sb.registry.resolve("kernel32.dll", "CreatePipe").unwrap();
+        for &a in [p_read_h, p_write_h, 0u32, 0u32].iter().rev() {
+            sb.cpu.push32(&mut sb.mmu, a).unwrap();
+        }
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = create_pipe;
+        sb.run_until_sentinel().unwrap();
+        assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 1, "CreatePipe TRUE");
+        let h_read = sb.mmu.load32(p_read_h).unwrap();
+        let h_write = sb.mmu.load32(p_write_h).unwrap();
+        assert!(h_read >= crate::sched::WAIT_OBJECT_HANDLE_BASE);
+        assert_ne!(h_read, h_write, "distinct ends");
+
+        // Stage data in MMU + WriteFile(write_handle, data, 5, &written, NULL).
+        sb.mmu.write_initializer(p_data_in, b"HELLO").unwrap();
+        let write_file = sb.registry.resolve("kernel32.dll", "WriteFile").unwrap();
+        for &a in [h_write, p_data_in, 5u32, p_written, 0u32].iter().rev() {
+            sb.cpu.push32(&mut sb.mmu, a).unwrap();
+        }
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = write_file;
+        sb.run_until_sentinel().unwrap();
+        assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 1);
+        assert_eq!(sb.mmu.load32(p_written).unwrap(), 5);
+
+        // ReadFile(read_handle, out_buf, 5, &n_read, NULL).
+        let read_file = sb.registry.resolve("kernel32.dll", "ReadFile").unwrap();
+        for &a in [h_read, p_data_out, 5u32, p_n_read, 0u32].iter().rev() {
+            sb.cpu.push32(&mut sb.mmu, a).unwrap();
+        }
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = read_file;
+        sb.run_until_sentinel().unwrap();
+        assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 1);
+        assert_eq!(sb.mmu.load32(p_n_read).unwrap(), 5);
+        // Verify the bytes round-tripped.
+        let mut got = [0u8; 5];
+        for i in 0..5 {
+            got[i] = sb.mmu.load8(p_data_out + i as u32).unwrap();
+        }
+        assert_eq!(&got, b"HELLO");
+    }
+
+    /// Named-pipe handshake: a `CreateNamedPipeA(\\.\pipe\X)`
+    /// server end + a `CreateFileA(\\.\pipe\X)` client end
+    /// reach each other through the named-object registry
+    /// and share a buffer for `WriteFile` / `ReadFile`.
+    #[test]
+    fn named_pipe_server_and_client_share_buffer() {
+        let mut sb = Sandbox::new();
+        sb.mmu.map(0x501_0000, 0x1000, Perm::R | Perm::W);
+        let p_name = 0x501_0000u32;
+        let pipe_path = b"\\\\.\\pipe\\test\0";
+        sb.mmu.write_initializer(p_name, pipe_path).unwrap();
+        let p_data_in = 0x501_0100u32;
+        let p_data_out = 0x501_0200u32;
+        let p_written = 0x501_0300u32;
+        let p_n_read = 0x501_0310u32;
+
+        // CreateNamedPipeA(name, PIPE_ACCESS_OUTBOUND, ...). With
+        // OUTBOUND, the server holds the write end.
+        let cnp = sb
+            .registry
+            .resolve("kernel32.dll", "CreateNamedPipeA")
+            .unwrap();
+        for &a in [p_name, 2u32, 0u32, 1u32, 4096u32, 4096u32, 0u32, 0u32]
+            .iter()
+            .rev()
+        {
+            sb.cpu.push32(&mut sb.mmu, a).unwrap();
+        }
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = cnp;
+        sb.run_until_sentinel().unwrap();
+        let h_server = sb.cpu.regs.get32(Reg32::Eax);
+        assert!(h_server >= crate::sched::WAIT_OBJECT_HANDLE_BASE);
+
+        // Client: CreateFileA(\\.\pipe\test, GENERIC_READ, ...).
+        let cfa = sb.registry.resolve("kernel32.dll", "CreateFileA").unwrap();
+        for &a in [p_name, 0x8000_0000u32, 0u32, 0u32, 3u32, 0u32, 0u32]
+            .iter()
+            .rev()
+        {
+            sb.cpu.push32(&mut sb.mmu, a).unwrap();
+        }
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = cfa;
+        sb.run_until_sentinel().unwrap();
+        let h_client = sb.cpu.regs.get32(Reg32::Eax);
+        assert_ne!(h_client, 0xFFFF_FFFF, "client open should succeed");
+        assert_ne!(h_client, h_server, "distinct handles");
+
+        // Server WriteFile.
+        sb.mmu.write_initializer(p_data_in, b"PING!").unwrap();
+        let wfile = sb.registry.resolve("kernel32.dll", "WriteFile").unwrap();
+        for &a in [h_server, p_data_in, 5u32, p_written, 0u32].iter().rev() {
+            sb.cpu.push32(&mut sb.mmu, a).unwrap();
+        }
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = wfile;
+        sb.run_until_sentinel().unwrap();
+        assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 1);
+        assert_eq!(sb.mmu.load32(p_written).unwrap(), 5);
+
+        // Client ReadFile.
+        let rfile = sb.registry.resolve("kernel32.dll", "ReadFile").unwrap();
+        for &a in [h_client, p_data_out, 5u32, p_n_read, 0u32].iter().rev() {
+            sb.cpu.push32(&mut sb.mmu, a).unwrap();
+        }
+        sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+        sb.cpu.regs.eip = rfile;
+        sb.run_until_sentinel().unwrap();
+        assert_eq!(sb.cpu.regs.get32(Reg32::Eax), 1);
+        assert_eq!(sb.mmu.load32(p_n_read).unwrap(), 5);
+        let mut got = [0u8; 5];
+        for i in 0..5 {
+            got[i] = sb.mmu.load8(p_data_out + i as u32).unwrap();
+        }
+        assert_eq!(&got, b"PING!");
+    }
+
     /// the kernel32 thunk dispatch.
     #[test]
     fn enter_leave_critical_section_round_trip() {

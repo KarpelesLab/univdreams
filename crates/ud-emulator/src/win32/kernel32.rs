@@ -873,6 +873,29 @@ pub fn register(registry: &mut Registry) {
         1,
     );
     registry.register("kernel32.dll", "ReadFile", stub_read_file as StubFn, 5);
+    // https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe
+    registry.register("kernel32.dll", "CreatePipe", stub_create_pipe as StubFn, 4);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea
+    registry.register(
+        "kernel32.dll",
+        "CreateNamedPipeA",
+        stub_create_named_pipe_a as StubFn,
+        8,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-connectnamedpipe
+    registry.register(
+        "kernel32.dll",
+        "ConnectNamedPipe",
+        stub_connect_named_pipe as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-disconnectnamedpipe
+    registry.register(
+        "kernel32.dll",
+        "DisconnectNamedPipe",
+        stub_disconnect_named_pipe as StubFn,
+        1,
+    );
 
     // ---- Codec-corpus probe additions --------------------------
     //
@@ -1252,6 +1275,7 @@ pub fn register(registry: &mut Registry) {
     );
     // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-openeventa
     registry.register("kernel32.dll", "OpenEventA", stub_open_event_a as StubFn, 3);
+    registry.register("kernel32.dll", "OpenEventW", stub_open_event_w as StubFn, 3);
     // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
     registry.register(
         "kernel32.dll",
@@ -2278,6 +2302,51 @@ fn stub_write_file(
     let n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WriteFile", t))?;
     let lp_written = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WriteFile", t))?;
     let _lp_ovl = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("WriteFile", t))?;
+    // Pipe write end: append to the shared buffer + wake any
+    // thread blocked on the paired read end.
+    if let Some(crate::sched::WaitObject::Pipe {
+        pipe_id,
+        is_read_end: false,
+    }) = state.scheduler.objects.get(&h).cloned()
+    {
+        let mut buf = vec![0u8; n as usize];
+        if lp_buf != 0 {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = mmu
+                    .load8(lp_buf + i as u32)
+                    .map_err(|t| trap_to_win32("WriteFile", t))?;
+            }
+        }
+        if let Some(p) = state.scheduler.pipes.get_mut(&pipe_id) {
+            p.bytes.extend(buf.iter());
+        }
+        // Wake any thread blocked on the read end of this pipe.
+        let read_handles: Vec<u32> = state
+            .scheduler
+            .objects
+            .iter()
+            .filter_map(|(handle, obj)| match obj {
+                crate::sched::WaitObject::Pipe {
+                    pipe_id: pid,
+                    is_read_end: true,
+                } if *pid == pipe_id => Some(*handle),
+                _ => None,
+            })
+            .collect();
+        for rh in read_handles {
+            for tid in crate::sched::waiters_on(&state.threads, rh) {
+                if let Some(t) = state.threads.get_mut(&tid) {
+                    t.status = crate::sched::ThreadStatus::Ready;
+                    t.wait = None;
+                }
+            }
+        }
+        if lp_written != 0 {
+            mmu.store32(lp_written, n)
+                .map_err(|t| trap_to_win32("WriteFile", t))?;
+        }
+        return Ok(1);
+    }
     if let Some(vfs) = state.context.vfs.as_mut() {
         if vfs.owns(h) && lp_buf != 0 {
             let mut buf = vec![0u8; n as usize];
@@ -2360,6 +2429,44 @@ fn stub_close_handle(
             reg.close_key(h);
             return Ok(1);
         }
+    }
+    // Pipe end: bump the buffer's closed-ends counter and
+    // wake any reader blocked on the matching end (so they
+    // can observe EOF). Drop the WaitObject entry once the
+    // pipe is fully closed.
+    if let Some(crate::sched::WaitObject::Pipe {
+        pipe_id,
+        is_read_end,
+    }) = state.scheduler.objects.get(&h).cloned()
+    {
+        if let Some(p) = state.scheduler.pipes.get_mut(&pipe_id) {
+            p.closed_ends = p.closed_ends.saturating_add(1);
+        }
+        // Wake parked readers if the writer just closed.
+        if !is_read_end {
+            let read_handles: Vec<u32> = state
+                .scheduler
+                .objects
+                .iter()
+                .filter_map(|(handle, obj)| match obj {
+                    crate::sched::WaitObject::Pipe {
+                        pipe_id: pid,
+                        is_read_end: true,
+                    } if *pid == pipe_id => Some(*handle),
+                    _ => None,
+                })
+                .collect();
+            for rh in read_handles {
+                for tid in crate::sched::waiters_on(&state.threads, rh) {
+                    if let Some(t) = state.threads.get_mut(&tid) {
+                        t.status = crate::sched::ThreadStatus::Ready;
+                        t.wait = None;
+                    }
+                }
+            }
+        }
+        state.scheduler.objects.remove(&h);
+        return Ok(1);
     }
     Ok(1)
 }
@@ -3592,7 +3699,13 @@ fn stub_lstrlen_a(
 /// `HANDLE CreateEventA(LPSECURITY_ATTRIBUTES lpEventAttributes,
 /// BOOL bManualReset, BOOL bInitialState, LPCSTR lpName)`.
 /// Mints an `Event` WaitObject with the supplied
-/// manual-reset / initial-state pair and hands back its handle.
+/// manual-reset / initial-state pair. When `lpName` is
+/// non-NULL and an event with that name already exists in
+/// the scheduler's named-object registry, returns the
+/// existing handle (matching the Win32 contract: subsequent
+/// `CreateEvent` calls on a named event "open" rather than
+/// "create"). Otherwise the new event is registered under
+/// the name so a sibling `OpenEventA` can find it.
 fn stub_create_event_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -3602,13 +3715,30 @@ fn stub_create_event_a(
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateEventA", t))?;
     let manual = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateEventA", t))?;
     let init = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateEventA", t))?;
-    let _name = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateEventA", t))?;
-    Ok(state
+    let p_name = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateEventA", t))?;
+    let name = if p_name != 0 {
+        read_cstr(mmu, p_name, 260).ok()
+    } else {
+        None
+    };
+    if let Some(n) = &name {
+        if let Some(h) = state.scheduler.lookup_named(n) {
+            // ERROR_ALREADY_EXISTS surfaces via GetLastError;
+            // the function still returns the existing handle.
+            state.last_error = 183;
+            return Ok(h);
+        }
+    }
+    let h = state
         .scheduler
         .insert_object(crate::sched::WaitObject::Event {
             signaled: init != 0,
             manual_reset: manual != 0,
-        }))
+        });
+    if let Some(n) = name {
+        state.scheduler.register_named(&n, h);
+    }
+    Ok(h)
 }
 
 /// `HANDLE CreateThread(LPSECURITY_ATTRIBUTES lpThreadAttributes,
@@ -4114,7 +4244,8 @@ fn stub_wait_for_multiple_objects(
 }
 
 /// `HANDLE CreateEventW(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCWSTR)`.
-/// UTF-16 twin of [`stub_create_event_a`].
+/// UTF-16 twin of [`stub_create_event_a`] — same named-object
+/// dedup semantics on the UTF-8-converted name.
 fn stub_create_event_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -4124,13 +4255,28 @@ fn stub_create_event_w(
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateEventW", t))?;
     let manual = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateEventW", t))?;
     let init = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateEventW", t))?;
-    let _name = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateEventW", t))?;
-    Ok(state
+    let p_name = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateEventW", t))?;
+    let name = if p_name != 0 {
+        Some(super::read_wide_cstr_local(mmu, p_name, 260))
+    } else {
+        None
+    };
+    if let Some(n) = &name {
+        if let Some(h) = state.scheduler.lookup_named(n) {
+            state.last_error = 183;
+            return Ok(h);
+        }
+    }
+    let h = state
         .scheduler
         .insert_object(crate::sched::WaitObject::Event {
             signaled: init != 0,
             manual_reset: manual != 0,
-        }))
+        });
+    if let Some(n) = &name {
+        state.scheduler.register_named(n, h);
+    }
+    Ok(h)
 }
 
 /// `HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES, LONG, LONG, LPCWSTR)`.
@@ -4482,9 +4628,11 @@ fn stub_load_library_w(
 }
 
 /// `BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED)`.
-/// When the handle was minted by the virtual filesystem, copies
-/// the bytes into the guest buffer; otherwise reports "read 0
-/// bytes" success (the historical no-FS fallback).
+/// Routes pipe handles through the scheduler's pipe buffer
+/// (parks the caller when empty so the writing peer can run),
+/// VFS handles through the virtual filesystem; otherwise
+/// reports "read 0 bytes" success (the historical no-FS
+/// fallback).
 fn stub_read_file(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -4495,6 +4643,57 @@ fn stub_read_file(
     let buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("ReadFile", t))?;
     let n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("ReadFile", t))?;
     let out = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("ReadFile", t))?;
+    // Pipe read end: drain up to `n` bytes from the shared
+    // buffer. Empty + writer alive → block on the handle until
+    // the writer adds data. Empty + writer closed → EOF
+    // (return TRUE, bytes_read = 0).
+    if let Some(crate::sched::WaitObject::Pipe {
+        pipe_id,
+        is_read_end: true,
+    }) = state.scheduler.objects.get(&h).cloned()
+    {
+        let (have_bytes, writer_open) = state
+            .scheduler
+            .pipes
+            .get(&pipe_id)
+            .map(|p| (!p.bytes.is_empty(), p.closed_ends < 2))
+            .unwrap_or((false, false));
+        if !have_bytes && writer_open {
+            // Park on the read handle; the writer's WriteFile
+            // wakes us.
+            state.yield_requested = Some(crate::sched::YieldRequest::Wait(
+                crate::sched::WaitCondition::Object {
+                    handle: h,
+                    timeout_after: None,
+                },
+            ));
+            if out != 0 {
+                mmu.store32(out, 0)
+                    .map_err(|t| trap_to_win32("ReadFile", t))?;
+            }
+            return Ok(1);
+        }
+        let want = n as usize;
+        let mut tmp = Vec::with_capacity(want);
+        if let Some(p) = state.scheduler.pipes.get_mut(&pipe_id) {
+            for _ in 0..want {
+                if let Some(b) = p.bytes.pop_front() {
+                    tmp.push(b);
+                } else {
+                    break;
+                }
+            }
+        }
+        if !tmp.is_empty() && buf != 0 {
+            mmu.write(buf, &tmp)
+                .map_err(|t| trap_to_win32("ReadFile", t))?;
+        }
+        if out != 0 {
+            mmu.store32(out, tmp.len() as u32)
+                .map_err(|t| trap_to_win32("ReadFile", t))?;
+        }
+        return Ok(1);
+    }
     if let Some(vfs) = state.context.vfs.as_mut() {
         if vfs.owns(h) && buf != 0 {
             let mut tmp = vec![0u8; n as usize];
@@ -5053,6 +5252,39 @@ fn stub_create_file_a(
         return Ok(INVALID_HANDLE_VALUE);
     }
     let name = read_cstr(mmu, p_name, 260)?;
+    // `\\.\pipe\<name>` is the Win32 pipe-client syntax —
+    // attach to a named pipe registered by a sibling
+    // CreateNamedPipeA call rather than opening a file in
+    // the VFS. Mint a fresh read-end handle pointing at the
+    // pipe's buffer.
+    if let Some(pipe_name) = parse_pipe_client_path(&name) {
+        if let Some(server_handle) = state.scheduler.lookup_named(&pipe_name) {
+            let pipe_id = match state.scheduler.objects.get(&server_handle) {
+                Some(crate::sched::WaitObject::Pipe { pipe_id, .. }) => *pipe_id,
+                _ => {
+                    state.last_error = ERROR_FILE_NOT_FOUND;
+                    return Ok(INVALID_HANDLE_VALUE);
+                }
+            };
+            // Client end: read from server's write side, so
+            // client opens the *other* end of the pair.
+            let is_read_end = !matches!(
+                state.scheduler.objects.get(&server_handle),
+                Some(crate::sched::WaitObject::Pipe {
+                    is_read_end: true,
+                    ..
+                })
+            );
+            return Ok(state
+                .scheduler
+                .insert_object(crate::sched::WaitObject::Pipe {
+                    pipe_id,
+                    is_read_end,
+                }));
+        }
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(INVALID_HANDLE_VALUE);
+    }
     let Some(vfs) = state.context.vfs.as_mut() else {
         state.last_error = ERROR_FILE_NOT_FOUND;
         return Ok(INVALID_HANDLE_VALUE);
@@ -5726,11 +5958,15 @@ fn stub_duplicate_handle(
 }
 
 /// `HANDLE OpenEventA(DWORD dwDesiredAccess, BOOL bInheritHandle,
-/// LPCSTR lpName)`. Mints a synthetic auto-reset Event
-/// WaitObject (signaled by default) for any requested name.
-/// Installer-class binaries that use `OpenEventA` to wait on
-/// a parent-process handshake see the event resolve
-/// immediately so the helper proceeds.
+/// LPCSTR lpName)`. Looks up the named-object registry; if a
+/// sibling thread created an event with this name the
+/// existing handle is returned so they share the kernel
+/// object. Otherwise mints a fresh auto-reset Event
+/// pre-signaled (so an admin.exe-style child whose parent
+/// hasn't actually staged the event still resolves and
+/// proceeds, rather than blocking forever on a wait that
+/// will never fire). The name is logged either way for
+/// monitor visibility.
 fn stub_open_event_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -5745,13 +5981,177 @@ fn stub_open_event_a(
     } else {
         String::new()
     };
-    state.debug_log.push(format!("OpenEventA(name={name:?})"));
-    Ok(state
+    open_event_by_name(state, &name)
+}
+
+/// Recognise `\\.\pipe\<name>` (in either Win32 backslash or
+/// forward-slash form) and return the canonical pipe name —
+/// the key the named-object registry indexes named pipes
+/// under. Returns `None` for non-pipe paths so the caller
+/// falls through to the VFS open path.
+fn parse_pipe_client_path(s: &str) -> Option<String> {
+    let lower = s.to_ascii_lowercase().replace('\\', "/");
+    let stripped = lower.strip_prefix("//./pipe/")?;
+    Some(stripped.to_string())
+}
+
+/// `HANDLE CreateNamedPipeA(LPCSTR lpName, DWORD dwOpenMode,
+/// DWORD dwPipeMode, DWORD nMaxInstances, DWORD nOutBufferSize,
+/// DWORD nInBufferSize, DWORD nDefaultTimeOut,
+/// LPSECURITY_ATTRIBUTES)`. Mints a fresh pipe buffer and
+/// registers the server end's handle under
+/// `\\.\pipe\<name>`'s canonical key so a client
+/// `CreateFileA(\\.\pipe\<name>)` can attach the other end.
+/// `dwOpenMode`'s `PIPE_ACCESS_INBOUND = 1` /
+/// `PIPE_ACCESS_OUTBOUND = 2` axis selects which end the
+/// server gets (default: duplex → server gets the read end).
+fn stub_create_named_pipe_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
+    let open_mode = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
+    let _pipe_mode = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
+    let _max = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
+    let _out_size = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
+    let _in_size = arg_dword(cpu, mmu, 5).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
+    let _timeout = arg_dword(cpu, mmu, 6).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
+    let _sa = arg_dword(cpu, mmu, 7).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
+    if p_name == 0 {
+        state.last_error = 87; // ERROR_INVALID_PARAMETER
+        return Ok(INVALID_HANDLE_VALUE);
+    }
+    let raw = read_cstr(mmu, p_name, 260)?;
+    let Some(key) = parse_pipe_client_path(&raw) else {
+        state.last_error = 87;
+        return Ok(INVALID_HANDLE_VALUE);
+    };
+    // Server end: by default the read end (PIPE_ACCESS_DUPLEX
+    // and PIPE_ACCESS_INBOUND both give the server the read
+    // side). PIPE_ACCESS_OUTBOUND (= 2) flips it.
+    const PIPE_ACCESS_OUTBOUND: u32 = 2;
+    let server_is_read = (open_mode & PIPE_ACCESS_OUTBOUND) == 0;
+    let pipe_id = state.scheduler.insert_pipe();
+    let h = state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Pipe {
+            pipe_id,
+            is_read_end: server_is_read,
+        });
+    state.scheduler.register_named(&key, h);
+    state
+        .debug_log
+        .push(format!("CreateNamedPipeA(name={raw:?})"));
+    Ok(h)
+}
+
+/// `BOOL ConnectNamedPipe(HANDLE hNamedPipe, LPOVERLAPPED)`.
+/// Returns TRUE when a client is already attached (we don't
+/// model the not-yet-connected state — the buffer's existence
+/// is enough). For overlapped (`lpOverlapped != NULL`),
+/// returns FALSE with `ERROR_PIPE_CONNECTED = 535` indicating
+/// the client is already attached.
+fn stub_connect_named_pipe(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state.last_error = 535; // ERROR_PIPE_CONNECTED
+    Ok(1)
+}
+
+/// `BOOL DisconnectNamedPipe(HANDLE hNamedPipe)`. No-op
+/// success.
+fn stub_disconnect_named_pipe(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL CreatePipe(PHANDLE hReadPipe, PHANDLE hWritePipe,
+/// LPSECURITY_ATTRIBUTES, DWORD nSize)`. Mints a fresh
+/// in-memory pipe buffer and returns a paired read + write
+/// `WaitObject::Pipe` handle. Both handles reference the
+/// same underlying [`crate::sched::PipeBuffer`].
+fn stub_create_pipe(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p_read = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreatePipe", t))?;
+    let p_write = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreatePipe", t))?;
+    let _attrs = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreatePipe", t))?;
+    let _size = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreatePipe", t))?;
+    if p_read == 0 || p_write == 0 {
+        state.last_error = 87; // ERROR_INVALID_PARAMETER
+        return Ok(0);
+    }
+    let pipe_id = state.scheduler.insert_pipe();
+    let h_read = state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Pipe {
+            pipe_id,
+            is_read_end: true,
+        });
+    let h_write = state
+        .scheduler
+        .insert_object(crate::sched::WaitObject::Pipe {
+            pipe_id,
+            is_read_end: false,
+        });
+    mmu.store32(p_read, h_read)
+        .map_err(|t| trap_to_win32("CreatePipe", t))?;
+    mmu.store32(p_write, h_write)
+        .map_err(|t| trap_to_win32("CreatePipe", t))?;
+    Ok(1)
+}
+
+/// UTF-16 twin of [`stub_open_event_a`].
+fn stub_open_event_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _access = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("OpenEventW", t))?;
+    let _inherit = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("OpenEventW", t))?;
+    let p_name = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("OpenEventW", t))?;
+    let name = if p_name != 0 {
+        super::read_wide_cstr_local(mmu, p_name, 260)
+    } else {
+        String::new()
+    };
+    open_event_by_name(state, &name)
+}
+
+/// Shared implementation: look the name up in the
+/// named-object registry; if present return the existing
+/// handle, otherwise mint a fresh pre-signaled auto-reset
+/// Event and register it.
+fn open_event_by_name(state: &mut HostState, name: &str) -> Result<u32, Win32Error> {
+    state.debug_log.push(format!("OpenEvent(name={name:?})"));
+    if !name.is_empty() {
+        if let Some(h) = state.scheduler.lookup_named(name) {
+            return Ok(h);
+        }
+    }
+    let h = state
         .scheduler
         .insert_object(crate::sched::WaitObject::Event {
             signaled: true,
             manual_reset: false,
-        }))
+        });
+    if !name.is_empty() {
+        state.scheduler.register_named(name, h);
+    }
+    Ok(h)
 }
 
 /// `HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle,

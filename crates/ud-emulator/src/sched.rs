@@ -131,6 +131,12 @@ pub enum WaitObject {
         owner: Option<u32>,
         recursion: u32,
     },
+    /// One end of an anonymous pipe minted by
+    /// `kernel32!CreatePipe` or a named-pipe instance from
+    /// `CreateNamedPipeA`. Both ends share a buffer keyed by
+    /// `pipe_id` in [`Scheduler::pipes`]; `is_read_end`
+    /// distinguishes the two.
+    Pipe { pipe_id: u32, is_read_end: bool },
 }
 
 /// What a stub is asking the scheduler to do on return. Set on
@@ -164,6 +170,23 @@ pub struct Scheduler {
     /// by `LPCRITICAL_SECTION` guest address. Populated on the
     /// first `EnterCriticalSection` against that address.
     pub critical_sections: BTreeMap<u32, u32>,
+    /// Named-object registry: `name → handle`. Populated by
+    /// `CreateEventA/W` / `CreateMutexA` / `CreateSemaphoreA/W`
+    /// / `CreateNamedPipeA` when invoked with a non-NULL
+    /// name; consulted by `OpenEventA` / `OpenMutexA` /
+    /// `OpenSemaphoreA` / pipe-client opens so a child
+    /// process can attach to an event the parent created.
+    /// Names are case-insensitive on Windows; we lowercase
+    /// the key for the same effect.
+    pub named_objects: BTreeMap<String, u32>,
+    /// Shared in-memory pipe buffers, keyed by an internal
+    /// pipe-id. Both ends of a `CreatePipe` reference the
+    /// same buffer through this index. Reader blocks when
+    /// the buffer is empty; writer succeeds immediately
+    /// (no high-water-mark backpressure modelled).
+    pub pipes: BTreeMap<u32, PipeBuffer>,
+    /// Next index for a freshly-minted pipe buffer.
+    pub next_pipe_index: u32,
     /// Next index for a freshly-minted wait object.
     pub next_handle_index: u32,
     /// Monotonic instruction counter driving sleep wake-ups.
@@ -175,12 +198,30 @@ pub struct Scheduler {
     pub quantum_default: u32,
 }
 
+/// In-memory pipe buffer. Both ends of a `CreatePipe` share
+/// the same buffer through their respective
+/// [`WaitObject::Pipe`] entries; the buffer's `closed_ends`
+/// counter tracks how many ends are still open so the read
+/// side can return EOF when the writer is gone.
+#[derive(Debug, Clone, Default)]
+pub struct PipeBuffer {
+    /// In-flight bytes — written but not yet read.
+    pub bytes: std::collections::VecDeque<u8>,
+    /// Number of ends (0..=2) currently closed. When the
+    /// write end closes and the buffer is empty, reads
+    /// return 0 (EOF).
+    pub closed_ends: u8,
+}
+
 impl Scheduler {
     #[must_use]
     pub fn new() -> Self {
         Scheduler {
             objects: BTreeMap::new(),
             critical_sections: BTreeMap::new(),
+            named_objects: BTreeMap::new(),
+            pipes: BTreeMap::new(),
+            next_pipe_index: 0,
             next_handle_index: 0,
             instructions_global: 0,
             quantum_default: crate::win32::DEFAULT_QUANTUM,
@@ -193,6 +234,29 @@ impl Scheduler {
         self.next_handle_index = self.next_handle_index.wrapping_add(1);
         self.objects.insert(handle, object);
         handle
+    }
+
+    /// Look up an existing named object handle. Names are
+    /// lowercased before comparison to match Win32's
+    /// case-insensitive kernel-object namespace.
+    #[must_use]
+    pub fn lookup_named(&self, name: &str) -> Option<u32> {
+        self.named_objects.get(&name.to_ascii_lowercase()).copied()
+    }
+
+    /// Register a freshly-minted object under a name.
+    pub fn register_named(&mut self, name: &str, handle: u32) {
+        self.named_objects.insert(name.to_ascii_lowercase(), handle);
+    }
+
+    /// Mint a fresh pipe buffer and return its index. The
+    /// caller pairs the index with two [`WaitObject::Pipe`]
+    /// entries (one read, one write) to back a `CreatePipe`.
+    pub fn insert_pipe(&mut self) -> u32 {
+        let id = self.next_pipe_index;
+        self.next_pipe_index = self.next_pipe_index.wrapping_add(1);
+        self.pipes.insert(id, PipeBuffer::default());
+        id
     }
 
     /// True iff `handle` is in this scheduler's wait-object
@@ -239,6 +303,11 @@ pub fn object_is_signaled(obj: &WaitObject) -> bool {
             false
         }
         WaitObject::CriticalSection { owner, .. } => owner.is_none(),
+        // Pipes signal when there's data to read (for the read
+        // end) or always (for the write end). The actual
+        // ReadFile path consults the buffer; this just answers
+        // the "is it ready right now?" probe.
+        WaitObject::Pipe { .. } => true,
     }
 }
 
@@ -297,6 +366,10 @@ pub fn consume_signal_if_auto_reset(obj: &mut WaitObject, waker_tid: u32) {
         }
         WaitObject::Thread { .. } | WaitObject::Process { .. } => {
             // No side effect — terminated stays terminated.
+        }
+        WaitObject::Pipe { .. } => {
+            // No state to clear — the ReadFile path consumes
+            // the actual buffer bytes.
         }
     }
 }

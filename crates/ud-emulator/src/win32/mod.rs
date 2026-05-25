@@ -1181,6 +1181,23 @@ pub fn read_cstr_local(mmu: &Mmu, mut addr: u32, max: u32) -> Result<String, Win
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Read a NUL-terminated UTF-16 string from guest memory at
+/// `addr`, stopping at NUL or after `max_chars` 16-bit code
+/// units. Used by every `*W` Win32 stub that takes an
+/// `LPCWSTR`.
+pub fn read_wide_cstr_local(mmu: &Mmu, mut addr: u32, max_chars: u32) -> String {
+    let mut units = Vec::new();
+    for _ in 0..max_chars {
+        match mmu.load16(addr) {
+            Ok(0) => break,
+            Ok(u) => units.push(u),
+            Err(_) => break,
+        }
+        addr = addr.wrapping_add(2);
+    }
+    String::from_utf16_lossy(&units)
+}
+
 /// Stub function used by [`Registry::register_unknown_fallback`].
 /// Looks up its own (dll, name) by reverse-resolving the entry
 /// EIP against the registry and raises a
