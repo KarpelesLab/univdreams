@@ -278,7 +278,11 @@ impl VirtualFs {
 
 /// Normalise a Windows-style path for case-insensitive lookup.
 /// Lowercases the whole string and converts `\` to `/`. Drive
-/// letters stay attached (`C:` stays `c:`).
+/// letters stay attached (`C:` stays `c:`). For registry paths,
+/// rewrites the four well-known hive prefixes
+/// (`HKEY_LOCAL_MACHINE`/`HKLM`, …) to their short canonical
+/// form so writes via long-name strings and reads via
+/// [`predefined_path`] meet at the same key.
 fn normalize_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for c in path.chars() {
@@ -286,6 +290,24 @@ fn normalize_path(path: &str) -> String {
             out.push('/');
         } else {
             out.extend(c.to_lowercase());
+        }
+    }
+    // Rewrite long hive names to their short canonical form.
+    // Order matters — `hkey_users` is a prefix of nothing else,
+    // but `hkey_local_machine` shares a prefix with the others
+    // only at `hkey_`, so any order is fine in practice.
+    for (long, short) in [
+        ("hkey_local_machine", "hklm"),
+        ("hkey_current_user", "hkcu"),
+        ("hkey_classes_root", "hkcr"),
+        ("hkey_users", "hku"),
+    ] {
+        if out == long {
+            return short.to_string();
+        }
+        let prefix = format!("{long}/");
+        if let Some(rest) = out.strip_prefix(&prefix) {
+            return format!("{short}/{rest}");
         }
     }
     out
@@ -408,10 +430,10 @@ impl VirtualRegistry {
     #[must_use]
     pub fn predefined_path(hkey: u32) -> Option<&'static str> {
         match hkey {
-            HKEY_CLASSES_ROOT => Some("hkey_classes_root"),
-            HKEY_CURRENT_USER => Some("hkey_current_user"),
-            HKEY_LOCAL_MACHINE => Some("hkey_local_machine"),
-            HKEY_USERS => Some("hkey_users"),
+            HKEY_CLASSES_ROOT => Some("hkcr"),
+            HKEY_CURRENT_USER => Some("hkcu"),
+            HKEY_LOCAL_MACHINE => Some("hklm"),
+            HKEY_USERS => Some("hku"),
             _ => None,
         }
     }
@@ -552,7 +574,7 @@ mod tests {
         );
         let h = reg.open_key(HKLM, "Software\\Foo").expect("opens");
         assert!(reg.owns(h));
-        assert_eq!(reg.path_of(h), Some("hkey_local_machine/software/foo"));
+        assert_eq!(reg.path_of(h), Some("hklm/software/foo"));
         assert!(reg.close_key(h));
     }
 

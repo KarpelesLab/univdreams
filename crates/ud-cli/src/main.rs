@@ -1066,7 +1066,10 @@ fn init_qtml(sandbox: &mut ud_emulator::Sandbox) -> u32 {
             v
         }
         Err(e) => {
-            eprintln!("InitializeQTML(0) trapped: {e}");
+            eprintln!(
+                "InitializeQTML(0) trapped: {e} (eip={:#010x})",
+                sandbox.cpu.regs.eip
+            );
             u32::MAX
         }
     }
