@@ -254,6 +254,44 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum QtcodecCommand {
+    /// Count the registered QT components matching a
+    /// `ComponentDescription { type, subType, manufacturer,
+    /// flags, flagsMask }`. Calls InitializeQTML + EnterMovies
+    /// first to bring up the runtime, then constructs a
+    /// 20-byte ComponentDescription in guest memory and
+    /// invokes `qtmlclient!CountComponents`. Use this to
+    /// confirm codecs are visible to the host:
+    ///
+    /// ```text
+    /// ud qtcodec list --type imdc --stage-vfs /tmp/qt_dump
+    /// ```
+    List {
+        /// componentType FourCC. Common: `imdc` (image
+        /// decompressor), `imco` (image compressor), `aenc`
+        /// (audio encoder), `adec` (audio decoder), `0` to
+        /// match every type.
+        #[arg(long, default_value = "imdc")]
+        ty: String,
+
+        /// componentSubType FourCC, or `0` to match every
+        /// subtype.
+        #[arg(long, default_value = "0")]
+        subtype: String,
+
+        /// componentManufacturer FourCC; `0` matches any.
+        #[arg(long, default_value = "0")]
+        manufacturer: String,
+
+        /// Mount these host directories into the sandbox VFS
+        /// before load.
+        #[arg(long, value_name = "DIR")]
+        stage_vfs: Vec<PathBuf>,
+
+        /// Cap the run at this many guest instructions.
+        #[arg(long, default_value_t = 1_000_000_000)]
+        max_instructions: u64,
+    },
+
     /// Call an arbitrary stdcall (or cdecl — caller cleans
     /// only matters for stack-pop bookkeeping which is a
     /// no-op here) export on a QT runtime DLL. Loads the DLL
@@ -834,6 +872,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ),
         },
         Command::Qtcodec { command } => match command {
+            QtcodecCommand::List {
+                ty,
+                subtype,
+                manufacturer,
+                stage_vfs,
+                max_instructions,
+            } => qtcodec_list(&ty, &subtype, &manufacturer, &stage_vfs, max_instructions),
             QtcodecCommand::Call {
                 dll,
                 export,
@@ -901,6 +946,35 @@ const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
 /// the codec ~95 MiB before the scratch range collides.
 const QTCODEC_SCRATCH: u32 = 0x65FE_0000;
 
+/// Drive `qtmlclient!InitializeQTML(0)` so the QT runtime's
+/// dispatcher slots get repointed from `BogusDispatcher`
+/// (return 0xF7D1) to the real `theQuickTimeDispatcher` in
+/// quicktime.qts. Must be called AFTER `preload_qt_runtime`.
+/// Returns the function's status code (0 = noErr).
+fn init_qtml(sandbox: &mut ud_emulator::Sandbox) -> u32 {
+    let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "InitializeQTML") else {
+        eprintln!("init_qtml: qtmlclient!InitializeQTML not in registry — pre-load missed?");
+        return u32::MAX;
+    };
+    match ud_emulator::win32::call_guest(
+        &mut sandbox.cpu,
+        &mut sandbox.mmu,
+        &sandbox.registry,
+        &mut sandbox.host,
+        target,
+        &[0],
+    ) {
+        Ok(v) => {
+            eprintln!("InitializeQTML(0) = {v:#x}");
+            v
+        }
+        Err(e) => {
+            eprintln!("InitializeQTML(0) trapped: {e}");
+            u32::MAX
+        }
+    }
+}
+
 /// Pre-load the QT runtime DLLs (qtmlclient.dll + quicktime.qts)
 /// from the sandbox VFS if present. The codec / app doesn't
 /// statically import them — they're picked up at runtime via
@@ -949,6 +1023,146 @@ fn preload_qt_runtime(sandbox: &mut ud_emulator::Sandbox) {
     }
 }
 
+fn fourcc_be(s: &str) -> u32 {
+    if let Ok(v) = parse_u32(s) {
+        if v == 0 {
+            return 0;
+        }
+    }
+    let mut b = [b' '; 4];
+    for (i, c) in s.bytes().take(4).enumerate() {
+        b[i] = c;
+    }
+    // OSType is Big-Endian — 'imdc' → 0x696d6463
+    u32::from_be_bytes(b)
+}
+
+fn qtcodec_list(
+    ty: &str,
+    subtype: &str,
+    manufacturer: &str,
+    stage_vfs: &[PathBuf],
+    max_instructions: u64,
+) -> anyhow::Result<()> {
+    let ty_v = fourcc_be(ty);
+    let sub_v = fourcc_be(subtype);
+    let man_v = fourcc_be(manufacturer);
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.trace_stubs = true;
+    sandbox.host.instruction_budget = Some(max_instructions);
+    sandbox
+        .context_mut()
+        .vfs
+        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+    for d in stage_vfs {
+        let n = stage_dir_into_vfs(sandbox.context_mut(), d)
+            .with_context(|| format!("stage {}", d.display()))?;
+        eprintln!("staged {n} files from {}", d.display());
+    }
+    preload_qt_runtime(&mut sandbox);
+
+    let init_rc = init_qtml(&mut sandbox);
+    if init_rc != 0 {
+        anyhow::bail!("InitializeQTML failed: {init_rc:#x}");
+    }
+    // EnterMovies
+    if let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "EnterMovies") {
+        match ud_emulator::win32::call_guest(
+            &mut sandbox.cpu,
+            &mut sandbox.mmu,
+            &sandbox.registry,
+            &mut sandbox.host,
+            target,
+            &[],
+        ) {
+            Ok(v) => eprintln!("EnterMovies() = {v:#x}"),
+            Err(e) => eprintln!("EnterMovies() trapped: {e}"),
+        }
+    }
+    // Build ComponentDescription { type, subType, manufacturer, flags, flagsMask }
+    let desc_addr = QTCODEC_SCRATCH + 0x10000;
+    let words = [ty_v, sub_v, man_v, 0, 0];
+    for (i, w) in words.iter().enumerate() {
+        sandbox
+            .mmu
+            .store32(desc_addr + (i as u32) * 4, *w)
+            .map_err(|e| anyhow::anyhow!("write CD[{i}]: {e}"))?;
+    }
+    eprintln!(
+        "ComponentDescription @ {desc_addr:#x}: type={ty_v:#x} subType={sub_v:#x} mfr={man_v:#x}"
+    );
+    // Call CountComponents(&desc)
+    let Some(target) = sandbox
+        .registry
+        .resolve("qtmlclient.dll", "CountComponents")
+    else {
+        anyhow::bail!("qtmlclient!CountComponents not in registry");
+    };
+    let stub_before = sandbox.host.stub_calls.len();
+    match ud_emulator::win32::call_guest(
+        &mut sandbox.cpu,
+        &mut sandbox.mmu,
+        &sandbox.registry,
+        &mut sandbox.host,
+        target,
+        &[desc_addr],
+    ) {
+        Ok(v) => {
+            println!("CountComponents(type={ty:?}, subType={subtype:?}) = {v}");
+        }
+        Err(e) => {
+            eprintln!("CountComponents trapped: {e}");
+        }
+    }
+    // Show the stubs CountComponents made (if any) — useful
+    // to find what scan it needs (FindFirstFile/RegOpenKey/etc).
+    let calls = &sandbox.host.stub_calls[stub_before..];
+    eprintln!("--- {} stub calls during CountComponents ---", calls.len());
+    for c in calls.iter().take(30) {
+        let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+        let arg_str = args.join(", ");
+        let eip = c.call_site_eip;
+        eprintln!(
+            "  {eip:#010x} {}!{}({arg_str}) -> {:#x}",
+            c.dll, c.name, c.ret
+        );
+    }
+    // Also try FindNextComponent which may lazily scan
+    if let Some(target) = sandbox
+        .registry
+        .resolve("qtmlclient.dll", "FindNextComponent")
+    {
+        let stub_before = sandbox.host.stub_calls.len();
+        match ud_emulator::win32::call_guest(
+            &mut sandbox.cpu,
+            &mut sandbox.mmu,
+            &sandbox.registry,
+            &mut sandbox.host,
+            target,
+            &[0, desc_addr], // (NULL, &desc) — find first matching
+        ) {
+            Ok(v) => println!("FindNextComponent(NULL, &desc) = {v:#x}"),
+            Err(e) => eprintln!("FindNextComponent trapped: {e}"),
+        }
+        let calls = &sandbox.host.stub_calls[stub_before..];
+        eprintln!(
+            "--- {} stub calls during FindNextComponent ---",
+            calls.len()
+        );
+        for c in calls.iter().take(30) {
+            let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+            let arg_str = args.join(", ");
+            let eip = c.call_site_eip;
+            eprintln!(
+                "  {eip:#010x} {}!{}({arg_str}) -> {:#x}",
+                c.dll, c.name, c.ret
+            );
+        }
+    }
+    Ok(())
+}
+
 fn qtcodec_call(
     dll: &Path,
     export: &str,
@@ -979,6 +1193,14 @@ fn qtcodec_call(
     match sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH) {
         Ok(v) => eprintln!("DllMain returned {v:#x}"),
         Err(e) => eprintln!("DllMain trapped: {e}"),
+    }
+    // Bring the QT runtime up so the dispatcher slots are
+    // real (theQuickTimeDispatcher in quicktime.qts) — without
+    // this every qtmlclient call returns 0xF7D1 from
+    // BogusDispatcher. Skip when the user is calling
+    // InitializeQTML itself (avoid the double-init).
+    if export != "InitializeQTML" {
+        init_qtml(&mut sandbox);
     }
     eprintln!("calling {export}({args:?})");
     sandbox.host.stub_calls.clear();
