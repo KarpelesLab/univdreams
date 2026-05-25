@@ -18,7 +18,12 @@ workspace = true
 thiserror = "2"
 
 [dev-dependencies]
-ud-arch-x86 = { version = "0.1.5", path = "../ud-arch-x86" }
-ud-arch-bpf = { version = "0.1.5", path = "../ud-arch-bpf" }
-ud-arch-aarch64 = { version = "0.1.5", path = "../ud-arch-aarch64" }
-ud-arch-6502 = { version = "0.1.5", path = "../ud-arch-6502" }
+# Path-only — these arches depend on ud-arch-codec so a
+# version= constraint would create a publish-time cycle.
+# Dev-deps without a version are excluded from the published
+# manifest (they're only needed when building this crate's
+# own tests in-tree).
+ud-arch-x86 = { path = "../ud-arch-x86" }
+ud-arch-bpf = { path = "../ud-arch-bpf" }
+ud-arch-aarch64 = { path = "../ud-arch-aarch64" }
+ud-arch-6502 = { path = "../ud-arch-6502" }
