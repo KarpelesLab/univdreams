@@ -40,6 +40,13 @@ thiserror = "2"
 # (open() takes Read+Seek; we feed it Cursor<&[u8]> over VFS
 # bytes).
 msi = "0.10"
+# Decompress Windows .cab archives (LZX / MSZIP). The MSI's
+# embedded `#name.cab` streams carry the actual file bodies
+# that the install would write under Program Files; we pump
+# the decompressed bytes through `win32::msiexec`'s
+# WriteFile actions so the VFS dump has real content rather
+# than zero-byte placeholders.
+cab = "0.6"
 
 [dev-dependencies]
 # Fetched-fixture corpus runner (`tests/codec_corpus.rs`).

@@ -32,11 +32,13 @@
 //!    namespace, building an absolute path per directory entry.
 //! 3. Walk the `Component → File` join and emit one
 //!    [`InstallAction::WriteFile`] per file, with the resolved
-//!    target path + the file's recorded size (the bytes
-//!    themselves are not extracted — they live in CAB streams
-//!    inside the MSI and would need a CAB decompressor; we
-//!    report zero-length markers for now and the caller can
-//!    upgrade the sink later).
+//!    target path + the file's recorded size + the
+//!    **decompressed bytes** pulled out of the MSI's embedded
+//!    cab streams via the [`cab`](https://crates.io/crates/cab)
+//!    crate (LZX / MSZIP). External (non-embedded) cabs would
+//!    need the host VFS plumbed through; for those the action's
+//!    `bytes` is `None` and the sink falls back to a zero-byte
+//!    marker.
 //! 4. Walk the `Registry` table and emit one
 //!    [`InstallAction::RegSet`] per row, with the resolved key
 //!    path + name + value, honouring `MsiFormatRecord`'s
@@ -90,13 +92,13 @@ pub enum InstallAction {
         path: String,
     },
     /// A `File` row resolved into a concrete target path. The
-    /// MSI records the source bytes inside an external CAB
-    /// stream that we don't decompress here; sinks that want
-    /// real bytes provide them through their own channel
-    /// (e.g. by intercepting the cabinet attached to the MSI's
-    /// `Media` table).
+    /// walker locates the cab the file belongs to (via the
+    /// `Media` table's sequence ranges) and includes the
+    /// decompressed bytes when extraction succeeds. `bytes =
+    /// None` signals "we couldn't unpack the cab" — the sink
+    /// can fall back to a zero-byte marker.
     WriteFile {
-        /// MSI file id.
+        /// MSI file id (matches the cab entry name).
         id: String,
         /// Resolved absolute path.
         path: String,
@@ -105,6 +107,10 @@ pub enum InstallAction {
         size: u64,
         /// Component id the file belongs to.
         component: String,
+        /// Decompressed file bytes when the cab the file lives
+        /// in could be opened + entry was found. `None` when
+        /// the row referenced a cab we couldn't load.
+        bytes: Option<Vec<u8>>,
     },
     /// One `Registry` row's resolved (root, key, name, value).
     RegSet {
@@ -360,8 +366,80 @@ pub fn process_msi(
     }
 
     // ------------------------------------------------------------
+    // CAB extraction — load every cab the Media table mentions
+    // so the File-row walk can read each file's actual bytes.
+    // `media` is sorted by LastSequence so we can binary-search
+    // a File.Sequence into its containing cab.
+    // ------------------------------------------------------------
+    let mut media: Vec<(i32, String)> = Vec::new();
+    if pkg.has_table("Media") {
+        let rows = pkg
+            .select_rows(msi::Select::table("Media"))
+            .map_err(|e| Error::Schema(format!("Media select: {e}")))?;
+        for row in rows {
+            let last_sequence = row[1].as_int().unwrap_or(0);
+            let cabinet = row[3].as_str().unwrap_or("").to_string();
+            if !cabinet.is_empty() {
+                media.push((last_sequence, cabinet));
+            }
+        }
+    }
+    media.sort_by_key(|(seq, _)| *seq);
+    // Open each referenced cab once. Embedded streams use the
+    // `#name` form (per MSI convention); external files would
+    // need to be looked up in the host VFS — we report Log()
+    // on the unsupported external case and treat as a missing
+    // cab for the affected files.
+    let mut cab_handles: BTreeMap<String, CabHandle> = BTreeMap::new();
+    for (_, cab_name) in &media {
+        if cab_handles.contains_key(cab_name) {
+            continue;
+        }
+        if let Some(stream_name) = cab_name.strip_prefix('#') {
+            match pkg.read_stream(stream_name) {
+                Ok(mut reader) => {
+                    let mut buf = Vec::new();
+                    if std::io::Read::read_to_end(&mut reader, &mut buf).is_ok() {
+                        match cab::Cabinet::new(Cursor::new(buf)) {
+                            Ok(cab) => {
+                                cab_handles.insert(cab_name.clone(), CabHandle::Loaded(cab));
+                            }
+                            Err(e) => {
+                                if !sink
+                                    .emit(InstallAction::Log(format!("cab open {cab_name}: {e}")))
+                                {
+                                    return Ok(properties);
+                                }
+                                cab_handles.insert(cab_name.clone(), CabHandle::Missing);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !sink.emit(InstallAction::Log(format!("msi stream {stream_name}: {e}"))) {
+                        return Ok(properties);
+                    }
+                    cab_handles.insert(cab_name.clone(), CabHandle::Missing);
+                }
+            }
+        } else {
+            // External cab (separate file on the install
+            // media). The MSI ships these alongside; we don't
+            // currently route the host VFS into the walker so
+            // these come up as `Missing`.
+            if !sink.emit(InstallAction::Log(format!(
+                "external cab {cab_name} not supported; file bytes will be missing"
+            ))) {
+                return Ok(properties);
+            }
+            cab_handles.insert(cab_name.clone(), CabHandle::Missing);
+        }
+    }
+
+    // ------------------------------------------------------------
     // File table — emit one WriteFile per row, gated by the
-    // sink's per-component decision.
+    // sink's per-component decision. When the file lives in a
+    // loaded cab, decompressed bytes are attached.
     // ------------------------------------------------------------
     if pkg.has_table("File") {
         let rows = pkg
@@ -374,17 +452,21 @@ pub fn process_msi(
             // long name; pick the long form when present.
             let file_name = pick_long_filename(row[2].as_str().unwrap_or(""));
             let size = row[3].as_int().unwrap_or(0).max(0) as u64;
+            // File.Sequence — column 7, used to pick the cab.
+            let sequence = row[7].as_int().unwrap_or(0);
             if component.is_empty() || !sink.install_component(&component) {
                 continue;
             }
             let dir_id = component_dir.get(&component).cloned().unwrap_or_default();
             let dir_path = resolved_dirs.get(&dir_id).cloned().unwrap_or_default();
             let path = join_path(&dir_path, &file_name);
+            let bytes = extract_file_bytes(&media, &mut cab_handles, sequence, &id);
             if !sink.emit(InstallAction::WriteFile {
                 id,
                 path,
                 size,
                 component,
+                bytes,
             }) {
                 return Ok(properties);
             }
@@ -688,6 +770,47 @@ fn parse_reg_value(s: &str) -> RegValue {
     RegValue::Sz(s.to_string())
 }
 
+/// One opened cab. Loaded variants hold the decompressor
+/// state needed by `Cabinet::read_file`; Missing means we
+/// couldn't open this cab (embedded stream wasn't readable,
+/// or an external cab the walker doesn't know how to fetch).
+enum CabHandle {
+    Loaded(cab::Cabinet<Cursor<Vec<u8>>>),
+    Missing,
+}
+
+/// Find the cab containing the file at `sequence` and read
+/// the entry named `file_id`. Returns `None` when the file
+/// isn't found in any loaded cab (cab missing, sequence out
+/// of every Media row's range, or the cab entry was skipped
+/// during compression).
+fn extract_file_bytes(
+    media: &[(i32, String)],
+    cabs: &mut BTreeMap<String, CabHandle>,
+    sequence: i32,
+    file_id: &str,
+) -> Option<Vec<u8>> {
+    let cab_name = media
+        .iter()
+        .find(|(last, _)| *last >= sequence)
+        .map(|(_, name)| name.clone())
+        // Fall back to the first cab if the sequence is past
+        // every recorded LastSequence — defensive against
+        // malformed Media rows.
+        .or_else(|| media.first().map(|(_, n)| n.clone()))?;
+    let handle = cabs.get_mut(&cab_name)?;
+    let cab = match handle {
+        CabHandle::Loaded(c) => c,
+        CabHandle::Missing => return None,
+    };
+    let mut reader = cab.read_file(file_id).ok()?;
+    let mut buf = Vec::new();
+    if std::io::Read::read_to_end(&mut reader, &mut buf).is_err() {
+        return None;
+    }
+    Some(buf)
+}
+
 /// Default sink that records every action into a `Vec` for the
 /// caller to inspect — useful for tests and the
 /// `msiexec --report` style CLI flag.
@@ -890,7 +1013,14 @@ struct EmulatorInstallSink<'a> {
     n_dirs: usize,
     n_files: usize,
     n_regs: usize,
+    /// Sum of `File.FileSize` columns — what the install
+    /// would write if every CAB extraction succeeded.
     n_bytes: u64,
+    /// Sum of actually-extracted decompressed bytes. Equals
+    /// `n_bytes` when every cab entry decompressed cleanly;
+    /// smaller when some entries fell back to zero-byte
+    /// markers.
+    n_real_bytes: u64,
 }
 
 impl InstallSink for EmulatorInstallSink<'_> {
@@ -905,13 +1035,21 @@ impl InstallSink for EmulatorInstallSink<'_> {
                     }
                 }
             }
-            InstallAction::WriteFile { path, size, .. } => {
+            InstallAction::WriteFile {
+                path, size, bytes, ..
+            } => {
                 self.n_files += 1;
                 self.n_bytes = self.n_bytes.saturating_add(size);
                 if let Some(vfs) = self.vfs.as_mut() {
-                    // Zero-byte placeholder — the CAB-extract
-                    // upgrade goes here later.
-                    vfs.write_path(&path, Vec::new());
+                    // Real decompressed bytes when the walker
+                    // could pull them from the cab; zero-byte
+                    // marker otherwise so the path still
+                    // surfaces in the install report.
+                    let payload = bytes.unwrap_or_default();
+                    if !payload.is_empty() {
+                        self.n_real_bytes = self.n_real_bytes.saturating_add(payload.len() as u64);
+                    }
+                    vfs.write_path(&path, payload);
                 }
             }
             InstallAction::RegSet {
@@ -1009,12 +1147,14 @@ pub fn dispatch_msiexec_install(
         n_files: 0,
         n_regs: 0,
         n_bytes: 0,
+        n_real_bytes: 0,
     };
     let result = process_msi(&bytes, &options, &mut sink);
     let dirs = sink.n_dirs;
     let files = sink.n_files;
     let regs = sink.n_regs;
     let bytes_total = sink.n_bytes;
+    let real_bytes = sink.n_real_bytes;
     for line in sink.log {
         state.debug_log.push(line);
     }
@@ -1022,7 +1162,7 @@ pub fn dispatch_msiexec_install(
     state.context.registry = reg;
     match result {
         Ok(_) => state.debug_log.push(format!(
-            "msiexec /i {msi_path:?} — synthesised {files} files ({bytes_total} bytes), {dirs} directories, {regs} registry entries"
+            "msiexec /i {msi_path:?} — synthesised {files} files ({real_bytes}/{bytes_total} bytes extracted), {dirs} directories, {regs} registry entries"
         )),
         Err(e) => state
             .debug_log

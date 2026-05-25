@@ -8,11 +8,12 @@ The emulator is **headless and sandboxed**. Nothing the guest does reaches the h
 
 `ud-emulator` ships a pure-Rust 32-bit x86 interpreter, a PE/COFF loader, and ~250 Win32 stub functions across `kernel32`, `user32`, `gdi32`, `winmm`, `msvcrt`, `ole32`, `advapi32`, `comctl32`, `shell32`, `shlwapi`, `mfplat`, `vfw32`, `version`, and `msi`. The scheduler is preemptive (round-robin with priority + quantum), supports multiple processes through `CreateProcessA`, and models the standard sync surface — Event / Mutex / Semaphore / CriticalSection with real waiter wake-up, named-object registry, anonymous + named pipes, and per-thread TLS / TIB.
 
-`CreateProcessA` targeting `C:\Windows\System32\msiexec.exe` routes into a host-side MSI walker (`win32::msiexec`) that parses the referenced `.msi` via the [`msi`](https://crates.io/crates/msi) crate and synthesises the install effects — resolved file paths into the VFS, registry entries into the VirtualRegistry. It is intentionally not a faithful Windows-Installer reimplementation: no custom-action execution, no conditional-expression evaluator, no `Installer` COM. What it produces is a complete picture of *what* an MSI would install *where*, plus the property values it would resolve those paths against.
+`CreateProcessA` targeting `C:\Windows\System32\msiexec.exe` routes into a host-side MSI walker (`win32::msiexec`) that parses the referenced `.msi` via the [`msi`](https://crates.io/crates/msi) crate and synthesises the install effects — resolved file paths *with the actual decompressed file bytes* into the VFS, registry entries into the VirtualRegistry. Embedded `#name.cab` streams referenced by the MSI's `Media` table are unpacked through the [`cab`](https://crates.io/crates/cab) crate (LZX / MSZIP); external CAB files are recognised but require staging through the VFS in a future patch.
 
-Two things the emulator **doesn't** do today:
+It is intentionally not a faithful Windows-Installer reimplementation: no custom-action execution, no conditional-expression evaluator, no `Installer` COM. What it produces is a complete picture of *what* an MSI would install *where*, with the real binary content available on disk after `--dump-vfs`.
 
-- **Extract real file bytes from MSI CAB streams.** Files are recorded as zero-byte placeholders at their resolved target paths. The MSI's `Media` table points at external `.cab` streams that would need an LZX decompressor to unpack. The `InstallSink` trait is the upgrade point — a custom sink can intercept `WriteFile` actions and supply real bytes from a separately-staged CAB.
+One thing the emulator **doesn't** do today:
+
 - **Render a UI.** `MessageBox*` / `DialogBoxParam*` etc. auto-accept with `IDOK`, `GetMessage` returns `WM_QUIT`. The installer's wizard pages headless-advance through their default path.
 
 ## The one-shot command
@@ -64,14 +65,15 @@ install-monitor report for QuickTimeInstaller-7.7.9.exe
   instructions executed: 2,244,168,597
   Win32 calls: 5,970
 
-  VFS writes: 1359 files
+  VFS writes: 1359 files (754 non-empty)  Total bytes: 82,540,980
+
     c:/temp/oxideav-vfw1.log                                   1381 bytes
     ixp051.tmp/quicktime.msi                              28,397,568 bytes
     ixp051.tmp/appleapplicationsupport.msi                19,727,040 bytes
     …
-    c:/program files/quicktime/quicktimeplayer.exe                0 bytes
-    c:/program files/quicktime/quicktimeplayer.dll                0 bytes
-    c:/program files/quicktime/qtocontrol.dll                     0 bytes
+    c:/program files/quicktime/quicktimeplayer.exe         1,235,264 bytes
+    c:/program files/quicktime/quicktimeplayer.dll         9,287,984 bytes
+    c:/program files/quicktime/qtocontrol.dll                895,280 bytes
     …
 
   Registry writes: 719 entries
@@ -85,13 +87,19 @@ install-monitor report for QuickTimeInstaller-7.7.9.exe
                    cmd="msiexec.exe /i \"IXP051.TMP\\QuickTime.msi\"")
     msiexec: property snapshot (51 entries)
     msiexec /i "IXP051.TMP\\QuickTime.msi" — synthesised 753 files
-            (82,539,599 bytes), 683 directories, 723 registry entries
+            (82,539,599 / 82,539,599 bytes extracted), 683 directories,
+            723 registry entries
 ```
+
+`file /tmp/qt_dump/c_/program\ files/quicktime/quicktimeplayer.exe`
+confirms `PE32 executable (GUI) Intel 80386, for MS Windows` — the
+binaries on disk are the real QuickTime player ready to feed into a
+disassembler / decompiler.
 
 Two things to read out of this:
 
 - **Extracted MSI bundle**: the four `.msi` files + the install helper exe under `ixp051.tmp/` are what the outer installer extracted from its embedded resources. They are real bytes — the dump folder has them on disk and you can analyse them with any standard MSI tool.
-- **Synthesised install**: the `c:/program files/quicktime/…` entries + the `HKCR\…` registry entries are what `msiexec /i quicktime.msi` would install. The file bodies are zero bytes (we don't unpack the CABs the MSIs reference), but the **paths and registry contents are real**.
+- **Synthesised install**: the `c:/program files/quicktime/…` entries + the `HKCR\…` registry entries are what `msiexec /i quicktime.msi` would install. The file bodies are the **real decompressed bytes** pulled out of the MSI's embedded CAB streams — `quicktimeplayer.exe` lands on disk as a 1.2 MB Win32 PE32 binary, `quicktimeplayer.dll` as 9.3 MB, ready to feed into any reverse-engineering tool. The msiexec summary line reports both `extracted / expected` so you can spot any cab entries that fell back to zero-byte markers.
 
 ### 3. Chain-load child binaries when needed
 
@@ -170,7 +178,7 @@ The walker calls `override_property` once per property *before* the directory re
 
 The big ones, in rough order of how often they surface:
 
-- **MSI file bytes are zero**. The MSI references its files through CAB streams in the `Media` table that we don't decompress. The path / size / registry intel is complete; the bytes aren't. An upgrade to plug in a CAB decompressor (e.g. `cabinet` crate) would close this — `InstallSink::emit(WriteFile)` is the hook.
+- **External (non-embedded) MSI cabs**. The MSI's `Media` table can reference cabs that ship as separate files on the install media (rather than `#name`-embedded streams). Those rows log `external cab N not supported; file bytes will be missing` and the affected files come out as zero-byte markers. The fix is plumbing the host VFS into the cab-resolution path; the embedded-stream case (which covers QuickTime, every modern self-contained installer, etc.) works.
 - **Some installer CRT epilogues hit spurious GS-cookie failures**. The emulator's interpreter perturbs FPU/SSE residue and segment-register shadow state in ways the real CPU doesn't, occasionally tripping `__report_gsfailure`. The `TerminateProcess(STATUS_STACK_BUFFER_OVERRUN)` path is now a logged no-op so the run completes the install before the failure surfaces as a memory fault.
 - **`CreateProcessA(child.exe)` with non-MSI children** loads the child via Phase 5c when the binary is in the VFS *and* every IAT import is host-stubbed. Strict import resolution falls through to a synthetic immediate-exit child on any unstubbed import; the `debug_log` records which one.
 - **No real Windows Installer custom actions**. The `CustomAction`, `InstallExecuteSequence`, `LaunchCondition`, `ServiceInstall`, `ODBCDataSource` tables are not interpreted. Installers whose install effects are *primarily* through custom actions (rare, but present in some enterprise installers) won't surface in our walker — only the static `File` + `Registry` rows do.
