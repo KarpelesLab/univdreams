@@ -324,6 +324,17 @@ enum QtcodecCommand {
         #[arg(long, value_name = "DIR")]
         stage_vfs: Vec<PathBuf>,
 
+        /// Optionally run the install of one or more MSIs
+        /// (`--install-msi /path/to/quicktime.msi`) AFTER
+        /// staging the VFS but BEFORE bringing up the QT
+        /// runtime. The msiexec walker runs in the SAME
+        /// sandbox, pumps deferred DLL CustomActions
+        /// (QuickTimePostInstallMSIProc), then InitializeQTML
+        /// + EnterMovies + CountComponents query observe the
+        /// post-install state.
+        #[arg(long, value_name = "MSI")]
+        install_msi: Vec<PathBuf>,
+
         /// Cap the run at this many guest instructions.
         #[arg(long, default_value_t = 1_000_000_000)]
         max_instructions: u64,
@@ -931,8 +942,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 subtype,
                 manufacturer,
                 stage_vfs,
+                install_msi,
                 max_instructions,
-            } => qtcodec_list(&ty, &subtype, &manufacturer, &stage_vfs, max_instructions),
+            } => qtcodec_list(
+                &ty,
+                &subtype,
+                &manufacturer,
+                &stage_vfs,
+                &install_msi,
+                max_instructions,
+            ),
             QtcodecCommand::Call {
                 dll,
                 export,
@@ -1215,12 +1234,13 @@ fn qtcodec_register(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn qtcodec_list(
     ty: &str,
     subtype: &str,
     manufacturer: &str,
     stage_vfs: &[PathBuf],
+    install_msi: &[PathBuf],
     max_instructions: u64,
 ) -> anyhow::Result<()> {
     let ty_v = fourcc_be(ty);
@@ -1234,10 +1254,49 @@ fn qtcodec_list(
         .context_mut()
         .vfs
         .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+    sandbox
+        .context_mut()
+        .registry
+        .get_or_insert_with(ud_emulator::context::VirtualRegistry::new);
     for d in stage_vfs {
         let n = stage_dir_into_vfs(sandbox.context_mut(), d)
             .with_context(|| format!("stage {}", d.display()))?;
         eprintln!("staged {n} files from {}", d.display());
+    }
+    // Run any --install-msi installs IN THIS SAME SANDBOX
+    // before bringing up the QT runtime. The msiexec walker
+    // synthesises file writes into the VFS, registry writes
+    // into the VirtualRegistry, and queues DLL CustomActions
+    // for the pump step which then runs them via call_guest
+    // (msi.dll stubs route MsiGetProperty/MsiSetProperty/etc.
+    // to the walker's property snapshot). After this loop the
+    // sandbox state reflects what a real Windows install would
+    // have produced for the QT runtime to discover.
+    for msi_path in install_msi {
+        let bytes =
+            std::fs::read(msi_path).with_context(|| format!("read {}", msi_path.display()))?;
+        let stage_key = format!(
+            "c:/temp/install_{}.msi",
+            msi_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("pkg")
+        );
+        if let Some(vfs) = sandbox.context_mut().vfs.as_mut() {
+            vfs.insert(&stage_key, bytes);
+        }
+        let synth_cmd = format!("msiexec.exe /i \"{stage_key}\"");
+        ud_emulator::win32::msiexec::dispatch_msiexec_install(
+            &mut sandbox.host,
+            &mut sandbox.mmu,
+            &stage_key,
+            &synth_cmd,
+        );
+        let pumped = sandbox.pump_pending_msi_install();
+        eprintln!(
+            "installed {} — pumped {pumped} deferred CustomAction(s)",
+            msi_path.display()
+        );
     }
     preload_qt_runtime(&mut sandbox);
 
