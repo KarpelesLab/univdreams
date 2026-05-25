@@ -38,6 +38,19 @@ pub fn register(registry: &mut Registry) {
     // `timeGetTime` as a higher-resolution wall-clock source than
     // `GetTickCount`. Both return DWORD milliseconds.
     registry.register("winmm.dll", "timeGetTime", stub_time_get_time as StubFn, 0);
+    registry.register(
+        "winmm.dll",
+        "timeGetDevCaps",
+        stub_time_get_dev_caps as StubFn,
+        2,
+    );
+    registry.register(
+        "winmm.dll",
+        "timeBeginPeriod",
+        stub_time_period as StubFn,
+        1,
+    );
+    registry.register("winmm.dll", "timeEndPeriod", stub_time_period as StubFn, 1);
 
     // Round 20 (mpg4c32.dll): the MSMPEG4 v3 codec calls
     // `GetDriverModuleHandle` to find its own HMODULE. We
@@ -89,6 +102,45 @@ fn stub_time_get_time(
 ) -> Result<u32, Win32Error> {
     state.tick = state.tick.wrapping_add(1);
     Ok(state.tick)
+}
+
+/// `MMRESULT timeGetDevCaps(LPTIMECAPS ptc, UINT cbtc)`. Reports
+/// the supported timer-period range. Stamp `wPeriodMin=1`,
+/// `wPeriodMax=1000000` — what real Win32 returns. Apple's
+/// QuickTime calls this during `EnterMovies` to size its
+/// timer-resolution probe.
+fn stub_time_get_dev_caps(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let ptc = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("timeGetDevCaps", t))?;
+    let cbtc = arg_dword(cpu, mmu, 1)
+        .map_err(|t| crate::win32::trap_to_win32_local("timeGetDevCaps", t))?;
+    if ptc == 0 || cbtc < 8 {
+        return Ok(0x0B); // TIMERR_STRUCT
+    }
+    mmu.store32(ptc, 1)
+        .map_err(|t| crate::win32::trap_to_win32_local("timeGetDevCaps", t))?; // wPeriodMin
+    mmu.store32(ptc + 4, 1_000_000)
+        .map_err(|t| crate::win32::trap_to_win32_local("timeGetDevCaps", t))?; // wPeriodMax
+    Ok(0) // TIMERR_NOERROR
+}
+
+/// `MMRESULT timeBeginPeriod(UINT uPeriod)` /
+/// `timeEndPeriod(UINT uPeriod)`. No-op success — the host
+/// scheduler is already always at ~1 ms granularity.
+fn stub_time_period(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _p = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("time{Begin,End}Period", t))?;
+    Ok(0)
 }
 
 /// `HMODULE GetDriverModuleHandle(HDRVR hdrvr)`. Returns the

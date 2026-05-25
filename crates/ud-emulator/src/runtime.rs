@@ -215,9 +215,24 @@ impl Sandbox {
         // fresh TIB out of this pool for each spawned thread,
         // setting the new thread's FS base to its own TIB.
         mmu.map(TIB_POOL_BOTTOM, TIB_POOL_SIZE, Perm::R | Perm::W);
-        // Child-process heap pool (R+W+X). Each `CreateProcessA`
-        // carves a 16 MiB heap arena from this region for the
-        // spawned child.
+        // KUSER_SHARED_DATA + the high-memory TEB scan shelf.
+        // QT's QTMLInitInternals walks the usermode region
+        // (0x7F000000..0x7FFFFFFF) looking for per-thread TEBs
+        // — Windows allocates TEBs from the top of usermode
+        // memory down in 64 KiB increments, and Apple's code
+        // probes each candidate 64 KiB-aligned address for a
+        // TEB self-pointer signature. The probe runs DOWN the
+        // region until it finds an unmapped page, so map the
+        // full 16 MiB shelf zero-filled (R+W since codecs
+        // sometimes write sentinel bytes back). 0x7FFE_0000 is
+        // the conventional KUSER_SHARED_DATA base; zero-fill
+        // for SystemTime / NtSystemRoot is fine for codecs
+        // that only consult these for diagnostic logging.
+        mmu.map(0x7F00_0000, 0x00FC_0000, Perm::R | Perm::W); // 0x7F00_0000..0x7FFC_0000
+        mmu.map(0x7FFD_F000, 0x0002_1000, Perm::R | Perm::W); // 0x7FFD_F000..0x8000_0000
+                                                              // Child-process heap pool (R+W+X). Each `CreateProcessA`
+                                                              // carves a 16 MiB heap arena from this region for the
+                                                              // spawned child.
         mmu.map(
             CHILD_HEAP_POOL_START,
             CHILD_HEAP_POOL_SIZE,

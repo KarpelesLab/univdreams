@@ -3086,15 +3086,18 @@ fn stub_get_system_directory_a(
 }
 
 /// `BOOL GetVersionExA(LPOSVERSIONINFOA)`. Fills in a
-/// Windows XP SP3 shape: 5.1.2600, VER_PLATFORM_WIN32_NT = 2.
-/// Apple's QuickTime 7.x bootstrap checks for NT and refuses
-/// to init on Win9x. Reads the caller-supplied
-/// `dwOSVersionInfoSize` at offset 0 to distinguish:
+/// Windows 7 SP1 shape: 6.1.7601, VER_PLATFORM_WIN32_NT = 2.
+/// Apple's QuickTime 7.7.x explicitly rejects MajorVersion <= 5
+/// at the QTMLInitInternals OS-fingerprint check (`cmp dword
+/// [osvi.dwMajorVersion], 5; jbe error`), so XP doesn't work
+/// either — we have to claim Vista or newer.
+///
+/// Reads the caller-supplied `dwOSVersionInfoSize` (offset 0)
+/// to distinguish:
 ///   * `OSVERSIONINFOA` (148): fills through szCSDVersion.
 ///   * `OSVERSIONINFOEXA` (156): also fills the EX tail
 ///     (wServicePackMajor/Minor, wSuiteMask, wProductType) —
-///     QT's `qts!_QTMLInitInternals` inspects these to confirm
-///     XP-or-later workstation NT.
+///     QT's `qts!_QTMLInitInternals` reads these.
 fn stub_get_version_ex_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -3108,15 +3111,15 @@ fn stub_get_version_ex_a(
     let cb = mmu
         .load32(p)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?;
-    mmu.store32(p + 4, 5)
+    mmu.store32(p + 4, 6)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwMajorVersion
     mmu.store32(p + 8, 1)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwMinorVersion
-    mmu.store32(p + 12, 2600)
+    mmu.store32(p + 12, 7601)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwBuildNumber
     mmu.store32(p + 16, 2)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwPlatformId (NT)
-    let csd = b"Service Pack 3";
+    let csd = b"Service Pack 1";
     for (i, b) in csd.iter().enumerate() {
         mmu.store8(p + 20 + i as u32, *b)
             .map_err(|t| trap_to_win32("GetVersionExA", t))?;
@@ -3127,7 +3130,7 @@ fn stub_get_version_ex_a(
     }
     if cb >= 156 {
         // OSVERSIONINFOEXA tail at offset 0x94..0x9C.
-        mmu.store16(p + 0x94, 3)
+        mmu.store16(p + 0x94, 1)
             .map_err(|t| trap_to_win32("GetVersionExA", t))?; // wServicePackMajor
         mmu.store16(p + 0x96, 0)
             .map_err(|t| trap_to_win32("GetVersionExA", t))?; // wServicePackMinor
