@@ -254,6 +254,38 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum QtcodecCommand {
+    /// Call an arbitrary stdcall (or cdecl — caller cleans
+    /// only matters for stack-pop bookkeeping which is a
+    /// no-op here) export on a QT runtime DLL. Loads the DLL
+    /// (and its VFS-discoverable deps) with the QT runtime
+    /// pre-load step, calls DllMain, then invokes the export
+    /// with the supplied positional `--arg` values.
+    Call {
+        /// PE32 DLL to load (typically `qtmlclient.dll`).
+        dll: PathBuf,
+
+        /// Export to call (e.g. `InitializeQTML`, `NewPtr`,
+        /// `EnterMovies`).
+        #[arg(long)]
+        export: String,
+
+        /// Positional u32 args (decimal or `0x`-hex). Pushed
+        /// right-to-left in stdcall order, so `--arg 1 --arg 2`
+        /// produces a stack of `[1, 2]` from the callee's
+        /// `[esp+4], [esp+8]` perspective.
+        #[arg(long, value_name = "U32", value_parser = parse_u32)]
+        arg: Vec<u32>,
+
+        /// Mount these host directories into the sandbox VFS
+        /// before load — typically a `--dump-vfs` directory.
+        #[arg(long, value_name = "DIR")]
+        stage_vfs: Vec<PathBuf>,
+
+        /// Cap the run at this many guest instructions.
+        #[arg(long, default_value_t = 200_000_000)]
+        max_instructions: u64,
+    },
+
     /// Invoke a single selector on a QuickTime component's
     /// `*_ComponentDispatch` entry. Loads the codec with
     /// VFS-DLL fallback, calls `DllMain(PROCESS_ATTACH)`,
@@ -802,6 +834,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ),
         },
         Command::Qtcodec { command } => match command {
+            QtcodecCommand::Call {
+                dll,
+                export,
+                arg,
+                stage_vfs,
+                max_instructions,
+            } => qtcodec_call(&dll, &export, &arg, &stage_vfs, max_instructions),
             QtcodecCommand::Dispatch {
                 codec,
                 export,
@@ -861,6 +900,103 @@ const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
 /// codec ~250 MiB before the scratch slot collides.
 const QTCODEC_SCRATCH: u32 = 0x6FFE_0000;
 
+/// Pre-load the QT runtime DLLs (qtmlclient.dll + quicktime.qts)
+/// from the sandbox VFS if present. The codec / app doesn't
+/// statically import them — they're picked up at runtime via
+/// LoadLibraryA / GetProcAddress — and our `LoadLibraryA` stub
+/// only consults already-loaded modules in `state.modules`, so
+/// pre-loading bridges that gap.
+fn preload_qt_runtime(sandbox: &mut ud_emulator::Sandbox) {
+    for runtime_dll in &["qtmlclient.dll", "quicktime.qts"] {
+        let path = sandbox.context().vfs.as_ref().and_then(|v| {
+            for prefix in ud_emulator::win32::dll_vfs_search_paths() {
+                let p = format!("{prefix}{runtime_dll}");
+                if v.read(&p).is_some() {
+                    return Some(p);
+                }
+            }
+            None
+        });
+        let Some(path) = path else { continue };
+        let dll_bytes = sandbox
+            .context()
+            .vfs
+            .as_ref()
+            .and_then(|v| v.read(&path))
+            .map(<[u8]>::to_vec);
+        let Some(dll_bytes) = dll_bytes else { continue };
+        match sandbox.load_with_deps(runtime_dll, &dll_bytes) {
+            Ok((img, _)) => {
+                eprintln!(
+                    "pre-loaded {runtime_dll} at {:#010x} ({} exports)",
+                    img.image_base,
+                    img.exports.len()
+                );
+                for (name, rva) in &img.exports {
+                    sandbox.registry.register_guest_export(
+                        runtime_dll,
+                        name,
+                        img.image_base.wrapping_add(*rva),
+                    );
+                }
+                if let Err(e) = sandbox.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH) {
+                    eprintln!("  {runtime_dll}: DllMain trapped: {e}");
+                }
+            }
+            Err(e) => eprintln!("pre-load {runtime_dll}: {e}"),
+        }
+    }
+}
+
+fn qtcodec_call(
+    dll: &Path,
+    export: &str,
+    args: &[u32],
+    stage_vfs: &[PathBuf],
+    max_instructions: u64,
+) -> anyhow::Result<()> {
+    let bytes = std::fs::read(dll).with_context(|| format!("read {}", dll.display()))?;
+    let stem = dll.file_name().and_then(|s| s.to_str()).unwrap_or("qtdll");
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.trace_stubs = true;
+    sandbox.host.instruction_budget = Some(max_instructions);
+    sandbox
+        .context_mut()
+        .vfs
+        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+    for d in stage_vfs {
+        let n = stage_dir_into_vfs(sandbox.context_mut(), d)
+            .with_context(|| format!("stage {}", d.display()))?;
+        eprintln!("staged {n} files from {}", d.display());
+    }
+    preload_qt_runtime(&mut sandbox);
+    let (image, _) = sandbox
+        .load_with_deps(stem, &bytes)
+        .with_context(|| format!("load_with_deps {}", dll.display()))?;
+    eprintln!("loaded {} at {:#010x}", stem, image.image_base);
+    match sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH) {
+        Ok(v) => eprintln!("DllMain returned {v:#x}"),
+        Err(e) => eprintln!("DllMain trapped: {e}"),
+    }
+    eprintln!("calling {export}({args:?})");
+    match sandbox.call_export(&image, export, args) {
+        Ok(ret) => {
+            #[allow(clippy::cast_possible_wrap)]
+            let signed = ret as i32;
+            println!("{export}: ret = {ret:#010x} ({signed})");
+        }
+        Err(e) => {
+            eprintln!("{export}: trapped: {e}");
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    }
+    for line in &sandbox.host.debug_log {
+        eprintln!("  {line}");
+    }
+    Ok(())
+}
+
 fn parse_u32(s: &str) -> Result<u32, String> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -898,6 +1034,8 @@ fn qtcodec_dispatch(
             .with_context(|| format!("stage {}", dir.display()))?;
         eprintln!("staged {n} files from {}", dir.display());
     }
+
+    preload_qt_runtime(&mut sandbox);
 
     let (image, _unresolved) = sandbox
         .load_with_deps(stem, &bytes)
