@@ -1398,6 +1398,8 @@ fn monitor_install(
         .map(|(dll, name)| UnresolvedImport { dll, name })
         .collect();
 
+    let debug_log = std::mem::take(&mut sandbox.host.debug_log);
+
     let report = MonitorReport {
         input: input.display().to_string(),
         image_base: image.image_base,
@@ -1410,6 +1412,7 @@ fn monitor_install(
         win32_calls_by_function,
         vfs_writes,
         registry_writes,
+        debug_log,
     };
 
     if as_json {
@@ -1442,6 +1445,12 @@ struct MonitorReport {
     /// Registry values the guest set through `RegSetValueEx`
     /// etc. routed to the attached VirtualRegistry.
     registry_writes: Vec<RegistryEntry>,
+    /// `OutputDebugString` lines + any stub-emitted
+    /// diagnostic chatter (CreateProcessA target paths,
+    /// Msi* arguments, …). Surfaces the path resolution +
+    /// MSI call detail an analyst needs to debug what the
+    /// installer attempted.
+    debug_log: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1541,6 +1550,15 @@ impl MonitorReport {
         println!("  Registry writes: {}", self.registry_writes.len());
         for e in self.registry_writes.iter().take(20) {
             println!("    {}\\{} = {}", e.key, e.name, e.value);
+        }
+        if !self.debug_log.is_empty() {
+            println!("  Debug log ({} entries):", self.debug_log.len());
+            for line in self.debug_log.iter().take(20) {
+                println!("    {line}");
+            }
+            if self.debug_log.len() > 20 {
+                println!("    … and {} more", self.debug_log.len() - 20);
+            }
         }
     }
 }

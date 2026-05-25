@@ -5748,6 +5748,10 @@ fn stub_create_process_a(
     {
         Some(pair) => pair,
         None => {
+            state.debug_log.push(format!(
+                "CreateProcessA: child {target:?} not loadable from VFS — \
+                 falling back to synthetic immediate-exit"
+            ));
             // Mint a synthetic, pre-Terminated child process.
             let parent_pid = state.cur_thread().pid;
             let pid = state.next_pid;
