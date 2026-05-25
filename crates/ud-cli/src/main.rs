@@ -2253,6 +2253,84 @@ fn monitor_msi_install(
     };
     debug_log.push(outcome_label.clone());
 
+    // If the walk queued DLL CustomActions, pump them through a
+    // freshly-minted sandbox so msi.dll stubs can answer the
+    // DLL's queries from the captured property snapshot. The
+    // sandbox starts with the install's VFS + VirtualRegistry
+    // pre-staged so CA-side writes (e.g. component registration
+    // entries) land in the same trees the report emits.
+    if let Ok(props) = &result {
+        // Re-walk to extract the pending CAs + binaries — the
+        // ReportingSink above only logged them; we need them
+        // queued through the Sandbox-side EmulatorInstallSink
+        // path.
+        // (Simpler: just call dispatch_msiexec_install which
+        // re-runs the walk into a sandbox-owned sink that DOES
+        // queue them.)
+        let mut sandbox = ud_emulator::Sandbox::new();
+        sandbox.host.trace_stubs = true;
+        sandbox.host.instruction_budget = Some(2_000_000_000);
+        // Stage the install's VFS + registry into the sandbox.
+        let mut sb_vfs = ud_emulator::context::VirtualFs::new();
+        for (p, _) in vfs.list() {
+            if let Some(b) = vfs.read(p) {
+                sb_vfs.insert(p, b.to_vec());
+            }
+        }
+        // Also stage the MSI bytes at a path dispatch can find.
+        sb_vfs.insert("c:/temp/install.msi", bytes.to_vec());
+        sandbox.context_mut().vfs = Some(sb_vfs);
+        // Stage registry (clone via the all_values iter).
+        let mut sb_reg = ud_emulator::context::VirtualRegistry::new();
+        for (k, n, v) in registry.all_values() {
+            sb_reg.set_value(k, n, v.clone());
+        }
+        sandbox.context_mut().registry = Some(sb_reg);
+
+        // Dispatch the install through the sandbox's
+        // msiexec walker (which queues CAs into HostState).
+        // Synthesise a `msiexec /i <path> EXTRA…` command
+        // line — the walker uses the verb to decide whether
+        // to do an install or a no-op (uninstall).
+        let synth_cmd = format!(
+            "msiexec.exe /i \"c:/temp/install.msi\" {}",
+            extra_args.unwrap_or("")
+        );
+        ud_emulator::win32::msiexec::dispatch_msiexec_install(
+            &mut sandbox.host,
+            &mut sandbox.mmu,
+            "c:/temp/install.msi",
+            &synth_cmd,
+        );
+        let pumped = sandbox.pump_pending_msi_install();
+        if pumped > 0 {
+            debug_log.push(format!(
+                "msiexec: pumped {pumped} deferred CustomAction(s) post-walk"
+            ));
+        }
+        // Pull effects back from the sandbox.
+        if let Some(sb_vfs) = sandbox.context().vfs.as_ref() {
+            for (p, _) in sb_vfs.list() {
+                if !vfs.contains(p) {
+                    if let Some(b) = sb_vfs.read(p) {
+                        vfs.insert(p, b.to_vec());
+                    }
+                }
+            }
+        }
+        if let Some(sb_reg) = sandbox.context().registry.as_ref() {
+            for (k, n, v) in sb_reg.all_values() {
+                registry.set_value(k, n, v.clone());
+            }
+        }
+        // Propagate any new debug_log lines the sandbox-side
+        // walker / pump emitted.
+        for line in &sandbox.host.debug_log {
+            debug_log.push(line.clone());
+        }
+        let _ = props;
+    }
+
     // Side-effect capture + optional disk dump.
     let vfs_writes: Vec<VfsEntry> = vfs
         .list()

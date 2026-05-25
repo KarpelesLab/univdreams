@@ -428,6 +428,19 @@ pub fn register(registry: &mut Registry) {
         stub_global_handle as StubFn,
         1,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-globalmemorystatus
+    registry.register(
+        "kernel32.dll",
+        "GlobalMemoryStatus",
+        stub_global_memory_status as StubFn,
+        1,
+    );
+    registry.register(
+        "kernel32.dll",
+        "GlobalMemoryStatusEx",
+        stub_global_memory_status_ex as StubFn,
+        1,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalrealloc
     registry.register(
         "kernel32.dll",
@@ -3155,6 +3168,87 @@ fn stub_global_handle(
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalHandle", t))?;
     Ok(p)
+}
+
+/// `void GlobalMemoryStatus(LPMEMORYSTATUS lpBuffer)`. Reports
+/// a synthetic 4 GiB physical / 8 GiB pagefile setup with
+/// plenty free — installers use this to gate the install
+/// against "do you have enough disk / RAM" sanity checks.
+///
+/// MEMORYSTATUS layout (32 bytes):
+///   DWORD dwLength
+///   DWORD dwMemoryLoad       (0..100, % in use)
+///   DWORD dwTotalPhys
+///   DWORD dwAvailPhys
+///   DWORD dwTotalPageFile
+///   DWORD dwAvailPageFile
+///   DWORD dwTotalVirtual
+///   DWORD dwAvailVirtual
+fn stub_global_memory_status(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalMemoryStatus", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    let four_gib_minus_1: u32 = u32::MAX;
+    let two_gib: u32 = 0x8000_0000;
+    let one_gib: u32 = 0x4000_0000;
+    let fields = [
+        32,               // dwLength
+        25,               // dwMemoryLoad (25% in use)
+        four_gib_minus_1, // dwTotalPhys
+        two_gib,          // dwAvailPhys
+        four_gib_minus_1, // dwTotalPageFile
+        two_gib,          // dwAvailPageFile
+        four_gib_minus_1, // dwTotalVirtual
+        one_gib,          // dwAvailVirtual
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        mmu.store32(p + (i as u32) * 4, *v)
+            .map_err(|t| trap_to_win32("GlobalMemoryStatus", t))?;
+    }
+    Ok(0)
+}
+
+/// `BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX lpBuffer)`. Wide
+/// (64-bit fields) variant.
+///
+/// MEMORYSTATUSEX layout (64 bytes):
+///   DWORD dwLength
+///   DWORD dwMemoryLoad
+///   DWORDLONG ullTotalPhys / ullAvailPhys / ullTotalPageFile /
+///             ullAvailPageFile / ullTotalVirtual /
+///             ullAvailExtendedVirtual / ullAvailVirtual
+fn stub_global_memory_status_ex(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalMemoryStatusEx", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    let four_gib: u64 = 0x1_0000_0000;
+    let two_gib: u64 = 0x8000_0000;
+    let one_gib: u64 = 0x4000_0000;
+    mmu.store32(p, 64)
+        .map_err(|t| trap_to_win32("GlobalMemoryStatusEx", t))?; // dwLength
+    mmu.store32(p + 4, 25)
+        .map_err(|t| trap_to_win32("GlobalMemoryStatusEx", t))?; // dwMemoryLoad
+    let qwords = [four_gib, two_gib, four_gib, two_gib, four_gib, one_gib, 0];
+    for (i, v) in qwords.iter().enumerate() {
+        let off = p + 8 + (i as u32) * 8;
+        mmu.store32(off, (*v & 0xFFFF_FFFF) as u32)
+            .map_err(|t| trap_to_win32("GlobalMemoryStatusEx", t))?;
+        mmu.store32(off + 4, (*v >> 32) as u32)
+            .map_err(|t| trap_to_win32("GlobalMemoryStatusEx", t))?;
+    }
+    Ok(1)
 }
 
 /// `HGLOBAL GlobalReAlloc(HGLOBAL hMem, SIZE_T dwBytes, UINT

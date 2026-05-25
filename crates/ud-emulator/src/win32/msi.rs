@@ -34,40 +34,82 @@ use crate::emulator::{Cpu, Mmu};
 ///    via `MsiGetProperty` / `MsiSetProperty` / etc. These
 ///    consult [`HostState::msi_session`] when set.
 pub fn register(registry: &mut Registry) {
-    registry.register("msi.dll", "@112", stub_msi_get_file_sig_info as StubFn, 5);
-    registry.register("msi.dll", "@87", stub_msi_install_product_a as StubFn, 2);
-    registry.register("msi.dll", "@136", stub_msi_set_external_ui_a as StubFn, 3);
-    registry.register("msi.dll", "@141", stub_msi_set_internal_ui as StubFn, 2);
-    // CA-surface ordinals (Windows 10 msi.dll).
+    // Named exports for the install-driver surface — the outer
+    // QuickTime installer EXE imports these by name. Ordinals
+    // are deliberately NOT registered for these since the
+    // QTInstallCode.dll inside the QuickTime MSI uses the SAME
+    // ordinal numbers for different functions (msi.dll ordinals
+    // varied across Windows versions).
+    registry.register(
+        "msi.dll",
+        "MsiGetFileSignatureInformationA",
+        stub_msi_get_file_sig_info as StubFn,
+        5,
+    );
+    registry.register(
+        "msi.dll",
+        "MsiInstallProductA",
+        stub_msi_install_product_a as StubFn,
+        2,
+    );
+    registry.register(
+        "msi.dll",
+        "MsiSetExternalUIA",
+        stub_msi_set_external_ui_a as StubFn,
+        3,
+    );
+    registry.register(
+        "msi.dll",
+        "MsiSetInternalUI",
+        stub_msi_set_internal_ui as StubFn,
+        2,
+    );
+    // CA-surface ordinals from the QuickTime-era msi.dll
+    // (matches QTInstallCode.dll / QTMSISupport.dll imports).
     // @8   MsiCloseHandle
     // @17  MsiGetActiveDatabase
-    // @64  MsiCloseAllHandles (we route to MsiCloseHandle no-op)
-    // @73  MsiDatabaseOpenViewA — returns ERROR_INVALID_HANDLE (not modelled)
+    // @64  MsiCloseAllHandles (we route to MsiCloseHandle)
+    // @73  MsiDatabaseOpenViewA — ERROR_INVALID_HANDLE (DB view not modelled)
+    // @87  MsiInstallProductA (alias for the named entry)
     // @103 MsiFormatRecordA
-    // @112 (already MsiGetFileSignatureInformationA above — collision; the
-    //      QTInstallCode import @112 actually means MsiGetPropertyA on its
-    //      msi.dll vintage. We register MsiGetPropertyA under the alias
-    //      "@112" only if no prior registration exists, and provide a
-    //      thunk that dispatches by inspecting the caller's args.)
+    // @112 MsiGetPropertyA  ← the QT-era ordinal mapping
     // @121 MsiGetTargetPathA
     // @124 MsiGetPropertyW
+    // @136 MsiSetExternalUIA
+    // @141 MsiSetInternalUI
     // @144 MsiProcessMessage
     // @204 MsiSetPropertyA
     registry.register("msi.dll", "@8", stub_msi_close_handle as StubFn, 1);
     registry.register("msi.dll", "@17", stub_msi_get_active_database as StubFn, 1);
+    // @49 = MsiGetMode(MSIHANDLE, MSIRUNMODE) — TRUE/FALSE for
+    // a given run mode. Return FALSE for every mode (we're not
+    // in admin / maintenance / rollback etc.), which is the
+    // most defensive answer.
+    registry.register("msi.dll", "@49", stub_msi_get_mode as StubFn, 2);
     registry.register("msi.dll", "@64", stub_msi_close_handle as StubFn, 1);
     registry.register("msi.dll", "@73", stub_msi_database_open_view as StubFn, 3);
+    registry.register("msi.dll", "@87", stub_msi_install_product_a as StubFn, 2);
     registry.register("msi.dll", "@103", stub_msi_format_record_a as StubFn, 4);
+    registry.register("msi.dll", "@112", stub_msi_get_property_a as StubFn, 4);
     registry.register("msi.dll", "@121", stub_msi_get_target_path_a as StubFn, 4);
     registry.register("msi.dll", "@124", stub_msi_get_property_w as StubFn, 4);
+    registry.register("msi.dll", "@136", stub_msi_set_external_ui_a as StubFn, 3);
+    registry.register("msi.dll", "@141", stub_msi_set_internal_ui as StubFn, 2);
     registry.register("msi.dll", "@144", stub_msi_process_message as StubFn, 3);
     registry.register("msi.dll", "@204", stub_msi_set_property_a as StubFn, 3);
     // Also expose the named entries (some consumers import by
-    // name rather than ordinal).
+    // name rather than ordinal). Idempotent — the second
+    // `register` call returns the previously-registered thunk.
     registry.register(
         "msi.dll",
         "MsiGetPropertyA",
         stub_msi_get_property_a as StubFn,
+        4,
+    );
+    registry.register(
+        "msi.dll",
+        "MsiGetPropertyW",
+        stub_msi_get_property_w as StubFn,
         4,
     );
     registry.register(
@@ -84,6 +126,12 @@ pub fn register(registry: &mut Registry) {
     );
     registry.register(
         "msi.dll",
+        "MsiGetActiveDatabase",
+        stub_msi_get_active_database as StubFn,
+        1,
+    );
+    registry.register(
+        "msi.dll",
         "MsiGetTargetPathA",
         stub_msi_get_target_path_a as StubFn,
         4,
@@ -93,6 +141,12 @@ pub fn register(registry: &mut Registry) {
         "MsiFormatRecordA",
         stub_msi_format_record_a as StubFn,
         4,
+    );
+    registry.register(
+        "msi.dll",
+        "MsiDatabaseOpenViewA",
+        stub_msi_database_open_view as StubFn,
+        3,
     );
     registry.register(
         "msi.dll",
@@ -518,11 +572,30 @@ fn stub_msi_database_open_view(
     let _db = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiDatabaseOpenViewA", t))?;
     let _q = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiDatabaseOpenViewA", t))?;
     let pv = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32_local("MsiDatabaseOpenViewA", t))?;
+    // Best-effort write of NULL to `*phView` so the caller sees
+    // "no handle" before checking our return code. Swallow a
+    // write-protect fault on a read-only buffer — the caller
+    // is doing an unusual thing if it's passing one, but we
+    // still want the return code to land cleanly.
     if pv != 0 {
-        mmu.store32(pv, 0)
-            .map_err(|t| trap_to_win32_local("MsiDatabaseOpenViewA", t))?;
+        let _ = mmu.store32(pv, 0);
     }
     Ok(ERROR_INVALID_HANDLE)
+}
+
+/// `BOOL MsiGetMode(MSIHANDLE hInstall, MSIRUNMODE iRunMode)`.
+/// Returns FALSE for every queried run mode — we're not in
+/// admin/maintenance/rollback/scheduled-CA/etc. The most
+/// defensive answer for a synthesised install.
+fn stub_msi_get_mode(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiGetMode", t))?;
+    let _mode = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiGetMode", t))?;
+    Ok(0)
 }
 
 /// `int MsiProcessMessage(MSIHANDLE, INSTALLMESSAGE eMessage,

@@ -424,6 +424,13 @@ impl Sandbox {
         self.host
             .modules
             .insert(name.to_ascii_lowercase(), img.image_base);
+        // Cache exports for later re-resolution (e.g. the MSI
+        // CustomAction pump that loads a Binary-table DLL once
+        // then dispatches multiple named entries against the
+        // same image).
+        self.host
+            .loaded_dll_exports
+            .insert(img.image_base, img.exports.clone());
         Ok(img)
     }
 
@@ -649,6 +656,12 @@ impl Sandbox {
         self.host
             .modules
             .insert(name.to_ascii_lowercase(), img.image_base);
+        // Cache exports so re-resolution against the loaded DLL
+        // (MSI CA pump, multiple GetProcAddress lookups) finds
+        // them.
+        self.host
+            .loaded_dll_exports
+            .insert(img.image_base, img.exports.clone());
         Ok((img, options.fail_soft_log.unwrap_or_default()))
     }
 
