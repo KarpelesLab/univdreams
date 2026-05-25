@@ -997,13 +997,11 @@ fn qtcodec_call(
     eprintln!("--- {} stub calls during {export} ---", calls.len());
     for c in &calls {
         let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+        let eip = c.call_site_eip;
+        let arg_str = args.join(", ");
         eprintln!(
-            "  {} {}!{}({}) -> {:#x}",
-            format!("{:#010x}", c.call_site_eip),
-            c.dll,
-            c.name,
-            args.join(", "),
-            c.ret
+            "  {eip:#010x} {}!{}({arg_str}) -> {:#x}",
+            c.dll, c.name, c.ret
         );
     }
     for line in &sandbox.host.debug_log {
