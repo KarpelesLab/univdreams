@@ -1397,7 +1397,10 @@ fn qtcodec_list(
             &[],
         ) {
             Ok(v) => eprintln!("EnterMovies() = {v:#x}"),
-            Err(e) => eprintln!("EnterMovies() trapped: {e}"),
+            Err(e) => eprintln!(
+                "EnterMovies() trapped: {e} (eip={:#010x})",
+                sandbox.cpu.regs.eip
+            ),
         }
         let calls = &sandbox.host.stub_calls[before..];
         eprintln!("--- {} stub calls during EnterMovies ---", calls.len());
