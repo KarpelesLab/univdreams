@@ -3788,9 +3788,37 @@ fn stub_tls_free(
     Ok(1)
 }
 
+/// Max TLS slot index for Win32 (MSDN's documented
+/// 1088-slot ceiling on modern Windows; also captures the
+/// `TLS_OUT_OF_INDEXES` sentinel `0xFFFFFFFF` and any other
+/// >= 1088 value as invalid).
+const TLS_MINIMUM_AVAILABLE: u32 = 64;
+const TLS_EXPANSION_SLOTS: u32 = 1024;
+const TLS_MAX_INDEX: u32 = TLS_MINIMUM_AVAILABLE + TLS_EXPANSION_SLOTS;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
+/// Set the current thread's LastError to `code`, mirroring it
+/// to `tib + 0x34` so guest code that reads the TIB directly
+/// (via `fs:[0x34]`) sees the same value as `GetLastError()`.
+fn set_last_error(state: &mut HostState, mmu: &mut Mmu, code: u32) {
+    state.last_error = code;
+    let tib = state.cur_thread().tib_addr;
+    if tib != 0 {
+        let _ = mmu.store32(tib + 0x34, code);
+    }
+}
+
 /// `LPVOID TlsGetValue(DWORD)`. Reads the current thread's TLS
-/// slot. Slots that were never assigned read back zero — matching
-/// the MSDN "indeterminate, but typically NULL" contract.
+/// slot. MSDN: indices >= 1088 (and the `TLS_OUT_OF_INDEXES`
+/// sentinel `0xFFFFFFFF`) are invalid — return 0 *and* set
+/// `LastError = ERROR_INVALID_PARAMETER`. Without this, MSVC
+/// CRT code that probes `_mtinit`'s state via "did I get a
+/// real index back from TlsAlloc?" gets stuck in an infinite
+/// `TlsGetValue(0xFFFFFFFF) → 0` retry loop (the qtmlclient
+/// EnterMovies path triggers this exactly). On success, MSDN
+/// says "the function clears the last error code by calling
+/// `SetLastError(0)` on success" — qtmlclient's CRT-style
+/// probe sequence relies on that, so mirror it.
 fn stub_tls_get_value(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -3798,11 +3826,18 @@ fn stub_tls_get_value(
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     let idx = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TlsGetValue", t))?;
+    if idx >= TLS_MAX_INDEX {
+        set_last_error(state, mmu, ERROR_INVALID_PARAMETER);
+        return Ok(0);
+    }
+    set_last_error(state, mmu, 0);
     Ok(state.cur_thread().tls_slots.get(&idx).copied().unwrap_or(0))
 }
 
 /// `BOOL TlsSetValue(DWORD, LPVOID)`. Writes the current thread's
-/// TLS slot.
+/// TLS slot. Same invalid-index validation as
+/// [`stub_tls_get_value`]: returns 0 + sets `LastError =
+/// ERROR_INVALID_PARAMETER` for indices outside `[0, 1088)`.
 fn stub_tls_set_value(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -3811,6 +3846,10 @@ fn stub_tls_set_value(
 ) -> Result<u32, Win32Error> {
     let idx = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TlsSetValue", t))?;
     let value = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("TlsSetValue", t))?;
+    if idx >= TLS_MAX_INDEX {
+        set_last_error(state, mmu, ERROR_INVALID_PARAMETER);
+        return Ok(0);
+    }
     state.cur_thread_mut().tls_slots.insert(idx, value);
     Ok(1)
 }

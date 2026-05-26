@@ -683,7 +683,24 @@ impl Sandbox {
     pub fn call_dll_main(&mut self, image: &Image, reason: u32) -> Result<u32, crate::Error> {
         let h_module = image.image_base;
         let lpv_reserved = 0u32;
-        let target = image.export("DllMain").unwrap_or(image.entry_point);
+        // Always prefer the PE `AddressOfEntryPoint` for DLLs: the
+        // OS loader calls THAT (typically `_DllMainCRTStartup`, the
+        // linker-generated wrapper) and it in turn runs the CRT
+        // init (_CRT_INIT / _initterm) before invoking the user's
+        // DllMain. Some DLLs additionally *export* a function
+        // literally named "DllMain" — qts does — but that's the
+        // bare user function, NOT the CRT wrapper. Calling it
+        // directly bypasses CRT init: FLS/TLS slot allocation,
+        // env block setup, etc., never run, and downstream
+        // qtmlclient!EnterMovies spins in an infinite
+        // `_getptd()` retry loop hitting `TlsGetValue(TLS_OUT_OF_INDEXES)`.
+        // Fall back to a `DllMain` export only when the PE has
+        // no entry point at all (rare; old hand-written DLLs).
+        let target = if image.entry_point != 0 {
+            image.entry_point
+        } else {
+            image.export("DllMain").unwrap_or(0)
+        };
         if target == 0 {
             return Err(crate::Error::Win32(
                 crate::win32::Win32Error::InvalidArgument {
