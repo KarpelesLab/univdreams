@@ -1945,6 +1945,24 @@ pub fn call_guest(
 ) -> Result<u32, crate::Error> {
     use crate::emulator::isa_int::RET_SENTINEL;
     use crate::emulator::regs::Reg32;
+    // Top-level host re-entries: the bootstrap thread always has a
+    // ready quantum and a cleared exit/wait state. Without this,
+    // a prior call_guest that ended with the guest in a `Waiting`
+    // status (e.g. a `WaitForSingleObject` inside the codec's
+    // DllMain) leaves `cur_thread().status` non-runnable —
+    // `run_until_sentinel` would then short-circuit and the new
+    // call would never execute a single instruction (returning
+    // whatever EAX already held). Snap the bootstrap thread back
+    // to Ready and clear its pending wait condition so each
+    // top-level call_guest starts from a clean scheduler state.
+    if state.active_tid == 1 {
+        let quantum = state.scheduler.quantum_default;
+        let t = state.cur_thread_mut();
+        t.status = crate::sched::ThreadStatus::Ready;
+        t.wait = None;
+        t.quantum_remaining = quantum;
+    }
+    state.exit_requested = None;
     // Push args right-to-left.
     for a in args.iter().rev() {
         cpu.push32(mmu, *a)?;

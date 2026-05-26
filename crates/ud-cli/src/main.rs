@@ -1532,6 +1532,40 @@ fn qtcodec_list(
             );
         }
     }
+    // Diagnostic: read qts internal CM state to see what the dispatch
+    // table + global state look like at runtime.
+    let probe_addrs = &[
+        (0x67356240u32, "dispatch_table[cat 0..3] (32 bytes)"),
+        (0x67386860u32, "CM global state struct (32 bytes)"),
+        (0x6734a4ecu32, "[CM global ptr]"),
+        (0x6734a4e0u32, "[QT dispatcher ptr]"),
+        (0x668845b0u32, "theQuickTimeDispatcher prologue (32 bytes)"),
+        (0x67356248u32, "cat[1] entry (8 bytes raw)"),
+        (0x1004dcd0u32, "qtmlclient init flag (4 bytes)"),
+        (0x1004dcdcu32, "qtmlclient->theQuickTimeDispatcher (4 bytes)"),
+        (0x10024220u32, "qtmlclient!RegisterComponent (16 bytes)"),
+        (0x66884890u32, "cat[1].subtable stub (16 bytes)"),
+    ];
+    eprintln!("--- runtime CM state ---");
+    for (a, label) in probe_addrs {
+        let mut bytes = [0u8; 32];
+        let mut ok = true;
+        for i in 0..32 {
+            match sandbox.mmu.load8(a.wrapping_add(i as u32)) {
+                Ok(b) => bytes[i] = b,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+            eprintln!("  0x{a:08x} ({label}): {hex}");
+        } else {
+            eprintln!("  0x{a:08x} ({label}): UNMAPPED");
+        }
+    }
     Ok(())
 }
 
