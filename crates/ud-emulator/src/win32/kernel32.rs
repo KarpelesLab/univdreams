@@ -1774,9 +1774,56 @@ fn stub_get_command_line_a(
     Ok(state.command_line_ptr)
 }
 
+/// Minimal Windows env block (`KEY=VAL\0…\0`) used by the
+/// ANSI and wide [`GetEnvironmentStrings`] / [`*W`] stubs.
+/// We populate enough of the common variables that the
+/// MSVC CRT's env init succeeds and downstream
+/// `getenv` / `_dupenv_s` calls for `PATH`, `SYSTEMROOT`,
+/// etc. return real values instead of NULL.
+const SYNTH_ENV_VARS: &[&str] = &[
+    "PATH=C:\\Windows\\system32;C:\\Windows;C:\\Windows\\System32\\Wbem",
+    "SystemRoot=C:\\Windows",
+    "SystemDrive=C:",
+    "windir=C:\\Windows",
+    "ComSpec=C:\\Windows\\system32\\cmd.exe",
+    "TEMP=C:\\Temp",
+    "TMP=C:\\Temp",
+    "USERPROFILE=C:\\Users\\sandbox",
+    "ALLUSERSPROFILE=C:\\ProgramData",
+    "PROGRAMFILES=C:\\Program Files",
+    "CommonProgramFiles=C:\\Program Files\\Common Files",
+    "USERNAME=sandbox",
+    "COMPUTERNAME=SANDBOX",
+    "NUMBER_OF_PROCESSORS=1",
+    "PROCESSOR_ARCHITECTURE=x86",
+    "OS=Windows_NT",
+];
+
+fn build_env_ansi() -> Vec<u8> {
+    let mut block = Vec::new();
+    for kv in SYNTH_ENV_VARS {
+        block.extend_from_slice(kv.as_bytes());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+fn build_env_utf16() -> Vec<u8> {
+    let mut block = Vec::new();
+    for kv in SYNTH_ENV_VARS {
+        for u in kv.encode_utf16() {
+            block.extend_from_slice(&u.to_le_bytes());
+        }
+        block.extend_from_slice(&[0, 0]);
+    }
+    block.extend_from_slice(&[0, 0]);
+    block
+}
+
 /// `LPCH GetEnvironmentStrings(void)`. Returns a guest-side
-/// pointer to a static block `"\0\0"` (empty environment,
-/// double-null-terminated).
+/// pointer to the synthesised ANSI env block (see
+/// [`SYNTH_ENV_VARS`]).
 fn stub_get_environment_strings(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -1784,9 +1831,9 @@ fn stub_get_environment_strings(
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     if state.environment_strings_ptr == 0 {
-        let s = b"\0\0";
-        let addr = state.arena_const_alloc(s.len() as u32)?;
-        mmu.write_initializer(addr, s)
+        let block = build_env_ansi();
+        let addr = state.arena_const_alloc(block.len() as u32)?;
+        mmu.write_initializer(addr, &block)
             .map_err(|t| trap_to_win32("GetEnvironmentStrings", t))?;
         state.environment_strings_ptr = addr;
     }
@@ -3015,23 +3062,24 @@ fn stub_get_current_thread_id(
     Ok(state.active_tid)
 }
 
-/// `LPWCH GetEnvironmentStringsW(void)`. We hand back the same
-/// pointer as `GetEnvironmentStrings` (an empty UTF-16 block).
+/// `LPWCH GetEnvironmentStringsW(void)`. Returns a fresh
+/// UTF-16 env block built from [`SYNTH_ENV_VARS`]. Cached on a
+/// separate slot from the ANSI block so each form has the
+/// correct encoding.
 fn stub_get_environment_strings_w(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    if state.environment_strings_ptr != 0 {
-        return Ok(state.environment_strings_ptr);
+    if state.environment_strings_w_ptr != 0 {
+        return Ok(state.environment_strings_w_ptr);
     }
-    // 4 bytes: two UTF-16 NULs (one to end the last entry, one to
-    // terminate the block).
-    let p = state.arena_const_alloc(4)?;
-    mmu.write_initializer(p, &[0, 0, 0, 0])
+    let block = build_env_utf16();
+    let p = state.arena_const_alloc(block.len() as u32)?;
+    mmu.write_initializer(p, &block)
         .map_err(|t| trap_to_win32("GetEnvironmentStringsW", t))?;
-    state.environment_strings_ptr = p;
+    state.environment_strings_w_ptr = p;
     Ok(p)
 }
 

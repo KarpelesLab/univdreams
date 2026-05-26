@@ -235,8 +235,12 @@ pub struct ProcessState {
     /// Cached pointer to the canned `"oxideav-vfw\0"` command
     /// line. Lazily populated by `GetCommandLineA`.
     pub command_line_ptr: u32,
-    /// Cached pointer to the canned empty environment block.
+    /// Cached pointer to the synthesised ANSI environment block.
     pub environment_strings_ptr: u32,
+    /// Cached pointer to the synthesised UTF-16 environment
+    /// block. Kept distinct from the ANSI cache so each
+    /// encoding holds its own bytes.
+    pub environment_strings_w_ptr: u32,
     /// Currently-live `HDC` values handed out by
     /// `gdi32!CreateCompatibleDC` / `user32!GetDC`. `None` until
     /// the first DC is allocated, then a populated set.

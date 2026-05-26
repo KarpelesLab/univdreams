@@ -1114,8 +1114,31 @@ fn preload_qt_runtime(sandbox: &mut ud_emulator::Sandbox) {
                         img.image_base.wrapping_add(*rva),
                     );
                 }
-                if let Err(e) = sandbox.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH) {
-                    eprintln!("  {runtime_dll}: DllMain trapped: {e}");
+                let stub_before = sandbox.host.stub_calls.len();
+                match sandbox.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH) {
+                    Ok(rc) => eprintln!("  {runtime_dll}: DllMain returned {rc:#x}"),
+                    Err(e) => eprintln!("  {runtime_dll}: DllMain trapped: {e}"),
+                }
+                let calls = &sandbox.host.stub_calls[stub_before..];
+                if !calls.is_empty() {
+                    eprintln!(
+                        "  --- {} stub calls during {runtime_dll} DllMain ---",
+                        calls.len()
+                    );
+                    for c in calls.iter().take(500) {
+                        let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+                        let eip = c.call_site_eip;
+                        eprintln!(
+                            "    {eip:#010x} {}!{}({}) -> {:#x}",
+                            c.dll,
+                            c.name,
+                            args.join(", "),
+                            c.ret
+                        );
+                    }
+                    if calls.len() > 500 {
+                        eprintln!("    … ({} more)", calls.len() - 500);
+                    }
                 }
             }
             Err(e) => eprintln!("pre-load {runtime_dll}: {e}"),
@@ -1363,6 +1386,8 @@ fn qtcodec_list(
     }
     // EnterMovies
     if let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "EnterMovies") {
+        sandbox.host.exit_requested = None;
+        let before = sandbox.host.stub_calls.len();
         match ud_emulator::win32::call_guest(
             &mut sandbox.cpu,
             &mut sandbox.mmu,
@@ -1373,6 +1398,22 @@ fn qtcodec_list(
         ) {
             Ok(v) => eprintln!("EnterMovies() = {v:#x}"),
             Err(e) => eprintln!("EnterMovies() trapped: {e}"),
+        }
+        let calls = &sandbox.host.stub_calls[before..];
+        eprintln!("--- {} stub calls during EnterMovies ---", calls.len());
+        for c in calls.iter().take(60) {
+            let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+            let eip = c.call_site_eip;
+            eprintln!(
+                "  {eip:#010x} {}!{}({}) -> {:#x}",
+                c.dll,
+                c.name,
+                args.join(", "),
+                c.ret
+            );
+        }
+        if calls.len() > 60 {
+            eprintln!("  … ({} more)", calls.len() - 60);
         }
     }
     // Build ComponentDescription { type, subType, manufacturer, flags, flagsMask }
