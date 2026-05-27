@@ -1117,7 +1117,10 @@ fn preload_qt_runtime(sandbox: &mut ud_emulator::Sandbox) {
                 let stub_before = sandbox.host.stub_calls.len();
                 match sandbox.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH) {
                     Ok(rc) => eprintln!("  {runtime_dll}: DllMain returned {rc:#x}"),
-                    Err(e) => eprintln!("  {runtime_dll}: DllMain trapped: {e}"),
+                    Err(e) => eprintln!(
+                        "  {runtime_dll}: DllMain trapped: {e} (eip={:#010x})",
+                        sandbox.cpu.regs.eip
+                    ),
                 }
                 let calls = &sandbox.host.stub_calls[stub_before..];
                 if !calls.is_empty() {
@@ -1548,6 +1551,12 @@ fn qtcodec_list(
         (0x1004dcdcu32, "qtmlclient->theQuickTimeDispatcher (4 bytes)"),
         (0x10024220u32, "qtmlclient!RegisterComponent (16 bytes)"),
         (0x66884890u32, "cat[1].subtable stub (16 bytes)"),
+        (0x67347000u32, "qts CRT-init flag (4 bytes)"),
+        (0x67347004u32, "qts TLS slot index (4 bytes)"),
+        (0x673851e8u32, "qts thread-data lock (4 bytes)"),
+        (0x673851ecu32, "qts thread-data list head (4 bytes)"),
+        (0x7FFD_DFF0u32, "page below TEB (32 bytes)"),
+        (0x7FFD_E000u32, "TEB start (32 bytes)"),
     ];
     eprintln!("--- runtime CM state ---");
     for (a, label) in probe_addrs {
