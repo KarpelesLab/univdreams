@@ -433,6 +433,9 @@ pub struct ThreadState {
     /// `TEB_BASE`); `CreateThread` carves a fresh page out of
     /// the per-process TIB pool for each new thread.
     pub tib_addr: u32,
+    /// Debug aid: previous EIP, used by the wild-jump tracer
+    /// under `UD_TRACE_WILD_JUMP`.
+    pub last_eip_before_wild: u32,
 }
 
 impl Default for ThreadState {
@@ -447,6 +450,7 @@ impl Default for ThreadState {
             status: crate::sched::ThreadStatus::Ready,
             wait: None,
             tib_addr: 0,
+            last_eip_before_wild: 0,
         }
     }
 }
@@ -1840,6 +1844,29 @@ pub fn run_until_sentinel(
                 if has_peer {
                     state.yield_requested = Some(crate::sched::YieldRequest::Yield);
                 }
+            }
+        }
+        // Wild-jump tracer: when EIP falls below 0x100_0000 (way
+        // below any loaded DLL's image base) we've almost
+        // certainly hit a `jmp eax`/`ret` whose target slot
+        // wasn't initialised. Recording the previous well-formed
+        // EIP gives the caller's instruction that triggered the
+        // wild jump, which is the diagnostic surface for missing
+        // delay-load resolvers.
+        if std::env::var("UD_TRACE_WILD_JUMP").is_ok() {
+            let eip = cpu.regs.eip;
+            if eip < 0x100_0000 {
+                let esp = cpu.regs.get32(crate::emulator::regs::Reg32::Esp);
+                let last = state.cur_thread().last_eip_before_wild;
+                let stack_top: Vec<u32> = (0..4)
+                    .map(|i| mmu.load32(esp + i * 4).unwrap_or(0xDEAD_BEEF))
+                    .collect();
+                eprintln!(
+                    "WILD-JUMP eip={eip:#010x} esp={esp:#010x} prev_eip={last:#010x} stack=[{:#x},{:#x},{:#x},{:#x}]",
+                    stack_top[0], stack_top[1], stack_top[2], stack_top[3]
+                );
+            } else {
+                state.cur_thread_mut().last_eip_before_wild = eip;
             }
         }
         if registry.is_thunk(cpu.regs.eip) {

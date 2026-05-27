@@ -1894,9 +1894,9 @@ fn preload_deps_free(
             .loaded_dll_exports
             .insert(img.image_base, img.exports.clone());
         state.modules.insert(dll_lc.clone(), img.image_base);
-        state
-            .debug_log
-            .push(format!("dynamic-load {dll_lc}: loaded at {base:#010x}"));
+        let msg = format!("dynamic-load {dll_lc}: loaded at {base:#010x}");
+        eprintln!("  {msg}");
+        state.debug_log.push(msg);
         let has_dll_main = img.exports.contains_key("DllMain");
         let has_entry = parsed_dep.optional.address_of_entry_point != 0;
         let target = if has_entry {
@@ -1917,9 +1917,9 @@ fn preload_deps_free(
                 target,
                 &[img.image_base, DLL_PROCESS_ATTACH, 0],
             ) {
-                state
-                    .debug_log
-                    .push(format!("dynamic-load {dll_lc}: DllMain trapped: {e}"));
+                let msg = format!("dynamic-load {dll_lc}: DllMain trapped: {e}");
+                eprintln!("  {msg}");
+                state.debug_log.push(msg);
             }
         }
         loading.remove(&dll_lc);
@@ -2012,10 +2012,12 @@ pub fn load_dll_dynamic(
         .loaded_dll_exports
         .insert(img.image_base, img.exports.clone());
     state.modules.insert(basename.clone(), img.image_base);
-    state.debug_log.push(format!(
+    let msg = format!(
         "dynamic-load {basename}: loaded at {:#010x}",
         img.image_base
-    ));
+    );
+    eprintln!("  {msg}");
+    state.debug_log.push(msg);
     let has_dll_main = img.exports.contains_key("DllMain");
     let has_entry = parsed.optional.address_of_entry_point != 0;
     let target = if has_entry {
@@ -2036,9 +2038,9 @@ pub fn load_dll_dynamic(
             target,
             &[img.image_base, DLL_PROCESS_ATTACH, 0],
         ) {
-            state
-                .debug_log
-                .push(format!("dynamic-load {basename}: DllMain trapped: {e}"));
+            let msg = format!("dynamic-load {basename}: DllMain trapped: {e}");
+            eprintln!("  {msg}");
+            state.debug_log.push(msg);
         }
     }
     img.image_base
