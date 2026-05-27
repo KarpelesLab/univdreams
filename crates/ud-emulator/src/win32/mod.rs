@@ -1390,10 +1390,18 @@ pub fn read_wide_cstr_local(mmu: &Mmu, mut addr: u32, max_chars: u32) -> String 
 /// [`Win32Error::UnknownImport`] that the runtime surfaces as
 /// `Trap::UnresolvedImport`. Execution halts on first call —
 /// the operator sees the precise import to implement next.
+///
+/// When `UD_LENIENT_UNRESOLVED=1` is set, the stub returns 0
+/// instead of trapping (logged once per import via debug_log).
+/// This is for chasing through deeply-stacked DLL chains —
+/// e.g. qtcf.dll → corefoundation.dll → many CRT helpers —
+/// where most failing imports are throwaway init/cleanup
+/// hooks and returning 0 lets the chain proceed. Trapping
+/// remains the default since it reveals what stubs to add.
 fn stub_unresolved_fallback(
     cpu: &mut Cpu,
     _mmu: &mut Mmu,
-    _state: &mut HostState,
+    state: &mut HostState,
     registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let addr = cpu.regs.eip;
@@ -1401,6 +1409,15 @@ fn stub_unresolved_fallback(
         .entry(addr)
         .map(|e| (e.dll.clone(), e.name.clone()))
         .unwrap_or_else(|| ("<unknown>".to_string(), format!("@{addr:#010x}")));
+    if std::env::var("UD_LENIENT_UNRESOLVED").is_ok() {
+        // One-line summary per unique (dll, name) the operator
+        // sees; the stub then returns 0 so the calling code
+        // proceeds as if a null/zero stub function did nothing.
+        state
+            .debug_log
+            .push(format!("lenient: returning 0 for {dll}!{name}"));
+        return Ok(0);
+    }
     Err(Win32Error::UnknownImport { dll, name })
 }
 

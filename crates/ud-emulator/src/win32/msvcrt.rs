@@ -294,10 +294,17 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     registry.register(dll, "_unlock", stub_purecall as StubFn, 0);
     // void *memcpy(void *dest, const void *src, size_t n).
     registry.register(dll, "memcpy", stub_memcpy as StubFn, 0);
+    // errno_t memcpy_s(void *dest, rsize_t destsz, const void
+    // *src, rsize_t count). MSVC's secure-CRT memcpy: same copy
+    // but with destination-size bound. Returns 0 on success.
+    registry.register(dll, "memcpy_s", stub_memcpy_s as StubFn, 0);
     // void *memset(void *dest, int c, size_t n).
     registry.register(dll, "memset", stub_memset as StubFn, 0);
     // void *memmove(void *dest, const void *src, size_t n).
     registry.register(dll, "memmove", stub_memmove as StubFn, 0);
+    // errno_t memmove_s(void *dest, rsize_t destsz, const void
+    // *src, rsize_t count). Returns 0 on success.
+    registry.register(dll, "memmove_s", stub_memmove_s as StubFn, 0);
     // char *strncpy(char *dest, const char *src, size_t n).
     registry.register(dll, "strncpy", stub_strncpy as StubFn, 0);
     // double _CIsqrt(double x) — x87-stack sqrt (FLD x on
@@ -329,6 +336,12 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     // `_iob[2]` (stderr) just need a non-NULL FILE* they
     // can pass to fprintf/etc., which we ignore.
     registry.register_data(dll, "_iob", 0);
+    // MSVC 8+ replaces direct `_iob` exports with the
+    // function form `__iob_func()` which returns a pointer to
+    // the `_iob` array. We return the registered data slot's
+    // address; the resulting `FILE*` is read by the caller as
+    // an opaque pointer that flows into fprintf/etc. (no-ops).
+    registry.register(dll, "__iob_func", stub_iob_func as StubFn, 0);
 
     // ---- Corpus round 2 -------------------------------------------
     // Additional CRT entries flagged by the corpus runner after
@@ -1247,6 +1260,33 @@ fn stub_returns_zero(
     Ok(0)
 }
 
+/// `FILE *__iob_func(void)`. MSVC 8+ replaced the `_iob` data
+/// export with this function form. Returns the address of the
+/// registered `_iob` data slot — which DLL alias is the
+/// caller's affects nothing since every CRT alias registers
+/// the same `_iob` symbol; we look up the first matching one.
+fn stub_iob_func(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    for dll in &[
+        "msvcr80.dll",
+        "msvcr90.dll",
+        "msvcr100.dll",
+        "msvcr110.dll",
+        "msvcr120.dll",
+        "msvcr71.dll",
+        "msvcrt.dll",
+    ] {
+        if let Some(addr) = registry.resolve(dll, "_iob") {
+            return Ok(addr);
+        }
+    }
+    Ok(0)
+}
+
 /// `void *memcpy(void *dest, const void *src, size_t n)`.
 /// Reads `n` bytes from `src` and writes them to `dest`. Returns
 /// `dest`. Cdecl.
@@ -1330,6 +1370,68 @@ fn stub_memmove(
     let data = mmu.read(src, n as usize).map_err(|t| trap("memmove", t))?;
     mmu.write(dest, &data).map_err(|t| trap("memmove", t))?;
     Ok(dest)
+}
+
+/// `errno_t memcpy_s(void *dest, rsize_t destsz, const void
+/// *src, rsize_t count)`. Returns 0 on success, EINVAL (22)
+/// when args are bad. Cdecl.
+fn stub_memcpy_s(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("memcpy_s", t))?;
+    let destsz = arg_dword(cpu, mmu, 1).map_err(|t| trap("memcpy_s", t))?;
+    let src = arg_dword(cpu, mmu, 2).map_err(|t| trap("memcpy_s", t))?;
+    let count = arg_dword(cpu, mmu, 3).map_err(|t| trap("memcpy_s", t))?;
+    if dest == 0 {
+        return Ok(22); // EINVAL
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    if src == 0 || count > destsz {
+        // Per the C11 Annex K contract, the destination is
+        // zeroed and an error is returned.
+        for i in 0..destsz {
+            let _ = mmu.store8(dest.wrapping_add(i), 0);
+        }
+        return Ok(22);
+    }
+    let data = mmu.read(src, count as usize).map_err(|t| trap("memcpy_s", t))?;
+    mmu.write(dest, &data).map_err(|t| trap("memcpy_s", t))?;
+    Ok(0)
+}
+
+/// `errno_t memmove_s(void *dest, rsize_t destsz, const void
+/// *src, rsize_t count)`. Same shape as `memcpy_s` but
+/// overlap-safe.
+fn stub_memmove_s(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("memmove_s", t))?;
+    let destsz = arg_dword(cpu, mmu, 1).map_err(|t| trap("memmove_s", t))?;
+    let src = arg_dword(cpu, mmu, 2).map_err(|t| trap("memmove_s", t))?;
+    let count = arg_dword(cpu, mmu, 3).map_err(|t| trap("memmove_s", t))?;
+    if dest == 0 {
+        return Ok(22);
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    if src == 0 || count > destsz {
+        for i in 0..destsz {
+            let _ = mmu.store8(dest.wrapping_add(i), 0);
+        }
+        return Ok(22);
+    }
+    let data = mmu.read(src, count as usize).map_err(|t| trap("memmove_s", t))?;
+    mmu.write(dest, &data).map_err(|t| trap("memmove_s", t))?;
+    Ok(0)
 }
 
 /// `char *strncpy(char *dest, const char *src, size_t n)`.
