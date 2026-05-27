@@ -529,7 +529,7 @@ fn stub_register_class_ex_a(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0xC001)
 }
@@ -544,7 +544,7 @@ fn stub_unregister_class_a(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -564,7 +564,7 @@ fn stub_map_dialog_rect(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hdlg = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("MapDialogRect", t))?;
@@ -589,7 +589,7 @@ fn stub_set_timer(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hwnd =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("SetTimer", t))?;
@@ -618,7 +618,7 @@ fn stub_kill_timer(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hwnd =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("KillTimer", t))?;
@@ -638,7 +638,7 @@ fn stub_zero0(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -646,7 +646,7 @@ fn stub_zero1(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -654,7 +654,7 @@ fn stub_zero2(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -662,7 +662,7 @@ fn stub_zero3(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -670,7 +670,7 @@ fn stub_zero4(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -678,7 +678,7 @@ fn stub_zero5(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -686,7 +686,7 @@ fn stub_zero7(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -697,16 +697,16 @@ fn stub_zero7(
 // must report success (TRUE = 1) for the codec to proceed past
 // the call.
 
-fn stub_one1(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
+fn stub_one1(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
     Ok(1)
 }
-fn stub_one2(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
+fn stub_one2(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
     Ok(1)
 }
-fn stub_one4(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
+fn stub_one4(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
     Ok(1)
 }
-fn stub_one6(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
+fn stub_one6(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
     Ok(1)
 }
 
@@ -719,7 +719,7 @@ fn stub_wsprintf_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let out =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("wsprintfW", t))?;
@@ -744,7 +744,7 @@ fn stub_create_window_ex_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hwnd = HWND_BASE.wrapping_add(state.next_hwnd_index);
     state.next_hwnd_index = state.next_hwnd_index.wrapping_add(1);
@@ -758,7 +758,7 @@ fn stub_destroy_window(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hwnd = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("DestroyWindow", t))?;
@@ -773,7 +773,7 @@ fn stub_is_window(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hwnd =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("IsWindow", t))?;
@@ -791,7 +791,7 @@ fn stub_get_message_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let lp =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("GetMessageA", t))?;
@@ -810,7 +810,7 @@ fn stub_get_client_rect(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hwnd = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("GetClientRect", t))?;
@@ -831,7 +831,7 @@ fn stub_is_rect_empty(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("IsRectEmpty", t))?;
@@ -859,7 +859,7 @@ fn stub_offset_rect(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("OffsetRect", t))?;
@@ -894,7 +894,7 @@ fn stub_user_simple_ret(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -905,7 +905,7 @@ fn stub_load_resource_handle(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = 0x6850_0000u32.wrapping_add(state.tick);
     state.tick = state.tick.wrapping_add(1);
@@ -919,7 +919,7 @@ fn stub_load_string_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("LoadStringA", t))?;
@@ -940,7 +940,7 @@ fn stub_load_string_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("LoadStringW", t))?;
@@ -965,7 +965,7 @@ fn stub_get_sys_color(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let idx =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("GetSysColor", t))?;
@@ -992,7 +992,7 @@ fn stub_get_sys_color_brush(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let idx = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("GetSysColorBrush", t))?;
@@ -1003,7 +1003,7 @@ fn stub_begin_paint(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hwnd =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("BeginPaint", t))?;
@@ -1022,7 +1022,7 @@ fn stub_end_paint(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -1040,7 +1040,7 @@ fn stub_dialog_box_param_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _ = IDCANCEL;
     Ok(IDOK)
@@ -1051,7 +1051,7 @@ fn stub_end_dialog(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -1062,7 +1062,7 @@ fn stub_get_dc(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     state
         .gdi_hdcs
@@ -1076,7 +1076,7 @@ fn stub_release_dc(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -1087,7 +1087,7 @@ fn stub_get_dlg_item_int(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hdlg = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("GetDlgItemInt", t))?;
@@ -1109,7 +1109,7 @@ fn stub_get_window_long_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -1120,7 +1120,7 @@ fn stub_get_window_rect(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hwnd = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("GetWindowRect", t))?;
@@ -1145,7 +1145,7 @@ fn stub_load_bitmap_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -1155,7 +1155,7 @@ fn stub_message_beep(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -1168,7 +1168,7 @@ fn stub_message_box_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hwnd =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxA", t))?;
@@ -1200,7 +1200,7 @@ fn stub_message_box_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hwnd =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxW", t))?;
@@ -1246,7 +1246,7 @@ fn stub_post_message_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -1256,7 +1256,7 @@ fn stub_set_dlg_item_text_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -1272,7 +1272,7 @@ fn stub_wsprintf_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let lp_out =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("wsprintfA", t))?;
@@ -1399,7 +1399,7 @@ mod tests {
     fn call(
         cpu: &mut Cpu,
         mmu: &mut Mmu,
-        registry: &Registry,
+        registry: &mut Registry,
         state: &mut HostState,
         dll: &str,
         name: &str,
@@ -1415,11 +1415,11 @@ mod tests {
 
     #[test]
     fn dialog_box_param_a_returns_idok_for_auto_advance() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "user32.dll",
             "DialogBoxParamA",
@@ -1433,7 +1433,7 @@ mod tests {
 
     #[test]
     fn message_box_a_logs_and_returns_idok() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // "hello\0" at 0x4000, "title\0" at 0x4010.
         mmu.write(0x4000, b"hello\0").unwrap();
         mmu.write(0x4010, b"title\0").unwrap();
@@ -1441,7 +1441,7 @@ mod tests {
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "user32.dll",
             "MessageBoxA",
@@ -1455,12 +1455,12 @@ mod tests {
 
     #[test]
     fn get_window_rect_returns_640x480() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let p = 0x4040;
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "user32.dll",
             "GetWindowRect",
@@ -1475,7 +1475,7 @@ mod tests {
 
     #[test]
     fn wsprintf_a_renders_int_and_str() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // "n=%d s=%s\0" at 0x4000, "abc\0" at 0x4020, output at 0x4080.
         mmu.write(0x4000, b"n=%d s=%s\0").unwrap();
         mmu.write(0x4020, b"abc\0").unwrap();
@@ -1487,7 +1487,7 @@ mod tests {
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "user32.dll",
             "wsprintfA",
@@ -1508,13 +1508,13 @@ mod tests {
 
     #[test]
     fn wsprintf_a_handles_hex_and_percent() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         mmu.write(0x4000, b"v=%X %% %x\0").unwrap();
         let args = [0x4080u32, 0x4000, 0xCAFEu32, 0xDEADu32];
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "user32.dll",
             "wsprintfA",

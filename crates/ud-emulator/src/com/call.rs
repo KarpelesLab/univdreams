@@ -43,7 +43,7 @@ use crate::win32::{HostState, Registry};
 pub fn call_method(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     obj: u32,
     slot: u32,
@@ -61,7 +61,7 @@ pub fn call_method(
 pub fn add_ref(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     obj: u32,
 ) -> Result<u32, crate::Error> {
@@ -76,7 +76,7 @@ pub fn add_ref(
 pub fn release(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     obj: u32,
 ) -> Result<u32, crate::Error> {
@@ -98,7 +98,7 @@ pub fn release(
 pub fn query_interface(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     obj: u32,
     iid_addr: u32,

@@ -39,6 +39,7 @@ pub mod user32;
 pub mod version;
 pub mod vfw32;
 pub mod winmm;
+pub mod winsock;
 
 /// First synthetic thunk address. Chosen well above any plausible
 /// `ImageBase + section.VirtualAddress` so it cannot be mistaken
@@ -59,7 +60,7 @@ const THUNK_STRIDE: u32 = 16;
 /// call back into the guest (used by the round-2 `vfw32` stub
 /// surface, which has to dispatch the codec DLL's `DriverProc`
 /// before returning to the IAT caller).
-pub type StubFn = fn(&mut Cpu, &mut Mmu, &mut HostState, &Registry) -> Result<u32, Win32Error>;
+pub type StubFn = fn(&mut Cpu, &mut Mmu, &mut HostState, &mut Registry) -> Result<u32, Win32Error>;
 
 /// One stub call recorded for analysis. Populated whenever
 /// [`HostState::trace_stubs`] is set; the [`HostState::stub_calls`]
@@ -1262,6 +1263,7 @@ impl Registry {
         let host_before = self.by_name.len();
         crate::com::host_iface::register(self);
         crate::com::host_iface_r31::register(self);
+        crate::win32::winsock::register(self);
         let host_count = self.by_name.len() - host_before;
         self.register_kernel32()
             + self.register_gdi32()
@@ -1388,7 +1390,7 @@ fn stub_unresolved_fallback(
     cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let addr = cpu.regs.eip;
     let (dll, name) = registry
@@ -1410,7 +1412,7 @@ fn stub_unresolved_fallback(
 pub fn dispatch_stub(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
 ) -> Result<(), crate::Error> {
     let addr = cpu.regs.eip;
@@ -1710,7 +1712,7 @@ fn wake_sleep_if_due(state: &mut HostState) {
 pub fn run_until_sentinel(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
 ) -> Result<(), crate::Error> {
     use crate::emulator::isa_int::{StepOk, RET_SENTINEL};
@@ -1938,7 +1940,7 @@ fn emit_trap_event(cpu: &Cpu, mmu: &Mmu, err: &crate::Error) {
 pub fn call_guest(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     target_va: u32,
     args: &[u32],
@@ -1982,7 +1984,7 @@ mod tests {
         _cpu: &mut Cpu,
         _mmu: &mut Mmu,
         _h: &mut HostState,
-        _r: &Registry,
+        _r: &mut Registry,
     ) -> Result<u32, Win32Error> {
         Ok(0xCAFE)
     }
@@ -2078,7 +2080,7 @@ mod tests {
             _cpu: &mut Cpu,
             _mmu: &mut Mmu,
             _h: &mut HostState,
-            _r: &Registry,
+            _r: &mut Registry,
         ) -> Result<u32, Win32Error> {
             Ok(0x6000_0000)
         }
@@ -2091,7 +2093,7 @@ mod tests {
 
         cpu.regs.eip = addr;
         let mut state = HostState::new(0, 0);
-        dispatch_stub(&mut cpu, &mut mmu, &registry, &mut state).unwrap();
+        dispatch_stub(&mut cpu, &mut mmu, &mut registry, &mut state).unwrap();
 
         // The captured JSONL line should carry args:[2928] (decimal,
         // matching the existing ev_win32_call format), the dummy
@@ -2133,7 +2135,7 @@ mod tests {
             _cpu: &mut Cpu,
             _mmu: &mut Mmu,
             _h: &mut HostState,
-            _r: &Registry,
+            _r: &mut Registry,
         ) -> Result<u32, Win32Error> {
             Ok(0)
         }
@@ -2142,7 +2144,7 @@ mod tests {
         cpu.push32(&mut mmu, 0x1c237e58).unwrap(); // saved ret
         cpu.regs.eip = addr;
         let mut state = HostState::new(0, 0);
-        dispatch_stub(&mut cpu, &mut mmu, &registry, &mut state).unwrap();
+        dispatch_stub(&mut cpu, &mut mmu, &mut registry, &mut state).unwrap();
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             s.contains(r#""args":[1610613440]"#),
@@ -2169,7 +2171,7 @@ mod tests {
 
         cpu.regs.eip = addr;
         let mut state = HostState::new(0, 0);
-        dispatch_stub(&mut cpu, &mut mmu, &registry, &mut state).unwrap();
+        dispatch_stub(&mut cpu, &mut mmu, &mut registry, &mut state).unwrap();
 
         // After: eax=0xCAFE, eip = ret addr, esp pops 12 bytes
         // total (1 ret + 2 args).

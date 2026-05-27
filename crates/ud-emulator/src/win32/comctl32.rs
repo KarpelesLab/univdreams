@@ -27,7 +27,7 @@ fn stub_init_common_controls_ex(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }

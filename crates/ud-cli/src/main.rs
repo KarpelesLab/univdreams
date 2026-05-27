@@ -1037,7 +1037,7 @@ fn init_qtml(sandbox: &mut ud_emulator::Sandbox) -> u32 {
     let result = ud_emulator::win32::call_guest(
         &mut sandbox.cpu,
         &mut sandbox.mmu,
-        &sandbox.registry,
+        &mut sandbox.registry,
         &mut sandbox.host,
         target,
         &[0],
@@ -1205,7 +1205,7 @@ fn qtcodec_register(
         match ud_emulator::win32::call_guest(
             &mut sandbox.cpu,
             &mut sandbox.mmu,
-            &sandbox.registry,
+            &mut sandbox.registry,
             &mut sandbox.host,
             target,
             &[],
@@ -1253,7 +1253,7 @@ fn qtcodec_register(
     let result = ud_emulator::win32::call_guest(
         &mut sandbox.cpu,
         &mut sandbox.mmu,
-        &sandbox.registry,
+        &mut sandbox.registry,
         &mut sandbox.host,
         target,
         &[desc_addr, entry_va, 0, 0, 0, 0],
@@ -1276,7 +1276,7 @@ fn qtcodec_register(
     match ud_emulator::win32::call_guest(
         &mut sandbox.cpu,
         &mut sandbox.mmu,
-        &sandbox.registry,
+        &mut sandbox.registry,
         &mut sandbox.host,
         target,
         &[desc_addr],
@@ -1394,7 +1394,7 @@ fn qtcodec_list(
         match ud_emulator::win32::call_guest(
             &mut sandbox.cpu,
             &mut sandbox.mmu,
-            &sandbox.registry,
+            &mut sandbox.registry,
             &mut sandbox.host,
             target,
             &[],
@@ -1445,7 +1445,7 @@ fn qtcodec_list(
     match ud_emulator::win32::call_guest(
         &mut sandbox.cpu,
         &mut sandbox.mmu,
-        &sandbox.registry,
+        &mut sandbox.registry,
         &mut sandbox.host,
         target,
         &[desc_addr],
@@ -1481,7 +1481,7 @@ fn qtcodec_list(
         match ud_emulator::win32::call_guest(
             &mut sandbox.cpu,
             &mut sandbox.mmu,
-            &sandbox.registry,
+            &mut sandbox.registry,
             &mut sandbox.host,
             target,
             &[ty_v, sub_v],
@@ -1515,7 +1515,7 @@ fn qtcodec_list(
         match ud_emulator::win32::call_guest(
             &mut sandbox.cpu,
             &mut sandbox.mmu,
-            &sandbox.registry,
+            &mut sandbox.registry,
             &mut sandbox.host,
             target,
             &[0, desc_addr], // (NULL, &desc) — find first matching

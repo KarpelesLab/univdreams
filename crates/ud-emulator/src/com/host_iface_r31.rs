@@ -356,7 +356,7 @@ pub fn register(registry: &mut Registry) {
 pub fn mint_host_input_pin_pair(
     state: &mut HostState,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<(u32, u32), crate::Error> {
     let mip_obj = state.arena_alloc(64).map_err(crate::Error::Win32)?;
     let mip_vtbl = mip_obj.wrapping_add(12);
@@ -436,7 +436,7 @@ pub fn mint_host_input_pin_pair(
 pub fn mint_host_base_filter(
     state: &mut HostState,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     input_pin: u32,
 ) -> Result<u32, crate::Error> {
     let obj = state.arena_alloc(80).map_err(crate::Error::Win32)?;
@@ -480,7 +480,7 @@ pub fn mint_host_base_filter(
 fn mint_host_enum_pins(
     state: &mut HostState,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     pin_addr: u32,
 ) -> Result<u32, Win32Error> {
     let obj = state.arena_alloc(48)?;
@@ -517,7 +517,7 @@ fn meminput_qi(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let piid = arg(cpu, mmu, 1)?;
@@ -552,7 +552,7 @@ fn meminput_get_allocator(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _this = arg(cpu, mmu, 0)?;
     let pp = arg(cpu, mmu, 1)?;
@@ -567,7 +567,7 @@ fn meminput_receive(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _this = arg(cpu, mmu, 0)?;
     let sample = arg(cpu, mmu, 1)?;
@@ -582,7 +582,7 @@ fn meminput_receive_multiple(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _this = arg(cpu, mmu, 0)?;
     let pp_samples = arg(cpu, mmu, 1)?;
@@ -612,7 +612,7 @@ fn capture_sample(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    registry: &Registry,
+    registry: &mut Registry,
     sample: u32,
 ) -> Result<(), Win32Error> {
     // Slot indices on IMediaSample: 3=GetPointer, 5=GetTime,
@@ -726,7 +726,7 @@ fn pin_input_qi(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let piid = arg(cpu, mmu, 1)?;
@@ -761,7 +761,7 @@ fn pin_input_query_direction(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _this = arg(cpu, mmu, 0)?;
     let p_pin_dir = arg(cpu, mmu, 1)?;
@@ -778,7 +778,7 @@ fn pin_input_receive_connection(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let _connector = arg(cpu, mmu, 1)?;
@@ -791,7 +791,7 @@ fn pin_input_connection_media_type(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let pmt = arg(cpu, mmu, 1)?;
@@ -820,7 +820,7 @@ fn filter_qi(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let piid = arg(cpu, mmu, 1)?;
@@ -847,7 +847,7 @@ fn filter_enum_pins(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let pp = arg(cpu, mmu, 1)?;
@@ -867,7 +867,7 @@ fn filter_find_pin(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let _id = arg(cpu, mmu, 1)?;
@@ -906,7 +906,7 @@ fn filter_query_filter_info(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let p_info = arg(cpu, mmu, 1)?;
@@ -943,7 +943,7 @@ fn filter_get_state(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _this = arg(cpu, mmu, 0)?;
     let _ms = arg(cpu, mmu, 1)?;
@@ -958,7 +958,7 @@ fn filter_get_sync_source(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _this = arg(cpu, mmu, 0)?;
     let pp = arg(cpu, mmu, 1)?;
@@ -974,7 +974,7 @@ fn enum_qi(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let piid = arg(cpu, mmu, 1)?;
@@ -997,7 +997,7 @@ fn enum_pins_next(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let c = arg(cpu, mmu, 1)?;
@@ -1039,7 +1039,7 @@ fn enum_pins_reset(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let _ = mmu.write_initializer(this + 12, &0u32.to_le_bytes());
@@ -1053,7 +1053,7 @@ fn enum_pins_reset(
 pub fn walk_codec_input_pin_amts(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     input_pin: u32,
     max: usize,
@@ -1130,7 +1130,7 @@ fn common_addref(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let rc = mmu.load32(this + 4).map_err(|t| trap("AddRef", t))?;
@@ -1144,7 +1144,7 @@ fn common_release(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let rc = mmu.load32(this + 4).map_err(|t| trap("Release", t))?;
@@ -1158,7 +1158,7 @@ fn common_s_ok_1(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(S_OK)
 }
@@ -1166,7 +1166,7 @@ fn common_s_ok_2(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(S_OK)
 }
@@ -1174,7 +1174,7 @@ fn common_s_ok_3(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(S_OK)
 }
@@ -1182,7 +1182,7 @@ fn common_s_ok_5(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(S_OK)
 }
@@ -1190,7 +1190,7 @@ fn common_e_notimpl_2(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(E_NOTIMPL)
 }
@@ -1198,7 +1198,7 @@ fn common_e_notimpl_3(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
-    _: &Registry,
+    _: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(E_NOTIMPL)
 }

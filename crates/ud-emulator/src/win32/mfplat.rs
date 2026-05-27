@@ -25,7 +25,7 @@ fn stub_mf_heap_alloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let size = arg_dword(cpu, mmu, 0).map_err(|t| trap("MFHeapAlloc", t))?;
     let _flags = arg_dword(cpu, mmu, 1).map_err(|t| trap("MFHeapAlloc", t))?;
@@ -53,7 +53,7 @@ fn stub_mf_heap_free(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap("MFHeapFree", t))?;
     state.heap.remove(&p);

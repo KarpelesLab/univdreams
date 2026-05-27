@@ -241,7 +241,7 @@ fn stub_msi_get_file_sig_info(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0x0000_03EE)
 }
@@ -258,7 +258,7 @@ fn stub_msi_install_product_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_pkg = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiInstallProductA", t))?;
     let p_cmd = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiInstallProductA", t))?;
@@ -287,7 +287,7 @@ fn stub_msi_set_external_ui_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_handler =
         arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiSetExternalUIA", t))?;
@@ -307,7 +307,7 @@ fn stub_msi_set_internal_ui(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let level = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiSetInternalUI", t))?;
     let _hwnd = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiSetInternalUI", t))?;
@@ -326,7 +326,7 @@ fn stub_msi_get_property_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiGetPropertyA", t))?;
     let p_name = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiGetPropertyA", t))?;
@@ -358,7 +358,7 @@ fn stub_msi_get_property_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiGetPropertyW", t))?;
     let p_name = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiGetPropertyW", t))?;
@@ -442,7 +442,7 @@ fn stub_msi_set_property_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiSetPropertyA", t))?;
     let p_name = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiSetPropertyA", t))?;
@@ -479,7 +479,7 @@ fn stub_msi_get_target_path_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiGetTargetPathA", t))?;
     let p_name = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiGetTargetPathA", t))?;
@@ -518,7 +518,7 @@ fn stub_msi_format_record_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiFormatRecordA", t))?;
     let _rec = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiFormatRecordA", t))?;
@@ -536,7 +536,7 @@ fn stub_msi_close_handle(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiCloseHandle", t))?;
     Ok(ERROR_SUCCESS)
@@ -550,7 +550,7 @@ fn stub_msi_get_active_database(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiGetActiveDatabase", t))?;
     if !check_session(state, h) {
@@ -567,7 +567,7 @@ fn stub_msi_database_open_view(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _db = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiDatabaseOpenViewA", t))?;
     let _q = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiDatabaseOpenViewA", t))?;
@@ -591,7 +591,7 @@ fn stub_msi_get_mode(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiGetMode", t))?;
     let _mode = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiGetMode", t))?;
@@ -605,7 +605,7 @@ fn stub_msi_process_message(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32_local("MsiProcessMessage", t))?;
     let m = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32_local("MsiProcessMessage", t))?;

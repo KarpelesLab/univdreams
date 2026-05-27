@@ -454,7 +454,7 @@ fn stub_returns_arg0(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     arg_dword(cpu, mmu, 0).map_err(|t| trap("_encode_pointer/_decode_pointer", t))
 }
@@ -467,7 +467,7 @@ fn stub_sprintf_s(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap("sprintf_s", t))?;
     if buf != 0 {
@@ -484,7 +484,7 @@ fn stub_operator_new(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let size = arg_dword(cpu, mmu, 0).map_err(|t| trap("operator new", t))?;
     if size == 0 {
@@ -503,7 +503,7 @@ fn stub_operator_delete(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap("operator delete", t))?;
     if p == 0 {
@@ -528,7 +528,7 @@ fn stub_except_handler3(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -547,7 +547,7 @@ fn stub_initterm(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let begin = arg_dword(cpu, mmu, 0).map_err(|t| trap("_initterm", t))?;
     let end = arg_dword(cpu, mmu, 1).map_err(|t| trap("_initterm", t))?;
@@ -590,7 +590,7 @@ fn stub_purecall(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -603,7 +603,7 @@ fn stub_malloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let size = arg_dword(cpu, mmu, 0).map_err(|t| trap("malloc", t))?;
     if size == 0 {
@@ -621,7 +621,7 @@ fn stub_free(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap("free", t))?;
     if p == 0 {
@@ -640,7 +640,7 @@ fn stub_onexit(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let func = arg_dword(cpu, mmu, 0).map_err(|t| trap("_onexit", t))?;
     Ok(func)
@@ -654,7 +654,7 @@ fn stub_dllonexit(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let func = arg_dword(cpu, mmu, 0).map_err(|t| trap("__dllonexit", t))?;
     Ok(func)
@@ -671,7 +671,7 @@ fn stub_sprintf(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap("sprintf", t))?;
     let fmt = arg_dword(cpu, mmu, 1).map_err(|t| trap("sprintf", t))?;
@@ -851,7 +851,7 @@ fn stub_end_thread_ex(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // Pull `retval` defensively so a stack-bounds trap surfaces
     // as a proper `Win32Error` rather than a silent under-read;
@@ -912,7 +912,7 @@ fn stub_strnicmp(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("_strnicmp", t))?;
     let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("_strnicmp", t))?;
@@ -1010,7 +1010,7 @@ fn stub_begin_thread_ex(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // Pull all 6 cdecl dwords defensively so a stack-bounds trap
     // surfaces as a proper `Win32Error::InvalidArgument` rather
@@ -1070,7 +1070,7 @@ fn stub_ftol(
     cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // Read ST(0) and pop the x87 stack.  The pop is mandatory:
     // codecs that follow the documented ABI rely on the post-call
@@ -1122,7 +1122,7 @@ fn stub_rand(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     state.rand_state = state.rand_state.wrapping_mul(214013).wrapping_add(2531011);
     let r = (state.rand_state >> 16) & 0x7FFF;
@@ -1153,7 +1153,7 @@ fn stub_srand(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let seed = arg_dword(cpu, mmu, 0).map_err(|t| trap("srand", t))?;
     state.rand_state = seed;
@@ -1193,7 +1193,7 @@ fn stub_ci_pow(
     cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // Per the x87 stack ordering: top-of-stack is the *last*
     // pushed value.  Caller emitted FLD base; FLD exp; so
@@ -1224,7 +1224,7 @@ fn stub_errno(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     if let Some(addr) = state.errno_cell {
         return Ok(addr);
@@ -1242,7 +1242,7 @@ fn stub_returns_zero(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -1254,7 +1254,7 @@ fn stub_memcpy(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("memcpy", t))?;
     let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("memcpy", t))?;
@@ -1304,7 +1304,7 @@ fn stub_memset(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("memset", t))?;
     let c = arg_dword(cpu, mmu, 1).map_err(|t| trap("memset", t))? as u8;
@@ -1320,7 +1320,7 @@ fn stub_memmove(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("memmove", t))?;
     let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("memmove", t))?;
@@ -1339,7 +1339,7 @@ fn stub_strncpy(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("strncpy", t))?;
     let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("strncpy", t))?;
@@ -1371,7 +1371,7 @@ fn stub_ci_sqrt(
     cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let x = cpu.fpu.st(0);
     let _ = cpu.fpu.pop();
@@ -1387,7 +1387,7 @@ fn stub_vsnwprintf(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s = arg_dword(cpu, mmu, 0).map_err(|t| trap("_vsnwprintf", t))?;
     let n = arg_dword(cpu, mmu, 1).map_err(|t| trap("_vsnwprintf", t))?;
@@ -1404,7 +1404,7 @@ fn stub_time(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     state.tick = state.tick.wrapping_add(1);
     // Anchor at 2024-01-01 00:00:00 UTC; bump by tick.
@@ -1426,7 +1426,7 @@ fn stub_localtime(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // Use a fixed offset into the const arena. Reserve 36
     // bytes = 9 i32 fields.
@@ -1444,7 +1444,7 @@ fn stub_returns_arg2(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let n = arg_dword(cpu, mmu, 2).map_err(|t| trap("_write", t))?;
     Ok(n)
@@ -1458,7 +1458,7 @@ fn stub_asctime(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = state.arena_const_alloc(26)?;
     let canned = b"Mon Jan  1 00:00:00 2024\n\0";
@@ -1473,7 +1473,7 @@ fn stub_snprintf(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap("_snprintf", t))?;
     let n = arg_dword(cpu, mmu, 1).map_err(|t| trap("_snprintf", t))?;
@@ -1490,7 +1490,7 @@ fn stub_stricmp(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("_stricmp", t))?;
     let p2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("_stricmp", t))?;
@@ -1519,7 +1519,7 @@ fn stub_strchr(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap("strchr", t))?;
     let needle = arg_dword(cpu, mmu, 1).map_err(|t| trap("strchr", t))? as u8;
@@ -1545,7 +1545,7 @@ fn stub_isupper(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("isupper", t))? as u8;
     Ok(u32::from(c.is_ascii_uppercase()))
@@ -1556,7 +1556,7 @@ fn stub_tolower(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("tolower", t))? as u8;
     Ok(u32::from(c.to_ascii_lowercase()))
@@ -1568,7 +1568,7 @@ fn stub_ceil(
     cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let x = cpu.fpu.st(0);
     let _ = cpu.fpu.pop();
@@ -1581,7 +1581,7 @@ fn stub_ci_cos(
     cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let x = cpu.fpu.st(0);
     let _ = cpu.fpu.pop();
@@ -1594,7 +1594,7 @@ fn stub_ci_sin(
     cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let x = cpu.fpu.st(0);
     let _ = cpu.fpu.pop();
@@ -1607,7 +1607,7 @@ fn stub_ci_log(
     cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let x = cpu.fpu.st(0);
     let _ = cpu.fpu.pop();
@@ -1627,7 +1627,7 @@ fn stub_isalnum(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("isalnum", t))? as u8;
     Ok(u32::from(c.is_ascii_alphanumeric()))
@@ -1638,7 +1638,7 @@ fn stub_isspace(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("isspace", t))? as u8;
     Ok(u32::from(c.is_ascii_whitespace()))
@@ -1652,7 +1652,7 @@ fn stub_iswctype(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -1662,7 +1662,7 @@ fn stub_toupper(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("toupper", t))?;
     Ok(u32::from((c as u8).to_ascii_uppercase()))
@@ -1674,7 +1674,7 @@ fn stub_towlower(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("towlower", t))?;
     Ok(if (b'A' as u32..=b'Z' as u32).contains(&c) {
@@ -1689,7 +1689,7 @@ fn stub_towupper(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let c = arg_dword(cpu, mmu, 0).map_err(|t| trap("towupper", t))?;
     Ok(if (b'a' as u32..=b'z' as u32).contains(&c) {
@@ -1704,7 +1704,7 @@ fn stub_memchr(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap("memchr", t))?;
     let c = arg_dword(cpu, mmu, 1).map_err(|t| trap("memchr", t))? as u8;
@@ -1726,7 +1726,7 @@ fn stub_memcmp(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("memcmp", t))?;
     let p2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("memcmp", t))?;
@@ -1766,7 +1766,7 @@ fn stub_strcat(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("strcat", t))?;
     let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("strcat", t))?;
@@ -1788,7 +1788,7 @@ fn stub_strcmp(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("strcmp", t))?;
     let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("strcmp", t))?;
@@ -1806,7 +1806,7 @@ fn stub_strlen(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s = arg_dword(cpu, mmu, 0).map_err(|t| trap("strlen", t))?;
     Ok(read_c(mmu, s, "strlen")?.len() as u32)
@@ -1817,7 +1817,7 @@ fn stub_strncmp(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("strncmp", t))?;
     let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("strncmp", t))?;
@@ -1844,7 +1844,7 @@ fn stub_strrchr(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s = arg_dword(cpu, mmu, 0).map_err(|t| trap("strrchr", t))?;
     let c = arg_dword(cpu, mmu, 1).map_err(|t| trap("strrchr", t))? as u8;
@@ -1870,7 +1870,7 @@ fn stub_strxfrm(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("strxfrm", t))?;
     let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("strxfrm", t))?;
@@ -1893,7 +1893,7 @@ fn stub_strerror(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let msg = b"Error\0";
     let addr = state.arena_alloc(msg.len() as u32)?;
@@ -1910,7 +1910,7 @@ fn stub_strftime(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("strftime", t))?;
     if dest != 0 {
@@ -1935,7 +1935,7 @@ fn stub_strtoul(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let nptr = arg_dword(cpu, mmu, 0).map_err(|t| trap("strtoul", t))?;
     let endptr = arg_dword(cpu, mmu, 1).map_err(|t| trap("strtoul", t))?;
@@ -1986,7 +1986,7 @@ fn stub_atoi(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let nptr = arg_dword(cpu, mmu, 0).map_err(|t| trap("atoi", t))?;
     let bytes = read_c(mmu, nptr, "atoi")?;
@@ -2029,7 +2029,7 @@ fn stub_wcslen(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s = arg_dword(cpu, mmu, 0).map_err(|t| trap("wcslen", t))?;
     Ok(read_w(mmu, s, "wcslen")?.len() as u32)
@@ -2041,7 +2041,7 @@ fn stub_wcscoll(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("wcscoll", t))?;
     let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("wcscoll", t))?;
@@ -2061,7 +2061,7 @@ fn stub_wcsxfrm(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("wcsxfrm", t))?;
     let src = arg_dword(cpu, mmu, 1).map_err(|t| trap("wcsxfrm", t))?;
@@ -2087,7 +2087,7 @@ fn stub_wcsftime(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest = arg_dword(cpu, mmu, 0).map_err(|t| trap("wcsftime", t))?;
     if dest != 0 {
@@ -2102,7 +2102,7 @@ fn stub_fputc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     arg_dword(cpu, mmu, 0).map_err(|t| trap("fputc", t))
 }
@@ -2114,7 +2114,7 @@ fn stub_fwrite(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     arg_dword(cpu, mmu, 2).map_err(|t| trap("fwrite", t))
 }
@@ -2125,7 +2125,7 @@ fn stub_calloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let num = arg_dword(cpu, mmu, 0).map_err(|t| trap("calloc", t))?;
     let size = arg_dword(cpu, mmu, 1).map_err(|t| trap("calloc", t))?;
@@ -2147,7 +2147,7 @@ fn stub_realloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let ptr = arg_dword(cpu, mmu, 0).map_err(|t| trap("realloc", t))?;
     let size = arg_dword(cpu, mmu, 1).map_err(|t| trap("realloc", t))?;
@@ -2184,7 +2184,7 @@ fn stub_localeconv(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // Layout (32-bit msvcrt): 10 char* (offsets 0..40) followed
     // by 8 signed-char fields (offsets 40..48). We append the
@@ -2220,7 +2220,7 @@ fn stub_setlocale(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _category = arg_dword(cpu, mmu, 0).map_err(|t| trap("setlocale", t))?;
     let locale = arg_dword(cpu, mmu, 1).map_err(|t| trap("setlocale", t))?;
@@ -2258,7 +2258,7 @@ mod tests {
     fn call_cdecl(
         cpu: &mut Cpu,
         mmu: &mut Mmu,
-        registry: &Registry,
+        registry: &mut Registry,
         state: &mut HostState,
         name: &str,
         args: &[u32],
@@ -2276,11 +2276,11 @@ mod tests {
 
     #[test]
     fn operator_new_zero_size_returns_null() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call_cdecl(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "??2@YAPAXI@Z",
             &[0],
@@ -2291,11 +2291,11 @@ mod tests {
 
     #[test]
     fn operator_new_nonzero_returns_heap_addr() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call_cdecl(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "??2@YAPAXI@Z",
             &[64],
@@ -2308,11 +2308,11 @@ mod tests {
 
     #[test]
     fn operator_delete_nullptr_is_noop() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call_cdecl(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "??3@YAXPAX@Z",
             &[0],
@@ -2323,22 +2323,22 @@ mod tests {
 
     #[test]
     fn malloc_then_free_round_trip() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
-        call_cdecl(&mut cpu, &mut mmu, &registry, &mut state, "malloc", &[128]).unwrap();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
+        call_cdecl(&mut cpu, &mut mmu, &mut registry, &mut state, "malloc", &[128]).unwrap();
         let p = cpu.regs.get32(Reg32::Eax);
         assert_ne!(p, 0);
         assert!(state.heap.contains_key(&p));
-        call_cdecl(&mut cpu, &mut mmu, &registry, &mut state, "free", &[p]).unwrap();
+        call_cdecl(&mut cpu, &mut mmu, &mut registry, &mut state, "free", &[p]).unwrap();
         assert!(!state.heap.contains_key(&p));
     }
 
     #[test]
     fn initterm_zero_args_is_noop() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call_cdecl(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "_initterm",
             &[0, 0],
@@ -2378,7 +2378,7 @@ mod tests {
         }
         cpu.push32(&mut mmu, 0xDEAD_DEAD).unwrap();
         cpu.regs.eip = registry.resolve("msvcrt.dll", "_initterm").unwrap();
-        crate::win32::dispatch_stub(&mut cpu, &mut mmu, &registry, &mut state).unwrap();
+        crate::win32::dispatch_stub(&mut cpu, &mut mmu, &mut registry, &mut state).unwrap();
         // No assertion on a side-effect register here — the
         // contract is "did not trap" (the fn-pointer was
         // walked + invoked via `call_guest` and returned).

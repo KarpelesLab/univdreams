@@ -321,7 +321,7 @@ impl Sandbox {
         // `CLASS_E_CLASSNOTAVAILABLE` (`0x80040111`) miss.  CLSID
         // value sourced from Windows SDK header `axextend.h`.
         if let Ok(factory) =
-            crate::com::mint_host_mem_allocator_class_factory(&mut host, &mut mmu, &registry)
+            crate::com::mint_host_mem_allocator_class_factory(&mut host, &mut mmu, &mut registry)
         {
             host.com
                 .register_class_factory(crate::com::CLSID_MEMORY_ALLOCATOR, factory);
@@ -715,7 +715,7 @@ impl Sandbox {
         call_guest(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             target,
             &[h_module, reason, lpv_reserved],
@@ -877,7 +877,7 @@ impl Sandbox {
             match crate::win32::call_guest(
                 &mut self.cpu,
                 &mut self.mmu,
-                &self.registry,
+                &mut self.registry,
                 &mut self.host,
                 entry,
                 &[1],
@@ -928,7 +928,7 @@ impl Sandbox {
         call_guest(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             target,
             args,
@@ -953,7 +953,7 @@ impl Sandbox {
         call_guest(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             image.entry_point,
             &[],
@@ -965,7 +965,7 @@ impl Sandbox {
     /// address. Thin wrapper over [`crate::win32::run_until_sentinel`]
     /// kept for API stability.
     pub fn run_until_sentinel(&mut self) -> Result<(), crate::Error> {
-        run_until_sentinel_free(&mut self.cpu, &mut self.mmu, &self.registry, &mut self.host)
+        run_until_sentinel_free(&mut self.cpu, &mut self.mmu, &mut self.registry, &mut self.host)
     }
 
     // ---- vfw32 IC* convenience wrappers ------------------------------
@@ -997,7 +997,7 @@ impl Sandbox {
         vfw32::ic_open(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             fcc_type,
             fcc_handler,
@@ -1010,7 +1010,7 @@ impl Sandbox {
         vfw32::ic_close(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
         )
@@ -1021,7 +1021,7 @@ impl Sandbox {
         vfw32::ic_get_info(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             cb,
@@ -1038,7 +1038,7 @@ impl Sandbox {
         vfw32::ic_decompress_query(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             input,
@@ -1057,7 +1057,7 @@ impl Sandbox {
         vfw32::ic_decompress_get_format(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             input,
@@ -1074,7 +1074,7 @@ impl Sandbox {
         vfw32::ic_decompress_begin(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             input,
@@ -1087,7 +1087,7 @@ impl Sandbox {
         vfw32::ic_decompress_end(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
         )
@@ -1174,7 +1174,7 @@ impl Sandbox {
         let hr = call_guest(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             target,
             &[scratch, scratch + 16, scratch + 32],
@@ -1235,7 +1235,7 @@ impl Sandbox {
         let r = crate::com::call::call_method(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             factory,
             crate::com::SLOT_CLASS_FACTORY_CREATE_INSTANCE,
@@ -1274,7 +1274,7 @@ impl Sandbox {
         let r = crate::com::call::query_interface(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             obj,
             scratch,
@@ -1309,7 +1309,7 @@ impl Sandbox {
     /// `JoinFilterGraph → ReceiveConnection` path the round-27
     /// probe takes.
     pub fn mint_host_filter_graph(&mut self) -> Result<u32, crate::Error> {
-        crate::com::mint_host_filter_graph(&mut self.host, &mut self.mmu, &self.registry)
+        crate::com::mint_host_filter_graph(&mut self.host, &mut self.mmu, &mut self.registry)
     }
 
     /// Round 27 — mint a host-side `IPin` stub that pretends to
@@ -1325,7 +1325,7 @@ impl Sandbox {
         crate::com::host_iface::mint_host_output_pin(
             &mut self.host,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             amt_addr,
         )
     }
@@ -1347,7 +1347,7 @@ impl Sandbox {
         crate::com::host_iface::mint_host_output_pin_with_connection(
             &mut self.host,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             amt_addr,
             connected_pin,
         )
@@ -1404,7 +1404,7 @@ impl Sandbox {
         crate::com::mint_host_mem_allocator(
             &mut self.host,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             pool_size,
             sample_capacity,
             media_type_ptr,
@@ -1423,7 +1423,7 @@ impl Sandbox {
         crate::com::mint_host_mem_allocator_class_factory(
             &mut self.host,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
         )
     }
 
@@ -1439,7 +1439,7 @@ impl Sandbox {
         crate::com::mint_host_media_sample(
             &mut self.host,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             data_capacity,
             media_type_ptr,
         )
@@ -1464,7 +1464,7 @@ impl Sandbox {
         crate::com::host_iface_r31::mint_host_input_pin_pair(
             &mut self.host,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
         )
     }
 
@@ -1474,7 +1474,7 @@ impl Sandbox {
         crate::com::host_iface_r31::mint_host_base_filter(
             &mut self.host,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             input_pin,
         )
     }
@@ -1518,7 +1518,7 @@ impl Sandbox {
         crate::com::call::add_ref(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             obj,
         )
@@ -1530,7 +1530,7 @@ impl Sandbox {
         crate::com::call::release(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             obj,
         )
@@ -1550,7 +1550,7 @@ impl Sandbox {
         vfw32::ic_decompress(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             flags,
@@ -1574,7 +1574,7 @@ impl Sandbox {
         vfw32::ic_compress_query(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             input,
@@ -1593,7 +1593,7 @@ impl Sandbox {
         vfw32::ic_compress_get_format(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             input,
@@ -1611,7 +1611,7 @@ impl Sandbox {
         vfw32::ic_compress_get_size(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             input,
@@ -1629,7 +1629,7 @@ impl Sandbox {
         vfw32::ic_compress_begin(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             input,
@@ -1642,7 +1642,7 @@ impl Sandbox {
         vfw32::ic_compress_end(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
         )
@@ -1677,7 +1677,7 @@ impl Sandbox {
         vfw32::ic_compress(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             flags,
@@ -1706,7 +1706,7 @@ impl Sandbox {
         vfw32::ic_get_state(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             dst_buf,
@@ -1724,7 +1724,7 @@ impl Sandbox {
         vfw32::ic_set_state(
             &mut self.cpu,
             &mut self.mmu,
-            &self.registry,
+            &mut self.registry,
             &mut self.host,
             hic,
             src_buf,
@@ -1804,6 +1804,244 @@ impl Sandbox {
             .write_initializer(va, &patch)
             .map_err(crate::Error::Trap)
     }
+}
+
+/// Recursively load `bytes`'s static imports from the VFS. Mirrors
+/// [`Sandbox::preload_deps`] but free-function shape so it can run
+/// from a stub (which doesn't own a Sandbox).
+fn preload_deps_free(
+    cpu: &mut crate::emulator::Cpu,
+    mmu: &mut crate::emulator::Mmu,
+    registry: &mut crate::win32::Registry,
+    state: &mut crate::win32::HostState,
+    bytes: &[u8],
+    loading: &mut std::collections::BTreeSet<String>,
+) {
+    use crate::pe;
+    let parsed = match pe::header::parse(bytes) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let imported = pe::imports::list_imported_dlls(&parsed, bytes).unwrap_or_default();
+    for dll in imported {
+        let dll_lc = dll.to_ascii_lowercase();
+        if loading.contains(&dll_lc) {
+            continue;
+        }
+        if crate::win32::is_host_stub_dll(&dll_lc) {
+            continue;
+        }
+        if state.modules.contains_key(&dll_lc) {
+            continue;
+        }
+        let bytes_dep = {
+            let Some(vfs) = state.context.vfs.as_ref() else {
+                continue;
+            };
+            let mut found: Option<Vec<u8>> = None;
+            for prefix in crate::win32::dll_vfs_search_paths() {
+                let p = format!("{prefix}{dll_lc}");
+                if let Some(b) = vfs.read(&p) {
+                    found = Some(b.to_vec());
+                    break;
+                }
+            }
+            match found {
+                Some(b) => b,
+                None => continue,
+            }
+        };
+        loading.insert(dll_lc.clone());
+        preload_deps_free(cpu, mmu, registry, state, &bytes_dep, loading);
+        let Ok(parsed_dep) = pe::header::parse(&bytes_dep) else {
+            loading.remove(&dll_lc);
+            continue;
+        };
+        let preferred = parsed_dep.optional.image_base;
+        let image_size = parsed_dep.optional.size_of_image;
+        let aligned = (image_size + 0xFFFF) & !0xFFFF;
+        let base = if mmu.region_is_unmapped(preferred, image_size) {
+            preferred
+        } else {
+            let b = state.next_dll_image_base;
+            state.next_dll_image_base = b.saturating_add(aligned);
+            b
+        };
+        let mut options = pe::LoadOptions {
+            imports: pe::imports::ResolveMode::FailSoft,
+            fail_soft_log: Some(Vec::new()),
+            target_image_base: Some(base),
+        };
+        let mut loader = pe::Loader::new(mmu, registry, state);
+        let img = match loader.load_with_options(&dll_lc, &bytes_dep, &mut options) {
+            Ok(i) => i,
+            Err(e) => {
+                state
+                    .debug_log
+                    .push(format!("dynamic-load {dll_lc}: load failed: {e}"));
+                loading.remove(&dll_lc);
+                continue;
+            }
+        };
+        for (export_name, rva) in &img.exports {
+            registry.register_guest_export(
+                &dll_lc,
+                export_name,
+                img.image_base.wrapping_add(*rva),
+            );
+        }
+        state
+            .loaded_dll_exports
+            .insert(img.image_base, img.exports.clone());
+        state.modules.insert(dll_lc.clone(), img.image_base);
+        state
+            .debug_log
+            .push(format!("dynamic-load {dll_lc}: loaded at {base:#010x}"));
+        let has_dll_main = img.exports.contains_key("DllMain");
+        let has_entry = parsed_dep.optional.address_of_entry_point != 0;
+        let target = if has_entry {
+            img.image_base
+                .wrapping_add(parsed_dep.optional.address_of_entry_point)
+        } else if has_dll_main {
+            img.image_base
+                .wrapping_add(*img.exports.get("DllMain").unwrap())
+        } else {
+            0
+        };
+        if target != 0 {
+            if let Err(e) = crate::win32::call_guest(
+                cpu,
+                mmu,
+                registry,
+                state,
+                target,
+                &[img.image_base, DLL_PROCESS_ATTACH, 0],
+            ) {
+                state
+                    .debug_log
+                    .push(format!("dynamic-load {dll_lc}: DllMain trapped: {e}"));
+            }
+        }
+        loading.remove(&dll_lc);
+    }
+}
+
+/// Dynamic `LoadLibraryA`: find a DLL by name in the attached
+/// VFS, load it (with its dependencies) at a fresh image base,
+/// register its exports against the stub registry, and invoke
+/// its `DllMain(PROCESS_ATTACH)`. Returns the new module's
+/// image base on success, 0 if the DLL can't be found or fails
+/// to load.
+///
+/// This lets `kernel32!LoadLibraryA` work for any DLL the
+/// VFS contains — qtcf.dll's delay-load resolver hits
+/// `LoadLibraryA("CoreFoundation.dll")` from inside qts's
+/// CRT init chain, and we now load it on demand rather than
+/// pre-staging everything.
+pub fn load_dll_dynamic(
+    cpu: &mut crate::emulator::Cpu,
+    mmu: &mut crate::emulator::Mmu,
+    registry: &mut crate::win32::Registry,
+    state: &mut crate::win32::HostState,
+    name: &str,
+) -> u32 {
+    use crate::pe;
+    let name_lc = name.to_ascii_lowercase();
+    let basename = name_lc
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(&name_lc)
+        .to_string();
+    if let Some(b) = state.modules.get(&basename) {
+        return *b;
+    }
+    if let Some(b) = state.modules.get(&name_lc) {
+        return *b;
+    }
+    if crate::win32::is_host_stub_dll(&basename) {
+        return 0;
+    }
+    let bytes = {
+        let Some(vfs) = state.context.vfs.as_ref() else {
+            return 0;
+        };
+        let mut found: Option<Vec<u8>> = None;
+        for prefix in crate::win32::dll_vfs_search_paths() {
+            let p = format!("{prefix}{basename}");
+            if let Some(b) = vfs.read(&p) {
+                found = Some(b.to_vec());
+                break;
+            }
+        }
+        match found {
+            Some(b) => b,
+            None => return 0,
+        }
+    };
+    let mut loading: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    loading.insert(basename.clone());
+    preload_deps_free(cpu, mmu, registry, state, &bytes, &mut loading);
+    loading.remove(&basename);
+    let Ok(parsed) = pe::header::parse(&bytes) else {
+        return 0;
+    };
+    let preferred = parsed.optional.image_base;
+    let image_size = parsed.optional.size_of_image;
+    let aligned = (image_size + 0xFFFF) & !0xFFFF;
+    let base = if mmu.region_is_unmapped(preferred, image_size) {
+        preferred
+    } else {
+        let b = state.next_dll_image_base;
+        state.next_dll_image_base = b.saturating_add(aligned);
+        b
+    };
+    let mut options = pe::LoadOptions {
+        imports: pe::imports::ResolveMode::FailSoft,
+        fail_soft_log: Some(Vec::new()),
+        target_image_base: Some(base),
+    };
+    let mut loader = pe::Loader::new(mmu, registry, state);
+    let img = match loader.load_with_options(&basename, &bytes, &mut options) {
+        Ok(i) => i,
+        Err(_) => return 0,
+    };
+    for (export_name, rva) in &img.exports {
+        registry.register_guest_export(&basename, export_name, img.image_base.wrapping_add(*rva));
+    }
+    state
+        .loaded_dll_exports
+        .insert(img.image_base, img.exports.clone());
+    state.modules.insert(basename.clone(), img.image_base);
+    state.debug_log.push(format!(
+        "dynamic-load {basename}: loaded at {:#010x}",
+        img.image_base
+    ));
+    let has_dll_main = img.exports.contains_key("DllMain");
+    let has_entry = parsed.optional.address_of_entry_point != 0;
+    let target = if has_entry {
+        img.image_base
+            .wrapping_add(parsed.optional.address_of_entry_point)
+    } else if has_dll_main {
+        img.image_base
+            .wrapping_add(*img.exports.get("DllMain").unwrap())
+    } else {
+        0
+    };
+    if target != 0 {
+        if let Err(e) = crate::win32::call_guest(
+            cpu,
+            mmu,
+            registry,
+            state,
+            target,
+            &[img.image_base, DLL_PROCESS_ATTACH, 0],
+        ) {
+            state
+                .debug_log
+                .push(format!("dynamic-load {basename}: DllMain trapped: {e}"));
+        }
+    }
+    img.image_base
 }
 
 #[cfg(test)]

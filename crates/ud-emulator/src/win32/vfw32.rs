@@ -404,7 +404,7 @@ pub const ICCOMPRESS_SIZE: u32 = 48;
 pub fn ic_open(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     fcc_type: u32,
     fcc_handler: u32,
@@ -526,7 +526,7 @@ pub fn ic_open(
 pub fn ic_close(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
 ) -> Result<u32, crate::Error> {
@@ -621,7 +621,7 @@ fn is_known_short_return_fcc(fcc: u32) -> bool {
 pub fn ic_get_info(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     cb: u32,
@@ -724,7 +724,7 @@ pub fn ic_get_info(
 pub fn ic_decompress_query(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     input: &Bih,
@@ -780,7 +780,7 @@ pub fn ic_decompress_query(
 pub fn ic_decompress_get_format(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     input: &Bih,
@@ -828,7 +828,7 @@ pub fn ic_decompress_get_format(
 pub fn ic_decompress_begin(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     input: &Bih,
@@ -938,7 +938,7 @@ fn msmpeg4_v3_preinit(
 pub fn ic_decompress_end(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
 ) -> Result<u32, crate::Error> {
@@ -974,7 +974,7 @@ pub fn ic_decompress_end(
 pub fn ic_decompress(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     flags: u32,
@@ -1070,7 +1070,7 @@ pub fn ic_decompress(
 pub fn ic_compress_query(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     input: &Bih,
@@ -1116,7 +1116,7 @@ pub fn ic_compress_query(
 pub fn ic_compress_get_format(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     input: &Bih,
@@ -1172,7 +1172,7 @@ pub fn ic_compress_get_format(
 pub fn ic_compress_get_size(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     input: &Bih,
@@ -1224,7 +1224,7 @@ pub fn ic_compress_get_size(
 pub fn ic_compress_begin(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     input: &Bih,
@@ -1260,7 +1260,7 @@ pub fn ic_compress_begin(
 pub fn ic_compress_end(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
 ) -> Result<u32, crate::Error> {
@@ -1309,7 +1309,7 @@ pub fn ic_compress_end(
 pub fn ic_get_state(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     dst_buf: &mut [u8],
@@ -1359,7 +1359,7 @@ pub fn ic_get_state(
 pub fn ic_set_state(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     src_buf: &[u8],
@@ -1451,7 +1451,7 @@ pub struct CompressOutcome {
 pub fn ic_compress(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     state: &mut HostState,
     hic: u32,
     flags: u32,
@@ -1654,7 +1654,7 @@ mod tests {
 
     #[test]
     fn ic_open_with_canned_driver_returns_synthetic_hic() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // Plant DriverProc at a fixed VA returning 0xC0FFEE
         // (driver-id) for DRV_OPEN.
         let dpv = 0x0040_0000;
@@ -1663,7 +1663,7 @@ mod tests {
         let fcc_video = u32::from_le_bytes(*b"VIDC");
         let fcc_cvid = u32::from_le_bytes(*b"cvid");
         let hic = ic_open(
-            &mut cpu, &mut mmu, &registry, &mut state, fcc_video, fcc_cvid, 1,
+            &mut cpu, &mut mmu, &mut registry, &mut state, fcc_video, fcc_cvid, 1,
         )
         .unwrap();
         assert_ne!(hic, 0);
@@ -1680,46 +1680,46 @@ mod tests {
 
     #[test]
     fn ic_open_returning_zero_does_not_install_hic() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         install_canned_driver_proc(&mut mmu, dpv, 0);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
         assert_eq!(hic, 0);
         assert!(state.hics.is_empty());
     }
 
     #[test]
     fn ic_close_invokes_driver_proc_and_drops_hic() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         install_canned_driver_proc(&mut mmu, dpv, 0xABCD);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
         // ic_close: codec returns whatever, we ensure the HIC is
         // gone.
-        let _ = ic_close(&mut cpu, &mut mmu, &registry, &mut state, hic).unwrap();
+        let _ = ic_close(&mut cpu, &mut mmu, &mut registry, &mut state, hic).unwrap();
         assert!(state.hics.is_empty());
     }
 
     #[test]
     fn ic_close_unknown_hic_errors() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
-        let r = ic_close(&mut cpu, &mut mmu, &registry, &mut state, 99);
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
+        let r = ic_close(&mut cpu, &mut mmu, &mut registry, &mut state, 99);
         assert!(r.is_err());
     }
 
     #[test]
     fn ic_get_info_reads_back_codec_buffer() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // DriverProc that, instead of writing icinfo, just
         // returns the cb argument so we can verify the message
         // round-trip + the cb passed into the callback.
         let dpv = 0x0040_0000;
         install_canned_driver_proc(&mut mmu, dpv, 16);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
-        let bytes = ic_get_info(&mut cpu, &mut mmu, &registry, &mut state, hic, 32).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
+        let bytes = ic_get_info(&mut cpu, &mut mmu, &mut registry, &mut state, hic, 32).unwrap();
         // We allocated 32; the canned proc returns 16 → we read
         // the first 16 bytes (all zero from arena_alloc).
         assert_eq!(bytes.len(), 16);
@@ -1735,7 +1735,7 @@ mod tests {
     /// known-Indeo FourCC.
     #[test]
     fn ic_get_info_short_return_synthesises_known_indeo_fcc() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         // DRV_OPEN must return non-zero to mint the HIC, but
         // ICM_GETINFO must return 0 to trigger the fallback. The
@@ -1747,7 +1747,7 @@ mod tests {
         let fcc_video = u32::from_le_bytes(*b"VIDC");
         let fcc_iv41 = u32::from_le_bytes(*b"IV41");
         let hic = ic_open(
-            &mut cpu, &mut mmu, &registry, &mut state, fcc_video, fcc_iv41, 1,
+            &mut cpu, &mut mmu, &mut registry, &mut state, fcc_video, fcc_iv41, 1,
         )
         .unwrap();
         assert_ne!(hic, 0);
@@ -1755,7 +1755,7 @@ mod tests {
         // DirectShow filter ignoring ICM_GETINFO.
         install_canned_driver_proc(&mut mmu, dpv, 0);
         let cb = 96u32;
-        let bytes = ic_get_info(&mut cpu, &mut mmu, &registry, &mut state, hic, cb).unwrap();
+        let bytes = ic_get_info(&mut cpu, &mut mmu, &mut registry, &mut state, hic, cb).unwrap();
         // Synthesised buffer: cb bytes (capped at 568, but cb=96 < 568).
         assert_eq!(bytes.len(), cb as usize);
         // dwSize echoes cb.
@@ -1782,15 +1782,15 @@ mod tests {
     /// `ic_get_info_reads_back_codec_buffer` (which uses fcc=0).
     #[test]
     fn ic_get_info_short_return_unknown_fcc_returns_empty() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
         state.default_driver_proc = dpv;
         let fcc_unknown = u32::from_le_bytes(*b"XXXX");
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, fcc_unknown, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, fcc_unknown, 1).unwrap();
         // Flip canned to 0.
         install_canned_driver_proc(&mut mmu, dpv, 0);
-        let bytes = ic_get_info(&mut cpu, &mut mmu, &registry, &mut state, hic, 64).unwrap();
+        let bytes = ic_get_info(&mut cpu, &mut mmu, &mut registry, &mut state, hic, 64).unwrap();
         // Codec wrote 0 bytes, fcc is not Indeo → no synthesis,
         // empty output preserved (existing contract).
         assert_eq!(bytes.len(), 0);
@@ -1804,7 +1804,7 @@ mod tests {
         // assembly routine — too much for an isa_int unit test.
         // Instead we just check the call dispatches and the
         // output buffer survives.
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         // Plant a non-zero return value so DRV_OPEN succeeds and
         // mints a HIC. The same canned proc is then re-used for
@@ -1812,7 +1812,7 @@ mod tests {
         // contract here is just "the buffers round-trip cleanly".
         install_canned_driver_proc(&mut mmu, dpv, 0xDEAD_BEEF);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
         assert_ne!(hic, 0);
         let bih_in = Bih {
             width: 16,
@@ -1831,7 +1831,7 @@ mod tests {
         let (lr, out) = ic_decompress(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             hic,
             0,
@@ -1874,11 +1874,11 @@ mod tests {
 
     #[test]
     fn ic_compress_query_dispatches_to_driver_proc() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
         assert_ne!(hic, 0);
         // Now flip the canned to return 0 (ICERR_OK), mirroring
         // a codec that accepts the format.
@@ -1900,7 +1900,7 @@ mod tests {
         let lr = ic_compress_query(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             hic,
             &bih_in,
@@ -1916,11 +1916,11 @@ mod tests {
         // are only verifying that the full ICCOMPRESS marshal +
         // call-guest sequence does not trap. Real-codec semantics
         // live in the integration test against `mpg4c32.dll`.
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         install_canned_driver_proc(&mut mmu, dpv, 0xDEAD_BEEF);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
         assert_ne!(hic, 0);
         let bih_in = Bih {
             width: 16,
@@ -1940,7 +1940,7 @@ mod tests {
         let outcome = ic_compress(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             hic,
             ICCOMPRESS_KEYFRAME,
@@ -1979,19 +1979,19 @@ mod tests {
 
     #[test]
     fn ic_get_state_dispatches_to_driver_proc_and_returns_lresult() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         // First DRV_OPEN: canned driver must return non-zero
         // driver-id so `ic_open` installs the HIC.
         install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
         assert_ne!(hic, 0);
         // Re-install the canned driver to return 24 — the byte
         // count we pretend the codec would write into the buffer.
         install_canned_driver_proc(&mut mmu, dpv, 24);
         let mut buf = vec![0u8; 64];
-        let written = ic_get_state(&mut cpu, &mut mmu, &registry, &mut state, hic, &mut buf)
+        let written = ic_get_state(&mut cpu, &mut mmu, &mut registry, &mut state, hic, &mut buf)
             .expect("ic_get_state should succeed");
         assert_eq!(written, 24);
         // Eax was set to the canned LRESULT.
@@ -2000,33 +2000,33 @@ mod tests {
 
     #[test]
     fn ic_set_state_dispatches_to_driver_proc_and_returns_ok() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
         assert_ne!(hic, 0);
         // Re-install the canned driver to return ICERR_OK (0) —
         // codec accepts the state.
         install_canned_driver_proc(&mut mmu, dpv, 0);
         let payload = vec![0xAAu8; 32];
-        ic_set_state(&mut cpu, &mut mmu, &registry, &mut state, hic, &payload)
+        ic_set_state(&mut cpu, &mut mmu, &mut registry, &mut state, hic, &payload)
             .expect("ic_set_state should succeed when codec returns ICERR_OK");
     }
 
     #[test]
     fn ic_set_state_surfaces_codec_failure_lresult() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
         assert_ne!(hic, 0);
         // Re-install the canned driver to return ICERR_BADFORMAT
         // (-2 = 0xFFFFFFFE) — codec rejects the state blob.
         install_canned_driver_proc(&mut mmu, dpv, 0xFFFF_FFFE);
         let payload = vec![0u8; 4];
-        let r = ic_set_state(&mut cpu, &mut mmu, &registry, &mut state, hic, &payload);
+        let r = ic_set_state(&mut cpu, &mut mmu, &mut registry, &mut state, hic, &payload);
         match r {
             Err(crate::Error::Win32(Win32Error::InvalidArgument { stub, .. })) => {
                 assert_eq!(stub, "ICSetState");
@@ -2041,16 +2041,16 @@ mod tests {
         // the codec how big its state blob is).  The wrapper still
         // dispatches and surfaces the LRESULT (the codec would
         // return its required size).
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let dpv = 0x0040_0000;
         install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
         state.default_driver_proc = dpv;
-        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, 0, 1).unwrap();
         // Re-install: probe-time the codec returns 128 (the size
         // it would write into a real buffer).
         install_canned_driver_proc(&mut mmu, dpv, 128);
         let mut empty: Vec<u8> = Vec::new();
-        let r = ic_get_state(&mut cpu, &mut mmu, &registry, &mut state, hic, &mut empty)
+        let r = ic_get_state(&mut cpu, &mut mmu, &mut registry, &mut state, hic, &mut empty)
             .expect("zero-length probe should succeed");
         assert_eq!(r, 128);
     }

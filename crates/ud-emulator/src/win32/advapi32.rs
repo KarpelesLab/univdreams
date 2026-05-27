@@ -149,7 +149,7 @@ fn stub_reg_close_key(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(ERROR_SUCCESS)
 }
@@ -161,7 +161,7 @@ fn stub_reg_create_key(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hkey = arg_dword(cpu, mmu, 0).map_err(|t| trap("RegCreateKeyA", t))?;
     let _sub = arg_dword(cpu, mmu, 1).map_err(|t| trap("RegCreateKeyA", t))?;
@@ -177,7 +177,7 @@ fn stub_reg_create_key_ex(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let phk = arg_dword(cpu, mmu, 6).map_err(|t| trap("RegCreateKeyExA", t))?;
     if phk != 0 {
@@ -196,7 +196,7 @@ fn stub_reg_delete(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(ERROR_SUCCESS)
 }
@@ -208,7 +208,7 @@ fn stub_reg_enum_key_ex_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     const ERROR_NO_MORE_ITEMS: u32 = 259;
     Ok(ERROR_NO_MORE_ITEMS)
@@ -263,7 +263,7 @@ fn stub_reg_open_key_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hkey = arg_dword(cpu, mmu, 0).map_err(|t| trap("RegOpenKeyA", t))?;
     let p_sub = arg_dword(cpu, mmu, 1).map_err(|t| trap("RegOpenKeyA", t))?;
@@ -282,7 +282,7 @@ fn stub_reg_open_key_ex_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hkey = arg_dword(cpu, mmu, 0).map_err(|t| trap("RegOpenKeyExA", t))?;
     let p_sub = arg_dword(cpu, mmu, 1).map_err(|t| trap("RegOpenKeyExA", t))?;
@@ -303,7 +303,7 @@ fn stub_reg_open_key_ex_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hkey = arg_dword(cpu, mmu, 0).map_err(|t| trap("RegOpenKeyExW", t))?;
     let p_sub = arg_dword(cpu, mmu, 1).map_err(|t| trap("RegOpenKeyExW", t))?;
@@ -324,7 +324,7 @@ fn stub_reg_query_value(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(ERROR_FILE_NOT_FOUND)
 }
@@ -432,7 +432,7 @@ fn stub_reg_query_value_ex(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hkey = arg_dword(cpu, mmu, 0).map_err(|t| trap("RegQueryValueExA", t))?;
     let p_value = arg_dword(cpu, mmu, 1).map_err(|t| trap("RegQueryValueExA", t))?;
@@ -466,7 +466,7 @@ fn stub_reg_query_value_ex_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hkey = arg_dword(cpu, mmu, 0).map_err(|t| trap("RegQueryValueExW", t))?;
     let p_value = arg_dword(cpu, mmu, 1).map_err(|t| trap("RegQueryValueExW", t))?;
@@ -500,7 +500,7 @@ fn stub_reg_set_value(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(ERROR_SUCCESS)
 }
@@ -515,7 +515,7 @@ fn stub_reg_set_value_ex_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hkey = arg_dword(cpu, mmu, 0).map_err(|t| trap("RegSetValueExA", t))?;
     let p_value = arg_dword(cpu, mmu, 1).map_err(|t| trap("RegSetValueExA", t))?;

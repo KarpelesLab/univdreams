@@ -44,7 +44,7 @@ fn stub_get_file_version_info_size_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _filename = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("GetFileVersionInfoSizeA", t))?;
@@ -63,7 +63,7 @@ fn stub_get_file_version_info_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -77,7 +77,7 @@ fn stub_ver_query_value_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }

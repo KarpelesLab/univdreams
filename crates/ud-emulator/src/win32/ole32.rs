@@ -105,7 +105,7 @@ fn stub_co_create_instance(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let rclsid = arg_dword(cpu, mmu, 0).map_err(|t| trap("CoCreateInstance", t))?;
     let p_unk_outer = arg_dword(cpu, mmu, 1).map_err(|t| trap("CoCreateInstance", t))?;
@@ -152,7 +152,7 @@ fn stub_co_free_unused_libraries(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -162,7 +162,7 @@ fn stub_co_initialize(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(S_OK)
 }
@@ -174,7 +174,7 @@ fn stub_co_initialize_ex(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(S_OK)
 }
@@ -184,7 +184,7 @@ fn stub_co_task_mem_alloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let n = arg_dword(cpu, mmu, 0).map_err(|t| trap("CoTaskMemAlloc", t))?;
     if n == 0 {
@@ -203,7 +203,7 @@ fn stub_co_task_mem_free(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -222,7 +222,7 @@ fn stub_co_task_mem_realloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let pv = arg_dword(cpu, mmu, 0).map_err(|t| trap("CoTaskMemRealloc", t))?;
     let cb = arg_dword(cpu, mmu, 1).map_err(|t| trap("CoTaskMemRealloc", t))?;
@@ -253,7 +253,7 @@ fn stub_co_uninitialize(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -268,7 +268,7 @@ fn stub_string_from_guid2(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let pguid = arg_dword(cpu, mmu, 0).map_err(|t| trap("StringFromGUID2", t))?;
     let psz = arg_dword(cpu, mmu, 1).map_err(|t| trap("StringFromGUID2", t))?;

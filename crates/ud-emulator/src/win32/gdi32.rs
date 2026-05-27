@@ -231,7 +231,7 @@ fn stub_delete_object(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -243,7 +243,7 @@ fn stub_bitblt(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -254,7 +254,7 @@ fn stub_create_compatible_dc(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     gdi_hdcs_mut(state).insert(SENTINEL_HDC);
     Ok(SENTINEL_HDC)
@@ -266,7 +266,7 @@ fn stub_delete_dc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("DeleteDC", t))?;
     gdi_hdcs_mut(state).remove(&h);
@@ -300,7 +300,7 @@ fn stub_get_device_caps(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hdc = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("GetDeviceCaps", t))?;
@@ -337,7 +337,7 @@ fn stub_get_nearest_color(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hdc = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("GetNearestColor", t))?;
@@ -353,7 +353,7 @@ fn stub_get_object_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -364,7 +364,7 @@ fn stub_get_system_palette_entries(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -375,7 +375,7 @@ fn stub_select_object(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hdc =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("SelectObject", t))?;
@@ -405,7 +405,7 @@ fn stub_create_handle(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = 0x6800_0000u32.wrapping_add(state.tick);
     state.tick = state.tick.wrapping_add(1);
@@ -418,7 +418,7 @@ fn stub_gdi_zero_arg_success(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -427,7 +427,7 @@ fn stub_stretch_dibits(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // We touch only the args we care about; the rest are pulled
     // through `arg_dword` so a stack-bounds trap surfaces as a
@@ -489,7 +489,7 @@ mod tests {
     fn call(
         cpu: &mut Cpu,
         mmu: &mut Mmu,
-        registry: &Registry,
+        registry: &mut Registry,
         state: &mut HostState,
         dll: &str,
         name: &str,
@@ -505,11 +505,11 @@ mod tests {
 
     #[test]
     fn create_compatible_dc_returns_sentinel() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "gdi32.dll",
             "CreateCompatibleDC",
@@ -521,11 +521,11 @@ mod tests {
 
     #[test]
     fn create_then_delete_dc_roundtrips() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "gdi32.dll",
             "CreateCompatibleDC",
@@ -536,7 +536,7 @@ mod tests {
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "gdi32.dll",
             "DeleteDC",
@@ -548,11 +548,11 @@ mod tests {
 
     #[test]
     fn get_device_caps_bitspixel_is_32() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "gdi32.dll",
             "GetDeviceCaps",
@@ -564,11 +564,11 @@ mod tests {
 
     #[test]
     fn get_nearest_color_is_identity() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "gdi32.dll",
             "GetNearestColor",
@@ -580,11 +580,11 @@ mod tests {
 
     #[test]
     fn select_object_returns_input_unchanged() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "gdi32.dll",
             "SelectObject",
@@ -596,14 +596,14 @@ mod tests {
 
     #[test]
     fn stretch_dibits_returns_dest_height() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // 13 args: hdc, xDest, yDest, DestWidth, DestHeight,
         //          xSrc, ySrc, SrcWidth, SrcHeight,
         //          lpBits, lpbmi, iUsage, rop.
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "gdi32.dll",
             "StretchDIBits",

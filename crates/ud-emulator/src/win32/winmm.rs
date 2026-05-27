@@ -70,7 +70,7 @@ fn stub_def_driver_proc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _id = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("DefDriverProc", t))?;
@@ -98,7 +98,7 @@ fn stub_time_get_time(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     state.tick = state.tick.wrapping_add(1);
     Ok(state.tick)
@@ -113,7 +113,7 @@ fn stub_time_get_dev_caps(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let ptc = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("timeGetDevCaps", t))?;
@@ -136,7 +136,7 @@ fn stub_time_period(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _p = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("time{Begin,End}Period", t))?;
@@ -155,7 +155,7 @@ fn stub_get_driver_module_handle(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _hdrvr = arg_dword(cpu, mmu, 0)
         .map_err(|t| crate::win32::trap_to_win32_local("GetDriverModuleHandle", t))?;
@@ -183,7 +183,7 @@ mod tests {
     fn call(
         cpu: &mut Cpu,
         mmu: &mut Mmu,
-        registry: &Registry,
+        registry: &mut Registry,
         state: &mut HostState,
         args: &[u32],
     ) -> Result<(), crate::Error> {
@@ -197,11 +197,11 @@ mod tests {
 
     #[test]
     fn drv_configure_returns_ok() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             &[0, 0, DRV_CONFIGURE, 0, 0],
         )
@@ -211,11 +211,11 @@ mod tests {
 
     #[test]
     fn drv_load_returns_zero() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             &[0, 0, DRV_LOAD, 0, 0],
         )

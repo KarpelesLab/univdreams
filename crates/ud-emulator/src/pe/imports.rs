@@ -159,7 +159,7 @@ pub fn resolve_strict(
     mmu: &mut Mmu,
     parsed: &Parsed,
     image_base: u32,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<(), PeError> {
     let dir = parsed.optional.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if dir.virtual_address == 0 || dir.size == 0 {

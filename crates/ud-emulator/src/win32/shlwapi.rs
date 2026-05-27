@@ -30,7 +30,7 @@ fn stub_path_append_w(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -43,7 +43,7 @@ fn stub_str_str_ia(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let hay =
         arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("StrStrIA", t))?;

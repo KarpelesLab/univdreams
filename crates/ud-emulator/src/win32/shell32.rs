@@ -55,7 +55,7 @@ fn stub_shell_execute(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(SE_OK)
 }
@@ -68,7 +68,7 @@ fn stub_sh_get_folder_path_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let path = arg_dword(cpu, mmu, 4)
         .map_err(|t| crate::win32::trap_to_win32_local("SHGetFolderPathW", t))?;
@@ -85,7 +85,7 @@ fn stub_shell_notify_icon(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }

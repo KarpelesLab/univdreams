@@ -1346,7 +1346,7 @@ fn stub_get_process_heap(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(state.process_heap_handle)
 }
@@ -1358,7 +1358,7 @@ fn stub_heap_alloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h_heap = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("HeapAlloc", t))?;
     let flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("HeapAlloc", t))?;
@@ -1384,7 +1384,7 @@ fn stub_heap_free(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("HeapFree", t))?;
     let _flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("HeapFree", t))?;
@@ -1407,7 +1407,7 @@ fn stub_heap_realloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("HeapReAlloc", t))?;
     let flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("HeapReAlloc", t))?;
@@ -1450,7 +1450,7 @@ fn stub_heap_size(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("HeapSize", t))?;
     let _flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("HeapSize", t))?;
@@ -1501,7 +1501,7 @@ fn stub_local_alloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let flags = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalAlloc", t))?;
     let n = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("LocalAlloc", t))?;
@@ -1528,7 +1528,7 @@ fn stub_local_free(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalFree", t))?;
     if addr == 0 {
@@ -1553,7 +1553,7 @@ fn stub_output_debug_string_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("OutputDebugStringA", t))?;
     let s = read_cstr(mmu, p, 4096)?;
@@ -1568,7 +1568,7 @@ fn stub_get_tick_count(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     state.tick = state.tick.wrapping_add(1);
     Ok(state.tick)
@@ -1581,7 +1581,7 @@ fn stub_interlocked_increment(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedIncrement", t))?;
     let v = mmu
@@ -1598,7 +1598,7 @@ fn stub_interlocked_decrement(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedDecrement", t))?;
     let v = mmu
@@ -1621,11 +1621,24 @@ fn stub_load_library_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadLibraryA", t))?;
     let name = read_cstr(mmu, p, 260)?.to_ascii_lowercase();
-    Ok(lookup_loaded_module(state, &name))
+    // 1) Already-loaded module (covers the host-stub system DLLs
+    //    pre-registered in `Sandbox::new` AND any DLL the PE
+    //    loader brought in eagerly).
+    let cached = lookup_loaded_module(state, &name);
+    if cached != 0 {
+        return Ok(cached);
+    }
+    // 2) Try a dynamic VFS-driven load. The guest sees this as
+    //    "the OS loader found and mapped the DLL on demand" —
+    //    same shape as real LoadLibraryA, just sourced from the
+    //    sandbox's mounted filesystem rather than disk. Handles
+    //    qtcf.dll's delay-load resolver calling LoadLibraryA on
+    //    CoreFoundation.dll from inside qts's CRT init.
+    Ok(crate::runtime::load_dll_dynamic(cpu, mmu, registry, state, &name))
 }
 
 /// Resolve a `LoadLibrary*` request against `state.modules`.
@@ -1661,7 +1674,7 @@ fn stub_get_proc_address(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetProcAddress", t))?;
     let name_p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetProcAddress", t))?;
@@ -1694,7 +1707,7 @@ fn stub_exit_process(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ExitProcess", t))?;
     state.exit_requested = Some(code);
@@ -1708,7 +1721,7 @@ fn stub_get_acp(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1252)
 }
@@ -1718,7 +1731,7 @@ fn stub_get_oem_cp(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(437)
 }
@@ -1730,7 +1743,7 @@ fn stub_get_cp_info(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _cp = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetCPInfo", t))?;
     let p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetCPInfo", t))?;
@@ -1762,7 +1775,7 @@ fn stub_get_command_line_a(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     if state.command_line_ptr == 0 {
         let s = b"oxideav-vfw\0";
@@ -1828,7 +1841,7 @@ fn stub_get_environment_strings(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     if state.environment_strings_ptr == 0 {
         let block = build_env_ansi();
@@ -1850,7 +1863,7 @@ fn stub_get_file_type(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetFileType", t))?;
     // STD_INPUT_HANDLE / STD_OUTPUT_HANDLE / STD_ERROR_HANDLE
@@ -1874,7 +1887,7 @@ fn stub_get_last_error(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let tib = state.cur_thread().tib_addr;
     if tib != 0 {
@@ -1892,7 +1905,7 @@ fn stub_set_last_error(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetLastError", t))?;
     state.last_error = code;
@@ -1914,7 +1927,7 @@ fn stub_get_module_file_name_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetModuleFileNameA", t))?;
     let dst = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetModuleFileNameA", t))?;
@@ -1954,7 +1967,7 @@ fn stub_get_module_handle_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetModuleHandleA", t))?;
     if p == 0 {
@@ -1970,7 +1983,7 @@ fn stub_get_startup_info_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetStartupInfoA", t))?;
     if p == 0 {
@@ -1993,7 +2006,7 @@ fn stub_get_std_handle(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0xFFFF_FFFF)
 }
@@ -2005,7 +2018,7 @@ fn stub_get_system_info(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetSystemInfo", t))?;
     if p == 0 {
@@ -2046,7 +2059,7 @@ fn stub_get_version(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0x0000_0A04)
 }
@@ -2059,7 +2072,7 @@ fn stub_global_alloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let flags = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalAlloc", t))?;
     let n = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GlobalAlloc", t))?;
@@ -2082,7 +2095,7 @@ fn stub_global_free(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalFree", t))?;
     if addr == 0 {
@@ -2104,7 +2117,7 @@ fn stub_global_lock(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalLock", t))?;
     Ok(addr)
@@ -2118,7 +2131,7 @@ fn stub_global_unlock(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalUnlock", t))?;
     state.last_error = 0; // NO_ERROR
@@ -2137,7 +2150,7 @@ fn stub_multi_byte_to_wide_char(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _cp = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
     let _flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
@@ -2203,7 +2216,7 @@ fn stub_wide_char_to_multi_byte(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _cp = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
     let _flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
@@ -2287,7 +2300,7 @@ fn stub_rtl_unwind(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -2357,7 +2370,7 @@ fn stub_virtual_alloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let lp_addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("VirtualAlloc", t))?;
     let size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("VirtualAlloc", t))?;
@@ -2391,7 +2404,7 @@ fn stub_virtual_free(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let lp_addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("VirtualFree", t))?;
     let size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("VirtualFree", t))?;
@@ -2421,7 +2434,7 @@ fn stub_write_file(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WriteFile", t))?;
     let lp_buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WriteFile", t))?;
@@ -2541,7 +2554,7 @@ fn stub_close_handle(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CloseHandle", t))?;
     if let Some(vfs) = state.context.vfs.as_mut() {
@@ -2610,7 +2623,7 @@ fn stub_create_file_mapping_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h_file = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateFileMappingA", t))?;
     let _attrs = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateFileMappingA", t))?;
@@ -2637,7 +2650,7 @@ fn stub_create_semaphore_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateSemaphoreA", t))?;
     let init = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateSemaphoreA", t))?;
@@ -2653,7 +2666,7 @@ fn stub_delete_critical_section(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -2664,7 +2677,7 @@ fn stub_disable_thread_library_calls(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -2680,7 +2693,7 @@ fn stub_enter_critical_section(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("EnterCriticalSection", t))?;
     if p == 0 {
@@ -2728,7 +2741,7 @@ fn stub_leave_critical_section(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LeaveCriticalSection", t))?;
     if p == 0 {
@@ -2774,7 +2787,7 @@ fn stub_try_enter_critical_section(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TryEnterCriticalSection", t))?;
     if p == 0 {
@@ -2810,7 +2823,7 @@ fn stub_initialize_critical_section(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InitializeCriticalSection", t))?;
     if p != 0 {
@@ -2989,7 +3002,7 @@ fn stub_find_resource_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h_module = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("FindResourceA", t))?;
     let lp_name = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("FindResourceA", t))?;
@@ -3002,7 +3015,7 @@ fn stub_flush_file_buffers(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3013,7 +3026,7 @@ fn stub_free_environment_strings(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3024,7 +3037,7 @@ fn stub_free_library(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3034,7 +3047,7 @@ fn stub_free_resource(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3045,7 +3058,7 @@ fn stub_get_current_process(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0xFFFF_FFFF)
 }
@@ -3057,7 +3070,7 @@ fn stub_get_current_thread_id(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(state.active_tid)
 }
@@ -3070,7 +3083,7 @@ fn stub_get_environment_strings_w(
     _cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     if state.environment_strings_w_ptr != 0 {
         return Ok(state.environment_strings_w_ptr);
@@ -3089,7 +3102,7 @@ fn stub_get_locale_info_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -3101,7 +3114,7 @@ fn stub_get_short_path_name_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -3114,7 +3127,7 @@ fn stub_get_string_type(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3128,7 +3141,7 @@ fn stub_get_system_directory_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetSystemDirectoryA", t))?;
     let size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetSystemDirectoryA", t))?;
@@ -3163,7 +3176,7 @@ fn stub_get_version_ex_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetVersionExA", t))?;
     if p == 0 {
@@ -3212,7 +3225,7 @@ fn stub_global_handle(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalHandle", t))?;
     Ok(p)
@@ -3236,7 +3249,7 @@ fn stub_global_memory_status(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalMemoryStatus", t))?;
     if p == 0 {
@@ -3275,7 +3288,7 @@ fn stub_global_memory_status_ex(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalMemoryStatusEx", t))?;
     if p == 0 {
@@ -3306,7 +3319,7 @@ fn stub_global_realloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalReAlloc", t))?;
     let n = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GlobalReAlloc", t))?;
@@ -3343,7 +3356,7 @@ fn stub_heap_create(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(state.process_heap_handle)
 }
@@ -3353,7 +3366,7 @@ fn stub_heap_destroy(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3365,7 +3378,7 @@ fn stub_is_bad_ptr(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -3376,7 +3389,7 @@ fn stub_lc_map_string(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -3394,7 +3407,7 @@ fn stub_load_resource(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h_module = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadResource", t))?;
     let h_res_info = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("LoadResource", t))?;
@@ -3407,7 +3420,7 @@ fn stub_local_handle(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalHandle", t))?;
     Ok(p)
@@ -3420,7 +3433,7 @@ fn stub_local_lock(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalLock", t))?;
     Ok(p)
@@ -3431,7 +3444,7 @@ fn stub_local_unlock(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3448,7 +3461,7 @@ fn stub_lock_resource(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LockResource", t))?;
     if h == 0 {
@@ -3480,7 +3493,7 @@ fn stub_sizeof_resource(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h_module = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SizeofResource", t))?;
     let h_res_info = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("SizeofResource", t))?;
@@ -3504,7 +3517,7 @@ fn stub_map_view_of_file(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("MapViewOfFile", t))?;
     let _access = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("MapViewOfFile", t))?;
@@ -3522,7 +3535,7 @@ fn stub_open_file_mapping_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -3534,7 +3547,7 @@ fn stub_query_performance_counter(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("QueryPerformanceCounter", t))?;
     state.tick = state.tick.wrapping_add(1);
@@ -3554,7 +3567,7 @@ fn stub_query_performance_frequency(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("QueryPerformanceFrequency", t))?;
     if p != 0 {
@@ -3574,7 +3587,7 @@ fn stub_raise_exception(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("RaiseException", t))?;
     state
@@ -3592,7 +3605,7 @@ fn stub_release_semaphore(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ReleaseSemaphore", t))?;
     let release = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("ReleaseSemaphore", t))?;
@@ -3622,7 +3635,7 @@ fn stub_set_file_pointer(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0xFFFF_FFFF)
 }
@@ -3633,7 +3646,7 @@ fn stub_set_handle_count(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let n = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetHandleCount", t))?;
     Ok(n)
@@ -3645,7 +3658,7 @@ fn stub_set_std_handle(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3657,7 +3670,7 @@ fn stub_set_unhandled_exception_filter(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -3672,7 +3685,7 @@ fn stub_sleep(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let ms = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("Sleep", t))?;
     let now = state.scheduler.instructions_global;
@@ -3706,7 +3719,7 @@ fn stub_terminate_process(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TerminateProcess", t))?;
     let code = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("TerminateProcess", t))?;
@@ -3764,7 +3777,7 @@ fn stub_tls_alloc(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let proc_ = state.cur_process_mut();
     let slot = proc_.next_tls_slot;
@@ -3779,7 +3792,7 @@ fn stub_tls_free(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let idx = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TlsFree", t))?;
     for t in state.threads.values_mut() {
@@ -3823,7 +3836,7 @@ fn stub_tls_get_value(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let idx = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TlsGetValue", t))?;
     if idx >= TLS_MAX_INDEX {
@@ -3842,7 +3855,7 @@ fn stub_tls_set_value(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let idx = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TlsSetValue", t))?;
     let value = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("TlsSetValue", t))?;
@@ -3859,7 +3872,7 @@ fn stub_unmap_view_of_file(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3878,7 +3891,7 @@ fn stub_wait_for_single_object(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WaitForSingleObject", t))?;
     let ms = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WaitForSingleObject", t))?;
@@ -3936,7 +3949,7 @@ fn stub_write_private_profile_string_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -3946,7 +3959,7 @@ fn stub_lstrlen_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("lstrlenA", t))?;
     if p == 0 {
@@ -3981,7 +3994,7 @@ fn stub_create_event_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateEventA", t))?;
     let manual = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateEventA", t))?;
@@ -4032,7 +4045,7 @@ fn stub_create_thread(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     use crate::emulator::isa_int::RET_SENTINEL;
     use crate::sched::{ThreadStatus, WaitObject};
@@ -4123,7 +4136,7 @@ fn stub_exit_thread(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ExitThread", t))?;
     state.yield_requested = Some(crate::sched::YieldRequest::Exit { code });
@@ -4139,7 +4152,7 @@ fn stub_set_event(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetEvent", t))?;
     let Some(crate::sched::WaitObject::Event {
@@ -4184,7 +4197,7 @@ fn stub_set_thread_priority(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetThreadPriority", t))?;
     let prio = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("SetThreadPriority", t))? as i32;
@@ -4204,7 +4217,7 @@ fn stub_switch_to_thread(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let cur_tid = state.active_tid;
     let has_peer = state
@@ -4227,7 +4240,7 @@ fn stub_resume_thread(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     use crate::sched::{ThreadStatus, WaitObject};
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ResumeThread", t))?;
@@ -4253,7 +4266,7 @@ fn stub_muldiv(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let a = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("MulDiv", t))? as i32;
     let b = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("MulDiv", t))? as i32;
@@ -4283,7 +4296,7 @@ fn stub_get_profile_int_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _app = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetProfileIntA", t))?;
     let _key = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetProfileIntA", t))?;
@@ -4300,7 +4313,7 @@ fn stub_get_current_process_id(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(state.cur_thread().pid)
 }
@@ -4316,7 +4329,7 @@ fn stub_get_system_time_as_file_time(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetSystemTimeAsFileTime", t))?;
     if p == 0 {
@@ -4345,7 +4358,7 @@ fn stub_get_current_thread(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0xFFFF_FFFE)
 }
@@ -4358,7 +4371,7 @@ fn stub_interlocked_exchange(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let target = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedExchange", t))?;
     let value = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("InterlockedExchange", t))?;
@@ -4378,7 +4391,7 @@ fn stub_interlocked_compare_exchange(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dest =
         arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedCompareExchange", t))?;
@@ -4406,7 +4419,7 @@ fn stub_unhandled_exception_filter(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -4418,7 +4431,7 @@ fn stub_set_error_mode(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _new_mode = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetErrorMode", t))?;
     Ok(0)
@@ -4431,7 +4444,7 @@ fn stub_reset_event(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ResetEvent", t))?;
     if let Some(crate::sched::WaitObject::Event { signaled, .. }) =
@@ -4453,7 +4466,7 @@ fn stub_wait_for_multiple_objects(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let n = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WaitForMultipleObjects", t))?;
     let p_handles =
@@ -4521,7 +4534,7 @@ fn stub_create_event_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateEventW", t))?;
     let manual = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateEventW", t))?;
@@ -4556,7 +4569,7 @@ fn stub_create_semaphore_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateSemaphoreW", t))?;
     let init = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateSemaphoreW", t))?;
@@ -4577,7 +4590,7 @@ fn stub_get_local_time(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetLocalTime", t))?;
     if p == 0 {
@@ -4603,7 +4616,7 @@ fn stub_get_module_handle_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetModuleHandleW", t))?;
     if p == 0 {
@@ -4638,7 +4651,7 @@ fn stub_get_private_profile_int_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _app = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
     let _key = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetPrivateProfileIntA", t))?;
@@ -4656,7 +4669,7 @@ fn stub_delay_load_failure_hook(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _dll = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("DelayLoadFailureHook", t))?;
     let _proc = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("DelayLoadFailureHook", t))?;
@@ -4673,7 +4686,7 @@ fn stub_get_version_ex_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetVersionExW", t))?;
     if p == 0 {
@@ -4709,7 +4722,7 @@ fn stub_signal_object_and_wait(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -4720,7 +4733,7 @@ fn stub_init_cs_spin(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -4732,7 +4745,7 @@ fn stub_is_debugger_present(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -4752,7 +4765,7 @@ fn stub_virtual_protect(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("VirtualProtect", t))?;
     let size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("VirtualProtect", t))?;
@@ -4780,7 +4793,7 @@ fn stub_interlocked_exchange_add(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let addend = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
     let value = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("InterlockedExchangeAdd", t))?;
@@ -4799,7 +4812,7 @@ fn stub_get_computer_name_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetComputerNameA", t))?;
     let n_ptr = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetComputerNameA", t))?;
@@ -4826,7 +4839,7 @@ fn stub_get_environment_variable_w(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -4840,7 +4853,7 @@ fn stub_get_process_affinity_mask(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetProcessAffinityMask", t))?;
     let proc_mask =
@@ -4863,7 +4876,7 @@ fn stub_get_thread_priority(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -4874,28 +4887,31 @@ fn stub_set_thread_affinity_mask(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
 
-/// `HMODULE LoadLibraryW(LPCWSTR lpLibFileName)`. We don't
-/// load arbitrary host DLLs into the guest; return 0 (failure)
-/// so the codec falls through to a backup path. Codecs that
-/// require a successful LoadLibrary tend to be the optional-
-/// codec-pack splitter shapes we don't try to fully drive.
+/// `HMODULE LoadLibraryW(LPCWSTR lpLibFileName)`. Same as
+/// `LoadLibraryA` with a UTF-16 path argument: consults
+/// already-loaded modules, then falls back to a dynamic
+/// VFS-driven load.
 fn stub_load_library_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadLibraryW", t))?;
     if p == 0 {
         return Ok(0);
     }
     let name = read_wcstr(mmu, p, 260)?.to_ascii_lowercase();
-    Ok(lookup_loaded_module(state, &name))
+    let cached = lookup_loaded_module(state, &name);
+    if cached != 0 {
+        return Ok(cached);
+    }
+    Ok(crate::runtime::load_dll_dynamic(cpu, mmu, registry, state, &name))
 }
 
 /// `BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED)`.
@@ -4908,7 +4924,7 @@ fn stub_read_file(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ReadFile", t))?;
     let buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("ReadFile", t))?;
@@ -4996,7 +5012,7 @@ fn stub_returns_zero(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -5006,7 +5022,7 @@ fn stub_returns_true(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -5021,7 +5037,7 @@ fn stub_lstrcat_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dst = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("lstrcatA", t))?;
     let src = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("lstrcatA", t))?;
@@ -5062,7 +5078,7 @@ fn stub_lstrcpy_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let dst = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("lstrcpyA", t))?;
     let src = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("lstrcpyA", t))?;
@@ -5112,7 +5128,7 @@ fn stub_lstrcmpi_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("lstrcmpiA", t))?;
     let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("lstrcmpiA", t))?;
@@ -5147,7 +5163,7 @@ fn stub_compare_string_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s1 = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CompareStringA", t))?;
     let s2 = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CompareStringA", t))?;
@@ -5161,7 +5177,7 @@ fn stub_compare_string_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let s1 = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CompareStringW", t))?;
     let s2 = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CompareStringW", t))?;
@@ -5190,7 +5206,7 @@ fn stub_fatal_app_exit_a(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
@@ -5201,7 +5217,7 @@ fn stub_get_system_time(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetSystemTime", t))?;
     if p == 0 {
@@ -5224,7 +5240,7 @@ fn stub_get_time_zone_information(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetTimeZoneInformation", t))?;
     if p != 0 {
@@ -5236,16 +5252,21 @@ fn stub_get_time_zone_information(
 
 /// `HMODULE LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile,
 /// DWORD dwFlags)`. Resolves like `LoadLibraryA`, ignoring the
-/// flags — a loaded module returns its image base, otherwise 0.
+/// flags: consults already-loaded modules first, then falls back
+/// to a dynamic VFS-driven load.
 fn stub_load_library_ex_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadLibraryExA", t))?;
     let name = read_cstr(mmu, p, 260)?.to_ascii_lowercase();
-    Ok(lookup_loaded_module(state, &name))
+    let cached = lookup_loaded_module(state, &name);
+    if cached != 0 {
+        return Ok(cached);
+    }
+    Ok(crate::runtime::load_dll_dynamic(cpu, mmu, registry, state, &name))
 }
 
 /// `BOOL WriteConsoleA(HANDLE, const VOID*, DWORD nNumberOfChars,
@@ -5255,7 +5276,7 @@ fn stub_write_console_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WriteConsoleA", t))?;
     let written = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WriteConsoleA", t))?;
@@ -5273,7 +5294,7 @@ fn stub_identity_pointer(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("EncodePointer/DecodePointer", t))
 }
@@ -5285,7 +5306,7 @@ fn stub_get_module_file_name_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetModuleFileNameW", t))?;
     let dst = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetModuleFileNameW", t))?;
@@ -5316,7 +5337,7 @@ fn stub_get_startup_info_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetStartupInfoW", t))?;
     if p == 0 {
@@ -5334,7 +5355,7 @@ fn stub_get_user_default_lcid(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0x0409)
 }
@@ -5347,7 +5368,7 @@ fn stub_get_long_path_name_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let short = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetLongPathNameA", t))?;
     let long = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetLongPathNameA", t))?;
@@ -5373,7 +5394,7 @@ fn stub_get_module_handle_ex_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let name_p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetModuleHandleExA", t))?;
     let out = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetModuleHandleExA", t))?;
@@ -5432,7 +5453,7 @@ fn stub_get_temp_path_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let n_buf = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetTempPathA", t))?;
     let lp_buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetTempPathA", t))?;
@@ -5455,7 +5476,7 @@ fn stub_get_temp_file_name_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_path = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetTempFileNameA", t))?;
     let p_prefix = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetTempFileNameA", t))?;
@@ -5509,7 +5530,7 @@ fn stub_create_file_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateFileA", t))?;
     let access = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateFileA", t))?;
@@ -5605,7 +5626,7 @@ fn stub_create_directory_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateDirectoryA", t))?;
     let _sa = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateDirectoryA", t))?;
@@ -5635,7 +5656,7 @@ fn stub_delete_file_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("DeleteFileA", t))?;
     if p_name == 0 {
@@ -5663,7 +5684,7 @@ fn stub_get_file_attributes_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetFileAttributesA", t))?;
     if p_name == 0 {
@@ -5694,7 +5715,7 @@ fn stub_get_file_size(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetFileSize", t))?;
     let p_hi = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetFileSize", t))?;
@@ -5719,7 +5740,7 @@ fn stub_dos_date_time_to_file_time(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let fat_date =
         arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("DosDateTimeToFileTime", t))? & 0xFFFF;
@@ -5769,7 +5790,7 @@ fn stub_create_mutex_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateMutexA", t))?;
     let init_owner = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateMutexA", t))?;
@@ -5787,7 +5808,7 @@ fn stub_create_mutex_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateMutexW", t))?;
     let init_owner = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateMutexW", t))?;
@@ -5834,7 +5855,7 @@ fn stub_release_mutex(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ReleaseMutex", t))?;
     let cur_tid = state.active_tid;
@@ -5880,7 +5901,7 @@ fn stub_release_mutex(
 fn try_spawn_child_pe(
     state: &mut HostState,
     mmu: &mut Mmu,
-    registry: &Registry,
+    registry: &mut Registry,
     target_path: &str,
     cmd: &str,
 ) -> Option<(u32, u32)> {
@@ -6023,7 +6044,7 @@ fn stub_create_process_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    registry: &Registry,
+    registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     use crate::sched::{ThreadStatus, WaitObject};
     let p_app = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateProcessA", t))?;
@@ -6139,7 +6160,7 @@ fn stub_get_exit_code_process(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetExitCodeProcess", t))?;
     let p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetExitCodeProcess", t))?;
@@ -6165,7 +6186,7 @@ fn stub_get_console_cp(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(437)
 }
@@ -6177,7 +6198,7 @@ fn stub_get_console_mode(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetConsoleMode", t))?;
     let p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetConsoleMode", t))?;
@@ -6196,7 +6217,7 @@ fn stub_local_file_time_to_file_time(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_src = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalFileTimeToFileTime", t))?;
     let p_dst = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("LocalFileTimeToFileTime", t))?;
@@ -6225,7 +6246,7 @@ fn stub_remove_directory_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("RemoveDirectoryA", t))?;
     if p_name == 0 {
@@ -6255,7 +6276,7 @@ fn stub_write_console_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WriteConsoleW", t))?;
     let p_buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WriteConsoleW", t))?;
@@ -6292,7 +6313,7 @@ fn stub_duplicate_handle(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _sp = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("DuplicateHandle", t))?;
     let h_src = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("DuplicateHandle", t))?;
@@ -6319,7 +6340,7 @@ fn stub_open_event_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _access = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("OpenEventA", t))?;
     let _inherit = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("OpenEventA", t))?;
@@ -6357,7 +6378,7 @@ fn stub_create_named_pipe_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
     let open_mode = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateNamedPipeA", t))?;
@@ -6405,7 +6426,7 @@ fn stub_connect_named_pipe(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     state.last_error = 535; // ERROR_PIPE_CONNECTED
     Ok(1)
@@ -6417,7 +6438,7 @@ fn stub_disconnect_named_pipe(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     _state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(1)
 }
@@ -6431,7 +6452,7 @@ fn stub_create_pipe(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_read = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreatePipe", t))?;
     let p_write = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreatePipe", t))?;
@@ -6466,7 +6487,7 @@ fn stub_open_event_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _access = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("OpenEventW", t))?;
     let _inherit = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("OpenEventW", t))?;
@@ -6510,7 +6531,7 @@ fn stub_open_process(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let _access = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("OpenProcess", t))?;
     let _inherit = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("OpenProcess", t))?;
@@ -6686,7 +6707,7 @@ fn stub_find_first_file_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("FindFirstFileA", t))?;
     let p_data = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("FindFirstFileA", t))?;
@@ -6721,7 +6742,7 @@ fn stub_find_first_file_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let p_name = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("FindFirstFileW", t))?;
     let p_data = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("FindFirstFileW", t))?;
@@ -6758,7 +6779,7 @@ fn stub_find_next_file_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     find_next_file(cpu, mmu, state, false)
 }
@@ -6768,7 +6789,7 @@ fn stub_find_next_file_w(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     find_next_file(cpu, mmu, state, true)
 }
@@ -6815,7 +6836,7 @@ fn stub_find_close(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
-    _registry: &Registry,
+    _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("FindClose", t))?;
     state.cur_process_mut().find_handles.remove(&h);
@@ -6846,7 +6867,7 @@ mod tests {
     fn push_args_and_call(
         cpu: &mut Cpu,
         mmu: &mut Mmu,
-        registry: &Registry,
+        registry: &mut Registry,
         state: &mut HostState,
         dll: &str,
         name: &str,
@@ -6871,11 +6892,11 @@ mod tests {
 
     #[test]
     fn get_process_heap_returns_canned_handle() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "GetProcessHeap",
@@ -6887,11 +6908,11 @@ mod tests {
 
     #[test]
     fn heap_alloc_then_heap_free_roundtrip() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "HeapAlloc",
@@ -6905,7 +6926,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "HeapFree",
@@ -6918,11 +6939,11 @@ mod tests {
 
     #[test]
     fn heap_alloc_zero_fills_when_flag_set() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "HeapAlloc",
@@ -6937,12 +6958,12 @@ mod tests {
 
     #[test]
     fn heap_free_invalid_pointer_errors() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let bad = 0xBAD_ADD00u32;
         let r = push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "HeapFree",
@@ -6956,11 +6977,11 @@ mod tests {
 
     #[test]
     fn local_alloc_local_free() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "LocalAlloc",
@@ -6972,7 +6993,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "LocalFree",
@@ -6984,7 +7005,7 @@ mod tests {
 
     #[test]
     fn output_debug_string_a_logs() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // Lay out "hi\0" at 0x4000 (heap arena start, R+W).
         mmu.write(0x4000, b"hi\0").unwrap();
         // Bump the heap_cursor to skip those bytes for cleanliness.
@@ -6992,7 +7013,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "OutputDebugStringA",
@@ -7004,11 +7025,11 @@ mod tests {
 
     #[test]
     fn get_tick_count_monotonic() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "GetTickCount",
@@ -7019,7 +7040,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "GetTickCount",
@@ -7032,7 +7053,7 @@ mod tests {
 
     #[test]
     fn interlocked_increment_decrement_roundtrip() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // Place a u32 = 5 at 0x4000.
         mmu.store32(0x4000, 5).unwrap();
         state.heap_cursor = 0x4010;
@@ -7040,7 +7061,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "InterlockedIncrement",
@@ -7053,7 +7074,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "InterlockedDecrement",
@@ -7065,7 +7086,7 @@ mod tests {
 
     #[test]
     fn load_library_a_returns_known_module_or_null() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         state.modules.insert("kernel32.dll".into(), 0x10000);
         // Lay out "kernel32.dll\0"
         let s = b"kernel32.dll\0";
@@ -7075,7 +7096,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "LoadLibraryA",
@@ -7090,7 +7111,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "LoadLibraryA",
@@ -7102,11 +7123,11 @@ mod tests {
 
     #[test]
     fn heap_realloc_preserves_old_bytes() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "HeapAlloc",
@@ -7122,7 +7143,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "HeapReAlloc",
@@ -7139,7 +7160,7 @@ mod tests {
     /// 3-level resource directory and return the data-entry VA.
     #[test]
     fn find_resource_a_walks_synthetic_resource_directory() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // Build a tiny resource directory at 0x10000:
         //   level 1 (type=2 → level 2)
         //   level 2 (id=112 → level 3)
@@ -7182,7 +7203,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "FindResourceA",
@@ -7202,7 +7223,7 @@ mod tests {
     /// thunk, then flip back.
     #[test]
     fn virtual_protect_flips_text_page_to_writable_and_back() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // Mark a fake "code" page as R+X (mirrors how the PE
         // loader stamps a real .text section).
         let code = 0x20000u32;
@@ -7217,7 +7238,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "VirtualProtect",
@@ -7237,7 +7258,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "VirtualProtect",
@@ -7258,13 +7279,13 @@ mod tests {
     /// committed).
     #[test]
     fn virtual_protect_rejects_unmapped_address() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // Out-param scratch.
         mmu.map(0x30000, 0x1000, Perm::R | Perm::W);
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "VirtualProtect",
@@ -7280,12 +7301,12 @@ mod tests {
     /// thread's `tls_slots` map.
     #[test]
     fn tls_alloc_set_get_value_round_trip() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // First TlsAlloc mints slot 0.
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "TlsAlloc",
@@ -7297,7 +7318,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "TlsAlloc",
@@ -7310,7 +7331,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "TlsGetValue",
@@ -7323,7 +7344,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "TlsSetValue",
@@ -7334,7 +7355,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "TlsGetValue",
@@ -7352,12 +7373,12 @@ mod tests {
     /// real context switch.
     #[test]
     fn sleep_records_a_wait_on_the_current_thread() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         let before = state.scheduler.instructions_global;
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "Sleep",
@@ -7389,12 +7410,12 @@ mod tests {
     /// `active_tid` to a different thread (single-process model).
     #[test]
     fn tls_value_is_isolated_per_thread() {
-        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let (mut cpu, mut mmu, mut registry, mut state) = make_env();
         // Mint a slot + set a value on the bootstrap thread.
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "TlsAlloc",
@@ -7405,7 +7426,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "TlsSetValue",
@@ -7425,7 +7446,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "TlsGetValue",
@@ -7443,7 +7464,7 @@ mod tests {
         push_args_and_call(
             &mut cpu,
             &mut mmu,
-            &registry,
+            &mut registry,
             &mut state,
             "kernel32.dll",
             "TlsGetValue",

@@ -878,7 +878,7 @@ pub fn lookup_in_process_class(table: &ComObjectTable, clsid: Guid, iid: Guid) -
 pub(crate) fn drive_guest(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    registry: &crate::win32::Registry,
+    registry: &mut crate::win32::Registry,
     state: &mut crate::win32::HostState,
     target: u32,
     args: &[u32],
