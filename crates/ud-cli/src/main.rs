@@ -1557,6 +1557,8 @@ fn qtcodec_list(
         (0x673851ecu32, "qts thread-data list head (4 bytes)"),
         (0x7FFD_DFF0u32, "page below TEB (32 bytes)"),
         (0x7FFD_E000u32, "TEB start (32 bytes)"),
+        (0x400380a0u32, "libdispatch IAT slot range (32 bytes incl _initterm)"),
+        (0x400380e0u32, "libdispatch IAT slot range (32 bytes incl pthread_setspecific @ +0x10)"),
     ];
     eprintln!("--- runtime CM state ---");
     for (a, label) in probe_addrs {
