@@ -1909,6 +1909,11 @@ fn preload_deps_free(
             0
         };
         if target != 0 {
+            if std::env::var("UD_TRACE_WILD_JUMP").is_ok() {
+                eprintln!(
+                    "  dynamic-load {dll_lc}: calling DllMain at {target:#010x}"
+                );
+            }
             if let Err(e) = crate::win32::call_guest(
                 cpu,
                 mmu,

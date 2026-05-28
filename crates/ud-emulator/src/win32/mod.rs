@@ -1863,29 +1863,6 @@ pub fn run_until_sentinel(
                 }
             }
         }
-        // Wild-jump tracer: when EIP falls below 0x100_0000 (way
-        // below any loaded DLL's image base) we've almost
-        // certainly hit a `jmp eax`/`ret` whose target slot
-        // wasn't initialised. Recording the previous well-formed
-        // EIP gives the caller's instruction that triggered the
-        // wild jump, which is the diagnostic surface for missing
-        // delay-load resolvers.
-        if std::env::var("UD_TRACE_WILD_JUMP").is_ok() {
-            let eip = cpu.regs.eip;
-            if eip < 0x100_0000 {
-                let esp = cpu.regs.get32(crate::emulator::regs::Reg32::Esp);
-                let last = state.cur_thread().last_eip_before_wild;
-                let stack_top: Vec<u32> = (0..4)
-                    .map(|i| mmu.load32(esp + i * 4).unwrap_or(0xDEAD_BEEF))
-                    .collect();
-                eprintln!(
-                    "WILD-JUMP eip={eip:#010x} esp={esp:#010x} prev_eip={last:#010x} stack=[{:#x},{:#x},{:#x},{:#x}]",
-                    stack_top[0], stack_top[1], stack_top[2], stack_top[3]
-                );
-            } else {
-                state.cur_thread_mut().last_eip_before_wild = eip;
-            }
-        }
         if registry.is_thunk(cpu.regs.eip) {
             match dispatch_stub(cpu, mmu, registry, state) {
                 Ok(()) => continue,
@@ -1896,8 +1873,19 @@ pub fn run_until_sentinel(
                 }
             }
         }
+        // Snapshot eip BEFORE the step so a successful step
+        // updates `last_eip_before_wild` to the actual last-
+        // executed instruction, and a trapping step leaves it
+        // holding the EIP of the instruction whose target was
+        // the bad one (the call/jmp that pointed at a bad slot).
+        let pre_step_eip = cpu.regs.eip;
         match cpu.step(mmu) {
-            Ok(StepOk::Continued) => continue,
+            Ok(StepOk::Continued) => {
+                if std::env::var("UD_TRACE_WILD_JUMP").is_ok() {
+                    state.cur_thread_mut().last_eip_before_wild = pre_step_eip;
+                }
+                continue;
+            }
             Ok(StepOk::Halted) => {
                 // The active thread executed a `ret` whose
                 // popped address was `RET_SENTINEL`. For the
@@ -1916,6 +1904,13 @@ pub fn run_until_sentinel(
                 continue;
             }
             Err(t) => {
+                if std::env::var("UD_TRACE_WILD_JUMP").is_ok() {
+                    let last = state.cur_thread().last_eip_before_wild;
+                    let esp = cpu.regs.get32(crate::emulator::regs::Reg32::Esp);
+                    eprintln!(
+                        "WILD-TRAP at_step_eip={pre_step_eip:#010x} prev_eip={last:#010x} esp={esp:#010x} trap={t}"
+                    );
+                }
                 let e: crate::Error = t.into();
                 #[cfg(feature = "trace")]
                 emit_trap_event(cpu, mmu, &e);
@@ -2015,6 +2010,13 @@ pub fn call_guest(
     }
     cpu.push32(mmu, RET_SENTINEL)?;
     cpu.regs.eip = target_va;
+    if std::env::var("UD_TRACE_WILD_JUMP").is_ok() {
+        eprintln!(
+            "  call_guest: eip set to {:#010x} (esp={:#010x})",
+            cpu.regs.eip,
+            cpu.regs.esp()
+        );
+    }
     run_until_sentinel(cpu, mmu, registry, state)?;
     Ok(cpu.regs.get32(Reg32::Eax))
 }
