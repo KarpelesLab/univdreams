@@ -1355,6 +1355,40 @@ fn qtcodec_register(
         Ok(v) => println!("CountComponents after register = {v}"),
         Err(e) => eprintln!("CountComponents trapped: {e}"),
     }
+
+    // Find the registered component via FindNextComponent(NULL, &desc),
+    // then open it with OpenComponent to get a live ComponentInstance.
+    let found = sandbox
+        .registry
+        .resolve("qtmlclient.dll", "FindNextComponent")
+        .and_then(|target| {
+            ud_emulator::win32::call_guest(
+                &mut sandbox.cpu,
+                &mut sandbox.mmu,
+                &mut sandbox.registry,
+                &mut sandbox.host,
+                target,
+                &[0, desc_addr],
+            )
+            .ok()
+        })
+        .unwrap_or(0);
+    println!("FindNextComponent(NULL, &desc) = {found:#010x}");
+    if found != 0 {
+        if let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "OpenComponent") {
+            match ud_emulator::win32::call_guest(
+                &mut sandbox.cpu,
+                &mut sandbox.mmu,
+                &mut sandbox.registry,
+                &mut sandbox.host,
+                target,
+                &[found],
+            ) {
+                Ok(v) => println!("OpenComponent({found:#010x}) = {v:#010x}"),
+                Err(e) => eprintln!("OpenComponent trapped: {e}"),
+            }
+        }
+    }
     Ok(())
 }
 
