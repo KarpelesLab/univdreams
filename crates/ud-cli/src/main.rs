@@ -1023,6 +1023,57 @@ const QTCODEC_SCRATCH: u32 = 0x65FE_0000;
 /// (return 0xF7D1) to the real `theQuickTimeDispatcher` in
 /// quicktime.qts. Must be called AFTER `preload_qt_runtime`.
 /// Returns the function's status code (0 = noErr).
+/// Force-init the qts Component Manager hashtable at
+/// `qts!0x67389e44`. This is the 6199-entry array that backs
+/// `RegisterComponent` / `CountComponents` / `FindNextComponent`.
+/// In a real QT runtime the allocation runs as part of an init
+/// path we haven't fully modelled (Movies / CF callback into
+/// qts!0x66892960). Until that's mapped, we invoke the qts
+/// internal allocator `qts!0x66892600` directly. It allocates
+/// `[qts!0x67359f6c] * 4` bytes (≈ 24 KiB) and stores the
+/// pointer at `qts!0x67389e44`; subsequent `RegisterComponent`s
+/// then insert into a real table instead of dereferencing NULL.
+///
+/// Offset `0x92600` is QT 7.7.9-Win specific. qts always loads
+/// at its preferred base 0x66800000 in our setup because nothing
+/// else competes for that band.
+fn ensure_cm_hashtable(sandbox: &mut ud_emulator::Sandbox) {
+    const HASHTABLE_GLOBAL: u32 = 0x6738_9e44;
+    const CM_INIT_OFFSET: u32 = 0x9_2600;
+    let qts_base = sandbox
+        .host
+        .modules
+        .get("quicktime.qts")
+        .copied()
+        .unwrap_or(0x6680_0000);
+    if qts_base == 0 {
+        return;
+    }
+    let before = sandbox.mmu.load32(HASHTABLE_GLOBAL).unwrap_or(0);
+    if before != 0 {
+        return; // already initialised — nothing to do
+    }
+    let init_fn = qts_base.wrapping_add(CM_INIT_OFFSET);
+    eprintln!(
+        "  qts CM hashtable @ {HASHTABLE_GLOBAL:#010x} is NULL — \
+         invoking qts!CM_init at {init_fn:#010x}"
+    );
+    sandbox.host.exit_requested = None;
+    match ud_emulator::win32::call_guest(
+        &mut sandbox.cpu,
+        &mut sandbox.mmu,
+        &mut sandbox.registry,
+        &mut sandbox.host,
+        init_fn,
+        &[],
+    ) {
+        Ok(v) => eprintln!("    qts!CM_init() = {v:#010x}"),
+        Err(e) => eprintln!("    qts!CM_init trapped: {e}"),
+    }
+    let after = sandbox.mmu.load32(HASHTABLE_GLOBAL).unwrap_or(0);
+    eprintln!("    qts CM hashtable @ {HASHTABLE_GLOBAL:#010x} = {after:#010x} (after init)");
+}
+
 fn init_qtml(sandbox: &mut ud_emulator::Sandbox) -> u32 {
     let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "InitializeQTML") else {
         eprintln!("init_qtml: qtmlclient!InitializeQTML not in registry — pre-load missed?");
@@ -1233,6 +1284,7 @@ fn qtcodec_register(
             Err(e) => eprintln!("EnterMovies() trapped: {e}"),
         }
     }
+    ensure_cm_hashtable(&mut sandbox);
 
     // Load the codec.
     let (image, _) = sandbox
@@ -1445,6 +1497,7 @@ fn qtcodec_list(
             eprintln!("  … ({} more)", calls.len() - 60);
         }
     }
+    ensure_cm_hashtable(&mut sandbox);
     // Build ComponentDescription { type, subType, manufacturer, flags, flagsMask }
     let desc_addr = QTCODEC_SCRATCH + 0x10000;
     let words = [ty_v, sub_v, man_v, 0, 0];
