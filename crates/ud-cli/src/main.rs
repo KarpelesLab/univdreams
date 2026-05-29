@@ -1200,7 +1200,7 @@ fn preload_qt_runtime(sandbox: &mut ud_emulator::Sandbox) {
                         );
                     };
                     if n <= head + tail {
-                        for c in calls.iter() {
+                        for c in calls {
                             log_call(c);
                         }
                     } else {
@@ -1408,7 +1408,7 @@ fn qtcodec_register(
                 );
             };
             if n <= head + tail {
-                for c in calls.iter() {
+                for c in calls {
                     log_call(c);
                 }
             } else {
