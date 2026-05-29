@@ -1128,8 +1128,17 @@ fn preload_qt_runtime(sandbox: &mut ud_emulator::Sandbox) {
                         "  --- {} stub calls during {runtime_dll} DllMain ---",
                         calls.len()
                     );
-                    for c in calls.iter().take(500) {
-                        let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+                    // The interesting calls are at the start (CRT init
+                    // signature) AND at the end (where the trap
+                    // happens, if any). Show both ends; collapse the
+                    // middle so the operator sees the tail without
+                    // losing the head.
+                    let n = calls.len();
+                    let head = 200;
+                    let tail = 200;
+                    let log_call = |c: &ud_emulator::win32::StubCall| {
+                        let args: Vec<String> =
+                            c.args.iter().map(|a| format!("{a:#x}")).collect();
                         let eip = c.call_site_eip;
                         eprintln!(
                             "    {eip:#010x} {}!{}({}) -> {:#x}",
@@ -1138,9 +1147,19 @@ fn preload_qt_runtime(sandbox: &mut ud_emulator::Sandbox) {
                             args.join(", "),
                             c.ret
                         );
-                    }
-                    if calls.len() > 500 {
-                        eprintln!("    … ({} more)", calls.len() - 500);
+                    };
+                    if n <= head + tail {
+                        for c in calls.iter() {
+                            log_call(c);
+                        }
+                    } else {
+                        for c in calls.iter().take(head) {
+                            log_call(c);
+                        }
+                        eprintln!("    … ({} more, last {} below)", n - head - tail, tail);
+                        for c in calls.iter().skip(n - tail) {
+                            log_call(c);
+                        }
                     }
                 }
             }
