@@ -965,7 +965,12 @@ impl Sandbox {
     /// address. Thin wrapper over [`crate::win32::run_until_sentinel`]
     /// kept for API stability.
     pub fn run_until_sentinel(&mut self) -> Result<(), crate::Error> {
-        run_until_sentinel_free(&mut self.cpu, &mut self.mmu, &mut self.registry, &mut self.host)
+        run_until_sentinel_free(
+            &mut self.cpu,
+            &mut self.mmu,
+            &mut self.registry,
+            &mut self.host,
+        )
     }
 
     // ---- vfw32 IC* convenience wrappers ------------------------------
@@ -1884,11 +1889,7 @@ fn preload_deps_free(
             }
         };
         for (export_name, rva) in &img.exports {
-            registry.register_guest_export(
-                &dll_lc,
-                export_name,
-                img.image_base.wrapping_add(*rva),
-            );
+            registry.register_guest_export(&dll_lc, export_name, img.image_base.wrapping_add(*rva));
         }
         state
             .loaded_dll_exports
@@ -1910,9 +1911,7 @@ fn preload_deps_free(
         };
         if target != 0 {
             if std::env::var("UD_TRACE_WILD_JUMP").is_ok() {
-                eprintln!(
-                    "  dynamic-load {dll_lc}: calling DllMain at {target:#010x}"
-                );
+                eprintln!("  dynamic-load {dll_lc}: calling DllMain at {target:#010x}");
             }
             if let Err(e) = crate::win32::call_guest(
                 cpu,

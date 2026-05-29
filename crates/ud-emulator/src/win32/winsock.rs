@@ -103,8 +103,7 @@ fn stub_passthrough_dword(
     _state: &mut HostState,
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
-    let v = arg_dword(cpu, mmu, 0)
-        .map_err(|t| crate::win32::trap_to_win32_local("htonl", t))?;
+    let v = arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("htonl", t))?;
     Ok(v)
 }
 
@@ -116,7 +115,6 @@ fn stub_passthrough_word(
     _state: &mut HostState,
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
-    let v = arg_dword(cpu, mmu, 0)
-        .map_err(|t| crate::win32::trap_to_win32_local("htons", t))?;
+    let v = arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("htons", t))?;
     Ok(v & 0xFFFF)
 }

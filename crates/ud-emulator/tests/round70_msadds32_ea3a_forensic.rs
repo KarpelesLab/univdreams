@@ -298,7 +298,7 @@ fn enum_pin_by_direction(sb: &mut Sandbox, filter: u32, want_dir: u32) -> Option
     let _ = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         filter,
         SLOT_BASEFILTER_STOP,
@@ -309,7 +309,7 @@ fn enum_pin_by_direction(sb: &mut Sandbox, filter: u32, want_dir: u32) -> Option
     call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         filter,
         SLOT_BASEFILTER_ENUM_PINS,
@@ -328,7 +328,7 @@ fn enum_pin_by_direction(sb: &mut Sandbox, filter: u32, want_dir: u32) -> Option
         let _ = call_method(
             &mut sb.cpu,
             &mut sb.mmu,
-            &sb.registry,
+            &mut sb.registry,
             &mut sb.host,
             pp,
             SLOT_ENUMPINS_NEXT,
@@ -347,7 +347,7 @@ fn enum_pin_by_direction(sb: &mut Sandbox, filter: u32, want_dir: u32) -> Option
         let _ = call_method(
             &mut sb.cpu,
             &mut sb.mmu,
-            &sb.registry,
+            &mut sb.registry,
             &mut sb.host,
             pin,
             SLOT_PIN_QUERY_DIRECTION,
@@ -483,7 +483,7 @@ fn run_watch_armed_receive(
     let r_rc = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         input_pin,
         SLOT_PIN_RECEIVE_CONNECTION,
@@ -540,7 +540,7 @@ fn run_watch_armed_receive(
     let _ = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         out_pin,
         SLOT_PIN_RECEIVE_CONNECTION,
@@ -553,7 +553,7 @@ fn run_watch_armed_receive(
     let r_ga = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         mip,
         SLOT_MEMINPUTPIN_GET_ALLOCATOR,
@@ -576,7 +576,7 @@ fn run_watch_armed_receive(
     let _ = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         target_alloc,
         SLOT_MEMALLOCATOR_SET_PROPERTIES,
@@ -585,7 +585,7 @@ fn run_watch_armed_receive(
     let _ = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         target_alloc,
         SLOT_MEMALLOCATOR_COMMIT,
@@ -594,7 +594,7 @@ fn run_watch_armed_receive(
     let _ = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         mip,
         SLOT_MEMINPUTPIN_NOTIFY_ALLOCATOR,
@@ -605,7 +605,7 @@ fn run_watch_armed_receive(
     let _ = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         filter,
         SLOT_MEDIAFILTER_PAUSE,
@@ -614,7 +614,7 @@ fn run_watch_armed_receive(
     let _ = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         filter,
         SLOT_MEDIAFILTER_RUN,
@@ -643,7 +643,7 @@ fn run_watch_armed_receive(
     let r = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
-        &sb.registry,
+        &mut sb.registry,
         &mut sb.host,
         mip,
         SLOT_MEMINPUTPIN_RECEIVE,

@@ -1399,7 +1399,9 @@ fn stub_memcpy_s(
         }
         return Ok(22);
     }
-    let data = mmu.read(src, count as usize).map_err(|t| trap("memcpy_s", t))?;
+    let data = mmu
+        .read(src, count as usize)
+        .map_err(|t| trap("memcpy_s", t))?;
     mmu.write(dest, &data).map_err(|t| trap("memcpy_s", t))?;
     Ok(0)
 }
@@ -1429,7 +1431,9 @@ fn stub_memmove_s(
         }
         return Ok(22);
     }
-    let data = mmu.read(src, count as usize).map_err(|t| trap("memmove_s", t))?;
+    let data = mmu
+        .read(src, count as usize)
+        .map_err(|t| trap("memmove_s", t))?;
     mmu.write(dest, &data).map_err(|t| trap("memmove_s", t))?;
     Ok(0)
 }
@@ -2426,7 +2430,15 @@ mod tests {
     #[test]
     fn malloc_then_free_round_trip() {
         let (mut cpu, mut mmu, mut registry, mut state) = make_env();
-        call_cdecl(&mut cpu, &mut mmu, &mut registry, &mut state, "malloc", &[128]).unwrap();
+        call_cdecl(
+            &mut cpu,
+            &mut mmu,
+            &mut registry,
+            &mut state,
+            "malloc",
+            &[128],
+        )
+        .unwrap();
         let p = cpu.regs.get32(Reg32::Eax);
         assert_ne!(p, 0);
         assert!(state.heap.contains_key(&p));

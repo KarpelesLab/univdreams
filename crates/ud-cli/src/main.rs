@@ -1287,7 +1287,11 @@ fn qtcodec_register(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::unreadable_literal
+)]
 fn qtcodec_list(
     ty: &str,
     subtype: &str,
@@ -1548,7 +1552,10 @@ fn qtcodec_list(
         (0x668845b0u32, "theQuickTimeDispatcher prologue (32 bytes)"),
         (0x67356248u32, "cat[1] entry (8 bytes raw)"),
         (0x1004dcd0u32, "qtmlclient init flag (4 bytes)"),
-        (0x1004dcdcu32, "qtmlclient->theQuickTimeDispatcher (4 bytes)"),
+        (
+            0x1004dcdcu32,
+            "qtmlclient->theQuickTimeDispatcher (4 bytes)",
+        ),
         (0x10024220u32, "qtmlclient!RegisterComponent (16 bytes)"),
         (0x66884890u32, "cat[1].subtable stub (16 bytes)"),
         (0x67347000u32, "qts CRT-init flag (4 bytes)"),
@@ -1557,24 +1564,45 @@ fn qtcodec_list(
         (0x673851ecu32, "qts thread-data list head (4 bytes)"),
         (0x7FFD_DFF0u32, "page below TEB (32 bytes)"),
         (0x7FFD_E000u32, "TEB start (32 bytes)"),
-        (0x400380a0u32, "libdispatch IAT slot range (32 bytes incl _initterm)"),
-        (0x400380e0u32, "libdispatch IAT slot range (32 bytes incl pthread_setspecific @ +0x10)"),
+        (
+            0x400380a0u32,
+            "libdispatch IAT slot range (32 bytes incl _initterm)",
+        ),
+        (
+            0x400380e0u32,
+            "libdispatch IAT slot range (32 bytes incl pthread_setspecific @ +0x10)",
+        ),
+        (
+            0x40006750u32,
+            "pthread_setspecific impl prologue (32 bytes)",
+        ),
+        (
+            0x4000c160u32,
+            "pthread internal state slot [+0xc164] (16 bytes)",
+        ),
+        (0x40006700u32, "pthread inner helper (32 bytes)"),
+        (0x4003a498u32, "libdispatch loaded value slot (32 bytes)"),
+        (0x4003a480u32, "libdispatch around 0xa498 (32 bytes)"),
+        (0x6000a810u32, "heap-allocated pthread_key_t (32 bytes)"),
     ];
     eprintln!("--- runtime CM state ---");
     for (a, label) in probe_addrs {
         let mut bytes = [0u8; 32];
         let mut ok = true;
-        for i in 0..32 {
-            match sandbox.mmu.load8(a.wrapping_add(i as u32)) {
-                Ok(b) => bytes[i] = b,
-                Err(_) => {
-                    ok = false;
-                    break;
-                }
+        for (i, slot) in bytes.iter_mut().enumerate() {
+            if let Ok(b) = sandbox.mmu.load8(a.wrapping_add(u32::try_from(i).unwrap())) {
+                *slot = b;
+            } else {
+                ok = false;
+                break;
             }
         }
         if ok {
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+            let hex: String = bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!("  0x{a:08x} ({label}): {hex}");
         } else {
             eprintln!("  0x{a:08x} ({label}): UNMAPPED");

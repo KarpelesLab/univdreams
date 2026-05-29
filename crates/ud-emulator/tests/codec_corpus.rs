@@ -202,7 +202,7 @@ fn stub_zero(
     _cpu: &mut ud_emulator::emulator::Cpu,
     _mmu: &mut ud_emulator::emulator::Mmu,
     _state: &mut ud_emulator::win32::HostState,
-    _registry: &ud_emulator::win32::Registry,
+    _registry: &mut ud_emulator::win32::Registry,
 ) -> Result<u32, ud_emulator::win32::Win32Error> {
     Ok(0)
 }

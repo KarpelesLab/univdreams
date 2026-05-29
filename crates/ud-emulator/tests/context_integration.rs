@@ -84,9 +84,6 @@ fn registry_can_open_preset_keys_via_hklm() {
         .open_key(HKLM, "Software\\Microsoft\\Windows")
         .expect("opens");
     assert!(registry.owns(h));
-    assert_eq!(
-        registry.path_of(h),
-        Some("hklm/software/microsoft/windows")
-    );
+    assert_eq!(registry.path_of(h), Some("hklm/software/microsoft/windows"));
     assert!(registry.close_key(h));
 }

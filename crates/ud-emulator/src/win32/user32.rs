@@ -697,16 +697,36 @@ fn stub_zero7(
 // must report success (TRUE = 1) for the codec to proceed past
 // the call.
 
-fn stub_one1(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
+fn stub_one1(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &mut Registry,
+) -> Result<u32, Win32Error> {
     Ok(1)
 }
-fn stub_one2(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
+fn stub_one2(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &mut Registry,
+) -> Result<u32, Win32Error> {
     Ok(1)
 }
-fn stub_one4(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
+fn stub_one4(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &mut Registry,
+) -> Result<u32, Win32Error> {
     Ok(1)
 }
-fn stub_one6(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
+fn stub_one6(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &mut Registry,
+) -> Result<u32, Win32Error> {
     Ok(1)
 }
 

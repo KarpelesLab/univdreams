@@ -33,6 +33,7 @@ pub mod msi;
 pub mod msiexec;
 pub mod msvcrt;
 pub mod ole32;
+pub mod pthread;
 pub mod shell32;
 pub mod shlwapi;
 pub mod user32;
@@ -305,6 +306,12 @@ pub struct ProcessState {
     /// per-thread [`ThreadState::tls_slots`]. Phase 2 of the
     /// scheduler refactor.
     pub next_tls_slot: u32,
+    /// pthread key counter. `pthread_key_create` consumes a
+    /// slot id from here. Distinct from `next_tls_slot` since
+    /// pthread keys form their own id space and the per-thread
+    /// values live in [`ThreadState::pthread_slots`]. Starts at
+    /// 1 so that `0` continues to mean "no key" / "unset".
+    pub next_pthread_key: u32,
     /// Bottom of the thread-stack pool. `CreateThread` carves
     /// stacks from `[bottom, top)` walking down from
     /// `next_thread_stack_top`. Both are `0` when no pool has
@@ -436,6 +443,11 @@ pub struct ThreadState {
     /// Debug aid: previous EIP, used by the wild-jump tracer
     /// under `UD_TRACE_WILD_JUMP`.
     pub last_eip_before_wild: u32,
+    /// pthread key → value for this thread. Set by
+    /// `pthread_setspecific`, read by `pthread_getspecific`.
+    /// Distinct from `tls_slots` (TlsAlloc / TlsSetValue) since
+    /// pthread keys come from a separate id-space.
+    pub pthread_slots: BTreeMap<u32, u32>,
 }
 
 impl Default for ThreadState {
@@ -451,6 +463,7 @@ impl Default for ThreadState {
             wait: None,
             tib_addr: 0,
             last_eip_before_wild: 0,
+            pthread_slots: BTreeMap::new(),
         }
     }
 }
@@ -1268,6 +1281,7 @@ impl Registry {
         crate::com::host_iface::register(self);
         crate::com::host_iface_r31::register(self);
         crate::win32::winsock::register(self);
+        crate::win32::pthread::register(self);
         let host_count = self.by_name.len() - host_before;
         self.register_kernel32()
             + self.register_gdi32()
