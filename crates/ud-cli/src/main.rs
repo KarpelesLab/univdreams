@@ -1376,6 +1376,7 @@ fn qtcodec_register(
     println!("FindNextComponent(NULL, &desc) = {found:#010x}");
     if found != 0 {
         if let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "OpenComponent") {
+            let before = sandbox.host.stub_calls.len();
             match ud_emulator::win32::call_guest(
                 &mut sandbox.cpu,
                 &mut sandbox.mmu,
@@ -1386,6 +1387,38 @@ fn qtcodec_register(
             ) {
                 Ok(v) => println!("OpenComponent({found:#010x}) = {v:#010x}"),
                 Err(e) => eprintln!("OpenComponent trapped: {e}"),
+            }
+            let calls = &sandbox.host.stub_calls[before..];
+            eprintln!("--- {} stub calls during OpenComponent ---", calls.len());
+            // Show head + tail; the codec's kComponentOpenSelect
+            // handler is usually called near the END of qts's
+            // open path so the tail is the most informative.
+            let n = calls.len();
+            let head = 60;
+            let tail = 60;
+            let log_call = |c: &ud_emulator::win32::StubCall| {
+                let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+                let eip = c.call_site_eip;
+                eprintln!(
+                    "  {eip:#010x} {}!{}({}) -> {:#x}",
+                    c.dll,
+                    c.name,
+                    args.join(", "),
+                    c.ret
+                );
+            };
+            if n <= head + tail {
+                for c in calls.iter() {
+                    log_call(c);
+                }
+            } else {
+                for c in calls.iter().take(head) {
+                    log_call(c);
+                }
+                eprintln!("  … ({} more, last {} below)", n - head - tail, tail);
+                for c in calls.iter().skip(n - tail) {
+                    log_call(c);
+                }
             }
         }
     }
