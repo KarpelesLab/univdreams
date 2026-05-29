@@ -31,6 +31,7 @@ pub mod kernel32;
 pub mod mfplat;
 pub mod msi;
 pub mod msiexec;
+pub mod corefoundation;
 pub mod msvcrt;
 pub mod ole32;
 pub mod pthread;
@@ -993,6 +994,11 @@ pub fn is_host_stub_dll(dll_lc: &str) -> bool {
             | "psapi.dll"
             | "userenv.dll"
             | "comdlg32.dll"
+            // See `crates/ud-emulator/src/win32/corefoundation.rs`
+            // for the host-stub rationale; CF's real DllMain on
+            // Windows pulls in libdispatch + ICU and crashes our
+            // call_guest stack discipline.
+            | "corefoundation.dll"
     )
 }
 
@@ -1285,6 +1291,7 @@ impl Registry {
         crate::com::host_iface_r31::register(self);
         crate::win32::winsock::register(self);
         crate::win32::pthread::register(self);
+        crate::win32::corefoundation::register(self);
         let host_count = self.by_name.len() - host_before;
         self.register_kernel32()
             + self.register_gdi32()

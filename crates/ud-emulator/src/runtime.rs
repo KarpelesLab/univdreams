@@ -303,6 +303,18 @@ impl Sandbox {
             "mfplat.dll",
             "version.dll",
             "vfw32.dll",
+            // Apple framework on Windows. The QT 7.7.9 + AAS install
+            // drops these into `c:\common files\apple\apple
+            // application support\`. Their real PE images participate
+            // in an intra-framework loader convention that our vanilla
+            // loader can't model (libdispatch writes into libicuuc's
+            // image; CF's DllMain runs ICU-string init that
+            // overwrites the call_guest return-address slot). We
+            // host-stub the surface that qtcf/qts actually reach so
+            // `GetModuleHandleA("CoreFoundation.dll")` and the
+            // subsequent `GetProcAddress`es resolve cleanly without
+            // running the real DllMain chain.
+            "corefoundation.dll",
         ]
         .iter()
         .enumerate()
