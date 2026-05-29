@@ -126,6 +126,15 @@ pub fn register(registry: &mut Registry) {
         stub_get_command_line_a as StubFn,
         0,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getcommandlinew
+    registry.register(
+        "kernel32.dll",
+        "GetCommandLineW",
+        stub_get_command_line_w as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-debugbreak
+    registry.register("kernel32.dll", "DebugBreak", stub_debug_break as StubFn, 0);
     // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getenvironmentstrings
     registry.register(
         "kernel32.dll",
@@ -1534,13 +1543,15 @@ fn stub_local_free(
     if addr == 0 {
         return Ok(0);
     }
-    state
-        .heap
-        .remove(&addr)
-        .ok_or(Win32Error::InvalidHeapBlock {
-            stub: "LocalFree",
-            addr,
-        })?;
+    // The analyser doesn't track ownership for pointers minted
+    // outside the heap (arena allocations, registry-stored argv,
+    // strings handed back by mock APIs). Real Windows would
+    // simply return without doing anything in that case as long
+    // as the pointer was a valid `LocalAlloc` result; we mimic
+    // the success-shaped path rather than trapping. Bookkeeping
+    // for heap-tracked blocks still runs so legitimate frees
+    // free the slot.
+    let _ = state.heap.remove(&addr);
     Ok(0) // Returns NULL on success per MSDN.
 }
 
@@ -1787,6 +1798,45 @@ fn stub_get_command_line_a(
         state.command_line_ptr = addr;
     }
     Ok(state.command_line_ptr)
+}
+
+/// `LPWSTR GetCommandLineW(void)`. Wide-character sibling of
+/// [`stub_get_command_line_a`]. Returns the same canned string
+/// as the ANSI version, transcoded once and cached on
+/// [`HostState::command_line_w_ptr`].
+fn stub_get_command_line_w(
+    _cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    if state.command_line_w_ptr == 0 {
+        let s = "oxideav-vfw";
+        let mut buf: Vec<u8> = Vec::with_capacity((s.len() + 1) * 2);
+        for c in s.encode_utf16() {
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+        buf.extend_from_slice(&[0, 0]);
+        let addr = state.arena_const_alloc(buf.len() as u32)?;
+        mmu.write_initializer(addr, &buf)
+            .map_err(|t| trap_to_win32("GetCommandLineW", t))?;
+        state.command_line_w_ptr = addr;
+    }
+    Ok(state.command_line_w_ptr)
+}
+
+/// `void DebugBreak(void)`. Real Windows raises `INT 3`; the
+/// analyser treats it as a soft hint and returns immediately so
+/// CRT init routines that probe for a debugger keep walking.
+/// Reference: Microsoft "DebugBreak function" —
+/// `https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-debugbreak`.
+fn stub_debug_break(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
 }
 
 /// Minimal Windows env block (`KEY=VAL\0…\0`) used by the

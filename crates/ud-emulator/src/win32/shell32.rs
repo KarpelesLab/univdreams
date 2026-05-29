@@ -45,6 +45,13 @@ pub fn register(registry: &mut Registry) {
         stub_shell_notify_icon as StubFn,
         2,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-commandlinetoargvw
+    registry.register(
+        "shell32.dll",
+        "CommandLineToArgvW",
+        stub_command_line_to_argv_w as StubFn,
+        2,
+    );
 }
 
 /// `HINSTANCE ShellExecuteA/W(HWND, LPCSTR lpOperation,
@@ -77,6 +84,35 @@ fn stub_sh_get_folder_path_w(
             .map_err(|t| crate::win32::trap_to_win32_local("SHGetFolderPathW", t))?;
     }
     Ok(0)
+}
+
+/// `LPWSTR* CommandLineToArgvW(LPCWSTR lpCmdLine, int *pNumArgs)`.
+/// MSDN says the caller passes the result to `LocalFree`. We hand
+/// back a single-entry argv pointing at the canned command line —
+/// the analyser never inspects the actual contents — and write
+/// `*pNumArgs = 1`. The returned argv lives in the const arena so
+/// `LocalFree` (a no-op stub) is safe.
+fn stub_command_line_to_argv_w(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let cmd = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("CommandLineToArgvW", t))?;
+    let p_argc = arg_dword(cpu, mmu, 1)
+        .map_err(|t| crate::win32::trap_to_win32_local("CommandLineToArgvW", t))?;
+    // Build a one-entry argv at &arena: [arg0_ptr]. Reuse the
+    // command-line pointer as arg0 — the caller may pass NULL,
+    // which is fine; argv[0] is then NULL.
+    let argv_addr = state.arena_const_alloc(4)?;
+    mmu.store32(argv_addr, cmd)
+        .map_err(|t| crate::win32::trap_to_win32_local("CommandLineToArgvW", t))?;
+    if p_argc != 0 {
+        mmu.store32(p_argc, 1)
+            .map_err(|t| crate::win32::trap_to_win32_local("CommandLineToArgvW", t))?;
+    }
+    Ok(argv_addr)
 }
 
 /// `BOOL Shell_NotifyIconA(DWORD dwMessage, PNOTIFYICONDATA)`.

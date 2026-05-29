@@ -458,6 +458,63 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     registry.register(dll, "sprintf_s", stub_sprintf_s as StubFn, 0);
     registry.register(dll, "sscanf", stub_returns_zero as StubFn, 0);
     registry.register(dll, "sscanf_s", stub_returns_zero as StubFn, 0);
+    // CRT locale internals — `__lc_handle` / `__lc_codepage` /
+    // `__mb_cur_max` are CRT-private accessors used by ctype-
+    // shaped APIs. Their MSVCR80+ exports carry a leading
+    // underscore prefix (the canonical names), and the import
+    // libraries sometimes pull in the *triple-underscore* aliases
+    // (`___lc_handle_func` etc.) too. Either way the analyser
+    // never reads the returned value; returning the address of a
+    // small zero-filled locale slot keeps the consumer happy.
+    // `vsprintf` / `vswprintf` / `_vsnprintf` / `_vsnwprintf` —
+    // va_list variants of the printf family. For the analyser
+    // path we don't need real formatting; write an empty buffer
+    // and return 0 so callers that branch on `bytes_written > 0`
+    // take the empty-output path.
+    registry.register(dll, "vsprintf", stub_vsprintf as StubFn, 0);
+    registry.register(dll, "vswprintf", stub_vsprintf as StubFn, 0);
+    registry.register(dll, "_vsnprintf", stub_vsprintf as StubFn, 0);
+    registry.register(dll, "_vsnwprintf", stub_vsprintf as StubFn, 0);
+    registry.register(dll, "vsnprintf", stub_vsprintf as StubFn, 0);
+    registry.register(dll, "_vsnprintf_s", stub_vsprintf as StubFn, 0);
+    registry.register(dll, "_vsnwprintf_s", stub_vsprintf as StubFn, 0);
+    // `_stat64` / `_wstat` / `_wstat64i32` — POSIX-shaped stat.
+    // Return -1 (errno-style failure) so callers fall back to the
+    // "file doesn't exist / can't query" branch instead of using
+    // garbage from an uninitialised stat buffer.
+    registry.register(dll, "_stat", stub_minus_one as StubFn, 0);
+    registry.register(dll, "_stat64", stub_minus_one as StubFn, 0);
+    registry.register(dll, "_stat64i32", stub_minus_one as StubFn, 0);
+    registry.register(dll, "_wstat", stub_minus_one as StubFn, 0);
+    registry.register(dll, "_wstat64", stub_minus_one as StubFn, 0);
+    registry.register(dll, "_wstat64i32", stub_minus_one as StubFn, 0);
+    registry.register(dll, "_fstat64", stub_minus_one as StubFn, 0);
+    registry.register(dll, "_fstat64i32", stub_minus_one as StubFn, 0);
+    // Heap-allocating string duplicator. CRT path: `_strdup` is
+    // `strdup` with a leading underscore for POSIX-namespace
+    // compliance; both names map to the same impl.
+    registry.register(dll, "_strdup", stub_strdup as StubFn, 0);
+    registry.register(dll, "strdup", stub_strdup as StubFn, 0);
+    registry.register(dll, "_wcsdup", stub_wcsdup as StubFn, 0);
+    registry.register(dll, "wcsdup", stub_wcsdup as StubFn, 0);
+    registry.register(dll, "__lc_handle_func", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "___lc_handle_func", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "__lc_codepage_func", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "___lc_codepage_func", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "__mb_cur_max_func", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "___mb_cur_max_func", stub_returns_zero as StubFn, 0);
+    registry.register(
+        dll,
+        "__lc_collate_cp_func",
+        stub_returns_zero as StubFn,
+        0,
+    );
+    registry.register(
+        dll,
+        "___lc_collate_cp_func",
+        stub_returns_zero as StubFn,
+        0,
+    );
 }
 
 /// Generic stub that returns the caller's first dword argument
@@ -1905,6 +1962,105 @@ fn stub_strcmp(
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     })
+}
+
+/// Generic stub that returns `(uint32_t)-1`. Matches the
+/// errno-style failure convention used by `_stat` and friends.
+#[allow(clippy::unnecessary_wraps)]
+fn stub_minus_one(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0xFFFF_FFFF)
+}
+
+/// `int vsprintf(char *buf, const char *fmt, va_list args)` and
+/// its wide/cap'd siblings. Writes an empty C-string into `buf`
+/// (or empty UTF-16 string when the wide variants are used —
+/// either way two consecutive NUL bytes is a valid termination
+/// for both) and returns 0. Real formatting is not needed for
+/// the analyser path; callers branch on `n > 0`, which we
+/// systematically take the "no output" side of.
+fn stub_vsprintf(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap("vsprintf", t))?;
+    if buf != 0 {
+        // Two zero bytes terminate both `char*` and `wchar_t*`.
+        mmu.store16(buf, 0).map_err(|t| trap("vsprintf", t))?;
+    }
+    Ok(0)
+}
+
+/// `char *_strdup(const char *src)`. Allocates `strlen(src)+1`
+/// bytes from the heap arena, copies the C-string, and returns
+/// the new pointer. NULL `src` returns NULL.
+fn stub_strdup(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let src = arg_dword(cpu, mmu, 0).map_err(|t| trap("_strdup", t))?;
+    if src == 0 {
+        return Ok(0);
+    }
+    let bytes = read_c(mmu, src, "_strdup")?;
+    let len = bytes.len() as u32;
+    let addr = state.arena_alloc(len + 1)?;
+    mmu.write_initializer(addr, &bytes)
+        .map_err(|t| trap("_strdup", t))?;
+    mmu.store8(addr.wrapping_add(len), 0)
+        .map_err(|t| trap("_strdup", t))?;
+    Ok(addr)
+}
+
+/// `wchar_t *_wcsdup(const wchar_t *src)`. Allocates
+/// `(wcslen(src) + 1) * 2` bytes from the heap arena, copies the
+/// wide string, and returns the new pointer. NULL `src` returns
+/// NULL.
+fn stub_wcsdup(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let src = arg_dword(cpu, mmu, 0).map_err(|t| trap("_wcsdup", t))?;
+    if src == 0 {
+        return Ok(0);
+    }
+    // Walk source until the NUL u16. Cap at 1 MiB / 2 = 512 KiB
+    // chars to keep the analyser well-bounded.
+    let mut n_chars: u32 = 0;
+    loop {
+        let w = mmu
+            .load16(src.wrapping_add(n_chars * 2))
+            .map_err(|t| trap("_wcsdup", t))?;
+        if w == 0 {
+            break;
+        }
+        n_chars = n_chars.checked_add(1).unwrap_or(u32::MAX);
+        if n_chars >= 0x80000 {
+            break;
+        }
+    }
+    let total_bytes = (n_chars + 1) * 2;
+    let addr = state.arena_alloc(total_bytes)?;
+    for i in 0..n_chars {
+        let w = mmu
+            .load16(src.wrapping_add(i * 2))
+            .map_err(|t| trap("_wcsdup", t))?;
+        mmu.store16(addr.wrapping_add(i * 2), w)
+            .map_err(|t| trap("_wcsdup", t))?;
+    }
+    mmu.store16(addr.wrapping_add(n_chars * 2), 0)
+        .map_err(|t| trap("_wcsdup", t))?;
+    Ok(addr)
 }
 
 /// `size_t strlen(const char *s)`.

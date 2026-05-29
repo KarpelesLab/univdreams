@@ -237,6 +237,9 @@ pub struct ProcessState {
     /// Cached pointer to the canned `"oxideav-vfw\0"` command
     /// line. Lazily populated by `GetCommandLineA`.
     pub command_line_ptr: u32,
+    /// Cached pointer to the UTF-16 transcoding of the canned
+    /// command line. Lazily populated by `GetCommandLineW`.
+    pub command_line_w_ptr: u32,
     /// Cached pointer to the synthesised ANSI environment block.
     pub environment_strings_ptr: u32,
     /// Cached pointer to the synthesised UTF-16 environment
