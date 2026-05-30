@@ -175,11 +175,11 @@ fn stub_init_task(
     cpu.regs.set16(Reg16::Si, 0);
     // DI = hInstance.
     cpu.regs.set16(Reg16::Di, WIN16_HINSTANCE);
-    // ES:BX = command line. Point at the DGROUP segment, offset 0x81
-    // (the classic PSP command-tail offset); the tail is empty.
-    cpu.regs.set16(Reg16::Bx, 0x81);
-    let ds = cpu.ds_selector();
-    cpu.set_segment_reg(0 /* ES */, ds);
+    // ES:BX = the PSP and command tail. The C startup reads the
+    // environment selector at PSP:0x2C (left 0) and the command tail at
+    // PSP:0x80.
+    cpu.regs.set16(Reg16::Bx, 0x80);
+    cpu.set_segment_reg(0 /* ES */, crate::ne::PSP_SELECTOR);
     // DX:AX — AX = success (1), DX = nCmdShow.
     Ok((u32::from(SW_SHOWNORMAL) << 16) | 1)
 }

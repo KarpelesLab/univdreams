@@ -3611,6 +3611,9 @@ impl Cpu {
         let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
+        if self.op_size_16() {
+            return self.group5_rm16(mmu, mr, op, entry_eip);
+        }
         let val = read_operand32(op, &self.regs, mmu)?;
         match mr.reg {
             0 => {
@@ -3645,6 +3648,88 @@ impl Cpu {
             6 => {
                 // PUSH r/m32
                 self.push32(mmu, val)?;
+            }
+            _ => {
+                return Err(Trap::UndefinedOpcode {
+                    eip: entry_eip,
+                    opcode: 0xFF00 | u32::from(mr.reg),
+                })
+            }
+        }
+        Ok(StepOk::Continued)
+    }
+
+    /// 16-bit `FF`-group (`INC`/`DEC`/`CALL`/`JMP`/`PUSH`, near and far)
+    /// for Win16 code. `op` is already segment-resolved.
+    fn group5_rm16(
+        &mut self,
+        mmu: &mut Mmu,
+        mr: ModRm,
+        op: Operand,
+        entry_eip: u32,
+    ) -> Result<StepOk, Trap> {
+        // Read the far pointer (offset:selector) a /3 or /5 form points at.
+        let far_ptr = |cpu: &Self, mmu: &mut Mmu| -> Result<(u16, u16), Trap> {
+            match op {
+                Operand::Mem32(a) => {
+                    let off = mmu.load16(a)?;
+                    let sel = mmu.load16(a.wrapping_add(2))?;
+                    let _ = cpu;
+                    Ok((off, sel))
+                }
+                Operand::Reg32(_) => Err(Trap::UndefinedOpcode {
+                    eip: entry_eip,
+                    opcode: 0xFF00 | u32::from(mr.reg),
+                }),
+            }
+        };
+        match mr.reg {
+            0 => {
+                let v = read_operand16(op, &self.regs, mmu)?;
+                let r = v.wrapping_add(1);
+                let cf = self.regs.flags.cf;
+                set_flags_inc_dec_16(&mut self.regs.flags, v, 1, r, false);
+                self.regs.flags.cf = cf;
+                write_operand16(op, r, &mut self.regs, mmu)?;
+            }
+            1 => {
+                let v = read_operand16(op, &self.regs, mmu)?;
+                let r = v.wrapping_sub(1);
+                let cf = self.regs.flags.cf;
+                set_flags_inc_dec_16(&mut self.regs.flags, v, 1, r, true);
+                self.regs.flags.cf = cf;
+                write_operand16(op, r, &mut self.regs, mmu)?;
+            }
+            2 => {
+                // CALL near r/m16 (absolute within CS).
+                let target = read_operand16(op, &self.regs, mmu)?;
+                let ret_ip = self.regs.eip.wrapping_sub(self.cs_base) as u16;
+                self.push16(mmu, ret_ip)?;
+                self.regs.eip = self.cs_base.wrapping_add(u32::from(target));
+            }
+            3 => {
+                // CALL FAR m16:16.
+                let (off, sel) = far_ptr(self, mmu)?;
+                let ret_ip = self.regs.eip.wrapping_sub(self.cs_base) as u16;
+                self.push16(mmu, self.cs_sel)?;
+                self.push16(mmu, ret_ip)?;
+                self.load_segment(Seg::Cs, sel);
+                self.regs.eip = self.cs_base.wrapping_add(u32::from(off));
+            }
+            4 => {
+                // JMP near r/m16.
+                let target = read_operand16(op, &self.regs, mmu)?;
+                self.regs.eip = self.cs_base.wrapping_add(u32::from(target));
+            }
+            5 => {
+                // JMP FAR m16:16.
+                let (off, sel) = far_ptr(self, mmu)?;
+                self.load_segment(Seg::Cs, sel);
+                self.regs.eip = self.cs_base.wrapping_add(u32::from(off));
+            }
+            6 => {
+                let v = read_operand16(op, &self.regs, mmu)?;
+                self.push16(mmu, v)?;
             }
             _ => {
                 return Err(Trap::UndefinedOpcode {

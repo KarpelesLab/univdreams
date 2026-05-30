@@ -39,6 +39,14 @@ pub const WIN16_SEG_STRIDE: u32 = 0x0001_0000;
 /// so the far target equals the registry thunk address and the run
 /// loop's `is_thunk` check fires.
 pub const IMPORT_SELECTOR: u16 = 0xF000;
+/// Selector for a synthetic PSP (Program Segment Prefix). `InitTask`
+/// hands this back in `ES`; the C startup reads the environment-segment
+/// selector at `PSP:0x2C` (left 0 → no environment) and the command
+/// tail at `PSP:0x80`.
+pub const PSP_SELECTOR: u16 = 0xF100;
+/// Linear base of the synthetic PSP window (just below the segment
+/// arena). One page is plenty for the 256-byte PSP.
+pub const PSP_BASE: u32 = 0x000F_0000;
 /// Selector token whose base is the CPU's `RET_SENTINEL`, pushed as the
 /// far-return target so a top-level `RETF` from the entry halts the run
 /// loop cleanly (mirrors how the PE path pushes `RET_SENTINEL`).
@@ -124,6 +132,14 @@ pub fn load_ne(
     }
     // The import-thunk window shares the registry's THUNK_BASE region.
     selectors.push((IMPORT_SELECTOR, THUNK_BASE));
+
+    // Synthetic PSP: one zeroed page. `PSP:0x2C` (environment selector)
+    // stays 0 so the C startup's environment walk is skipped; the
+    // command tail at `PSP:0x80` is an empty `0x00, 0x0D`.
+    mmu.map(PSP_BASE, 0x1000, Perm::R | Perm::W);
+    let _ = mmu.store8(PSP_BASE + 0x80, 0); // command-tail length = 0
+    let _ = mmu.store8(PSP_BASE + 0x81, 0x0D); // CR terminator
+    selectors.push((PSP_SELECTOR, PSP_BASE));
 
     // 2) Apply per-segment relocations.
     let mut unresolved: Vec<(String, String)> = Vec::new();
