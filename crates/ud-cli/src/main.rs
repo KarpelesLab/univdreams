@@ -1374,6 +1374,36 @@ fn qtcodec_register(
         })
         .unwrap_or(0);
     println!("FindNextComponent(NULL, &desc) = {found:#010x}");
+    // Snapshot the qts dispatch table before and after the open
+    // attempt. theQuickTimeDispatcher uses
+    // [(selector_hi_byte) * 8 + 0x67356240]; the first byte of
+    // each entry gates routing. If our entries 0..3 are still
+    // all-zero, the codec's late-bound dispatch reaches the
+    // codec's own fail stub at 0x67d712c0.
+    {
+        eprintln!("qts dispatch_table[0..7] pre-Open:");
+        for cat in 0..8u32 {
+            let a = 0x6735_6240u32.wrapping_add(cat * 8);
+            let enabled = sandbox.mmu.load8(a).unwrap_or(0);
+            let fn_ptr = sandbox.mmu.load32(a + 4).unwrap_or(0);
+            eprintln!(
+                "  cat[{cat}] @ {a:#010x}: enabled=0x{enabled:02x}  fn_ptr={fn_ptr:#010x}"
+            );
+        }
+    }
+    // Snapshot the codec's vtable slots that the late-bind thunk
+    // at 0x67d7f810 reads. [0x67ddc000] = resolver (cleared to 0
+    // after resolver runs once); [0x67ddc00c] = late-bound
+    // dispatch target (initially 0x67d712c0 fail stub, patched
+    // to qts!theQuickTimeDispatcher 0x668845b0 after resolver).
+    {
+        let v0 = sandbox.mmu.load32(0x67dd_c000).unwrap_or(0);
+        let vc = sandbox.mmu.load32(0x67dd_c00c).unwrap_or(0);
+        eprintln!(
+            "codec vtable: [0x67ddc000]={v0:#010x} \
+             [0x67ddc00c]={vc:#010x} (pre-Open)"
+        );
+    }
     if found != 0 {
         if let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "OpenComponent") {
             let before = sandbox.host.stub_calls.len();
@@ -1387,6 +1417,14 @@ fn qtcodec_register(
             ) {
                 Ok(v) => println!("OpenComponent({found:#010x}) = {v:#010x}"),
                 Err(e) => eprintln!("OpenComponent trapped: {e}"),
+            }
+            {
+                let v0 = sandbox.mmu.load32(0x67dd_c000).unwrap_or(0);
+                let vc = sandbox.mmu.load32(0x67dd_c00c).unwrap_or(0);
+                eprintln!(
+                    "codec vtable: [0x67ddc000]={v0:#010x} \
+                     [0x67ddc00c]={vc:#010x} (post-Open)"
+                );
             }
             let calls = &sandbox.host.stub_calls[before..];
             eprintln!("--- {} stub calls during OpenComponent ---", calls.len());
