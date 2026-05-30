@@ -209,13 +209,21 @@ fn apply_segment_relocs(
         let target = match src_type {
             SRC_INTERNAL => {
                 let seg = record[4];
-                let off = u16::from_le_bytes([record[6], record[7]]);
                 if seg == 0xFF {
-                    // Movable internal ref (via entry table) — not yet
-                    // resolved; leave the placeholder.
-                    continue;
+                    // Movable internal ref: the target is an entry-table
+                    // ordinal (bytes 6-7). Resolve it to the entry's
+                    // (segment, offset) — this is how MFC's movable code
+                    // segments are reached (e.g. the C++ constructor
+                    // table the startup walks via `call far`).
+                    let ordinal = u16::from_le_bytes([record[6], record[7]]);
+                    match ne.entries.iter().find(|e| e.ordinal == ordinal) {
+                        Some(e) => Some((u16::from(e.segment), e.offset)),
+                        None => continue,
+                    }
+                } else {
+                    let off = u16::from_le_bytes([record[6], record[7]]);
+                    Some((u16::from(seg), off))
                 }
-                Some((u16::from(seg), off))
             }
             SRC_IMPORT_ORDINAL => {
                 let mod_idx = u16::from_le_bytes([record[4], record[5]]) as usize;

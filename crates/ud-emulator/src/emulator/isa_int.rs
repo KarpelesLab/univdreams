@@ -1543,11 +1543,19 @@ impl Cpu {
                 }
                 Ok(StepOk::Continued)
             }
-            // 0xC9 — LEAVE: mov esp, ebp; pop ebp
+            // 0xC9 — LEAVE: mov (e)sp, (e)bp; pop (e)bp. 16-bit mode
+            // operates on SP/BP and pops a single word.
             0xC9 => {
-                self.regs.set_esp(self.regs.ebp());
-                let v = self.pop32(mmu)?;
-                self.regs.set32(Reg32::Ebp, v);
+                if self.code16 {
+                    let bp = self.regs.get16(Reg16::Bp);
+                    self.regs.set_esp(u32::from(bp));
+                    let v = self.pop16(mmu)?;
+                    self.regs.set16(Reg16::Bp, v);
+                } else {
+                    self.regs.set_esp(self.regs.ebp());
+                    let v = self.pop32(mmu)?;
+                    self.regs.set32(Reg32::Ebp, v);
+                }
                 Ok(StepOk::Continued)
             }
 
