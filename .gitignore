@@ -8,6 +8,9 @@ Cargo.lock
 *.swo
 *~
 
+# Scratch space for ad-hoc binaries under analysis (not committed).
+/scratch
+
 # External fixtures fetched by scripts/fetch-test-fixtures.sh
 # from URLs listed in testdata/external/MANIFEST. The manifest
 # itself is committed; the downloads are not.
