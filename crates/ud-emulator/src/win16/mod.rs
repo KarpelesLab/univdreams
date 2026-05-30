@@ -30,6 +30,24 @@ const SW_SHOWNORMAL: u16 = 1;
 /// to trap-on-call for anything unimplemented).
 pub fn register_all(registry: &mut Registry) {
     register_kernel(registry);
+    register_user(registry);
+}
+
+/// `USER` ordinal stubs.
+fn register_user(registry: &mut Registry) {
+    // USER.5 InitApp(hInstance) — set up the task's message queue.
+    // Must return non-zero or the C startup aborts.
+    registry.register_far_pascal("user", "@5", stub_ret1_1word, 2);
+}
+
+/// Generic FAR PASCAL stub: clean one word of args, return 1 (success).
+fn stub_ret1_1word(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
 }
 
 /// Service a software interrupt raised in 16-bit mode. Returns `true`
@@ -91,12 +109,29 @@ fn dos_int21(cpu: &mut Cpu) {
 fn register_kernel(registry: &mut Registry) {
     // KERNEL.91 InitTask() — no args.
     registry.register_far_pascal("kernel", "@91", stub_init_task, 0);
-    // KERNEL.23 WaitEvent(HTASK) — yields until an event is posted; in
+    // KERNEL.23 LockSegment(seg) — lock a segment so it can't move; in
+    // the sandbox segments never move, so just hand back a non-zero
+    // selector (the current DGROUP) for success.
+    registry.register_far_pascal("kernel", "@23", stub_lock_segment, 2);
+    // KERNEL.24 UnlockSegment(seg) — inverse of LockSegment.
+    registry.register_far_pascal("kernel", "@24", stub_ret0_1word, 2);
+    // KERNEL.30 WaitEvent(HTASK) — yield until an event is posted; in
     // the single-task sandbox there is nothing to wait for.
-    registry.register_far_pascal("kernel", "@23", stub_ret0_1word, 2);
+    registry.register_far_pascal("kernel", "@30", stub_ret0_1word, 2);
     // KERNEL.3 GetVersion() → Windows 3.10 in AX (LOBYTE major, HIBYTE
     // minor), DOS version in DX.
     registry.register_far_pascal("kernel", "@3", stub_get_version, 0);
+}
+
+/// `KERNEL.23 LockSegment(seg)` → return a non-zero selector (the
+/// DGROUP) so the caller treats the lock as successful.
+fn stub_lock_segment(
+    cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(u32::from(cpu.ds_selector()))
 }
 
 /// Generic FAR PASCAL stub that cleans one word of args and returns 0.

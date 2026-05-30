@@ -652,6 +652,62 @@ impl Cpu {
         Ok(v)
     }
 
+    /// Pop a near-return target. In 16-bit mode the pushed value is a
+    /// 16-bit IP offset within the current code segment, so fold it onto
+    /// `cs_base` to recover the linear `eip` (unless it is the synthetic
+    /// `RET_SENTINEL`); in 32-bit mode it is the full linear address.
+    fn near_ret_pop(&mut self, mmu: &mut Mmu) -> Result<u32, Trap> {
+        if self.code16 {
+            let ip = self.pop16(mmu)?;
+            Ok(self.cs_base.wrapping_add(u32::from(ip)))
+        } else {
+            self.pop32(mmu)
+        }
+    }
+
+    /// `PUSH <seg>` (0x06/0x0E/0x16/0x1E) — push a segment selector.
+    /// 16-bit mode only; in flat 32-bit user code these opcodes never
+    /// appear, so they stay undefined there.
+    fn seg_push(
+        &mut self,
+        mmu: &mut Mmu,
+        seg: Seg,
+        entry_eip: u32,
+        opc: u8,
+    ) -> Result<StepOk, Trap> {
+        if self.code16 {
+            let sel = self.segment_selector(seg);
+            self.push16(mmu, sel)?;
+            Ok(StepOk::Continued)
+        } else {
+            Err(Trap::UndefinedOpcode {
+                eip: entry_eip,
+                opcode: u32::from(opc),
+            })
+        }
+    }
+
+    /// `POP <seg>` (0x07/0x17/0x1F) — pop a segment selector and reload
+    /// the segment's cached base. 16-bit mode only.
+    fn seg_pop(
+        &mut self,
+        mmu: &mut Mmu,
+        seg: Seg,
+        entry_eip: u32,
+        opc: u8,
+    ) -> Result<StepOk, Trap> {
+        if self.code16 {
+            let sel = self.pop16(mmu)?;
+            self.load_segment(seg, sel);
+            Ok(StepOk::Continued)
+        } else {
+            Err(Trap::UndefinedOpcode {
+                eip: entry_eip,
+                opcode: u32::from(opc),
+            })
+        }
+    }
+
     /// Decode + execute one instruction. Returns
     /// [`StepOk::Halted`] when the instruction was a `ret` and
     /// the popped return address was [`RET_SENTINEL`].
@@ -1408,9 +1464,8 @@ impl Cpu {
             // 0xC2 — RETN imm16 ; 0xC3 — RETN
             0xC2 => {
                 let pop = self.fetch_imm16(mmu)?;
-                let ret = self.pop32(mmu)?;
-                self.regs
-                    .set_esp(self.regs.esp().wrapping_add(u32::from(pop)));
+                let ret = self.near_ret_pop(mmu)?;
+                self.inc_sp(u32::from(pop));
                 self.regs.eip = ret;
                 if ret == RET_SENTINEL {
                     Ok(StepOk::Halted)
@@ -1419,7 +1474,7 @@ impl Cpu {
                 }
             }
             0xC3 => {
-                let ret = self.pop32(mmu)?;
+                let ret = self.near_ret_pop(mmu)?;
                 self.regs.eip = ret;
                 if ret == RET_SENTINEL {
                     Ok(StepOk::Halted)
@@ -1531,15 +1586,30 @@ impl Cpu {
 
             // 0xE8 — CALL rel32
             0xE8 => {
-                let disp = self.fetch_imm32(mmu)? as i32;
-                let target = (self.regs.eip as i32).wrapping_add(disp) as u32;
-                self.push32(mmu, self.regs.eip)?;
-                self.regs.eip = target;
+                // Near CALL — the displacement and the pushed return
+                // IP follow the operand size: rel16 + push16 in 16-bit
+                // mode, rel32 + push32 otherwise.
+                if self.op_size_16() {
+                    let disp = i32::from(self.fetch_imm16(mmu)? as i16);
+                    let ret_ip = self.regs.eip.wrapping_sub(self.cs_base) as u16;
+                    let target = (self.regs.eip as i32).wrapping_add(disp) as u32;
+                    self.push16(mmu, ret_ip)?;
+                    self.regs.eip = target;
+                } else {
+                    let disp = self.fetch_imm32(mmu)? as i32;
+                    let target = (self.regs.eip as i32).wrapping_add(disp) as u32;
+                    self.push32(mmu, self.regs.eip)?;
+                    self.regs.eip = target;
+                }
                 Ok(StepOk::Continued)
             }
-            // 0xE9 — JMP rel32
+            // 0xE9 — JMP rel16/rel32
             0xE9 => {
-                let disp = self.fetch_imm32(mmu)? as i32;
+                let disp = if self.op_size_16() {
+                    i32::from(self.fetch_imm16(mmu)? as i16)
+                } else {
+                    self.fetch_imm32(mmu)? as i32
+                };
                 self.regs.eip = (self.regs.eip as i32).wrapping_add(disp) as u32;
                 Ok(StepOk::Continued)
             }
@@ -1547,6 +1617,20 @@ impl Cpu {
             0xEB => {
                 let disp = sign_ext_8_to_32(self.fetch_imm8(mmu)?);
                 self.regs.eip = self.regs.eip.wrapping_add(disp);
+                Ok(StepOk::Continued)
+            }
+            // 0xE3 — JCXZ/JECXZ rel8 (jump if CX/ECX == 0). The tested
+            // register follows the address size.
+            0xE3 => {
+                let disp = sign_ext_8_to_32(self.fetch_imm8(mmu)?);
+                let zero = if self.addr16() {
+                    self.regs.get16(Reg16::Cx) == 0
+                } else {
+                    self.regs.get32(Reg32::Ecx) == 0
+                };
+                if zero {
+                    self.regs.eip = self.regs.eip.wrapping_add(disp);
+                }
                 Ok(StepOk::Continued)
             }
 
@@ -1652,6 +1736,15 @@ impl Cpu {
                     })
                 }
             }
+
+            // PUSH/POP segment registers (16-bit Win16 code only).
+            0x06 => self.seg_push(mmu, Seg::Es, entry_eip, 0x06),
+            0x07 => self.seg_pop(mmu, Seg::Es, entry_eip, 0x07),
+            0x0E => self.seg_push(mmu, Seg::Cs, entry_eip, 0x0E),
+            0x16 => self.seg_push(mmu, Seg::Ss, entry_eip, 0x16),
+            0x17 => self.seg_pop(mmu, Seg::Ss, entry_eip, 0x17),
+            0x1E => self.seg_push(mmu, Seg::Ds, entry_eip, 0x1E),
+            0x1F => self.seg_pop(mmu, Seg::Ds, entry_eip, 0x1F),
 
             // Far CALL ptr16:16 (0x9A) / far JMP ptr16:16 (0xEA).
             // Only meaningful in 16-bit segmented (Win16/NE) mode,
