@@ -19,13 +19,13 @@
 //! 1 Appendix B (EFLAGS Cross-Reference).
 
 use super::decode::{
-    read_operand16, read_operand32, resolve_modrm32, sign_ext_8_to_16, sign_ext_8_to_32,
-    write_operand16, write_operand32, ModRm, Operand,
+    read_operand16, read_operand32, resolve_modrm16, resolve_modrm32, sign_ext_8_to_16,
+    sign_ext_8_to_32, write_operand16, write_operand32, ModRm, Operand,
 };
 use super::mmu::Mmu;
 use super::regs::{Flags, Reg16, Reg32, Reg8, Regs};
 use super::Trap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Sentinel return address pushed by host-initiated calls. When
 /// `eip` reaches the sentinel after a `ret`, [`Cpu::run`] stops.
@@ -194,6 +194,38 @@ pub struct Cpu {
     /// captures, additional watchpoint hits are silently
     /// dropped to keep the diagnostic compact.  Default 16.
     pub register_snapshots_cap: usize,
+
+    // ── 16-bit segmented (Win16 / NE) execution ────────────────
+    /// When `true`, the *default* operand and address size is 16-bit
+    /// (the `0x66`/`0x67` prefixes toggle to 32-bit) and real
+    /// segmentation is in effect: every memory access adds the active
+    /// segment's linear base. Set by the NE loader; `false` for the
+    /// flat 32-bit Win32 path, where all the machinery below is inert
+    /// (all bases 0, default size 32-bit) so behaviour is unchanged.
+    code16: bool,
+    /// Current segment selectors (the 16-bit tokens loaded into the
+    /// segment registers). Only meaningful in `code16` mode; used so
+    /// `far call`/`push cs` can save the real selector.
+    cs_sel: u16,
+    ds_sel: u16,
+    es_sel: u16,
+    ss_sel: u16,
+    /// Cached linear bases for CS/DS/ES/SS (FS/GS use [`Self::fs_base`]
+    /// / [`Self::gs_base`]). In flat 32-bit mode these stay 0.
+    cs_base: u32,
+    ds_base: u32,
+    es_base: u32,
+    ss_base: u32,
+    /// Default segment for the operand most recently resolved by
+    /// [`Self::resolve_modrm`]. In 16-bit addressing `[bp]`-based
+    /// forms default to SS, everything else to DS; in 32-bit mode it
+    /// is always DS (bases are 0, so it never changes the result).
+    cur_default_seg: Seg,
+    /// Loader-populated selector → linear-base map. The NE loader
+    /// assigns each segment (and the import-thunk window) a selector
+    /// and registers its base here; `mov ds,ax` / `retf` / far `call`
+    /// look the base up when a segment register is reloaded.
+    selectors: BTreeMap<u16, u32>,
 }
 
 /// Segment-override prefix selector.
@@ -248,6 +280,17 @@ impl Cpu {
             register_snapshots: Vec::new(),
             memory_snapshots: Vec::new(),
             register_snapshots_cap: 16,
+            code16: false,
+            cs_sel: 0,
+            ds_sel: 0,
+            es_sel: 0,
+            ss_sel: 0,
+            cs_base: 0,
+            ds_base: 0,
+            es_base: 0,
+            ss_base: 0,
+            cur_default_seg: Seg::Ds,
+            selectors: BTreeMap::new(),
         }
     }
 
@@ -341,12 +384,179 @@ impl Cpu {
     /// segment-override prefix. Called by every memory-touching
     /// helper. Returns the final linear address.
     pub(super) fn seg_translate(&self, ea: u32) -> u32 {
-        match self.seg_override {
-            Some(Seg::Fs) => ea.wrapping_add(self.fs_base),
-            Some(Seg::Gs) => ea.wrapping_add(self.gs_base),
-            // In 32-bit flat mode all other segment bases are 0,
-            // so a CS/DS/ES/SS override is a no-op.
-            _ => ea,
+        // The effective segment is the override prefix if present,
+        // else the operand's default segment (DS, or SS for
+        // BP-relative 16-bit forms). In flat 32-bit mode every base
+        // is 0 except FS/GS, so this reduces exactly to the old
+        // behaviour (CS/DS/ES/SS overrides were no-ops).
+        let seg = self.seg_override.unwrap_or(self.cur_default_seg);
+        ea.wrapping_add(self.seg_base(seg))
+    }
+
+    /// Linear base of segment `s`.
+    fn seg_base(&self, s: Seg) -> u32 {
+        match s {
+            Seg::Es => self.es_base,
+            Seg::Cs => self.cs_base,
+            Seg::Ss => self.ss_base,
+            Seg::Ds => self.ds_base,
+            Seg::Fs => self.fs_base,
+            Seg::Gs => self.gs_base,
+        }
+    }
+
+    /// Enable 16-bit segmented (Win16) execution. After this, the
+    /// default operand/address size is 16-bit and segment bases are
+    /// applied to every access. Called by the NE loader.
+    pub fn set_code16(&mut self, on: bool) {
+        self.code16 = on;
+    }
+
+    /// Register a selector → linear-base mapping (NE loader).
+    pub fn define_selector(&mut self, selector: u16, base: u32) {
+        self.selectors.insert(selector, base);
+    }
+
+    /// Base for a selector, if defined.
+    fn selector_base(&self, selector: u16) -> Option<u32> {
+        self.selectors.get(&selector).copied()
+    }
+
+    /// Load a segment register with `selector`, updating the cached
+    /// base from the selector table (unknown selectors map to base 0).
+    pub(crate) fn load_segment(&mut self, seg: Seg, selector: u16) {
+        let base = self.selector_base(selector).unwrap_or(0);
+        match seg {
+            Seg::Cs => {
+                self.cs_sel = selector;
+                self.cs_base = base;
+            }
+            Seg::Ds => {
+                self.ds_sel = selector;
+                self.ds_base = base;
+            }
+            Seg::Es => {
+                self.es_sel = selector;
+                self.es_base = base;
+            }
+            Seg::Ss => {
+                self.ss_sel = selector;
+                self.ss_base = base;
+            }
+            Seg::Fs => self.fs_base = base,
+            Seg::Gs => self.gs_base = base,
+        }
+    }
+
+    /// Selector currently in `seg` (only CS/DS/ES/SS tracked).
+    fn segment_selector(&self, seg: Seg) -> u16 {
+        match seg {
+            Seg::Cs => self.cs_sel,
+            Seg::Ds => self.ds_sel,
+            Seg::Es => self.es_sel,
+            Seg::Ss => self.ss_sel,
+            Seg::Fs | Seg::Gs => 0,
+        }
+    }
+
+    /// Set the entry point as a far `CS:IP` pair, resolving the CS
+    /// base from the selector table and folding it into the linear
+    /// `eip` the fetch path uses.
+    pub fn set_cs_ip(&mut self, cs_selector: u16, ip: u16) {
+        self.load_segment(Seg::Cs, cs_selector);
+        self.regs.eip = self.cs_base.wrapping_add(u32::from(ip));
+    }
+
+    /// Set `SS:SP` for the initial 16-bit stack.
+    pub fn set_ss_sp(&mut self, ss_selector: u16, sp: u16) {
+        self.load_segment(Seg::Ss, ss_selector);
+        self.regs.set_esp(u32::from(sp));
+    }
+
+    /// True if the CPU is in 16-bit segmented (Win16) mode.
+    #[must_use]
+    pub fn is_code16(&self) -> bool {
+        self.code16
+    }
+
+    /// Current DS selector (the DGROUP/auto-data segment in Win16).
+    #[must_use]
+    pub fn ds_selector(&self) -> u16 {
+        self.ds_sel
+    }
+
+    /// Load segment register `which` (0=ES, 1=CS, 2=SS, 3=DS) with a
+    /// selector — the Sreg encoding Win16 API stubs use to hand back
+    /// `ES:BX`-style far results. CS reloads also refold `eip`.
+    pub fn set_segment_reg(&mut self, which: u8, selector: u16) {
+        self.load_segment(seg_from_reg_field(which), selector);
+    }
+
+    /// Linear address of a far pointer `selector:offset`, using the
+    /// loader-populated selector table. Win16 API stubs use this to
+    /// marshal `LPSTR` / buffer arguments (which arrive as far
+    /// pointers) into host-readable linear addresses.
+    #[must_use]
+    pub fn far_to_linear(&self, selector: u16, offset: u16) -> u32 {
+        self.selector_base(selector)
+            .unwrap_or(0)
+            .wrapping_add(u32::from(offset))
+    }
+
+    /// Read a 16-bit word off the current stack at `SS:(SP + byte_off)`
+    /// — the way Win16 FAR PASCAL stubs fetch their arguments (which
+    /// sit above the 4-byte far return address).
+    ///
+    /// # Errors
+    /// Propagates a memory fault if the stack slot is unmapped.
+    pub fn stack_word(&self, mmu: &Mmu, byte_off: u32) -> Result<u16, Trap> {
+        let sp = self.regs.esp().wrapping_add(byte_off) & 0xFFFF;
+        mmu.load16(self.ss_base.wrapping_add(sp))
+    }
+
+    /// Read a 32-bit dword (e.g. a far pointer or `LONG`) off the stack
+    /// at `SS:(SP + byte_off)`.
+    ///
+    /// # Errors
+    /// Propagates a memory fault if the stack slot is unmapped.
+    pub fn stack_dword(&self, mmu: &Mmu, byte_off: u32) -> Result<u32, Trap> {
+        let lo = self.stack_word(mmu, byte_off)?;
+        let hi = self.stack_word(mmu, byte_off + 2)?;
+        Ok((u32::from(hi) << 16) | u32::from(lo))
+    }
+
+    /// Perform a Win16 FAR PASCAL return from a stub: pop the far
+    /// return address (IP then CS), reload CS, and discard
+    /// `clean_bytes` of caller-pushed arguments (callee-cleanup).
+    ///
+    /// # Errors
+    /// Propagates a memory fault if the stack is unmapped.
+    pub(crate) fn far_return_and_clean(
+        &mut self,
+        mmu: &mut Mmu,
+        clean_bytes: u16,
+    ) -> Result<(), Trap> {
+        let ip = self.pop16(mmu)?;
+        let cs = self.pop16(mmu)?;
+        self.load_segment(Seg::Cs, cs);
+        self.regs.eip = self.cs_base.wrapping_add(u32::from(ip));
+        if clean_bytes != 0 {
+            self.inc_sp(u32::from(clean_bytes));
+        }
+        Ok(())
+    }
+
+    /// Resolve a ModR/M operand, dispatching on the effective address
+    /// size. Records the operand's default segment (for `seg_translate`)
+    /// and returns the operand plus the bytes consumed past the ModR/M.
+    fn resolve_modrm(&mut self, mr: ModRm, bytes: &[u8]) -> Result<(Operand, usize), Trap> {
+        if self.addr16() {
+            let (op, consumed, bp_relative) = resolve_modrm16(mr, bytes, &self.regs)?;
+            self.cur_default_seg = if bp_relative { Seg::Ss } else { Seg::Ds };
+            Ok((op, consumed))
+        } else {
+            self.cur_default_seg = Seg::Ds;
+            resolve_modrm32(mr, bytes, &self.regs)
         }
     }
 
@@ -386,35 +596,59 @@ impl Cpu {
         }
     }
 
+    /// Decrement the stack pointer by `n`, wrapping at 16 bits in
+    /// `code16` mode (SP is 16-bit there) and returning the new value.
+    fn dec_sp(&mut self, n: u32) -> u32 {
+        let sp = if self.code16 {
+            (self.regs.esp().wrapping_sub(n)) & 0xFFFF
+        } else {
+            self.regs.esp().wrapping_sub(n)
+        };
+        self.regs.set_esp(sp);
+        sp
+    }
+
+    /// Increment the stack pointer by `n` (16-bit wrap in `code16`).
+    fn inc_sp(&mut self, n: u32) {
+        let sp = if self.code16 {
+            (self.regs.esp().wrapping_add(n)) & 0xFFFF
+        } else {
+            self.regs.esp().wrapping_add(n)
+        };
+        self.regs.set_esp(sp);
+    }
+
+    /// Linear address of the current top of stack: `ss_base + SP`
+    /// (`ss_base` is 0 in flat 32-bit mode, so this is identity there).
+    fn stack_addr(&self, sp: u32) -> u32 {
+        self.ss_base.wrapping_add(sp)
+    }
+
     /// Push a 32-bit value onto the guest stack.
     pub fn push32(&mut self, mmu: &mut Mmu, value: u32) -> Result<(), Trap> {
-        let new_esp = self.regs.esp().wrapping_sub(4);
-        self.regs.set_esp(new_esp);
-        mmu.store32(new_esp, value)
+        let new_sp = self.dec_sp(4);
+        mmu.store32(self.stack_addr(new_sp), value)
     }
 
     /// Pop a 32-bit value off the guest stack.
     pub fn pop32(&mut self, mmu: &mut Mmu) -> Result<u32, Trap> {
-        let esp = self.regs.esp();
-        let v = mmu.load32(esp)?;
-        self.regs.set_esp(esp.wrapping_add(4));
+        let v = mmu.load32(self.stack_addr(self.regs.esp()))?;
+        self.inc_sp(4);
         Ok(v)
     }
 
     /// Push a 16-bit value onto the guest stack — used by 0x66-
-    /// prefixed PUSH r16 / PUSH imm16 forms. Decrements ESP by 2.
+    /// prefixed PUSH r16 / PUSH imm16 forms (and every push in
+    /// `code16` mode). Decrements SP by 2.
     pub fn push16(&mut self, mmu: &mut Mmu, value: u16) -> Result<(), Trap> {
-        let new_esp = self.regs.esp().wrapping_sub(2);
-        self.regs.set_esp(new_esp);
-        mmu.store16(new_esp, value)
+        let new_sp = self.dec_sp(2);
+        mmu.store16(self.stack_addr(new_sp), value)
     }
 
-    /// Pop a 16-bit value off the guest stack — used by 0x66-
-    /// prefixed POP r16 forms. Increments ESP by 2.
+    /// Pop a 16-bit value off the guest stack. Increments SP by 2.
     pub fn pop16(&mut self, mmu: &mut Mmu) -> Result<u16, Trap> {
-        let esp = self.regs.esp();
-        let v = mmu.load16(esp)?;
-        self.regs.set_esp(esp.wrapping_add(2));
+        let v = mmu.load16(self.stack_addr(self.regs.esp()))?;
+        self.inc_sp(2);
         Ok(v)
     }
 
@@ -689,7 +923,7 @@ impl Cpu {
             // is the low 16 bits of the corresponding GP reg, and
             // flags are computed at 16-bit width (sign bit at 0x8000).
             0x40..=0x47 => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let r = Reg16::from_bits(op - 0x40);
                     let v = self.regs.get16(r);
                     let cf = self.regs.flags.cf;
@@ -708,7 +942,7 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
             0x48..=0x4F => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let r = Reg16::from_bits(op - 0x48);
                     let v = self.regs.get16(r);
                     let cf = self.regs.flags.cf;
@@ -772,7 +1006,7 @@ impl Cpu {
             // 16 bits of the corresponding GP register (upper 16
             // preserved per Intel SDM Vol. 1 §3.4.1.1).
             0x50..=0x57 => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let r = Reg16::from_bits(op - 0x50);
                     let v = self.regs.get16(r);
                     self.push16(mmu, v)?;
@@ -784,7 +1018,7 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
             0x58..=0x5F => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let r = Reg16::from_bits(op - 0x58);
                     let v = self.pop16(mmu)?;
                     self.regs.set16(r, v);
@@ -799,7 +1033,7 @@ impl Cpu {
             // PUSH imm32 (0x68) / PUSH imm8 (0x6A) — under 0x66
             // PUSH imm16 / PUSH imm8-sign-extended-to-16, ESP -= 2.
             0x68 => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let v = self.fetch_imm16(mmu)?;
                     self.push16(mmu, v)?;
                 } else {
@@ -809,7 +1043,7 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
             0x6A => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let v = sign_ext_8_to_16(self.fetch_imm8(mmu)?);
                     self.push16(mmu, v)?;
                 } else {
@@ -824,10 +1058,10 @@ impl Cpu {
             0x69 => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (src_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (src_op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let src_op = self.seg_apply(src_op);
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let imm = self.fetch_imm16(mmu)? as i16 as i32;
                     let dst = Reg16::from_bits(mr.reg);
                     let a = read_operand16(src_op, &self.regs, mmu)? as i16 as i32;
@@ -858,10 +1092,10 @@ impl Cpu {
             0x6B => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (src_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (src_op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let src_op = self.seg_apply(src_op);
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let imm = sign_ext_8_to_16(self.fetch_imm8(mmu)?) as i16 as i32;
                     let dst = Reg16::from_bits(mr.reg);
                     let a = read_operand16(src_op, &self.regs, mmu)? as i16 as i32;
@@ -920,7 +1154,7 @@ impl Cpu {
             0x87 => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (rm_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (rm_op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let rm_op = self.seg_apply(rm_op);
                 let rhs_reg = Reg32::from_bits(mr.reg);
@@ -986,7 +1220,7 @@ impl Cpu {
             // 0x9C — PUSHFD (no prefix) // PUSHF (under 0x66)
             0x9C => {
                 let v = self.regs.flags.pack();
-                if self.op_size_16 {
+                if self.op_size_16() {
                     self.push16(mmu, v as u16)?;
                 } else {
                     self.push32(mmu, v)?;
@@ -995,7 +1229,7 @@ impl Cpu {
             }
             // 0x9D — POPFD (no prefix) // POPF (under 0x66)
             0x9D => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let lo = self.pop16(mmu)?;
                     let cur = self.regs.flags.pack();
                     self.regs.flags = Flags::unpack((cur & 0xFFFF_0000) | u32::from(lo));
@@ -1039,16 +1273,16 @@ impl Cpu {
 
             // 0xA0 — MOV al, moffs8 ; 0xA1 — MOV eax, moffs32 ; A2/A3 inverse
             0xA0 => {
-                let imm = self.fetch_imm32(mmu)?;
+                let imm = self.fetch_moffs(mmu)?;
                 let m = self.seg_translate(imm);
                 let v = mmu.load8(m)?;
                 self.regs.set8(Reg8::Al, v);
                 Ok(StepOk::Continued)
             }
             0xA1 => {
-                let imm = self.fetch_imm32(mmu)?;
+                let imm = self.fetch_moffs(mmu)?;
                 let m = self.seg_translate(imm);
-                if self.op_size_16 {
+                if self.op_size_16() {
                     // 0x66 0xA1 moffs32 — MOV AX, [moffs32]. The
                     // moffs is still 32 bits in 32-bit address mode;
                     // 0x66 only changes the destination width.
@@ -1061,15 +1295,15 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
             0xA2 => {
-                let imm = self.fetch_imm32(mmu)?;
+                let imm = self.fetch_moffs(mmu)?;
                 let m = self.seg_translate(imm);
                 mmu.store8(m, self.regs.get8(Reg8::Al))?;
                 Ok(StepOk::Continued)
             }
             0xA3 => {
-                let imm = self.fetch_imm32(mmu)?;
+                let imm = self.fetch_moffs(mmu)?;
                 let m = self.seg_translate(imm);
-                if self.op_size_16 {
+                if self.op_size_16() {
                     mmu.store16(m, self.regs.get16(Reg16::Ax))?;
                 } else {
                     mmu.store32(m, self.regs.get32(Reg32::Eax))?;
@@ -1109,7 +1343,7 @@ impl Cpu {
             // 0xA9 — TEST eax, imm32 (no prefix) // TEST AX,
             // imm16 (under 0x66).
             0xA9 => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let imm = self.fetch_imm16(mmu)?;
                     let res = self.regs.get16(Reg16::Ax) & imm;
                     self.regs.flags.cf = false;
@@ -1137,7 +1371,7 @@ impl Cpu {
             // SDM Vol. 1 §3.4.1.1 the upper 16 bits are preserved
             // when writing through the 16-bit alias.
             0xB8..=0xBF => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let r = Reg16::from_bits(op - 0xB8);
                     let imm = self.fetch_imm16(mmu)?;
                     self.regs.set16(r, imm);
@@ -1215,10 +1449,10 @@ impl Cpu {
                 let mr = self.fetch_modrm(mmu)?;
                 debug_assert!(mr.reg == 0, "group 11 /0");
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let imm = self.fetch_imm16(mmu)?;
                     write_operand16(op, imm, &mut self.regs, mmu)?;
                 } else {
@@ -1271,10 +1505,23 @@ impl Cpu {
             }),
 
             // 0xCD — INT imm8 → trap.
-            0xCD => Err(Trap::PrivilegedOpcode {
-                eip: entry_eip,
-                mnemonic: "int imm8",
-            }),
+            0xCD => {
+                let num = self.fetch_imm8(mmu)?;
+                if self.code16 {
+                    // Software interrupts (DOS INT 21h, …) are serviced
+                    // by the run loop; `eip` already points past the
+                    // 2-byte `INT n`.
+                    Err(Trap::SoftwareInterrupt {
+                        num,
+                        eip: self.regs.eip,
+                    })
+                } else {
+                    Err(Trap::PrivilegedOpcode {
+                        eip: entry_eip,
+                        mnemonic: "int imm8",
+                    })
+                }
+            }
 
             // 0xCF — IRETD → trap.
             0xCF => Err(Trap::PrivilegedOpcode {
@@ -1406,36 +1653,99 @@ impl Cpu {
                 }
             }
 
-            // Far-call / far-jmp / segment loads and other
-            // non-supported single-byte opcodes trap.
-            0x9A | 0xEA => Err(Trap::PrivilegedOpcode {
-                eip: entry_eip,
-                mnemonic: "far call/jmp",
-            }),
+            // Far CALL ptr16:16 (0x9A) / far JMP ptr16:16 (0xEA).
+            // Only meaningful in 16-bit segmented (Win16/NE) mode,
+            // where they transfer between segments and are how an NE
+            // module reaches an imported entry point (the loader
+            // rewrites the operand to a thunk selector:offset). In
+            // flat 32-bit user mode these never appear; keep trapping.
+            0x9A => {
+                if self.code16 {
+                    let off = self.fetch_imm16(mmu)?;
+                    let sel = self.fetch_imm16(mmu)?;
+                    // eip already points past the operand → its offset
+                    // within CS is the return IP.
+                    let ret_ip = self.regs.eip.wrapping_sub(self.cs_base) as u16;
+                    self.push16(mmu, self.cs_sel)?;
+                    self.push16(mmu, ret_ip)?;
+                    self.load_segment(Seg::Cs, sel);
+                    self.regs.eip = self.cs_base.wrapping_add(u32::from(off));
+                    Ok(StepOk::Continued)
+                } else {
+                    Err(Trap::PrivilegedOpcode {
+                        eip: entry_eip,
+                        mnemonic: "far call",
+                    })
+                }
+            }
+            0xEA => {
+                if self.code16 {
+                    let off = self.fetch_imm16(mmu)?;
+                    let sel = self.fetch_imm16(mmu)?;
+                    self.load_segment(Seg::Cs, sel);
+                    self.regs.eip = self.cs_base.wrapping_add(u32::from(off));
+                    Ok(StepOk::Continued)
+                } else {
+                    Err(Trap::PrivilegedOpcode {
+                        eip: entry_eip,
+                        mnemonic: "far jmp",
+                    })
+                }
+            }
+            // Far RET (0xCB) and far RET imm16 (0xCA) — pop IP then CS
+            // and (for 0xCA) discard `imm16` stack bytes. 16-bit only.
+            0xCB | 0xCA => {
+                if self.code16 {
+                    let pop_extra = if op == 0xCA {
+                        self.fetch_imm16(mmu)?
+                    } else {
+                        0
+                    };
+                    let ip = self.pop16(mmu)?;
+                    let sel = self.pop16(mmu)?;
+                    self.load_segment(Seg::Cs, sel);
+                    self.regs.eip = self.cs_base.wrapping_add(u32::from(ip));
+                    if pop_extra != 0 {
+                        self.inc_sp(u32::from(pop_extra));
+                    }
+                    if self.regs.eip == RET_SENTINEL {
+                        Ok(StepOk::Halted)
+                    } else {
+                        Ok(StepOk::Continued)
+                    }
+                } else {
+                    Err(Trap::PrivilegedOpcode {
+                        eip: entry_eip,
+                        mnemonic: "far ret",
+                    })
+                }
+            }
             // `MOV r/m16, Sreg` (0x8C) and `MOV Sreg, r/m16` (0x8E).
-            // Userland 32-bit code uses these only to save/restore
-            // segment selectors into a CONTEXT structure (the CRT's
-            // RtlCaptureContext-style exception bookkeeping). The
-            // segment selectors don't affect memory addressing in
-            // the flat user-mode model — CS/DS/ES/SS use a fixed
-            // flat selector, FS_BASE is set elsewhere (TIB), GS is
-            // unused. We hand back canonical Win32 selector values
-            // on read; writes are accepted and discarded.
+            // In 16-bit mode these load/store the real segment
+            // selectors and update the cached segment base. In flat
+            // 32-bit user mode the selectors don't affect addressing,
+            // so we keep the legacy behaviour: hand back canonical
+            // Win32 selector values on read; accept + discard writes.
             //
             // Reference: Intel SDM Vol. 2A `MOV — Move to/from
             // Segment Register` instruction reference.
             0x8C => {
                 let mr = self.fetch_modrm(mmu)?;
-                let value = win32_segment_selector(mr.reg);
+                let value = if self.code16 {
+                    self.segment_selector(seg_from_reg_field(mr.reg))
+                } else {
+                    win32_segment_selector(mr.reg)
+                };
                 let (_old, dst) = self.resolve_op16(mr, mmu)?;
                 self.write_op16(dst, value, mmu)?;
                 Ok(StepOk::Continued)
             }
             0x8E => {
                 let mr = self.fetch_modrm(mmu)?;
-                // Read + discard — the selector value carries no
-                // meaning in our flat memory model.
-                let _ = self.resolve_op16(mr, mmu)?;
+                let (value, _dst) = self.resolve_op16(mr, mmu)?;
+                if self.code16 {
+                    self.load_segment(seg_from_reg_field(mr.reg), value);
+                }
                 Ok(StepOk::Continued)
             }
 
@@ -1454,7 +1764,7 @@ impl Cpu {
             0x40..=0x4F => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (src_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (src_op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let src_op = self.seg_apply(src_op);
                 let dst = Reg32::from_bits(mr.reg);
@@ -1507,7 +1817,7 @@ impl Cpu {
             0xA3 => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
                 let v = read_operand32(op, &self.regs, mmu)?;
@@ -1527,7 +1837,7 @@ impl Cpu {
             0xAB => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
                 let v = read_operand32(op, &self.regs, mmu)?;
@@ -1542,7 +1852,7 @@ impl Cpu {
             0xB3 => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
                 let v = read_operand32(op, &self.regs, mmu)?;
@@ -1556,7 +1866,7 @@ impl Cpu {
             0xB1 => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
                 let dest = read_operand32(op, &self.regs, mmu)?;
@@ -1574,7 +1884,7 @@ impl Cpu {
             0xC1 => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
                 let dest = read_operand32(op, &self.regs, mmu)?;
@@ -1596,7 +1906,7 @@ impl Cpu {
             0xAF => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
                 let dst = Reg32::from_bits(mr.reg);
@@ -1631,7 +1941,7 @@ impl Cpu {
             0xBA => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
                 let v = read_operand32(op, &self.regs, mmu)?;
@@ -1656,7 +1966,7 @@ impl Cpu {
             0xBC | 0xBD => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
-                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
                 let dst = Reg32::from_bits(mr.reg);
@@ -1710,7 +2020,7 @@ impl Cpu {
                 // MagicYUV's stack-buffer descriptor relied on
                 // *not* happening. Route to the SSE2 executor when
                 // the `0x66` prefix is set.
-                if self.op_size_16 {
+                if self.op_size_16() {
                     super::isa_sse::dispatch_xmm_int(self, mmu, op2, entry_eip)
                 } else {
                     super::isa_mmx::dispatch(self, mmu, op2, entry_eip)
@@ -1759,7 +2069,7 @@ impl Cpu {
     fn movbe_load(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let dst = Reg32::from_bits(mr.reg);
@@ -1783,13 +2093,13 @@ impl Cpu {
     fn movbe_store(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let src = self.regs.get32(Reg32::from_bits(mr.reg));
         match op {
             Operand::Mem32(addr) => {
-                if self.op_size_16 {
+                if self.op_size_16() {
                     let v = (src as u16).swap_bytes();
                     mmu.write(addr, &v.to_le_bytes())?;
                 } else {
@@ -1887,11 +2197,32 @@ impl Cpu {
         Ok(u32::from_le_bytes([b0, b1, b2, b3]))
     }
 
-    /// Operand-size override (`0x66` prefix) for the current
-    /// instruction. Exposed for the SSE executor — `0x66` selects
-    /// packed-double semantics on SSE2 opcodes.
+    /// Fetch a direct memory offset for the `MOV AL/AX/eAX ↔ moffs`
+    /// opcodes (`0xA0..=0xA3`): 16-bit wide in 16-bit address mode,
+    /// 32-bit otherwise. The default segment for a `moffs` is DS (a
+    /// segment-override prefix still wins via `seg_translate`).
+    fn fetch_moffs(&mut self, mmu: &Mmu) -> Result<u32, Trap> {
+        self.cur_default_seg = Seg::Ds;
+        if self.addr16() {
+            Ok(u32::from(self.fetch_imm16(mmu)?))
+        } else {
+            self.fetch_imm32(mmu)
+        }
+    }
+
+    /// *Effective* 16-bit operand size for the current instruction:
+    /// the CPU's default size (32-bit in flat mode, 16-bit in
+    /// `code16`) XOR the `0x66` operand-size override. In the flat
+    /// 32-bit path `code16` is `false`, so this equals the raw `0x66`
+    /// flag and behaviour is identical to before.
     pub(super) fn op_size_16(&self) -> bool {
-        self.op_size_16
+        self.op_size_16 ^ self.code16
+    }
+
+    /// *Effective* 16-bit address size: the default (32-bit flat /
+    /// 16-bit `code16`) XOR the `0x67` address-size override.
+    pub(super) fn addr16(&self) -> bool {
+        self.addr_size_16 ^ self.code16
     }
 
     /// REP / REPNE prefix byte for the current instruction, if any
@@ -1955,7 +2286,7 @@ impl Cpu {
             Ok((self.regs.get8(r), Op8Dst::Reg(r)))
         } else {
             let bytes = self.peek_after_modrm(mmu, 16)?;
-            let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+            let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
             self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
             match self.seg_apply(op) {
                 Operand::Reg32(_) => unreachable!("mod != 11 cannot be reg form"),
@@ -1970,7 +2301,7 @@ impl Cpu {
             Ok((self.regs.get16(r), Op16Dst::Reg(r)))
         } else {
             let bytes = self.peek_after_modrm(mmu, 16)?;
-            let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+            let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
             self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
             match self.seg_apply(op) {
                 Operand::Reg32(_) => unreachable!(),
@@ -2002,13 +2333,13 @@ impl Cpu {
     // ----- ALU dispatch helpers (32-bit) --------------------------
 
     fn alu_rm32_r32(&mut self, op: u8, mmu: &mut Mmu, f: AluFn32) -> Result<StepOk, Trap> {
-        if self.op_size_16 {
+        if self.op_size_16() {
             let f16 = alu_fn16_for_opcode(op);
             return self.alu_rm16_r16(mmu, f16);
         }
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (lhs_op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let lhs_op = self.seg_apply(lhs_op);
         let lhs = read_operand32(lhs_op, &self.regs, mmu)?;
@@ -2021,13 +2352,13 @@ impl Cpu {
     }
 
     fn alu_r32_rm32(&mut self, op: u8, mmu: &mut Mmu, f: AluFn32) -> Result<StepOk, Trap> {
-        if self.op_size_16 {
+        if self.op_size_16() {
             let f16 = alu_fn16_for_opcode(op);
             return self.alu_r16_rm16(mmu, f16);
         }
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (rhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (rhs_op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let rhs_op = self.seg_apply(rhs_op);
         let dst = Reg32::from_bits(mr.reg);
@@ -2045,7 +2376,7 @@ impl Cpu {
     fn alu_rm16_r16(&mut self, mmu: &mut Mmu, f: AluFn16) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (lhs_op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let lhs_op = self.seg_apply(lhs_op);
         let lhs = read_operand16(lhs_op, &self.regs, mmu)?;
@@ -2062,7 +2393,7 @@ impl Cpu {
     fn alu_r16_rm16(&mut self, mmu: &mut Mmu, f: AluFn16) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (rhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (rhs_op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let rhs_op = self.seg_apply(rhs_op);
         let dst = Reg16::from_bits(mr.reg);
@@ -2076,7 +2407,7 @@ impl Cpu {
     }
 
     fn alu_eax_imm32(&mut self, op: u8, mmu: &Mmu, f: AluFn32) -> Result<StepOk, Trap> {
-        if self.op_size_16 {
+        if self.op_size_16() {
             let f16 = alu_fn16_for_opcode(op);
             let imm = self.fetch_imm16(mmu)?;
             let lhs = self.regs.get16(Reg16::Ax);
@@ -2113,10 +2444,10 @@ impl Cpu {
     fn group1_rm32_imm32(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (lhs_op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let lhs_op = self.seg_apply(lhs_op);
-        if self.op_size_16 {
+        if self.op_size_16() {
             let lhs = read_operand16(lhs_op, &self.regs, mmu)?;
             let imm = self.fetch_imm16(mmu)?;
             let (result, write_back) = group1_op_16(mr.reg, lhs, imm, &mut self.regs.flags);
@@ -2140,10 +2471,10 @@ impl Cpu {
     fn group1_rm32_imm8(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (lhs_op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let lhs_op = self.seg_apply(lhs_op);
-        if self.op_size_16 {
+        if self.op_size_16() {
             let lhs = read_operand16(lhs_op, &self.regs, mmu)?;
             let imm = sign_ext_8_to_16(self.fetch_imm8(mmu)?);
             let (result, write_back) = group1_op_16(mr.reg, lhs, imm, &mut self.regs.flags);
@@ -2183,10 +2514,10 @@ impl Cpu {
     fn mov_rm32_r32(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
-        if self.op_size_16 {
+        if self.op_size_16() {
             // 0x66 prefix: MOV r/m16, r16. The reg field still
             // selects from the same r0..r7 quadrant — we reinterpret
             // it as the low-16 of the corresponding GP reg.
@@ -2209,10 +2540,10 @@ impl Cpu {
     fn mov_r32_rm32(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
-        if self.op_size_16 {
+        if self.op_size_16() {
             // 0x66 prefix: MOV r16, r/m16. Preserves the upper 16
             // bits of the destination register per Intel SDM
             // Vol. 1 §3.4.1.1 (general-purpose register access in
@@ -2238,7 +2569,7 @@ impl Cpu {
             });
         }
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         // LEA computes the effective address WITHOUT applying any
         // segment-base — Intel SDM Vol. 2A LEA.
@@ -2260,7 +2591,7 @@ impl Cpu {
         }
         let v = self.pop32(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         write_operand32(op, v, &mut self.regs, mmu)?;
@@ -2268,12 +2599,12 @@ impl Cpu {
     }
 
     fn group2_rm32(&mut self, mmu: &mut Mmu, source: ShiftCount) -> Result<StepOk, Trap> {
-        if self.op_size_16 {
+        if self.op_size_16() {
             return self.group2_rm16(mmu, source);
         }
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let val = read_operand32(op, &self.regs, mmu)?;
@@ -2391,7 +2722,7 @@ impl Cpu {
     fn group2_rm16(&mut self, mmu: &mut Mmu, source: ShiftCount) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let val = read_operand16(op, &self.regs, mmu)?;
@@ -2497,12 +2828,12 @@ impl Cpu {
     }
 
     fn group3_rm32(&mut self, mmu: &mut Mmu, entry_eip: u32) -> Result<StepOk, Trap> {
-        if self.op_size_16 {
+        if self.op_size_16() {
             return self.group3_rm16(mmu, entry_eip);
         }
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let val = read_operand32(op, &self.regs, mmu)?;
@@ -2587,7 +2918,7 @@ impl Cpu {
     fn group3_rm16(&mut self, mmu: &mut Mmu, entry_eip: u32) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let val = read_operand16(op, &self.regs, mmu)?;
@@ -2891,7 +3222,7 @@ impl Cpu {
     fn shld_imm(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let imm = u32::from(self.fetch_imm8(mmu)? & 0x1F);
@@ -2901,7 +3232,7 @@ impl Cpu {
     fn shld_cl(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let count = u32::from(self.regs.get8(Reg8::Cl)) & 0x1F;
@@ -2935,7 +3266,7 @@ impl Cpu {
     fn shrd_imm(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let imm = u32::from(self.fetch_imm8(mmu)? & 0x1F);
@@ -2945,7 +3276,7 @@ impl Cpu {
     fn shrd_cl(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let count = u32::from(self.regs.get8(Reg8::Cl)) & 0x1F;
@@ -3124,7 +3455,7 @@ impl Cpu {
     fn string_size(&self, sized_dword: bool) -> StringSize {
         if !sized_dword {
             StringSize::B8
-        } else if self.op_size_16 {
+        } else if self.op_size_16() {
             StringSize::W16
         } else {
             StringSize::D32
@@ -3184,7 +3515,7 @@ impl Cpu {
     fn group5_rm32(&mut self, mmu: &mut Mmu, entry_eip: u32) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
         let val = read_operand32(op, &self.regs, mmu)?;
@@ -3258,6 +3589,19 @@ fn win32_segment_selector(reg_field: u8) -> u16 {
         4 => 0x003B, // FS — per-thread TIB selector
         5 => 0x0000, // GS — unused in 32-bit NT
         _ => 0x0000,
+    }
+}
+
+/// Map a ModR/M `reg` field to a segment register, per Intel's Sreg
+/// encoding (used by `MOV Sreg,r/m16` / `MOV r/m16,Sreg`).
+fn seg_from_reg_field(reg_field: u8) -> Seg {
+    match reg_field & 7 {
+        0 => Seg::Es,
+        1 => Seg::Cs,
+        2 => Seg::Ss,
+        3 => Seg::Ds,
+        4 => Seg::Fs,
+        _ => Seg::Gs,
     }
 }
 
@@ -4640,5 +4984,111 @@ mod tests {
             *slot = mmu.load8(0x4200 + i as u32).unwrap();
         }
         assert_eq!(&got, b"ABCD");
+    }
+
+    // ── 16-bit segmented (Win16 / NE) execution ────────────────
+
+    /// Build a CPU in 16-bit mode with a code segment (sel 1 → base
+    /// `CODE`), data segment (sel 2 → base `DATA`) and stack segment
+    /// (sel 3 → base `STACK`), all mapped, with `code16` on.
+    fn make16() -> (Cpu, Mmu) {
+        const CODE: u32 = 0x10000;
+        const DATA: u32 = 0x20000;
+        const STACK: u32 = 0x30000;
+        let mut mmu = Mmu::new();
+        mmu.map(CODE, 0x1_0000, Perm::R | Perm::X);
+        mmu.map(DATA, 0x1_0000, Perm::R | Perm::W);
+        mmu.map(STACK, 0x1_0000, Perm::R | Perm::W);
+        let mut cpu = Cpu::new();
+        cpu.set_code16(true);
+        cpu.define_selector(1, CODE);
+        cpu.define_selector(2, DATA);
+        cpu.define_selector(3, STACK);
+        cpu.set_cs_ip(1, 0);
+        cpu.load_segment(Seg::Ds, 2);
+        cpu.load_segment(Seg::Es, 2);
+        cpu.set_ss_sp(3, 0xF000);
+        (cpu, mmu)
+    }
+
+    #[test]
+    fn modrm16_addressing_forms() {
+        let mut regs = Regs::new();
+        regs.set16(Reg16::Bx, 0x0100);
+        regs.set16(Reg16::Si, 0x0020);
+        regs.set16(Reg16::Bp, 0x0200);
+        // mod=00, rm=000 → [bx+si]
+        let (op, n, bp_rel) = resolve_modrm16(ModRm::decode(0b00_000_000), &[], &regs).unwrap();
+        assert!(matches!(op, Operand::Mem32(0x0120)));
+        assert_eq!(n, 0);
+        assert!(!bp_rel);
+        // mod=10, rm=110 → [bp+disp16], BP-relative (SS default)
+        let (op, n, bp_rel) =
+            resolve_modrm16(ModRm::decode(0b10_000_110), &[0x10, 0x00], &regs).unwrap();
+        assert!(matches!(op, Operand::Mem32(0x0210)));
+        assert_eq!(n, 2);
+        assert!(bp_rel);
+        // mod=00, rm=110 → bare disp16 (DS), not BP-relative
+        let (op, _n, bp_rel) =
+            resolve_modrm16(ModRm::decode(0b00_000_110), &[0x34, 0x12], &regs).unwrap();
+        assert!(matches!(op, Operand::Mem32(0x1234)));
+        assert!(!bp_rel);
+    }
+
+    #[test]
+    fn executes_16bit_entry_sequence() {
+        // Mirrors the SITEX10 entry: xor bp,bp ; push bp ; then a few
+        // 16-bit reg/mem ops through the DS segment base.
+        let (mut cpu, mut mmu) = make16();
+        // 33 ed          xor bp,bp
+        // 55             push bp
+        // b8 78 56       mov ax,0x5678
+        // a3 00 10       mov [0x1000],ax        (DS:0x1000)
+        write_code(
+            &mut mmu,
+            0x10000,
+            &[0x33, 0xED, 0x55, 0xB8, 0x78, 0x56, 0xA3, 0x00, 0x10],
+        );
+        for _ in 0..4 {
+            cpu.step(&mut mmu).unwrap();
+        }
+        assert_eq!(cpu.regs.get16(Reg16::Bp), 0);
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 0x5678);
+        // push bp decremented SP by 2 (0xF000 → 0xEFFE).
+        assert_eq!(cpu.regs.esp() & 0xFFFF, 0xEFFE);
+        // store landed at DS base + 0x1000 = 0x21000.
+        assert_eq!(mmu.load16(0x21000).unwrap(), 0x5678);
+    }
+
+    #[test]
+    fn far_call_transfers_segment_and_pushes_return() {
+        let (mut cpu, mut mmu) = make16();
+        // A separate "import thunk" window: selector 0xF1 → base 0x90000.
+        cpu.define_selector(0xF1, 0x90000);
+        // 9a 10 00 f1 00   call far 00F1:0010
+        write_code(&mut mmu, 0x10000, &[0x9A, 0x10, 0x00, 0xF1, 0x00]);
+        cpu.step(&mut mmu).unwrap();
+        // CS now the thunk selector; eip = base 0x90000 + 0x10.
+        assert_eq!(cpu.regs.eip, 0x90010);
+        // Return CS:IP pushed (selector 1, offset 5 = past the 5-byte
+        // far call). Stack grew down by 4 (two 16-bit pushes).
+        assert_eq!(cpu.regs.esp() & 0xFFFF, 0xEFFC);
+        let sp = cpu.ss_base.wrapping_add(cpu.regs.esp());
+        assert_eq!(mmu.load16(sp).unwrap(), 0x0005); // return IP
+        assert_eq!(mmu.load16(sp + 2).unwrap(), 0x0001); // return CS sel
+    }
+
+    #[test]
+    fn far_ret_restores_segment() {
+        let (mut cpu, mut mmu) = make16();
+        mmu.map(0x90000, 0x1000, Perm::R | Perm::X);
+        cpu.define_selector(0xF1, 0x90000);
+        // Push a far return target 0001:0042 then execute `retf`.
+        cpu.push16(&mut mmu, 0x0001).unwrap(); // CS selector
+        cpu.push16(&mut mmu, 0x0042).unwrap(); // IP
+        cpu.set_cs_ip(0xF1, 0); // pretend we're running in the thunk seg
+        write_code(&mut mmu, 0x90000, &[0xCB]); // retf
+        cpu.step(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.eip, 0x10042); // CODE base + 0x42
     }
 }

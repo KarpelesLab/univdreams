@@ -35,6 +35,10 @@ features = ["trace", "trace-exec"]
 
 [dependencies]
 thiserror = "2"
+# Reuse the byte-identical NE (16-bit Windows) reader for the Win16
+# loader (`ne` module): header, segment table, name / module-reference
+# tables. Segment mapping + relocation live in `ne`.
+ud-format = { path = "../ud-format" }
 # Read MSI compound-document tables for the in-emulator
 # msiexec implementation under `win32::msiexec`. Read-only
 # (open() takes Read+Seek; we feed it Cursor<&[u8]> over VFS

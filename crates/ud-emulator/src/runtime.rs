@@ -960,6 +960,89 @@ impl Sandbox {
         )
     }
 
+    /// Load a 16-bit Windows NE module in fail-soft mode: every
+    /// imported ordinal is wired to a trap-on-call thunk, so the run
+    /// stops at the first Win16 API the stub surface doesn't cover
+    /// (the NE analogue of [`Self::load_fail_soft`]). Returns the
+    /// [`crate::ne::NeImage`] describing how to enter it.
+    ///
+    /// # Errors
+    /// Returns [`crate::Error::NeLoader`] if the bytes are not a valid
+    /// NE or a segment fails to map.
+    pub fn load_ne_fail_soft(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<crate::ne::NeImage, crate::Error> {
+        // Register the Win16 API stub surface so the loader's
+        // relocation pass resolves known ordinals (KERNEL.91, …) to
+        // real stubs and only falls back to trap-on-call for the rest.
+        crate::win16::register_all(&mut self.registry);
+        let image = crate::ne::load_ne(&mut self.mmu, &mut self.registry, bytes)
+            .map_err(|e| crate::Error::NeLoader(e.to_string()))?;
+        self.host
+            .modules
+            .insert(name.to_ascii_lowercase(), crate::ne::WIN16_SEG_BASE);
+        Ok(image)
+    }
+
+    /// Drive a loaded NE module's entry point in 16-bit segmented
+    /// mode. Primes the CPU's selectors, `CS:IP`, `SS:SP` and DGROUP
+    /// data segments from `image`, pushes a far-return sentinel, then
+    /// runs until the entry returns or — in fail-soft mode — traps at
+    /// the first imported Win16 call. Mirrors [`Self::call_entry_point`].
+    ///
+    /// # Errors
+    /// Propagates any CPU trap (including the fail-soft
+    /// [`crate::emulator::Trap::UnresolvedImport`] that marks the first
+    /// unimplemented Win16 API).
+    pub fn call_ne_entry(&mut self, image: &crate::ne::NeImage) -> Result<u32, crate::Error> {
+        use crate::emulator::isa_int::{Seg, RET_SENTINEL};
+        use crate::emulator::regs::Reg32;
+
+        // Enter 16-bit segmented mode and install the selector table.
+        self.cpu.set_code16(true);
+        for &(sel, base) in &image.selectors {
+            self.cpu.define_selector(sel, base);
+        }
+        // Far-return sentinel selector → RET_SENTINEL linear address.
+        self.cpu
+            .define_selector(crate::ne::SENTINEL_SELECTOR, RET_SENTINEL);
+
+        // Initial stack, then push a far-return sentinel (CS:IP) so a
+        // top-level RETF halts the run loop.
+        self.cpu.set_ss_sp(image.init_ss, image.init_sp);
+        self.cpu
+            .push16(&mut self.mmu, crate::ne::SENTINEL_SELECTOR)?;
+        self.cpu.push16(&mut self.mmu, 0)?;
+
+        // DGROUP: DS/ES point at the automatic data segment.
+        if image.auto_data != 0 {
+            self.cpu.load_segment(Seg::Ds, image.auto_data);
+            self.cpu.load_segment(Seg::Es, image.auto_data);
+        }
+        self.cpu.set_cs_ip(image.entry_cs, image.entry_ip);
+
+        // Reset the bootstrap thread to a clean runnable state — the
+        // same hygiene `call_guest` applies before a top-level entry.
+        if self.host.active_tid == 1 {
+            let quantum = self.host.scheduler.quantum_default;
+            let t = self.host.cur_thread_mut();
+            t.status = crate::sched::ThreadStatus::Ready;
+            t.wait = None;
+            t.quantum_remaining = quantum;
+        }
+        self.host.exit_requested = None;
+
+        run_until_sentinel_free(
+            &mut self.cpu,
+            &mut self.mmu,
+            &mut self.registry,
+            &mut self.host,
+        )?;
+        Ok(self.cpu.regs.get32(Reg32::Eax))
+    }
+
     /// Drive the CPU until `eip == RET_SENTINEL`, dispatching to
     /// Win32 stubs whenever `eip` lands on a registered thunk
     /// address. Thin wrapper over [`crate::win32::run_until_sentinel`]

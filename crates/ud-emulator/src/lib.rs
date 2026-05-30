@@ -204,9 +204,11 @@ pub mod context;
 pub mod coverage;
 pub mod emulator;
 pub mod ffi;
+pub mod ne;
 pub mod pe;
 pub mod runtime;
 pub mod sched;
+pub mod win16;
 #[cfg(feature = "trace")]
 pub mod trace;
 pub mod win32;
@@ -249,6 +251,10 @@ pub enum Error {
     /// surface cannot satisfy (unknown DLL, unknown ordinal,
     /// invalid heap handle, etc.).
     Win32(win32::Win32Error),
+    /// NE (16-bit Windows) loader rejected the input — bad signature,
+    /// truncated segment, or a failed segment map. Carries the
+    /// formatted detail (the loader error is not `Eq`).
+    NeLoader(String),
 }
 
 impl core::fmt::Display for Error {
@@ -261,6 +267,7 @@ impl core::fmt::Display for Error {
             Error::Trap(t) => write!(f, "oxideav-vfw emulator trap: {t}"),
             Error::PeLoader(e) => write!(f, "oxideav-vfw PE loader: {e}"),
             Error::Win32(e) => write!(f, "oxideav-vfw Win32 stub: {e}"),
+            Error::NeLoader(e) => write!(f, "oxideav-vfw NE loader: {e}"),
         }
     }
 }

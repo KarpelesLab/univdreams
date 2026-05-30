@@ -48,6 +48,11 @@ pub enum Trap {
     /// Privileged opcode (CR/DR access, IO, INT, HLT, far call,
     /// segment load, …) — cannot run inside the sandbox.
     PrivilegedOpcode { eip: u32, mnemonic: &'static str },
+    /// A software interrupt (`INT n`) executed in 16-bit (Win16) mode.
+    /// The run loop services known vectors in place (e.g. DOS
+    /// `INT 21h`) and resumes; unhandled vectors surface as an error.
+    /// `eip` is the address of the instruction after the `INT`.
+    SoftwareInterrupt { num: u8, eip: u32 },
     /// Integer divide by zero.
     DivideByZero { eip: u32 },
     /// Codec called a Win32 function we have not stubbed.
@@ -92,6 +97,9 @@ impl core::fmt::Display for Trap {
             }
             Trap::PrivilegedOpcode { eip, mnemonic } => {
                 write!(f, "privileged opcode {mnemonic:?} at eip={eip:#010x}")
+            }
+            Trap::SoftwareInterrupt { num, eip } => {
+                write!(f, "unhandled INT {num:#04x} at eip={eip:#010x}")
             }
             Trap::DivideByZero { eip } => write!(f, "divide-by-zero at eip={eip:#010x}"),
             Trap::UnresolvedImport { dll, name } => {

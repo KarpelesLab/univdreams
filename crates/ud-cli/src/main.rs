@@ -714,6 +714,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     .with_context(|| format!("parse {} as ELF", input.display()))?;
                 ud_translate::decompile::decompile_to_text(&elf)
                     .with_context(|| format!("decompile {}", input.display()))?
+            } else if ud_format::ne::is_ne(&bytes) {
+                // Before PE: both start with `MZ`, and `is_pe` checks only
+                // that, so the 16-bit NE has to be detected first.
+                let ne = ud_format::ne::NeFile::parse(&bytes)
+                    .with_context(|| format!("parse {} as NE", input.display()))?;
+                ud_translate::decompile::decompile_ne_to_text(&ne)
             } else if ud_format::pe::is_pe(&bytes) {
                 let pe = ud_format::pe::PeFile::parse(&bytes)
                     .with_context(|| format!("parse {} as PE", input.display()))?;
@@ -732,7 +738,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     .with_context(|| format!("decompile {} as 6502 raw", input.display()))?
             } else {
                 anyhow::bail!(
-                    "unrecognised binary format: {} (expected ELF, PE, Mach-O, WASM, or 6502 raw image)",
+                    "unrecognised binary format: {} (expected ELF, PE, NE, Mach-O, WASM, or 6502 raw image)",
                     input.display()
                 );
             };
@@ -786,13 +792,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     _ => None,
                 })
                 .ok_or_else(|| {
-                    anyhow::anyhow!("`@module.format` is missing — expected \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw\"")
+                    anyhow::anyhow!("`@module.format` is missing — expected \"elf\", \"pe\", \"ne\", \"macho\", \"wasm\", or \"raw\"")
                 })?;
             let bytes = match format.as_str() {
                 "elf" => ud_translate::compile::lower_to_elf(&ast)
                     .with_context(|| format!("lower {} to ELF", input.display()))?,
                 "pe" => ud_translate::compile::lower_to_pe(&ast)
                     .with_context(|| format!("lower {} to PE", input.display()))?,
+                "ne" => ud_translate::compile::lower_to_ne(&ast)
+                    .with_context(|| format!("lower {} to NE", input.display()))?,
                 "macho" => ud_translate::compile::lower_to_macho(&ast)
                     .with_context(|| format!("lower {} to Mach-O", input.display()))?,
                 "wasm" => ud_translate::compile::lower_to_wasm(&ast)
@@ -800,7 +808,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 "raw" => ud_translate::compile::lower_to_raw(&ast)
                     .with_context(|| format!("lower {} to raw", input.display()))?,
                 other => anyhow::bail!(
-                    "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw\")"
+                    "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"ne\", \"macho\", \"wasm\", or \"raw\")"
                 ),
             };
             std::fs::write(&output, &bytes)
@@ -2636,6 +2644,156 @@ fn monitor_msi_install(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Monitor a 16-bit Windows NE installer: load it through the Win16
+/// loader, drive its entry point in the segmented executor, and report
+/// the Win16 API calls / first unimplemented ordinal, plus any virtual
+/// FS / registry side effects (with `--dump-vfs`). Phase 1 of NE
+/// support: the run reaches the first imported Win16 call (KERNEL.91
+/// `InitTask` for an MFC app), which fail-soft surfaces as a trap.
+fn monitor_install_ne(
+    input: &Path,
+    bytes: &[u8],
+    max_instructions: u64,
+    as_json: bool,
+    dump_vfs: Option<&Path>,
+    preserve_deletes: bool,
+) -> anyhow::Result<()> {
+    let stem = input
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("input.exe");
+
+    let mut sandbox = ud_emulator::Sandbox::new();
+    sandbox.host.trace_stubs = true;
+    sandbox.host.instruction_budget = Some(max_instructions);
+    sandbox.host.preserve_deletes = preserve_deletes;
+    sandbox
+        .context_mut()
+        .vfs
+        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+    sandbox
+        .context_mut()
+        .registry
+        .get_or_insert_with(ud_emulator::context::VirtualRegistry::new);
+
+    let image = sandbox
+        .load_ne_fail_soft(stem, bytes)
+        .with_context(|| format!("NE load {}", input.display()))?;
+
+    // Linear entry address = base of the entry code segment + IP.
+    let entry_base = image
+        .selectors
+        .iter()
+        .find(|(sel, _)| *sel == image.entry_cs)
+        .map_or(ud_emulator::ne::WIN16_SEG_BASE, |(_, base)| *base);
+    let entry_linear = entry_base.wrapping_add(u32::from(image.entry_ip));
+
+    let entry_result = sandbox.call_ne_entry(&image);
+    let instructions_executed = sandbox.cpu.instr_count;
+    let stub_calls = std::mem::take(&mut sandbox.host.stub_calls);
+
+    let outcome = match &entry_result {
+        Ok(ret) => EntryOutcome::Returned { value: *ret },
+        Err(e) => EntryOutcome::Trapped {
+            message: e.to_string(),
+        },
+    };
+
+    let win32_calls: Vec<Win32Call> = stub_calls
+        .into_iter()
+        .map(|c| Win32Call {
+            dll: c.dll,
+            name: c.name,
+            args: c.args,
+            return_value: c.ret,
+            call_site_eip: c.call_site_eip,
+        })
+        .collect();
+    let mut by_func: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for c in &win32_calls {
+        *by_func.entry(format!("{}!{}", c.dll, c.name)).or_default() += 1;
+    }
+    let win32_calls_by_function: Vec<Win32CallCount> = by_func
+        .into_iter()
+        .map(|(function, count)| Win32CallCount { function, count })
+        .collect();
+
+    let ctx = sandbox.context();
+    let vfs_writes: Vec<VfsEntry> = ctx
+        .vfs
+        .as_ref()
+        .map(|vfs| {
+            vfs.list()
+                .map(|(path, len)| VfsEntry {
+                    path: path.to_string(),
+                    bytes: len,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(dump_root) = dump_vfs {
+        if let Some(vfs) = ctx.vfs.as_ref() {
+            std::fs::create_dir_all(dump_root)
+                .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
+            for (vpath, _) in vfs.list() {
+                if vpath.ends_with("/.dir") {
+                    continue;
+                }
+                let out = dump_root.join(sanitise_vfs_path(vpath));
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                if let Some(data) = vfs.read(vpath) {
+                    std::fs::write(&out, data)
+                        .with_context(|| format!("write VFS dump file {}", out.display()))?;
+                }
+            }
+        }
+    }
+    let registry_writes: Vec<RegistryEntry> = ctx
+        .registry
+        .as_ref()
+        .map(|reg| {
+            reg.all_values()
+                .map(|(key, name, value)| RegistryEntry {
+                    key: key.to_string(),
+                    name: name.to_string(),
+                    value: format!("{value:?}"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let unresolved_imports: Vec<UnresolvedImport> = image
+        .unresolved
+        .iter()
+        .cloned()
+        .map(|(dll, name)| UnresolvedImport { dll, name })
+        .collect();
+    let debug_log = std::mem::take(&mut sandbox.host.debug_log);
+
+    let report = MonitorReport {
+        input: input.display().to_string(),
+        image_base: ud_emulator::ne::WIN16_SEG_BASE,
+        entry_point: entry_linear,
+        outcome,
+        instructions_executed,
+        instruction_budget: max_instructions,
+        unresolved_imports,
+        win32_calls,
+        win32_calls_by_function,
+        vfs_writes,
+        registry_writes,
+        debug_log,
+    };
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        report.write_text();
+    }
+    Ok(())
+}
+
 fn monitor_install(
     input: &Path,
     max_instructions: u64,
@@ -2664,9 +2822,21 @@ fn monitor_install(
             dump_vfs,
         );
     }
+    // NE (16-bit Windows) installers run through the Win16 loader +
+    // segmented executor. Detect before PE (both carry an `MZ` header).
+    if ud_format::ne::is_ne(&bytes) {
+        return monitor_install_ne(
+            input,
+            &bytes,
+            max_instructions,
+            as_json,
+            dump_vfs,
+            preserve_deletes,
+        );
+    }
     if !ud_format::pe::is_pe(&bytes) {
         anyhow::bail!(
-            "ud analyze --monitor requires a PE32 or MSI binary; {} is neither",
+            "ud analyze --monitor requires a PE32, NE, or MSI binary; {} is neither",
             input.display()
         );
     }
