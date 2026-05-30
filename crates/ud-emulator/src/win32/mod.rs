@@ -1912,12 +1912,18 @@ pub fn run_until_sentinel(
                 let lo = u32::from_str_radix(lo_s.trim_start_matches("0x"), 16).unwrap_or(0);
                 let hi = u32::from_str_radix(hi_s.trim_start_matches("0x"), 16).unwrap_or(0);
                 if pre_step_eip >= lo && pre_step_eip <= hi {
-                    let esp = cpu.regs.get32(crate::emulator::regs::Reg32::Esp);
+                    use crate::emulator::regs::Reg32;
+                    let esp = cpu.regs.get32(Reg32::Esp);
+                    let eax = cpu.regs.get32(Reg32::Eax);
+                    let ecx = cpu.regs.get32(Reg32::Ecx);
+                    let edx = cpu.regs.get32(Reg32::Edx);
                     let opc: Vec<u8> = (0..6)
                         .map(|i| mmu.load8(pre_step_eip.wrapping_add(i)).unwrap_or(0))
                         .collect();
                     eprintln!(
-                        "TRACE eip={pre_step_eip:#010x} esp={esp:#010x} bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                        "TRACE eip={pre_step_eip:#010x} esp={esp:#010x} \
+                         eax={eax:#010x} ecx={ecx:#010x} edx={edx:#010x} \
+                         bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
                         opc[0], opc[1], opc[2], opc[3], opc[4], opc[5]
                     );
                 }

@@ -1399,9 +1399,15 @@ fn qtcodec_register(
     {
         let v0 = sandbox.mmu.load32(0x67dd_c000).unwrap_or(0);
         let vc = sandbox.mmu.load32(0x67dd_c00c).unwrap_or(0);
+        let tls_off = sandbox.mmu.load32(0x6734_7000).unwrap_or(0);
+        let tls_idx = sandbox.mmu.load32(0x6734_7004).unwrap_or(0);
         eprintln!(
             "codec vtable: [0x67ddc000]={v0:#010x} \
              [0x67ddc00c]={vc:#010x} (pre-Open)"
+        );
+        eprintln!(
+            "qts TLS: [0x67347000]={tls_off:#010x} \
+             [0x67347004]={tls_idx:#010x} (pre-Open)"
         );
     }
     if found != 0 {
