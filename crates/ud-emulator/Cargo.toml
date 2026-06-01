@@ -51,6 +51,10 @@ msi = "0.10"
 # WriteFile actions so the VFS dump has real content rather
 # than zero-byte placeholders.
 cab = "0.6"
+# Serialize the headless Win16 GUI model (windows / dialogs / message
+# boxes) to JSON so an external "expect"-style driver can observe and
+# script a GUI program (e.g. an installer) non-interactively.
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # Fetched-fixture corpus runner (`tests/codec_corpus.rs`).

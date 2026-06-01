@@ -13,6 +13,8 @@
 //! consumes (`AX` ok-flag, `CX` stack top, `DX` nCmdShow, `SI`
 //! hPrevInstance, `DI` hInstance, `ES:BX` command line).
 
+pub mod gui;
+
 use crate::emulator::regs::{Reg16, Reg8};
 use crate::emulator::{Cpu, Mmu};
 use crate::win32::{HostState, Registry, Win32Error};
@@ -23,6 +25,47 @@ use crate::win32::{HostState, Registry, Win32Error};
 pub const WIN16_HINSTANCE: u16 = 0x0100;
 /// `SW_SHOWNORMAL` — the default `nCmdShow` for a launched app.
 const SW_SHOWNORMAL: u16 = 1;
+
+/// Call a guest 16-bit **FAR PASCAL** callback (a window or dialog
+/// procedure) from the host and return its `DX:AX` result. This is how
+/// the headless GUI delivers messages — `WM_INITDIALOG`, `WM_COMMAND`,
+/// … — into the program's own code so its handlers actually run.
+///
+/// `args` are pushed left-to-right (PASCAL order); a `WndProc`/`DlgProc`
+/// is invoked as `&[hwnd, msg, wparam, lparam_hi, lparam_lo]`. A far
+/// return sentinel is pushed so the callee's `RETF n` lands back here;
+/// the call is stack-balanced (the callee cleans its own args).
+///
+/// # Errors
+/// Propagates any trap raised while the callback runs.
+pub fn call_guest_far16(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &mut Registry,
+    state: &mut HostState,
+    proc_sel: u16,
+    proc_off: u16,
+    args: &[u16],
+) -> Result<u32, crate::Error> {
+    use crate::emulator::isa_int::RET_SENTINEL;
+
+    cpu.define_selector(crate::ne::SENTINEL_SELECTOR, RET_SENTINEL);
+    for &a in args {
+        cpu.push16(mmu, a)?;
+    }
+    // Far-return sentinel: CS = sentinel selector (base RET_SENTINEL),
+    // IP = 0, so the callee's RETF returns to RET_SENTINEL and the run
+    // loop halts.
+    cpu.push16(mmu, crate::ne::SENTINEL_SELECTOR)?;
+    cpu.push16(mmu, 0)?;
+    cpu.set_cs_ip(proc_sel, proc_off);
+
+    crate::win32::run_until_sentinel(cpu, mmu, registry, state)?;
+
+    let ax = u32::from(cpu.regs.get16(Reg16::Ax));
+    let dx = u32::from(cpu.regs.get16(Reg16::Dx));
+    Ok((dx << 16) | ax)
+}
 
 /// Register the Win16 stub surface with `registry`. Safe to call once
 /// per sandbox before loading an NE module; the loader's relocation

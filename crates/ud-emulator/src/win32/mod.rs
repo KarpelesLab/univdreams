@@ -554,6 +554,10 @@ pub struct HostState {
     /// to `eprintln!`). Distinct from `debug_log` so a test can
     /// distinguish OutputDebugStringA traffic from real popups.
     pub message_box_log: Vec<String>,
+    /// Headless Win16 GUI model — windows, dialogs, controls, and a
+    /// transcript of GUI actions, recorded by the USER stubs and
+    /// serialised to JSON for expect-style automation.
+    pub gui: crate::win16::gui::GuiState,
     /// Optional per-run instruction budget. Decremented at each
     /// top-of-loop iteration in [`run_until_sentinel`] (both
     /// instruction steps and stub dispatches count). When it
@@ -644,6 +648,7 @@ impl Default for HostState {
         processes.insert(1, p);
         HostState {
             processes,
+            gui: crate::win16::gui::GuiState::default(),
             active_pid: 1,
             next_pid: 2,
             next_child_image_base: 0,
