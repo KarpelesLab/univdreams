@@ -558,6 +558,8 @@ pub struct HostState {
     /// transcript of GUI actions, recorded by the USER stubs and
     /// serialised to JSON for expect-style automation.
     pub gui: crate::win16::gui::GuiState,
+    /// Win16 global heap — `GlobalAlloc`/`GlobalLock` backing store.
+    pub win16_heap: crate::win16::Win16Heap,
     /// Optional per-run instruction budget. Decremented at each
     /// top-of-loop iteration in [`run_until_sentinel`] (both
     /// instruction steps and stub dispatches count). When it
@@ -649,6 +651,7 @@ impl Default for HostState {
         HostState {
             processes,
             gui: crate::win16::gui::GuiState::default(),
+            win16_heap: crate::win16::Win16Heap::default(),
             active_pid: 1,
             next_pid: 2,
             next_child_image_base: 0,

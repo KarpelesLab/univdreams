@@ -15,9 +15,50 @@
 
 pub mod gui;
 
+use std::collections::BTreeMap;
+
+use crate::emulator::mmu::Perm;
 use crate::emulator::regs::{Reg16, Reg8};
 use crate::emulator::{Cpu, Mmu};
 use crate::win32::{HostState, Registry, Win32Error};
+
+/// Linear base of the Win16 global-heap arena (above the segment
+/// windows and PSP).
+const WIN16_HEAP_BASE: u32 = 0x0040_0000;
+/// First selector handed out for a `GlobalAlloc` block (avoids the
+/// segment numbers, HINSTANCE, import/PSP/sentinel selectors).
+const WIN16_HEAP_FIRST_SEL: u16 = 0x0200;
+
+/// A simple Win16 global heap. Each `GlobalAlloc` gets its own linear
+/// window and a unique selector (handle == selector, GMEM_FIXED-style);
+/// `GlobalLock` just hands back `selector:0000`.
+#[derive(Debug, Default, Clone)]
+pub struct Win16Heap {
+    next_base: u32,
+    next_selector: u16,
+    /// selector → (linear base, requested size).
+    pub blocks: BTreeMap<u16, (u32, u32)>,
+}
+
+impl Win16Heap {
+    /// Allocate `size` bytes: map a fresh window, assign a selector,
+    /// register it on the CPU, and return the selector (the handle).
+    fn alloc(&mut self, cpu: &mut Cpu, mmu: &mut Mmu, size: u32) -> u16 {
+        if self.next_base < WIN16_HEAP_BASE {
+            self.next_base = WIN16_HEAP_BASE;
+            self.next_selector = WIN16_HEAP_FIRST_SEL;
+        }
+        let rounded = size.max(1).wrapping_add(0xFFF) & !0xFFF;
+        let base = self.next_base;
+        let sel = self.next_selector;
+        mmu.map(base, rounded, Perm::R | Perm::W | Perm::X);
+        cpu.define_selector(sel, base);
+        self.blocks.insert(sel, (base, size));
+        self.next_base = self.next_base.wrapping_add(rounded);
+        self.next_selector = self.next_selector.wrapping_add(8);
+        sel
+    }
+}
 
 /// Synthetic instance handle handed to the task (Win16 `HINSTANCE`).
 /// Real Windows hands back the module's DGROUP selector; any stable
@@ -305,6 +346,74 @@ fn register_kernel(registry: &mut Registry) {
     // KERNEL.3 GetVersion() → Windows 3.10 in AX (LOBYTE major, HIBYTE
     // minor), DOS version in DX.
     registry.register_far_pascal("kernel", "@3", stub_get_version, 0);
+    // KERNEL.15 GlobalAlloc(wFlags, dwBytes) → HGLOBAL (a selector).
+    registry.register_far_pascal("kernel", "@15", stub_global_alloc, 6);
+    // KERNEL.16 GlobalReAlloc(hMem, dwBytes, wFlags) → HGLOBAL.
+    registry.register_far_pascal("kernel", "@16", stub_global_realloc, 8);
+    // KERNEL.17 GlobalFree(hMem) → 0 on success.
+    registry.register_far_pascal("kernel", "@17", stub_ret0_1word, 2);
+    // KERNEL.18 GlobalLock(hMem) → far pointer selector:0000.
+    registry.register_far_pascal("kernel", "@18", stub_global_lock, 2);
+    // KERNEL.19 GlobalUnlock(hMem) → 0.
+    registry.register_far_pascal("kernel", "@19", stub_ret0_1word, 2);
+    // KERNEL.20 GlobalSize(hMem) → block size in bytes (DX:AX).
+    registry.register_far_pascal("kernel", "@20", stub_global_size, 2);
+}
+
+/// `KERNEL.20 GlobalSize(hMem)` → the requested size of the block.
+fn stub_global_size(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let handle = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let size = state
+        .win16_heap
+        .blocks
+        .get(&handle)
+        .map_or(0x1000, |&(_, s)| s);
+    Ok(size)
+}
+
+/// `KERNEL.15 GlobalAlloc(wFlags, dwBytes)` → a fresh selector/handle
+/// backed by a newly-mapped window.
+fn stub_global_alloc(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: wFlags pushed first (SP+8), dwBytes (4) last (SP+4).
+    let size = cpu.stack_dword(mmu, 4).unwrap_or(0);
+    let sel = state.win16_heap.alloc(cpu, mmu, size);
+    Ok(u32::from(sel))
+}
+
+/// `KERNEL.16 GlobalReAlloc(hMem, dwBytes, wFlags)` — allocate a new
+/// block (we never move existing ones) and return its handle.
+fn stub_global_realloc(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hMem (SP+10), dwBytes (4) (SP+6), wFlags (SP+4).
+    let size = cpu.stack_dword(mmu, 6).unwrap_or(0);
+    let sel = state.win16_heap.alloc(cpu, mmu, size);
+    Ok(u32::from(sel))
+}
+
+/// `KERNEL.18 GlobalLock(hMem)` → the far pointer `selector:0000`
+/// (DX = selector, AX = 0).
+fn stub_global_lock(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let handle = cpu.stack_word(mmu, 4).unwrap_or(0);
+    Ok(u32::from(handle) << 16)
 }
 
 /// `KERNEL.23 LockSegment(seg)` → return a non-zero selector (the
