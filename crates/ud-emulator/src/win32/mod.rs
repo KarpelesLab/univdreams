@@ -1444,7 +1444,7 @@ pub fn read_wide_cstr_local(mmu: &Mmu, mut addr: u32, max_chars: u32) -> String 
 /// remains the default since it reveals what stubs to add.
 fn stub_unresolved_fallback(
     cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    mmu: &mut Mmu,
     state: &mut HostState,
     registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
@@ -1453,6 +1453,14 @@ fn stub_unresolved_fallback(
         .entry(addr)
         .map(|e| (e.dll.clone(), e.name.clone()))
         .unwrap_or_else(|| ("<unknown>".to_string(), format!("@{addr:#010x}")));
+    // Win16 debugging aid: print where the unimplemented ordinal was
+    // called from (caller CS:IP sit above the far return) so the call
+    // site can be disassembled to read its argument count.
+    if cpu.is_code16() && std::env::var("UD_NE_DEBUG").is_ok() {
+        let ip = cpu.stack_word(mmu, 0).unwrap_or(0);
+        let cs = cpu.stack_word(mmu, 2).unwrap_or(0);
+        eprintln!("WIN16 unresolved {dll}!{name} called from {cs:#06x}:{ip:#06x}");
+    }
     if std::env::var("UD_LENIENT_UNRESOLVED").is_ok() {
         // One-line summary per unique (dll, name) the operator
         // sees; the stub then returns 0 so the calling code
@@ -2030,7 +2038,9 @@ fn emit_trap_event(cpu: &Cpu, mmu: &Mmu, err: &crate::Error) {
                 ("UndefinedOpcode", *eip, Some(*opcode))
             }
             crate::emulator::Trap::PrivilegedOpcode { eip, .. } => ("PrivilegedOpcode", *eip, None),
-            crate::emulator::Trap::SoftwareInterrupt { eip, .. } => ("SoftwareInterrupt", *eip, None),
+            crate::emulator::Trap::SoftwareInterrupt { eip, .. } => {
+                ("SoftwareInterrupt", *eip, None)
+            }
             crate::emulator::Trap::DivideByZero { eip } => ("DivideByZero", *eip, None),
             crate::emulator::Trap::UnresolvedImport { .. } => {
                 ("UnresolvedImport", cpu.regs.eip, None)

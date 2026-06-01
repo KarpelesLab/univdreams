@@ -82,6 +82,39 @@ fn register_gdi(registry: &mut Registry) {
     // GDI.80 GetDeviceCaps(hDC, index) — display capabilities MFC reads
     // off the screen DC during startup.
     registry.register_far_pascal("gdi", "@80", stub_get_device_caps, 4);
+    // GDI.91 GetTextExtent(hDC, lpString far, cbString) → DWORD extent
+    // (width in AX, height in DX). Return a fixed 8×16 cell metric.
+    registry.register_far_pascal("gdi", "@91", stub_get_text_extent, 8);
+    // GDI.66 CreateSolidBrush(COLORREF) → HBRUSH. MFC builds brushes for
+    // the system colours during startup.
+    registry.register_far_pascal("gdi", "@66", stub_create_object, 4);
+    // GDI.61 CreatePen(style, width, COLORREF) → HPEN.
+    registry.register_far_pascal("gdi", "@61", stub_create_object, 8);
+}
+
+/// Generic GDI object factory → a fresh unique object handle. The
+/// argument layout doesn't matter (the handle is opaque); the cleanup
+/// byte count is supplied per-registration.
+fn stub_create_object(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(u32::from(state.gui.alloc_obj_handle()))
+}
+
+/// `GDI.91 GetTextExtent` → a plausible fixed-pitch extent so MFC's font
+/// measurement proceeds. width = 8·cbString, height = 16.
+fn stub_get_text_extent(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let cb = cpu.stack_word(mmu, 4).unwrap_or(1); // cbString (last arg)
+    let width = 8u32.wrapping_mul(u32::from(cb)) & 0xFFFF;
+    Ok((16u32 << 16) | width)
 }
 
 /// `GDI.80 GetDeviceCaps(hDC, nIndex)` → plausible 640×480 8bpp,
@@ -114,8 +147,45 @@ fn register_user(registry: &mut Registry) {
     // USER.66 GetDC(hWnd) — MFC grabs the screen DC at startup to read
     // display metrics, then releases it. Return a non-zero DC handle.
     registry.register_far_pascal("user", "@66", stub_ret_handle_1word, 2);
+    // USER.68 ReleaseDC(hWnd, hDC) — release the screen DC; return 1.
+    registry.register_far_pascal("user", "@68", stub_ret1_2word, 4);
     // USER.179 GetSystemMetrics(index).
     registry.register_far_pascal("user", "@179", stub_get_system_metrics, 2);
+    // USER.180 GetSysColor(index) → COLORREF.
+    registry.register_far_pascal("user", "@180", stub_get_sys_color, 2);
+    // USER.173 LoadCursor(hInstance, lpCursorName far) → HCURSOR.
+    registry.register_far_pascal("user", "@173", stub_create_object, 6);
+    // USER.174 LoadIcon(hInstance, lpIconName far) → HICON.
+    registry.register_far_pascal("user", "@174", stub_create_object, 6);
+}
+
+/// `USER.180 GetSysColor(nIndex)` → a plausible 3-D grey scheme.
+fn stub_get_sys_color(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let index = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let color: u32 = match index {
+        15 => 0x00C0_C0C0,     // COLOR_BTNFACE
+        16 => 0x0080_8080,     // COLOR_BTNSHADOW
+        20 => 0x00FF_FFFF,     // COLOR_BTNHIGHLIGHT
+        18 | 8 => 0x0000_0000, // COLOR_BTNTEXT / WINDOWTEXT
+        5 => 0x00FF_FFFF,      // COLOR_WINDOW
+        _ => 0x0080_8080,
+    };
+    Ok(color)
+}
+
+/// Generic FAR PASCAL stub: clean two words of args, return 1 (success).
+fn stub_ret1_2word(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
 }
 
 /// Generic FAR PASCAL stub returning a fixed non-zero handle (one word

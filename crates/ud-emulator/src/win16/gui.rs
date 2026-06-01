@@ -97,6 +97,9 @@ pub struct GuiState {
     /// Next window handle to hand out.
     #[serde(skip)]
     pub next_hwnd: u16,
+    /// Next GDI/USER object handle (brush/cursor/icon/…).
+    #[serde(skip)]
+    pub next_obj_handle: u16,
     /// Ordered transcript of GUI actions.
     pub events: Vec<GuiEvent>,
 }
@@ -104,8 +107,23 @@ pub struct GuiState {
 /// Window handles start here so they don't collide with the synthetic
 /// selector / thunk ranges.
 const HWND_BASE: u16 = 0x1000;
+/// GDI/USER object handles start here, above the window-handle range.
+const OBJ_HANDLE_BASE: u16 = 0x8000;
 
 impl GuiState {
+    /// Allocate a fresh, distinct GDI/USER object handle (brush, cursor,
+    /// icon, …) — non-zero and unique so the program can tell them apart
+    /// and free them individually.
+    pub fn alloc_obj_handle(&mut self) -> u16 {
+        // Object handles live above the window-handle range.
+        if self.next_obj_handle < OBJ_HANDLE_BASE {
+            self.next_obj_handle = OBJ_HANDLE_BASE;
+        }
+        let h = self.next_obj_handle;
+        self.next_obj_handle = self.next_obj_handle.wrapping_add(4);
+        h
+    }
+
     /// Allocate a fresh window handle.
     pub fn alloc_hwnd(&mut self) -> u16 {
         if self.next_hwnd < HWND_BASE {

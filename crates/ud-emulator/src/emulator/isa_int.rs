@@ -1523,6 +1523,17 @@ impl Cpu {
             0xC8 => {
                 let alloc_size = self.fetch_imm16(mmu)?;
                 let nesting_level = self.fetch_imm8(mmu)? & 0x1F;
+                if self.code16 {
+                    // 16-bit ENTER: push BP (2 bytes), BP = SP, SP -= n.
+                    // C/C++ frames always use nesting level 0; the
+                    // display copy for deeper levels is omitted.
+                    self.push16(mmu, self.regs.get16(Reg16::Bp))?;
+                    let frame_temp = (self.regs.esp() & 0xFFFF) as u16;
+                    self.regs.set16(Reg16::Bp, frame_temp);
+                    let new_sp = self.regs.esp().wrapping_sub(u32::from(alloc_size)) & 0xFFFF;
+                    self.regs.set_esp(new_sp);
+                    return Ok(StepOk::Continued);
+                }
                 let frame_temp = self.regs.esp().wrapping_sub(4);
                 self.push32(mmu, self.regs.ebp())?;
                 if nesting_level == 0 {
@@ -1734,6 +1745,27 @@ impl Cpu {
             // 32-bit codec code, so we treat a VEX-shaped second
             // byte as VEX and anything else as undefined.
             0xC4 | 0xC5 => {
+                if self.code16 {
+                    // LES (C4) / LDS (C5): load a far pointer from memory
+                    // into a 16-bit register + ES/DS. Pervasive in Win16
+                    // code for dereferencing far pointers.
+                    let mr = self.fetch_modrm(mmu)?;
+                    let bytes = self.peek_after_modrm(mmu, 16)?;
+                    let (operand, consumed) = self.resolve_modrm(mr, &bytes)?;
+                    self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                    let operand = self.seg_apply(operand);
+                    let Operand::Mem32(lin) = operand else {
+                        return Err(Trap::UndefinedOpcode {
+                            eip: entry_eip,
+                            opcode: u32::from(op),
+                        });
+                    };
+                    let off = mmu.load16(lin)?;
+                    let seg = mmu.load16(lin.wrapping_add(2))?;
+                    self.regs.set16(Reg16::from_bits(mr.reg), off);
+                    self.load_segment(if op == 0xC4 { Seg::Es } else { Seg::Ds }, seg);
+                    return Ok(StepOk::Continued);
+                }
                 let probe = mmu.fetch_x8(self.regs.eip)?;
                 if probe & 0x80 != 0 {
                     super::isa_avx::dispatch(self, mmu, op, entry_eip)
