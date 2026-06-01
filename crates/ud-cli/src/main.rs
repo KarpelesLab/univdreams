@@ -1430,6 +1430,17 @@ fn qtcodec_register(
                     "codec vtable: [0x67ddc000]={v0:#010x} \
                      [0x67ddc00c]={vc:#010x} (post-Open)"
                 );
+                // qts CM records struct
+                let recs_ptr = sandbox.mmu.load32(0x6734_a4ec).unwrap_or(0);
+                if recs_ptr != 0 {
+                    let count = sandbox.mmu.load16(recs_ptr.wrapping_add(0x14)).unwrap_or(0);
+                    let arr_ptr = sandbox.mmu.load32(recs_ptr.wrapping_add(0x18)).unwrap_or(0);
+                    let pool = sandbox.mmu.load32(recs_ptr.wrapping_add(0x20)).unwrap_or(0);
+                    eprintln!(
+                        "qts records: ptr={recs_ptr:#010x} \
+                         count=0x{count:04x} arr=0x{arr_ptr:08x} pool=0x{pool:08x}"
+                    );
+                }
             }
             let calls = &sandbox.host.stub_calls[before..];
             eprintln!("--- {} stub calls during OpenComponent ---", calls.len());
