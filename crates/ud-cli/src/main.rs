@@ -1374,21 +1374,20 @@ fn qtcodec_register(
         })
         .unwrap_or(0);
     println!("FindNextComponent(NULL, &desc) = {found:#010x}");
-    // Snapshot the qts dispatch table before and after the open
-    // attempt. theQuickTimeDispatcher uses
-    // [(selector_hi_byte) * 8 + 0x67356240]; the first byte of
-    // each entry gates routing. If our entries 0..3 are still
-    // all-zero, the codec's late-bound dispatch reaches the
-    // codec's own fail stub at 0x67d712c0.
+    // Snapshot the qts dispatch table — only print rows that
+    // differ from cat-0 default so registered entries stand out.
     {
-        eprintln!("qts dispatch_table[0..7] pre-Open:");
-        for cat in 0..8u32 {
+        eprintln!("qts dispatch_table — non-default entries:");
+        let cat0_fn = sandbox.mmu.load32(0x6735_6240 + 4).unwrap_or(0);
+        for cat in 0..0x100u32 {
             let a = 0x6735_6240u32.wrapping_add(cat * 8);
             let enabled = sandbox.mmu.load8(a).unwrap_or(0);
             let fn_ptr = sandbox.mmu.load32(a + 4).unwrap_or(0);
-            eprintln!(
-                "  cat[{cat}] @ {a:#010x}: enabled=0x{enabled:02x}  fn_ptr={fn_ptr:#010x}"
-            );
+            if enabled != 0 || (fn_ptr != cat0_fn && fn_ptr != 0) {
+                eprintln!(
+                    "  cat[0x{cat:02x}] @ {a:#010x}: enabled=0x{enabled:02x}  fn_ptr={fn_ptr:#010x}"
+                );
+            }
         }
     }
     // Snapshot the codec's vtable slots that the late-bind thunk

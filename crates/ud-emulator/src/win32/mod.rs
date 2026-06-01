@@ -1917,12 +1917,19 @@ pub fn run_until_sentinel(
                     let eax = cpu.regs.get32(Reg32::Eax);
                     let ecx = cpu.regs.get32(Reg32::Ecx);
                     let edx = cpu.regs.get32(Reg32::Edx);
+                    let edi = cpu.regs.get32(Reg32::Edi);
+                    let esi = cpu.regs.get32(Reg32::Esi);
                     let opc: Vec<u8> = (0..6)
                         .map(|i| mmu.load8(pre_step_eip.wrapping_add(i)).unwrap_or(0))
                         .collect();
+                    let s0 = mmu.load32(esp).unwrap_or(0);
+                    let s4 = mmu.load32(esp.wrapping_add(4)).unwrap_or(0);
+                    let s8 = mmu.load32(esp.wrapping_add(8)).unwrap_or(0);
                     eprintln!(
                         "TRACE eip={pre_step_eip:#010x} esp={esp:#010x} \
                          eax={eax:#010x} ecx={ecx:#010x} edx={edx:#010x} \
+                         edi={edi:#010x} esi={esi:#010x} \
+                         [esp]={s0:#010x} [esp+4]={s4:#010x} [esp+8]={s8:#010x} \
                          bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
                         opc[0], opc[1], opc[2], opc[3], opc[4], opc[5]
                     );
