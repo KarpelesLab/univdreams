@@ -1430,16 +1430,37 @@ fn qtcodec_register(
                     "codec vtable: [0x67ddc000]={v0:#010x} \
                      [0x67ddc00c]={vc:#010x} (post-Open)"
                 );
-                // qts CM records struct
+                // qts CM records struct — also dump instance-list
+                // count/limit at +0x0c/+0x0e since qts!0x66881ab1
+                // reads those to decide whether to grow.
                 let recs_ptr = sandbox.mmu.load32(0x6734_a4ec).unwrap_or(0);
                 if recs_ptr != 0 {
+                    let inst_cnt = sandbox.mmu.load16(recs_ptr.wrapping_add(0x0c)).unwrap_or(0);
+                    let inst_lim = sandbox.mmu.load16(recs_ptr.wrapping_add(0x0e)).unwrap_or(0);
                     let count = sandbox.mmu.load16(recs_ptr.wrapping_add(0x14)).unwrap_or(0);
                     let arr_ptr = sandbox.mmu.load32(recs_ptr.wrapping_add(0x18)).unwrap_or(0);
                     let pool = sandbox.mmu.load32(recs_ptr.wrapping_add(0x20)).unwrap_or(0);
                     eprintln!(
                         "qts records: ptr={recs_ptr:#010x} \
+                         inst_cnt=0x{inst_cnt:04x} inst_lim=0x{inst_lim:04x} \
                          count=0x{count:04x} arr=0x{arr_ptr:08x} pool=0x{pool:08x}"
                     );
+                    // Dump record[0]
+                    if arr_ptr != 0 {
+                        eprintln!("  record[0] @ {arr_ptr:#010x}:");
+                        for row in 0..7u32 {
+                            let off = arr_ptr.wrapping_add(row * 16);
+                            let bytes: Vec<String> = (0..16u32)
+                                .map(|i| {
+                                    format!(
+                                        "{:02x}",
+                                        sandbox.mmu.load8(off + i).unwrap_or(0)
+                                    )
+                                })
+                                .collect();
+                            eprintln!("    +{:#04x}: {}", row * 16, bytes.join(" "));
+                        }
+                    }
                 }
             }
             let calls = &sandbox.host.stub_calls[before..];
