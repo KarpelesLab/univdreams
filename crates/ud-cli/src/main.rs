@@ -2786,12 +2786,53 @@ fn monitor_install_ne(
         registry_writes,
         debug_log,
     };
+    // The headless Win16 GUI transcript — windows, dialogs, message
+    // boxes the program put up — for expect-style automation.
+    let gui = std::mem::take(&mut sandbox.host.gui);
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let combined = serde_json::json!({ "report": report, "gui": gui });
+        println!("{}", serde_json::to_string_pretty(&combined)?);
     } else {
         report.write_text();
+        print_gui_transcript(&gui);
     }
     Ok(())
+}
+
+/// Render the headless GUI transcript as a readable text section.
+fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
+    use ud_emulator::win16::gui::GuiEvent;
+    if gui.events.is_empty() {
+        return;
+    }
+    println!("  ── GUI transcript ── ({} events)", gui.events.len());
+    for ev in &gui.events {
+        match ev {
+            GuiEvent::RegisterClass { name } => println!("    RegisterClass {name}"),
+            GuiEvent::CreateWindow {
+                hwnd, class, title, ..
+            } => println!("    CreateWindow hwnd={hwnd:#06x} [{class}] {title:?}"),
+            GuiEvent::ShowWindow { hwnd, cmd } => {
+                println!("    ShowWindow hwnd={hwnd:#06x} cmd={cmd}")
+            }
+            GuiEvent::MessageBox {
+                caption,
+                text,
+                result,
+                ..
+            } => println!("    MessageBox {caption:?}: {text:?} -> {result}"),
+            GuiEvent::DialogStart { title, controls } => {
+                println!("    Dialog {title:?} ({} controls):", controls.len());
+                for c in controls {
+                    println!("      [{}] {:?} id={}", c.class, c.text, c.id);
+                }
+            }
+            GuiEvent::DialogEnd { result } => println!("    DialogEnd -> {result}"),
+            GuiEvent::SetWindowText { hwnd, text } => {
+                println!("    SetWindowText hwnd={hwnd:#06x} {text:?}")
+            }
+        }
+    }
 }
 
 fn monitor_install(

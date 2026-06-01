@@ -74,6 +74,36 @@ pub fn call_guest_far16(
 pub fn register_all(registry: &mut Registry) {
     register_kernel(registry);
     register_user(registry);
+    register_gdi(registry);
+}
+
+/// `GDI` ordinal stubs.
+fn register_gdi(registry: &mut Registry) {
+    // GDI.80 GetDeviceCaps(hDC, index) — display capabilities MFC reads
+    // off the screen DC during startup.
+    registry.register_far_pascal("gdi", "@80", stub_get_device_caps, 4);
+}
+
+/// `GDI.80 GetDeviceCaps(hDC, nIndex)` → plausible 640×480 8bpp,
+/// 96-DPI VGA values.
+fn stub_get_device_caps(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hDC pushed first (SP+6), nIndex pushed last (SP+4).
+    let index = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let v: u16 = match index {
+        8 => 640,      // HORZRES
+        10 => 480,     // VERTRES
+        12 => 8,       // BITSPIXEL
+        14 => 1,       // PLANES
+        88 | 90 => 96, // LOGPIXELSX / LOGPIXELSY
+        24 => 20,      // NUMCOLORS
+        _ => 0,
+    };
+    Ok(u32::from(v))
 }
 
 /// `USER` ordinal stubs.
@@ -81,6 +111,47 @@ fn register_user(registry: &mut Registry) {
     // USER.5 InitApp(hInstance) — set up the task's message queue.
     // Must return non-zero or the C startup aborts.
     registry.register_far_pascal("user", "@5", stub_ret1_1word, 2);
+    // USER.66 GetDC(hWnd) — MFC grabs the screen DC at startup to read
+    // display metrics, then releases it. Return a non-zero DC handle.
+    registry.register_far_pascal("user", "@66", stub_ret_handle_1word, 2);
+    // USER.179 GetSystemMetrics(index).
+    registry.register_far_pascal("user", "@179", stub_get_system_metrics, 2);
+}
+
+/// Generic FAR PASCAL stub returning a fixed non-zero handle (one word
+/// of args). Used for HDC / HCURSOR / HICON-returning calls whose value
+/// the program only checks for non-NULL and later releases.
+fn stub_ret_handle_1word(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0x0010)
+}
+
+/// `USER.179 GetSystemMetrics(nIndex)` — return plausible 640×480 VGA
+/// metrics so MFC's layout math doesn't divide by zero.
+fn stub_get_system_metrics(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // FAR PASCAL: the single word arg sits above the 4-byte far return.
+    let index = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let v: u16 = match index {
+        0 => 640,   // SM_CXSCREEN
+        1 => 480,   // SM_CYSCREEN
+        2 => 16,    // SM_CXVSCROLL
+        3 => 16,    // SM_CYHSCROLL
+        4 => 19,    // SM_CYCAPTION
+        5 | 6 => 1, // SM_CXBORDER / SM_CYBORDER
+        11 => 32,   // SM_CXICON
+        12 => 32,   // SM_CYICON
+        _ => 0,
+    };
+    Ok(u32::from(v))
 }
 
 /// Generic FAR PASCAL stub: clean one word of args, return 1 (success).
