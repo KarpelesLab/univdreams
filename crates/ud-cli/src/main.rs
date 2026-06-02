@@ -1409,6 +1409,25 @@ fn qtcodec_register(
              [0x67347004]={tls_idx:#010x} (pre-Open)"
         );
     }
+    // Experimental: qts!0x668820f0 (the helper called from
+    // qts!0x66883120 sel 0x10020) reads `[record+0x50]` as an
+    // "instance pointer". If 0 it takes a deeper code path
+    // that re-derives the handle from records-array index
+    // arithmetic. Try populating it with the pool slot from
+    // [records+0] so qts can compute the handle directly.
+    {
+        let recs = sandbox.mmu.load32(0x6734_a4ec).unwrap_or(0);
+        if recs != 0 {
+            let arr = sandbox.mmu.load32(recs.wrapping_add(0x18)).unwrap_or(0);
+            let pool0 = sandbox.mmu.load32(recs).unwrap_or(0);
+            if arr != 0 && pool0 != 0 {
+                let slot50 = sandbox.mmu.load32(arr.wrapping_add(0x50)).unwrap_or(0);
+                eprintln!(
+                    "  [record[0]+0x50]: 0x{slot50:08x}  pool[0]: 0x{pool0:08x}"
+                );
+            }
+        }
+    }
     if found != 0 {
         if let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "OpenComponent") {
             let before = sandbox.host.stub_calls.len();
