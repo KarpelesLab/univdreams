@@ -573,6 +573,12 @@ pub struct HostState {
     /// carrying its result code. Polled by the `DialogBox` driver.
     pub dialog_ended: bool,
     pub dialog_result: i16,
+    /// Active modal dialog's controls: control id → child window handle,
+    /// for `GetDlgItem`. Populated by the `DialogBox` driver.
+    pub dialog_items: std::collections::BTreeMap<u16, u16>,
+    /// Button/checkbox check state, keyed by control HWND (`BM_GETCHECK` /
+    /// `BM_SETCHECK` / `CheckDlgButton`).
+    pub dialog_checks: std::collections::BTreeMap<u16, u16>,
     /// Optional per-run instruction budget. Decremented at each
     /// top-of-loop iteration in [`run_until_sentinel`] (both
     /// instruction steps and stub dispatches count). When it
@@ -670,6 +676,8 @@ impl Default for HostState {
             resources: Vec::new(),
             dialog_ended: false,
             dialog_result: 0,
+            dialog_items: BTreeMap::new(),
+            dialog_checks: BTreeMap::new(),
             active_pid: 1,
             next_pid: 2,
             next_child_image_base: 0,

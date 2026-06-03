@@ -142,6 +142,8 @@ fn register_gdi(registry: &mut Registry) {
     registry.register_far_pascal("gdi", "@61", stub_create_object, 8);
     // GDI.69 DeleteObject(hObject) → BOOL success.
     registry.register_far_pascal("gdi", "@69", stub_ret1_1word, 2);
+    // GDI.87 GetStockObject(fnObject) → HGDIOBJ.
+    registry.register_far_pascal("gdi", "@87", stub_create_object, 2);
 }
 
 /// Generic GDI object factory → a fresh unique object handle. The
@@ -226,10 +228,28 @@ fn register_user(registry: &mut Registry) {
     registry.register_far_pascal("user", "@292", stub_ret1_2word, 4);
     // USER.1 MessageBox(hWnd, lpText far, lpCaption far, wType) → int.
     registry.register_far_pascal("user", "@1", stub_message_box, 12);
+    // USER.229 GetTopWindow(hWnd) → first child HWND (none in our model).
+    registry.register_far_pascal("user", "@229", stub_ret0_1word, 2);
+    // USER.262 GetWindow(hWnd, uCmd) → related HWND (none in our model).
+    registry.register_far_pascal("user", "@262", stub_ret0_1word, 4);
+    // USER.32 GetWindowRect(hWnd, lpRect far).
+    registry.register_far_pascal("user", "@32", stub_get_window_rect, 6);
+    // USER.232 SetWindowPos(hWnd, after, x, y, cx, cy, flags) → BOOL.
+    registry.register_far_pascal("user", "@232", stub_ret1_1word, 14);
+    // USER.111 SendMessage(hWnd, msg, wParam, lParam long).
+    registry.register_far_pascal("user", "@111", stub_send_message, 10);
+    // Dialog control accessors.
+    registry.register_far_pascal("user", "@91", stub_get_dlg_item, 4);
+    registry.register_far_pascal("user", "@36", stub_get_window_text, 8);
+    registry.register_far_pascal("user", "@37", stub_set_window_text, 6);
+    registry.register_far_pascal("user", "@92", stub_set_dlg_item_text, 8);
+    registry.register_far_pascal("user", "@93", stub_get_dlg_item_text, 10);
     // USER.404 GetClassInfo(hInst, lpClassName far, lpWndClass far) → BOOL.
     registry.register_far_pascal("user", "@404", stub_get_class_info, 10);
     // USER.268 GlobalAddAtom(lpString far) → ATOM.
     registry.register_far_pascal("user", "@268", stub_global_add_atom, 4);
+    // USER.269 GlobalDeleteAtom(atom) → 0 on success.
+    registry.register_far_pascal("user", "@269", stub_ret0_1word, 2);
 }
 
 /// `USER.180 GetSysColor(nIndex)` → a plausible 3-D grey scheme.
@@ -397,6 +417,10 @@ fn register_kernel(registry: &mut Registry) {
     registry.register_far_pascal("kernel", "@131", stub_echo_1word, 2);
     // KERNEL.89 lstrcat(lpString1 far, lpString2 far) → lpString1.
     registry.register_far_pascal("kernel", "@89", stub_lstrcat, 8);
+    // KERNEL.90 lstrlen(lpString far) → length.
+    registry.register_far_pascal("kernel", "@90", stub_lstrlen, 4);
+    // KERNEL.137 FatalAppExit(uAction, lpMessageText far).
+    registry.register_far_pascal("kernel", "@137", stub_fatal_app_exit, 6);
     // KERNEL.47 GetModuleHandle(lpModuleName far) → hModule.
     registry.register_far_pascal("kernel", "@47", stub_get_module_handle, 4);
     // KERNEL.36 GetCurrentTask() → hTask.
@@ -476,6 +500,35 @@ fn read_guest_cstr(mmu: &Mmu, addr: u32, max: usize) -> Vec<u8> {
 fn far_arg_linear(cpu: &Cpu, mmu: &Mmu, byte_off: u32) -> u32 {
     let v = cpu.stack_dword(mmu, byte_off).unwrap_or(0);
     cpu.far_to_linear((v >> 16) as u16, v as u16)
+}
+
+/// `KERNEL.137 FatalAppExit(uAction, lpMessageText)` — the app is
+/// aborting. Record the message (it never returns on real Windows).
+fn stub_fatal_app_exit(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: uAction(SP+8), lpMessageText far(SP+4).
+    let lin = far_arg_linear(cpu, mmu, 4);
+    let msg = String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 1024)).into_owned();
+    state.message_box_log.push(format!("FatalAppExit: {msg}"));
+    Err(Win32Error::InvalidArgument {
+        stub: "FatalAppExit",
+        reason: msg,
+    })
+}
+
+/// `KERNEL.90 lstrlen(lpString far)` → the string length.
+fn stub_lstrlen(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let lin = far_arg_linear(cpu, mmu, 4);
+    Ok(read_guest_cstr(mmu, lin, 0x8000).len() as u32)
 }
 
 /// `KERNEL.89 lstrcat(lpString1, lpString2)` → append string2 to string1
@@ -780,6 +833,182 @@ fn stub_throw(
     Ok(u32::from(throwback))
 }
 
+/// `USER.32 GetWindowRect(hWnd, lpRect far)` → fill a plausible screen
+/// rectangle (the dialog uses it for centering).
+fn stub_get_window_rect(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hWnd(SP+8), lpRect far(SP+4). RECT = left,top,right,bottom.
+    let r = far_arg_linear(cpu, mmu, 4);
+    for (i, v) in [0u16, 0, 640, 480].iter().enumerate() {
+        let _ = mmu.store16(r.wrapping_add(i as u32 * 2), *v);
+    }
+    Ok(1)
+}
+
+/// `USER.111 SendMessage(hWnd, msg, wParam, lParam)` → route a message to
+/// our headless control model. Handles the text and button-check messages
+/// the dialog uses; everything else returns 0.
+fn stub_send_message(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL (10 bytes): hWnd(SP+12), msg(SP+10), wParam(SP+8), lParam(SP+4).
+    let hwnd = cpu.stack_word(mmu, 12).unwrap_or(0);
+    let msg = cpu.stack_word(mmu, 10).unwrap_or(0);
+    let wparam = cpu.stack_word(mmu, 8).unwrap_or(0);
+    let lparam = cpu.stack_dword(mmu, 4).unwrap_or(0);
+    let lp_lin = || cpu.far_to_linear((lparam >> 16) as u16, lparam as u16);
+    match msg {
+        0x000C => {
+            // WM_SETTEXT: lParam → text.
+            let text = String::from_utf8_lossy(&read_guest_cstr(mmu, lp_lin(), 1024)).into_owned();
+            if let Some(w) = state.gui.windows.get_mut(&hwnd) {
+                w.title = text;
+            }
+            Ok(1)
+        }
+        0x000D => {
+            // WM_GETTEXT: wParam = max, lParam = buffer.
+            let text = state
+                .gui
+                .windows
+                .get(&hwnd)
+                .map(|w| w.title.clone())
+                .unwrap_or_default();
+            write_guest_cstr(mmu, lp_lin(), wparam, text.as_bytes())
+        }
+        0x000E => {
+            // WM_GETTEXTLENGTH.
+            Ok(state
+                .gui
+                .windows
+                .get(&hwnd)
+                .map_or(0, |w| w.title.len() as u32))
+        }
+        0x00F0 => Ok(u32::from(
+            state.dialog_checks.get(&hwnd).copied().unwrap_or(0),
+        )), // BM_GETCHECK
+        0x00F1 => {
+            // BM_SETCHECK.
+            state.dialog_checks.insert(hwnd, wparam);
+            Ok(0)
+        }
+        _ => Ok(0),
+    }
+}
+
+/// `USER.91 GetDlgItem(hDlg, nID)` → the child control's HWND (0 if none).
+fn stub_get_dlg_item(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hDlg (SP+6), nID (SP+4).
+    let id = cpu.stack_word(mmu, 4).unwrap_or(0);
+    Ok(u32::from(state.dialog_items.get(&id).copied().unwrap_or(0)))
+}
+
+/// `USER.93 GetDlgItemText(hDlg, nID, lpString far, nMax)` → copy a
+/// control's text; returns the length copied.
+fn stub_get_dlg_item_text(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hDlg(SP+12), nID(SP+10), lpString far(SP+6), nMax(SP+4).
+    let n_max = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let buf = far_arg_linear(cpu, mmu, 6);
+    let id = cpu.stack_word(mmu, 10).unwrap_or(0);
+    let text = state
+        .dialog_items
+        .get(&id)
+        .and_then(|h| state.gui.windows.get(h))
+        .map(|w| w.title.clone())
+        .unwrap_or_default();
+    if n_max == 0 {
+        return Ok(0);
+    }
+    write_guest_cstr(mmu, buf, n_max, text.as_bytes())
+}
+
+/// `USER.92 SetDlgItemText(hDlg, nID, lpString far)` → set a control's text.
+fn stub_set_dlg_item_text(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hDlg(SP+8), nID(SP+6), lpString far(SP+4).
+    let lin = far_arg_linear(cpu, mmu, 4);
+    let id = cpu.stack_word(mmu, 6).unwrap_or(0);
+    let text = String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 1024)).into_owned();
+    if let Some(&hwnd) = state.dialog_items.get(&id) {
+        if let Some(w) = state.gui.windows.get_mut(&hwnd) {
+            w.title = text.clone();
+        }
+        state
+            .gui
+            .events
+            .push(gui::GuiEvent::SetWindowText { hwnd, text });
+    }
+    Ok(1)
+}
+
+/// `USER.36 GetWindowText(hWnd, lpString far, nMax)` → copy the window's
+/// text into the buffer; returns the length copied.
+fn stub_get_window_text(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hWnd (SP+8), lpString far (SP+4), nMax (... )? Layout:
+    // hWnd(SP+8), lpString off(SP+6)/sel(SP+? ) — GetWindowText(hwnd, lp, max):
+    // hWnd(SP+10), lpString far(SP+6), nMax(SP+4).
+    let n_max = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let buf = far_arg_linear(cpu, mmu, 6);
+    let hwnd = cpu.stack_word(mmu, 10).unwrap_or(0);
+    let text = state
+        .gui
+        .windows
+        .get(&hwnd)
+        .map(|w| w.title.clone())
+        .unwrap_or_default();
+    if n_max == 0 {
+        return Ok(0);
+    }
+    write_guest_cstr(mmu, buf, n_max, text.as_bytes())
+}
+
+/// `USER.37 SetWindowText(hWnd, lpString far)` → set the window text.
+fn stub_set_window_text(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hWnd (SP+8), lpString far (SP+4).
+    let lin = far_arg_linear(cpu, mmu, 4);
+    let hwnd = cpu.stack_word(mmu, 8).unwrap_or(0);
+    let text = String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 1024)).into_owned();
+    if let Some(w) = state.gui.windows.get_mut(&hwnd) {
+        w.title = text.clone();
+    }
+    state
+        .gui
+        .events
+        .push(gui::GuiEvent::SetWindowText { hwnd, text });
+    Ok(1)
+}
+
 /// `USER.1 MessageBox(hWnd, lpText, lpCaption, wType)` → record the prompt
 /// in the GUI transcript and answer affirmatively (IDOK/IDYES) so the
 /// installer proceeds.
@@ -833,6 +1062,11 @@ fn stub_dialog_box(
     let proc_sel = cpu.stack_word(mmu, 6).unwrap_or(0);
     let tmpl_off = cpu.stack_word(mmu, 10).unwrap_or(0);
     let tmpl_sel = cpu.stack_word(mmu, 12).unwrap_or(0);
+    // MFC's `CWnd::DoModal` keeps the dialog object (`this`) in ES:BX right
+    // up to the `DialogBox` call; capture it so the drive path can attach
+    // it to the synthetic HWND in MFC's handle map.
+    let this_sel = cpu.segment_selector(crate::emulator::isa_int::Seg::Es);
+    let this_off = cpu.regs.get16(Reg16::Bx);
 
     // Resolve the template id (integer resource or a name string).
     let want = if tmpl_sel == 0 {
@@ -867,6 +1101,47 @@ fn stub_dialog_box(
         let hdlg = state.gui.alloc_hwnd();
         state.dialog_ended = false;
         state.dialog_result = 0;
+        // Create a child window for every control so GetDlgItem resolves,
+        // mapping control id → HWND. Seed the destination-directory edit
+        // control with a default install path (the dialog input an
+        // expect-style driver would supply).
+        state.dialog_items.clear();
+        let dest_dir = std::env::var("UD_NE_INSTALL_DIR").unwrap_or_else(|_| "C:\\EXPANDER".into());
+        for c in &controls {
+            let initial = if c.class.eq_ignore_ascii_case("Edit") {
+                dest_dir.as_str()
+            } else {
+                c.text.as_str()
+            };
+            let chwnd = state
+                .gui
+                .create_window(&c.class, initial, hdlg, c.id, c.style);
+            state.dialog_items.insert(c.id, chwnd);
+        }
+        // Replicate MFC's CBT-hook attach: register hdlg → the dialog
+        // object in the handle map by calling CWnd::Attach (the function
+        // right after FromHandle in the same code segment), so the proc's
+        // FromHandle(hdlg) resolves. Args (FAR PASCAL): this.off, this.sel,
+        // hwnd.
+        let attach_off = mfc_attach_offset();
+        call_guest_far16(
+            cpu,
+            mmu,
+            registry,
+            state,
+            proc_sel,
+            attach_off,
+            &[hdlg, this_sel, this_off],
+        )
+        .map_err(|e| Win32Error::InvalidArgument {
+            stub: "DialogBox/attach",
+            reason: e.to_string(),
+        })?;
+        // WM_SETFONT then WM_INITDIALOG, then drive the default / OK / Cancel
+        // commands until the proc calls EndDialog.
+        deliver_message(
+            cpu, mmu, registry, state, proc_sel, proc_off, hdlg, 0x0030, 0, 0,
+        )?;
         deliver_message(
             cpu,
             mmu,
@@ -895,8 +1170,18 @@ fn stub_dialog_box(
         }
         return Ok(u32::from(state.dialog_result as u16));
     }
-    let _ = (proc_sel, proc_off);
+    let _ = (proc_sel, proc_off, this_sel, this_off);
     Ok(1) // IDOK
+}
+
+/// Offset of MFC's `CWnd::Attach` in the StuffIt installer's code segment.
+/// Driving the dialog is binary-specific (gated behind UD_NE_DRIVE_DIALOG);
+/// this lets the synthetic HWND be registered in MFC's handle map.
+fn mfc_attach_offset() -> u16 {
+    std::env::var("UD_NE_ATTACH_OFF")
+        .ok()
+        .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x91a6)
 }
 
 /// Deliver one window message to a guest dialog/window procedure
