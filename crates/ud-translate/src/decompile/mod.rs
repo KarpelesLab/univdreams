@@ -39,6 +39,7 @@ mod data_lookup;
 mod expr;
 mod idioms;
 pub mod macho;
+pub mod ne;
 mod patterns;
 pub mod pe;
 pub mod raw6502;
@@ -49,6 +50,7 @@ mod wasm_disasm;
 
 pub use data_lookup::DataLookup;
 pub use macho::{decompile_macho, decompile_macho_to_text};
+pub use ne::{decompile_ne, decompile_ne_to_text};
 pub use pe::{decompile_pe, decompile_pe_to_text};
 pub use raw6502::{decompile_raw_6502, decompile_raw_6502_to_text};
 pub use wasm::{decompile_wasm, decompile_wasm_to_text};

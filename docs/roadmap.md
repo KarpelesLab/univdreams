@@ -99,6 +99,58 @@ Editing semantics are not yet defined. Concretely:
 
 The arch-trait abstraction (`ArchInsn`) is in place; adding a backend is mostly a question of writing the decoder/encoder/lifter for the new arch and shipping signatures.
 
+### NE (16-bit Windows New Executable) — round-trip + readable listing ✅
+
+- [x] `ud-format::ne`: hand-rolled NE reader (DOS stub, 64-byte NE header, segment / entry / resident+non-resident name / module-reference tables) with byte-identical `write_to_vec`.
+- [x] `ud-translate::decompile::decompile_ne`: `@module.format = "ne"` with the full structural decode in `build{}`, plus Ghidra-style `//` listings — imported modules (KERNEL/GDI/USER/…), exported entry points, and a per-segment 16-bit disassembly (`Bitness::Bits16`).
+- [x] `ud-translate::compile::lower_to_ne`: reconstructs the file from the authoritative `@raw` coverage; whole-binary source round-trip defended via the `SITEX10.EXE` external fixture.
+- [ ] Structured 16-bit lifting (segment:offset addressing, NE relocation records as imports, `if`/`switch`/`goto`) — the natural next increment, mirroring how PE/ELF grew from "skeleton + raw" into structured lifts.
+
+### NE (Win16) execution — Phase 1: loader + 16-bit segmented CPU ✅
+
+`ud analyze --monitor` can now load and *run* a 16-bit Windows NE binary, not
+just decode it — reusing the existing Sandbox / Context VFS+registry /
+fail-soft-thunk / monitor-report machinery.
+
+- [x] 16-bit segmented mode in the i386 executor (`emulator::isa_int`): a
+  `code16` flag making the default operand/address size 16-bit, real segment
+  bases (`seg_translate` extended from the FS/GS-only model), 16-bit ModR/M
+  addressing (`decode::resolve_modrm16`), far `CALL`/`JMP`/`RETF` and
+  `MOV Sreg`, and a selector→base table. The flat 32-bit codec path is
+  behaviour-identical (all bases 0, default size 32-bit); 235 emulator unit
+  tests stay green.
+- [x] NE loader (`ne::load_ne`): reuses `ud_format::ne::NeFile`, maps each
+  segment to a 64 KiB linear window, applies internal + imported-ordinal
+  relocations (imports → fail-soft thunks via `register_unknown_fallback`),
+  and returns an `NeImage` (entry `CS:IP`, `SS:SP`, selector table).
+- [x] `Sandbox::load_ne_fail_soft` + `call_ne_entry` drive the entry in 16-bit
+  mode through the existing `run_until_sentinel` loop; `ud analyze --monitor`
+  detects NE before PE and reports the Win16 call surface.
+- Demonstrated on `SITEX10.EXE` (StuffIt Expander 1.0 Setup): loads 3 segments
+  + 227 imported ordinals, executes the entry prologue, and reaches the first
+  Win16 call (`KERNEL.91` = `InitTask`), surfaced as a fail-soft trap.
+### NE (Win16) execution — Phase 2: FAR PASCAL API layer (in progress)
+
+- [x] **FAR PASCAL call ABI** in `win32::dispatch_stub` (it branches on the CPU's
+  16-bit mode): arguments read left-to-right as 16-bit words / far pointers,
+  return value in `DX:AX`, far return (`RETF n`) with callee stack cleanup.
+  `Registry::register_far_pascal` registers stubs keyed by `(module, "@ord")`.
+- [x] **Win16 stub module** (`win16`): KERNEL `InitTask` (91, the keystone —
+  returns the task's `AX/CX/DX/SI/DI/ES:BX` register block), `WaitEvent` (23),
+  `GetVersion` (3); the NE loader resolves known ordinals to these stubs and
+  only falls back to trap-on-call for the rest.
+- [x] **DOS `INT 21h`** serviced in the run loop (`Trap::SoftwareInterrupt` →
+  `win16::service_interrupt`): get-version, current-drive, get/set-vector, …
+- [x] Fixed a CPU bug surfaced by real code: the `MOV moffs` opcodes
+  (`A0`–`A3`) now use a 16-bit offset in 16-bit address mode.
+- Result: `SITEX10.EXE` now executes its MFC / C-runtime startup through
+  `InitTask → WaitEvent → GetVersion → INT 21h` (34 instructions, was 3),
+  stopping at the next unimplemented ordinal (`KERNEL.30`).
+- [ ] Remaining Phase 2: the rest of the KERNEL startup surface, then USER /
+  GDI (window class, message loop, dialog procs).
+- [ ] **Phase 3** — drive the installer's silent path + capture the extracted
+  `EXPANDER.EXE` via `--dump-vfs`.
+
 ## Beyond v1
 
 In open consideration once Phases 5–9 stabilize:

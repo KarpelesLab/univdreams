@@ -9,6 +9,7 @@
 //! * [`elf`] — ELF32 / ELF64 (`Elf64File`).
 //! * [`pe`] — PE / COFF, PE32 and PE32+ (`PeFile`).
 //! * [`macho`] — thin 64-bit Mach-O (`MachoFile`).
+//! * [`ne`] — 16-bit Windows New Executable (`NeFile`).
 //! * [`raw`] — headerless flat images, e.g. 6502 ROMs
 //!   (`RawImage`).
 //! * [`wasm`] — WebAssembly modules (`WasmFile`).
@@ -21,6 +22,7 @@
 
 pub mod elf;
 pub mod macho;
+pub mod ne;
 pub mod pe;
 pub mod raw;
 pub mod solana;

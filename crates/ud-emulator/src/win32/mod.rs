@@ -99,6 +99,11 @@ pub struct StubEntry {
     /// The synthetic guest address that, when called, invokes
     /// this stub.
     pub thunk_addr: u32,
+    /// For Win16 FAR PASCAL stubs: the number of argument bytes the
+    /// callee must clean on return (`RETF n`). 0 for Win32 stdcall
+    /// stubs, where `arg_dwords * 4` is used instead. The dispatcher
+    /// picks the convention by the CPU's 16-bit mode.
+    pub far_pascal_arg_bytes: u16,
 }
 
 /// Errors a stub can raise. Wrapped in `crate::Error::Win32`.
@@ -566,6 +571,31 @@ pub struct HostState {
     /// to `eprintln!`). Distinct from `debug_log` so a test can
     /// distinguish OutputDebugStringA traffic from real popups.
     pub message_box_log: Vec<String>,
+    /// Headless Win16 GUI model — windows, dialogs, controls, and a
+    /// transcript of GUI actions, recorded by the USER stubs and
+    /// serialised to JSON for expect-style automation.
+    pub gui: crate::win16::gui::GuiState,
+    /// Win16 global heap — `GlobalAlloc`/`GlobalLock` backing store.
+    pub win16_heap: crate::win16::Win16Heap,
+    /// `RT_STRING` resources parsed from a loaded NE module, keyed by
+    /// string id, for `LoadString`.
+    pub string_resources: std::collections::BTreeMap<u16, String>,
+    /// Global atom table (`GlobalAddAtom`/`GlobalFindAtom`/…): interned
+    /// strings; the atom for index `i` is `0xC000 + i`.
+    pub atoms: Vec<String>,
+    /// Resources parsed from a loaded NE module, for `FindResource` /
+    /// `LoadResource`. The `HRSRC` handed out is the 1-based index.
+    pub resources: Vec<crate::win16::LoadedResource>,
+    /// Set by `EndDialog` to signal the active modal dialog should close,
+    /// carrying its result code. Polled by the `DialogBox` driver.
+    pub dialog_ended: bool,
+    pub dialog_result: i16,
+    /// Active modal dialog's controls: control id → child window handle,
+    /// for `GetDlgItem`. Populated by the `DialogBox` driver.
+    pub dialog_items: std::collections::BTreeMap<u16, u16>,
+    /// Button/checkbox check state, keyed by control HWND (`BM_GETCHECK` /
+    /// `BM_SETCHECK` / `CheckDlgButton`).
+    pub dialog_checks: std::collections::BTreeMap<u16, u16>,
     /// Optional per-run instruction budget. Decremented at each
     /// top-of-loop iteration in [`run_until_sentinel`] (both
     /// instruction steps and stub dispatches count). When it
@@ -656,6 +686,15 @@ impl Default for HostState {
         processes.insert(1, p);
         HostState {
             processes,
+            gui: crate::win16::gui::GuiState::default(),
+            win16_heap: crate::win16::Win16Heap::default(),
+            string_resources: BTreeMap::new(),
+            atoms: Vec::new(),
+            resources: Vec::new(),
+            dialog_ended: false,
+            dialog_result: 0,
+            dialog_items: BTreeMap::new(),
+            dialog_checks: BTreeMap::new(),
             active_pid: 1,
             next_pid: 2,
             next_child_image_base: 0,
@@ -1089,6 +1128,39 @@ impl Registry {
                 func,
                 arg_dwords,
                 thunk_addr,
+                far_pascal_arg_bytes: 0,
+            },
+        );
+        thunk_addr
+    }
+
+    /// Register a Win16 FAR PASCAL stub keyed by `(module, "@ordinal")`
+    /// — e.g. `("kernel", "@91")` for `InitTask`. `arg_bytes` is the
+    /// number of argument bytes the callee cleans on its far return.
+    /// Returns the thunk address far pointers should target.
+    pub fn register_far_pascal(
+        &mut self,
+        module: &str,
+        ordinal: &str,
+        func: StubFn,
+        arg_bytes: u16,
+    ) -> u32 {
+        let key = (module.to_ascii_lowercase(), ordinal.to_string());
+        if let Some(addr) = self.by_name.get(&key) {
+            return *addr;
+        }
+        let thunk_addr = THUNK_BASE.wrapping_add(self.next_slot.wrapping_mul(THUNK_STRIDE));
+        self.next_slot += 1;
+        self.by_name.insert(key.clone(), thunk_addr);
+        self.by_thunk.insert(
+            thunk_addr,
+            StubEntry {
+                dll: key.0,
+                name: key.1,
+                func,
+                arg_dwords: 0,
+                thunk_addr,
+                far_pascal_arg_bytes: arg_bytes,
             },
         );
         thunk_addr
@@ -1149,6 +1221,7 @@ impl Registry {
                 func: stub_unresolved_fallback,
                 arg_dwords: 0,
                 thunk_addr,
+                far_pascal_arg_bytes: 0,
             },
         );
         thunk_addr
@@ -1424,7 +1497,7 @@ pub fn read_wide_cstr_local(mmu: &Mmu, mut addr: u32, max_chars: u32) -> String 
 /// remains the default since it reveals what stubs to add.
 fn stub_unresolved_fallback(
     cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    mmu: &mut Mmu,
     state: &mut HostState,
     registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
@@ -1433,6 +1506,14 @@ fn stub_unresolved_fallback(
         .entry(addr)
         .map(|e| (e.dll.clone(), e.name.clone()))
         .unwrap_or_else(|| ("<unknown>".to_string(), format!("@{addr:#010x}")));
+    // Win16 debugging aid: print where the unimplemented ordinal was
+    // called from (caller CS:IP sit above the far return) so the call
+    // site can be disassembled to read its argument count.
+    if cpu.is_code16() && std::env::var("UD_NE_DEBUG").is_ok() {
+        let ip = cpu.stack_word(mmu, 0).unwrap_or(0);
+        let cs = cpu.stack_word(mmu, 2).unwrap_or(0);
+        eprintln!("WIN16 unresolved {dll}!{name} called from {cs:#06x}:{ip:#06x}");
+    }
     if std::env::var("UD_LENIENT_UNRESOLVED").is_ok() {
         // One-line summary per unique (dll, name) the operator
         // sees; the stub then returns 0 so the calling code
@@ -1489,14 +1570,27 @@ pub fn dispatch_stub(
     #[cfg(feature = "trace")]
     let capture_args = capture_args || mmu.trace.has_sink();
     let snapshot: Option<(u32, Vec<u32>)> = if capture_args {
-        let call_site_eip = mmu.load32(cpu.regs.esp()).unwrap_or(0);
-        let n_args = cdecl_trace_arg_count(&entry.dll, &entry.name).unwrap_or(entry.arg_dwords);
-        let mut args = Vec::with_capacity(n_args as usize);
-        for i in 0..n_args {
-            let a = arg_dword(cpu, mmu, i).unwrap_or(0);
-            args.push(a);
+        if cpu.is_code16() {
+            // Win16 FAR PASCAL: the 4-byte far return address sits at
+            // SP+0..3; arguments are 16-bit words above it. Capture the
+            // return IP as the call site and each declared word arg.
+            let call_site_eip = u32::from(cpu.stack_word(mmu, 0).unwrap_or(0));
+            let n_words = u32::from(entry.far_pascal_arg_bytes / 2);
+            let mut args = Vec::with_capacity(n_words as usize);
+            for i in 0..n_words {
+                args.push(u32::from(cpu.stack_word(mmu, 4 + i * 2).unwrap_or(0)));
+            }
+            Some((call_site_eip, args))
+        } else {
+            let call_site_eip = mmu.load32(cpu.regs.esp()).unwrap_or(0);
+            let n_args = cdecl_trace_arg_count(&entry.dll, &entry.name).unwrap_or(entry.arg_dwords);
+            let mut args = Vec::with_capacity(n_args as usize);
+            for i in 0..n_args {
+                let a = arg_dword(cpu, mmu, i).unwrap_or(0);
+                args.push(a);
+            }
+            Some((call_site_eip, args))
         }
-        Some((call_site_eip, args))
     } else {
         None
     };
@@ -1529,16 +1623,25 @@ pub fn dispatch_stub(
         mmu.trace
             .ev_win32_call(&entry.dll, &entry.name, &args, ret, call_site_eip);
     }
-    // stdcall: pop return address, advance esp by arg_dwords*4,
-    // set eax to the return value.
-    let ret_addr = cpu.pop32(mmu)?;
-    cpu.regs.set32(crate::emulator::regs::Reg32::Eax, ret);
-    let new_esp = cpu
-        .regs
-        .esp()
-        .wrapping_add(entry.arg_dwords.wrapping_mul(4));
-    cpu.regs.set_esp(new_esp);
-    cpu.regs.eip = ret_addr;
+    if cpu.is_code16() {
+        // Win16 FAR PASCAL: return value in DX:AX, far return, callee
+        // cleans `far_pascal_arg_bytes` of arguments.
+        cpu.regs.set16(crate::emulator::regs::Reg16::Ax, ret as u16);
+        cpu.regs
+            .set16(crate::emulator::regs::Reg16::Dx, (ret >> 16) as u16);
+        cpu.far_return_and_clean(mmu, entry.far_pascal_arg_bytes)?;
+    } else {
+        // stdcall: pop return address, advance esp by arg_dwords*4,
+        // set eax to the return value.
+        let ret_addr = cpu.pop32(mmu)?;
+        cpu.regs.set32(crate::emulator::regs::Reg32::Eax, ret);
+        let new_esp = cpu
+            .regs
+            .esp()
+            .wrapping_add(entry.arg_dwords.wrapping_mul(4));
+        cpu.regs.set_esp(new_esp);
+        cpu.regs.eip = ret_addr;
+    }
     Ok(())
 }
 
@@ -1961,6 +2064,16 @@ pub fn run_until_sentinel(
                 continue;
             }
             Err(t) => {
+                // Win16 software interrupts (DOS INT 21h, …) are
+                // serviced in place and the run resumes.
+                if let crate::emulator::Trap::SoftwareInterrupt { num, .. } = t {
+                    if crate::win16::service_interrupt(num, cpu, mmu, state) {
+                        continue;
+                    }
+                }
+                if cpu.is_code16() && std::env::var("UD_NE_DEBUG").is_ok() {
+                    eprintln!("TRAP {t} | {}", cpu.seg_state());
+                }
                 if std::env::var("UD_TRACE_WILD_JUMP").is_ok() {
                     let last = state.cur_thread().last_eip_before_wild;
                     let esp = cpu.regs.get32(crate::emulator::regs::Reg32::Esp);
@@ -1994,6 +2107,9 @@ fn emit_trap_event(cpu: &Cpu, mmu: &Mmu, err: &crate::Error) {
                 ("UndefinedOpcode", *eip, Some(*opcode))
             }
             crate::emulator::Trap::PrivilegedOpcode { eip, .. } => ("PrivilegedOpcode", *eip, None),
+            crate::emulator::Trap::SoftwareInterrupt { eip, .. } => {
+                ("SoftwareInterrupt", *eip, None)
+            }
             crate::emulator::Trap::DivideByZero { eip } => ("DivideByZero", *eip, None),
             crate::emulator::Trap::UnresolvedImport { .. } => {
                 ("UnresolvedImport", cpu.regs.eip, None)
@@ -2007,6 +2123,7 @@ fn emit_trap_event(cpu: &Cpu, mmu: &Mmu, err: &crate::Error) {
         },
         crate::Error::PeLoader(_) => ("PeLoader", cpu.regs.eip, None),
         crate::Error::Win32(_) => ("Win32", cpu.regs.eip, None),
+        crate::Error::NeLoader(_) => ("NeLoader", cpu.regs.eip, None),
         crate::Error::NotImplemented => ("NotImplemented", cpu.regs.eip, None),
     };
     let regs = [

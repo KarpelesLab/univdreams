@@ -20,7 +20,7 @@ For every committed fixture, the entire file — headers, segment / section tabl
 
 What's working today:
 
-- **Byte-identical round-trip** across ELF64, PE/COFF, and thin Mach-O (x86-64 + arm64), plus 6502 raw images.
+- **Byte-identical round-trip** across ELF64, PE/COFF, thin Mach-O (x86-64 + arm64), and 16-bit Windows NE, plus 6502 raw images.
 - **Architectures**: x86-64 + i386 via `iced-x86`, AArch64 (decode + lift), 6502 (full assembler + disassembler).
 - **Structured statement lifting**, not just `@asm()` dumps: `if`/`switch`/`goto`, register-named locals, `dword ptr [global] = expr` stores, `lea`-as-`&` address-of, `sub_foo(arg_8, arg_c)` calls with stdcall/cdecl push-chain folding, `tail_F(args)` for tail-jmps, prologue/epilogue auto-generation, SSA expression composition.
 - **PE / Mach-O readability** comparable to Ghidra's Headers + Memory Map + Symbol Table + Listing panes: structural decode of load commands (`LC_SEGMENT_64`, `LC_SYMTAB`, `LC_MAIN`, `LC_BUILD_VERSION`, `LC_LOAD_DYLIB`, etc.), inline disassembly comments, IAT-resolved imports (`GetDriverModuleHandle(arg_c)`).
@@ -145,6 +145,7 @@ source round-trip ok: testdata/external/wmpcdcs8-mpg4c32.dll == /tmp/mpg4c32.reb
 | **v1 (working)** | ELF64 | x86-64 (SysV), x86 (32-bit), aarch64 | ✅ whole-binary source round-trip; DWARF; structured lifts |
 | **v1 (working)** | PE/COFF | x86-64, x86 (Windows MSVC + MinGW) | ✅ whole-binary source round-trip; imports + signatures |
 | **v1 (working)** | Mach-O (thin) | x86-64, arm64 (macOS) | ✅ whole-binary source round-trip; Ghidra-style listing |
+| **v1 (working)** | NE | x86-16 (Windows 1.x–3.x) | ✅ whole-binary source round-trip; Ghidra-style listing (imports, exports, 16-bit disasm) — structured lifting pending |
 | **v1 (working)** | raw / flat | 6502 (Apple I / WozMon) | ✅ round-trip + lift |
 | 2 | Mach-O fat | universal binaries | demux to thin first |
 | 2 | ARM / Thumb | 32-bit ARM | not yet |
@@ -181,7 +182,7 @@ Rust. Reasoning, briefly:
 │   └── installers.md           # running Win32 installers under `ud analyze --monitor`
 └── crates/
     ├── ud-core/                # shared types: VAddr, Result, byte helpers
-    ├── ud-format/              # ELF64 + PE/COFF + thin Mach-O + raw readers + writers (byte-identical)
+    ├── ud-format/              # ELF64 + PE/COFF + thin Mach-O + NE + raw readers + writers (byte-identical)
     ├── ud-arch-x86/            # x86 decode + lift + Intel formatter + assembler
     ├── ud-arch-aarch64/        # AArch64 decode + lift
     ├── ud-arch-6502/           # 6502 decode + lift + assembler

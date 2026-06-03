@@ -13,7 +13,7 @@
 //! primitives the executor needs.
 
 use super::mmu::Mmu;
-use super::regs::{Reg32, Regs};
+use super::regs::{Reg16, Reg32, Regs};
 use super::Trap;
 
 /// Decoded ModR/M byte.
@@ -168,6 +168,81 @@ pub fn resolve_modrm32(
     }
 
     Ok((Operand::Mem32(addr), consumed))
+}
+
+/// 16-bit-mode effective-address resolution.
+///
+/// Intel SDM Vol. 2A §2.1.5 Table 2-1 ("16-Bit Addressing Forms with
+/// the ModR/M Byte"). Returns the resolved [`Operand`] (the offset is
+/// the 16-bit effective address; the executor adds the segment base in
+/// `seg_translate`), the bytes consumed past the ModR/M byte, and
+/// whether the addressing form is BP-relative (which defaults to the
+/// SS segment instead of DS).
+pub fn resolve_modrm16(
+    modrm: ModRm,
+    bytes_after_modrm: &[u8],
+    regs: &Regs,
+) -> Result<(Operand, usize, bool), Trap> {
+    if modrm.mode == 0b11 {
+        return Ok((Operand::Reg32(Reg32::from_bits(modrm.rm)), 0, false));
+    }
+    let r16 = |r: Reg16| u32::from(regs.get16(r));
+
+    // Base term + BP-relative (default-SS) flag, per Table 2-1.
+    let (base, bp_relative): (u32, bool) = match modrm.rm {
+        0b000 => (r16(Reg16::Bx).wrapping_add(r16(Reg16::Si)), false),
+        0b001 => (r16(Reg16::Bx).wrapping_add(r16(Reg16::Di)), false),
+        0b010 => (r16(Reg16::Bp).wrapping_add(r16(Reg16::Si)), true),
+        0b011 => (r16(Reg16::Bp).wrapping_add(r16(Reg16::Di)), true),
+        0b100 => (r16(Reg16::Si), false),
+        0b101 => (r16(Reg16::Di), false),
+        0b110 => {
+            // mod=00 + rm=110 is a bare disp16 (DS); otherwise [BP+disp].
+            if modrm.mode == 0b00 {
+                (0, false)
+            } else {
+                (r16(Reg16::Bp), true)
+            }
+        }
+        0b111 => (r16(Reg16::Bx), false),
+        _ => unreachable!(),
+    };
+
+    let mut consumed = 0usize;
+    let disp: u32 = match modrm.mode {
+        0b00 => {
+            if modrm.rm == 0b110 {
+                let d = read_imm16(bytes_after_modrm, 0)?;
+                consumed += 2;
+                u32::from(d)
+            } else {
+                0
+            }
+        }
+        0b01 => {
+            let b = *bytes_after_modrm.first().ok_or_else(unreachable_trap)?;
+            consumed += 1;
+            u32::from(sign_ext_8_to_16(b))
+        }
+        0b10 => {
+            let d = read_imm16(bytes_after_modrm, 0)?;
+            consumed += 2;
+            u32::from(d)
+        }
+        _ => unreachable!(),
+    };
+
+    // 16-bit effective addresses wrap at the 64 KiB segment boundary.
+    let addr = base.wrapping_add(disp) & 0xFFFF;
+    Ok((Operand::Mem32(addr), consumed, bp_relative))
+}
+
+fn read_imm16(bytes: &[u8], offset: usize) -> Result<u16, Trap> {
+    bytes
+        .get(offset..offset + 2)
+        .and_then(|s| s.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or_else(unreachable_trap)
 }
 
 enum BaseKind {

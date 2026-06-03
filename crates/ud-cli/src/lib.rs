@@ -58,6 +58,14 @@ fn pipeline_bytes(bytes: &[u8]) -> Vec<u8> {
         // ELF that we still can't parse (e.g. malformed header sizes).
         // Fall through to byte-copy so the round-trip contract holds.
     }
+    // NE must be tested before PE: both carry an `MZ` DOS header, and
+    // `is_pe` only checks that, so an NE would otherwise misroute.
+    if ud_format::ne::is_ne(bytes) {
+        if let Ok(ne) = ud_format::ne::NeFile::parse(bytes) {
+            return ne.write_to_vec();
+        }
+        // NE-shaped but invalid; fall through to byte-copy.
+    }
     if ud_format::pe::is_pe(bytes) {
         if let Ok(pe) = ud_format::pe::PeFile::parse(bytes) {
             return pe.write_to_vec();
@@ -128,6 +136,8 @@ pub enum SourceRoundTripError {
     #[error(transparent)]
     MachoFormat(#[from] ud_format::macho::Error),
     #[error(transparent)]
+    NeFormat(#[from] ud_format::ne::Error),
+    #[error(transparent)]
     WasmFormat(#[from] ud_format::wasm::Error),
     #[error("parse of decompile output failed: {0}")]
     Parse(String),
@@ -137,6 +147,8 @@ pub enum SourceRoundTripError {
     PeLower(#[from] ud_translate::compile::PeLowerError),
     #[error(transparent)]
     MachoLower(#[from] ud_translate::compile::MachoLowerError),
+    #[error(transparent)]
+    NeLower(#[from] ud_translate::compile::NeLowerError),
     #[error(transparent)]
     RawLower(#[from] ud_translate::compile::RawLowerError),
     #[error(transparent)]
@@ -164,6 +176,17 @@ pub fn roundtrip_through_source(
             .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
         let warnings = ud_translate::compile::verify_asm(&parsed);
         let rebuilt = ud_translate::compile::lower_to_elf(&parsed)?;
+        (text, warnings, rebuilt)
+    } else if ud_format::ne::is_ne(&input_bytes) {
+        // Before PE: NE and PE share the `MZ` header and `is_pe` only
+        // checks that, so NE has to win the dispatch.
+        let ne = ud_format::ne::NeFile::parse(&input_bytes)?;
+        let ast = ud_translate::decompile::decompile_ne(&ne);
+        let text = ud_ast::emit(&ast);
+        let parsed = ud_translate::compile::parse(&text)
+            .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = ud_translate::compile::verify_asm(&parsed);
+        let rebuilt = ud_translate::compile::lower_to_ne(&parsed)?;
         (text, warnings, rebuilt)
     } else if ud_format::pe::is_pe(&input_bytes) {
         let pe = ud_format::pe::PeFile::parse(&input_bytes)?;

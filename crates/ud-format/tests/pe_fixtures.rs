@@ -43,6 +43,12 @@ fn pe_fixtures_roundtrip_byte_identical() {
 
     for fixture in &fixtures {
         let bytes = std::fs::read(fixture).expect("read fixture");
+        // NE (16-bit Windows) binaries also carry an `MZ` header, which
+        // is all `is_pe` checks — skip them here; they have their own
+        // reader and round-trip path.
+        if ud_format::ne::is_ne(&bytes) {
+            continue;
+        }
         if !ud_format::pe::is_pe(&bytes) {
             continue;
         }
