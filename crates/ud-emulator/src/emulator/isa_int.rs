@@ -485,6 +485,22 @@ impl Cpu {
         self.ds_sel
     }
 
+    /// One-line dump of the segment registers + cached bases (debugging).
+    #[must_use]
+    pub fn seg_state(&self) -> String {
+        format!(
+            "cs={:#06x}/{:#x} ds={:#06x}/{:#x} es={:#06x}/{:#x} ss={:#06x}/{:#x}",
+            self.cs_sel,
+            self.cs_base,
+            self.ds_sel,
+            self.ds_base,
+            self.es_sel,
+            self.es_base,
+            self.ss_sel,
+            self.ss_base,
+        )
+    }
+
     /// Load segment register `which` (0=ES, 1=CS, 2=SS, 3=DS) with a
     /// selector — the Sreg encoding Win16 API stubs use to hand back
     /// `ES:BX`-style far results. CS reloads also refold `eip`.
@@ -3454,8 +3470,8 @@ impl Cpu {
             // (NOT overridable). seg_translate captures the
             // override on the source side; ES base is 0 in flat
             // 32-bit mode so the destination is unmodified.
-            let src = this.seg_translate(this.regs.get32(Reg32::Esi));
-            let dst = this.regs.get32(Reg32::Edi);
+            let src = this.str_si_addr(/*translate*/ true);
+            let dst = this.str_di_addr();
             match size {
                 StringSize::B8 => {
                     let v = mmu.load8(src)?;
@@ -3470,14 +3486,8 @@ impl Cpu {
                     mmu.store32(dst, v)?;
                 }
             }
-            this.regs.set32(
-                Reg32::Esi,
-                this.regs.get32(Reg32::Esi).wrapping_add(step as u32),
-            );
-            this.regs.set32(
-                Reg32::Edi,
-                this.regs.get32(Reg32::Edi).wrapping_add(step as u32),
-            );
+            this.str_advance(Reg16::Si, Reg32::Esi, step);
+            this.str_advance(Reg16::Di, Reg32::Edi, step);
             Ok(())
         };
         self.string_loop(mmu, do_one, /*compare*/ false)
@@ -3487,13 +3497,13 @@ impl Cpu {
         let size = self.string_size(sized_dword);
         let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
-            let dst = this.regs.get32(Reg32::Edi);
+            let dst = this.str_di_addr();
             match size {
                 StringSize::B8 => mmu.store8(dst, this.regs.get8(Reg8::Al))?,
                 StringSize::W16 => mmu.store16(dst, this.regs.get16(Reg16::Ax))?,
                 StringSize::D32 => mmu.store32(dst, this.regs.get32(Reg32::Eax))?,
             }
-            this.regs.set32(Reg32::Edi, dst.wrapping_add(step as u32));
+            this.str_advance(Reg16::Di, Reg32::Edi, step);
             Ok(())
         };
         self.string_loop(mmu, do_one, /*compare*/ false)
@@ -3503,7 +3513,7 @@ impl Cpu {
         let size = self.string_size(sized_dword);
         let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
-            let src = this.regs.get32(Reg32::Esi);
+            let src = this.str_si_addr(/*translate*/ false);
             match size {
                 StringSize::B8 => {
                     let v = mmu.load8(src)?;
@@ -3518,7 +3528,7 @@ impl Cpu {
                     this.regs.set32(Reg32::Eax, v);
                 }
             }
-            this.regs.set32(Reg32::Esi, src.wrapping_add(step as u32));
+            this.str_advance(Reg16::Si, Reg32::Esi, step);
             Ok(())
         };
         self.string_loop(mmu, do_one, /*compare*/ false)
@@ -3548,7 +3558,7 @@ impl Cpu {
                 }
             }
             this.regs.set32(Reg32::Esi, src.wrapping_add(step as u32));
-            this.regs.set32(Reg32::Edi, dst.wrapping_add(step as u32));
+            this.str_advance(Reg16::Di, Reg32::Edi, step);
             Ok(())
         };
         self.string_loop(mmu, do_one, /*compare*/ true)
@@ -3558,7 +3568,7 @@ impl Cpu {
         let size = self.string_size(sized_dword);
         let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
-            let dst = this.regs.get32(Reg32::Edi);
+            let dst = this.str_di_addr();
             match size {
                 StringSize::B8 => {
                     let v = mmu.load8(dst)?;
@@ -3576,7 +3586,7 @@ impl Cpu {
                     let _ = alu_sub_32(acc, v, &mut this.regs.flags);
                 }
             }
-            this.regs.set32(Reg32::Edi, dst.wrapping_add(step as u32));
+            this.str_advance(Reg16::Di, Reg32::Edi, step);
             Ok(())
         };
         self.string_loop(mmu, do_one, /*compare*/ true)
@@ -3598,6 +3608,44 @@ impl Cpu {
     /// +N or -N depending on DF and operand size. Returned as i32
     /// so callers can sign-extend it via `as u32` for
     /// wrapping_add.
+    /// Linear address of the string destination `ES:DI` (ES is not
+    /// overridable). In 16-bit mode this adds the ES base to a 16-bit
+    /// DI; in flat 32-bit mode the ES base is 0, so EDI is used as-is.
+    fn str_di_addr(&self) -> u32 {
+        if self.code16 {
+            self.es_base
+                .wrapping_add(u32::from(self.regs.get16(Reg16::Di)))
+        } else {
+            self.regs.get32(Reg32::Edi)
+        }
+    }
+
+    /// Linear address of the string source `(DS|override):SI`. In
+    /// 32-bit mode `translate` selects the existing per-op behaviour
+    /// (MOVS applies a segment override; LODS does not).
+    fn str_si_addr(&self, translate: bool) -> u32 {
+        if self.code16 {
+            let base = self.seg_base(self.seg_override.unwrap_or(Seg::Ds));
+            base.wrapping_add(u32::from(self.regs.get16(Reg16::Si)))
+        } else if translate {
+            self.seg_translate(self.regs.get32(Reg32::Esi))
+        } else {
+            self.regs.get32(Reg32::Esi)
+        }
+    }
+
+    /// Advance a string index register by `step`, wrapping at 16 bits in
+    /// `code16` mode (SI/DI) and otherwise updating the full 32-bit reg.
+    fn str_advance(&mut self, r16: Reg16, r32: Reg32, step: i32) {
+        if self.code16 {
+            let v = (i32::from(self.regs.get16(r16)).wrapping_add(step)) as u16;
+            self.regs.set16(r16, v);
+        } else {
+            let v = (i64::from(self.regs.get32(r32)) + i64::from(step)) as u32;
+            self.regs.set32(r32, v);
+        }
+    }
+
     fn string_step_for(&self, size: StringSize) -> i32 {
         let inc: i32 = match size {
             StringSize::B8 => 1,

@@ -2008,6 +2008,9 @@ pub fn run_until_sentinel(
                         continue;
                     }
                 }
+                if cpu.is_code16() && std::env::var("UD_NE_DEBUG").is_ok() {
+                    eprintln!("TRAP {t} | {}", cpu.seg_state());
+                }
                 if std::env::var("UD_TRACE_WILD_JUMP").is_ok() {
                     let last = state.cur_thread().last_eip_before_wild;
                     let esp = cpu.regs.get32(crate::emulator::regs::Reg32::Esp);
