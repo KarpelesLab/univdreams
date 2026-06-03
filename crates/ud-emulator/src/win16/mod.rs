@@ -41,6 +41,11 @@ pub struct Win16Heap {
 }
 
 impl Win16Heap {
+    /// The 64 KiB selector window used as the minimum allocation
+    /// grain for [`Win16Heap::alloc`] and as the in-place-resize
+    /// ceiling for [`Win16Heap::realloc`].
+    const SEGMENT: u32 = 0x10000;
+
     /// Allocate `size` bytes: map a fresh window, assign a selector,
     /// register it on the CPU, and return the selector (the handle).
     ///
@@ -62,13 +67,12 @@ impl Win16Heap {
     /// — those programs allocate exactly what they need and don't
     /// generally over-poke past it.
     fn alloc(&mut self, cpu: &mut Cpu, mmu: &mut Mmu, size: u32) -> u16 {
-        const SEGMENT: u32 = 0x10000;
         if self.next_base < WIN16_HEAP_BASE {
             self.next_base = WIN16_HEAP_BASE;
             self.next_selector = WIN16_HEAP_FIRST_SEL;
         }
         let page_rounded = size.max(1).wrapping_add(0xFFF) & !0xFFF;
-        let mapped = page_rounded.max(SEGMENT);
+        let mapped = page_rounded.max(Self::SEGMENT);
         let base = self.next_base;
         let sel = self.next_selector;
         mmu.map(base, mapped, Perm::R | Perm::W | Perm::X);
@@ -84,6 +88,36 @@ impl Win16Heap {
         self.next_base = self.next_base.wrapping_add(mapped);
         self.next_selector = self.next_selector.wrapping_add(8);
         sel
+    }
+
+    /// Grow `handle` to `size` bytes in place when its existing 64
+    /// KiB selector window can absorb the new size; otherwise fall
+    /// back to a fresh selector via [`Self::alloc`].
+    ///
+    /// Real `GlobalReAlloc` keeps the handle stable across resizes
+    /// when the heap manager doesn't need to relocate the block.
+    /// Win16 code routinely captures the original selector in a
+    /// `DS`/`ES` and continues using it after a resize; minting a
+    /// fresh selector on every grow strands those captures and turns
+    /// post-resize accesses into reads of a stale, zero-filled window.
+    /// In-place growth honours that contract for the common case
+    /// where the requested size still fits the segment we already
+    /// mapped.
+    fn realloc(&mut self, cpu: &mut Cpu, mmu: &mut Mmu, handle: u16, size: u32) -> u16 {
+        let Some(&(base, _old_size)) = self.blocks.get(&handle) else {
+            return self.alloc(cpu, mmu, size);
+        };
+        if size <= Self::SEGMENT {
+            self.blocks.insert(handle, (base, size));
+            if std::env::var("UD_NE_HEAP_DEBUG").is_ok() {
+                eprintln!(
+                    "win16_heap: realloc-in-place sel={handle:#06x} \
+                     base={base:#010x} new_size={size:#x}"
+                );
+            }
+            return handle;
+        }
+        self.alloc(cpu, mmu, size)
     }
 }
 
@@ -1440,8 +1474,11 @@ fn stub_global_alloc(
     Ok(u32::from(sel))
 }
 
-/// `KERNEL.16 GlobalReAlloc(hMem, dwBytes, wFlags)` — allocate a new
-/// block (we never move existing ones) and return its handle.
+/// `KERNEL.16 GlobalReAlloc(hMem, dwBytes, wFlags)` — grow `hMem` in
+/// place when it fits the existing 64 KiB selector window, otherwise
+/// fall back to a fresh selector. Real Win16 keeps the handle stable
+/// when the heap manager doesn't need to relocate; guests stash the
+/// original selector in `DS`/`ES` and keep using it across resizes.
 fn stub_global_realloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -1452,7 +1489,7 @@ fn stub_global_realloc(
     let h_mem = cpu.stack_word(mmu, 10).unwrap_or(0);
     let size = cpu.stack_dword(mmu, 6).unwrap_or(0);
     let flags = cpu.stack_word(mmu, 4).unwrap_or(0);
-    let sel = state.win16_heap.alloc(cpu, mmu, size);
+    let sel = state.win16_heap.realloc(cpu, mmu, h_mem, size);
     if std::env::var("UD_NE_HEAP_DEBUG").is_ok() {
         eprintln!(
             "  GlobalReAlloc(hMem={h_mem:#06x}, size={size:#x}, flags={flags:#06x}) \

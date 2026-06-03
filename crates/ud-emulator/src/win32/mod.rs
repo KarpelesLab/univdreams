@@ -1956,6 +1956,23 @@ pub fn run_until_sentinel(
         // loop the analyser host.
         if let Some(remaining) = state.instruction_budget.as_mut() {
             if *remaining == 0 {
+                if std::env::var("UD_BUDGET_DEBUG").is_ok() {
+                    use crate::emulator::regs::Reg16;
+                    eprintln!(
+                        "budget-exhaust: linear-eip={:#010x} segs=[{}] \
+                         ax={:#06x} bx={:#06x} cx={:#06x} dx={:#06x} \
+                         bp={:#06x} si={:#06x} di={:#06x}",
+                        cpu.regs.eip,
+                        cpu.seg_state(),
+                        cpu.regs.get16(Reg16::Ax),
+                        cpu.regs.get16(Reg16::Bx),
+                        cpu.regs.get16(Reg16::Cx),
+                        cpu.regs.get16(Reg16::Dx),
+                        cpu.regs.get16(Reg16::Bp),
+                        cpu.regs.get16(Reg16::Si),
+                        cpu.regs.get16(Reg16::Di),
+                    );
+                }
                 return Err(crate::Error::Win32(Win32Error::BudgetExhausted {
                     executed: state.instructions_executed,
                 }));
