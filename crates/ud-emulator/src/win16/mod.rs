@@ -352,6 +352,9 @@ pub fn service_interrupt(num: u8, cpu: &mut Cpu, _mmu: &mut Mmu, _state: &mut Ho
 /// Minimal DOS `INT 21h` dispatcher keyed on `AH`.
 fn dos_int21(cpu: &mut Cpu) {
     let ah = cpu.regs.get8(Reg8::Ah);
+    if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
+        eprintln!("DOS INT21 AH={ah:#04x}");
+    }
     // Default to "success": clear the carry flag.
     cpu.regs.flags.cf = false;
     match ah {
