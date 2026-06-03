@@ -242,6 +242,7 @@ fn register_user(registry: &mut Registry) {
     registry.register_far_pascal("user", "@91", stub_get_dlg_item, 4);
     registry.register_far_pascal("user", "@36", stub_get_window_text, 8);
     registry.register_far_pascal("user", "@37", stub_set_window_text, 6);
+    registry.register_far_pascal("user", "@38", stub_get_window_text_length, 2);
     registry.register_far_pascal("user", "@92", stub_set_dlg_item_text, 8);
     registry.register_far_pascal("user", "@93", stub_get_dlg_item_text, 10);
     // USER.404 GetClassInfo(hInst, lpClassName far, lpWndClass far) → BOOL.
@@ -965,6 +966,21 @@ fn stub_set_dlg_item_text(
     Ok(1)
 }
 
+/// `USER.38 GetWindowTextLength(hWnd)` → the window text length.
+fn stub_get_window_text_length(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let hwnd = cpu.stack_word(mmu, 4).unwrap_or(0);
+    Ok(state
+        .gui
+        .windows
+        .get(&hwnd)
+        .map_or(0, |w| w.title.len() as u32))
+}
+
 /// `USER.36 GetWindowText(hWnd, lpString far, nMax)` → copy the window's
 /// text into the buffer; returns the length copied.
 fn stub_get_window_text(
@@ -1159,17 +1175,35 @@ fn stub_dialog_box(
         )?;
         let mut order: Vec<u16> = controls
             .iter()
-            .filter(|c| c.class.eq_ignore_ascii_case("Button") && c.style & 0x0001 != 0)
+            .filter(|c| c.class.eq_ignore_ascii_case("Button") && c.style & 0x000F == 1)
             .map(|c| c.id)
             .collect();
         order.extend([1u16, 2u16]); // IDOK, IDCANCEL
+        let dbg = std::env::var("UD_NE_DOS_DEBUG").is_ok();
+        // The dialog-init proc (lpDialogFunc) only handles WM_INITDIALOG /
+        // WM_SETFONT; it subclasses the window to MFC's AfxWndProc, which
+        // is what routes WM_COMMAND through the message map to OnOK. Deliver
+        // commands there (the wndproc MFC registered for the AfxWnd class).
+        let (cmd_sel, cmd_off) = state
+            .gui
+            .classes
+            .get("AfxWnd")
+            .map_or((proc_sel, proc_off), |c| (c.wndproc_sel, c.wndproc_off));
         for &id in &order {
             if state.dialog_ended {
                 break;
             }
-            deliver_message(
-                cpu, mmu, registry, state, proc_sel, proc_off, hdlg, WM_COMMAND, id, 0,
+            // WM_COMMAND lParam = MAKELONG(hwndCtl, BN_CLICKED=0).
+            let ctl = u32::from(state.dialog_items.get(&id).copied().unwrap_or(0));
+            let r = deliver_message(
+                cpu, mmu, registry, state, cmd_sel, cmd_off, hdlg, WM_COMMAND, id, ctl,
             )?;
+            if dbg {
+                eprintln!(
+                    "DRIVE WM_COMMAND id={id} -> {r:#x}, dialog_ended={}",
+                    state.dialog_ended
+                );
+            }
         }
         return Ok(u32::from(state.dialog_result as u16));
     }
@@ -1221,6 +1255,9 @@ fn stub_end_dialog(
 ) -> Result<u32, Win32Error> {
     // PASCAL: hDlg (SP+6), nResult (SP+4).
     let result = cpu.stack_word(mmu, 4).unwrap_or(0);
+    if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
+        eprintln!("EndDialog(result={result})");
+    }
     state.dialog_ended = true;
     state.dialog_result = result as i16;
     Ok(1)
