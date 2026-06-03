@@ -205,6 +205,11 @@ fn register_gdi(registry: &mut Registry) {
     registry.register_far_pascal("gdi", "@69", stub_ret1_1word, 2);
     // GDI.87 GetStockObject(fnObject) → HGDIOBJ.
     registry.register_far_pascal("gdi", "@87", stub_create_object, 2);
+    // GDI.442 CreateDIBitmap(hDC, lpbmih far, fdwInit, lpbInit far,
+    // lpbmi far, fuUsage) → HBITMAP. Used by the installer to load its
+    // dialog backdrop / banner bitmaps. Return a synthetic non-zero
+    // handle; the bitmap content is not rendered in the headless GUI.
+    registry.register_far_pascal("gdi", "@442", stub_create_object, 14);
 }
 
 /// Generic GDI object factory → a fresh unique object handle. The
@@ -489,6 +494,14 @@ fn register_kernel(registry: &mut Registry) {
     registry.register_far_pascal("kernel", "@20", stub_global_size, 2);
     // KERNEL.49 GetModuleFileName(hInst, lpFilename far, nSize) → length.
     registry.register_far_pascal("kernel", "@49", stub_get_module_filename, 8);
+    // KERNEL.51 MakeProcInstance(lpProc far, hInst) — bind a function
+    // pointer to a Win16 hInstance. In flat 16-bit emulation the proc
+    // pointer is already self-contained; just echo it back via DX:AX
+    // (the caller treats the result as a callable far pointer).
+    registry.register_far_pascal("kernel", "@51", stub_make_proc_instance, 6);
+    // KERNEL.52 FreeProcInstance(lpProc far) → BOOL. Counterpart to
+    // MakeProcInstance; nothing to release in our model.
+    registry.register_far_pascal("kernel", "@52", stub_ret1_2word, 4);
     // KERNEL.134 GetWindowsDirectory(lpBuffer far, uSize) → length.
     // SITEX10 plants temp files under the Windows directory; a
     // plausible "C:\\WINDOWS" satisfies its bookkeeping.
@@ -534,6 +547,22 @@ fn stub_echo_1word(
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(u32::from(cpu.stack_word(mmu, 4).unwrap_or(0)))
+}
+
+/// `KERNEL.51 MakeProcInstance(lpProc far, hInstance)` — on real
+/// Win16, returns a thunk that prepends DS to a call into `lpProc`.
+/// Our emulation already passes DS through the FAR PASCAL call path,
+/// so the original far pointer is callable directly; echo it back as
+/// the "thunk" in `DX:AX`.
+fn stub_make_proc_instance(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hInstance (SP+8), lpProc far (SP+4..7).
+    cpu.stack_dword(mmu, 4)
+        .map_err(|t| crate::win32::trap_to_win32_local("MakeProcInstance", t))
 }
 
 /// `KERNEL.49 GetModuleFileName(hInst, lpFilename, nSize)` — write a
@@ -808,9 +837,13 @@ fn stub_find_resource(
     state: &mut HostState,
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
-    // PASCAL: hModule (SP+10), lpName far (SP+6), lpType far (SP+4).
+    // PASCAL push order (left-to-right): hModule (1 word), lpName (FAR
+    // = 2 words), lpType (FAR = 2 words). After the FAR-return 4 bytes:
+    //   SP+4..7:  lpType (last pushed, offset then segment)
+    //   SP+8..11: lpName
+    //   SP+12:    hModule
     let want_type = res_id_arg(cpu, mmu, 4);
-    let want_name = res_id_arg(cpu, mmu, 6);
+    let want_name = res_id_arg(cpu, mmu, 8);
     let hrsrc = state
         .resources
         .iter()
