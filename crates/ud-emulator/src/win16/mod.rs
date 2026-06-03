@@ -43,18 +43,45 @@ pub struct Win16Heap {
 impl Win16Heap {
     /// Allocate `size` bytes: map a fresh window, assign a selector,
     /// register it on the CPU, and return the selector (the handle).
+    ///
+    /// The mapped window is padded to at least one full 16-bit
+    /// segment (64 KiB). A Win16 selector is a base + limit pair;
+    /// 16-bit guest code accesses `sel:offset` where `offset` is a
+    /// u16, so the selector can legally address any byte 0..0xFFFF
+    /// even when the program only requested a smaller block.
+    /// `GlobalAlloc` on real Win9x pads small requests to the
+    /// allocation granularity, and selectors carry a fence the
+    /// guest rarely consults; emulating an exact-size byte map turns
+    /// every legal-on-real-Win16 high-offset poke into a fault.
+    /// Padding to 64 KiB matches Win9x's effective behaviour for
+    /// blocks below that size and frees the guest to use the full
+    /// selector range.
+    ///
+    /// For requests larger than 64 KiB (decompression buffers,
+    /// large bitmaps), we still round up to a 4 KiB page boundary
+    /// — those programs allocate exactly what they need and don't
+    /// generally over-poke past it.
     fn alloc(&mut self, cpu: &mut Cpu, mmu: &mut Mmu, size: u32) -> u16 {
+        const SEGMENT: u32 = 0x10000;
         if self.next_base < WIN16_HEAP_BASE {
             self.next_base = WIN16_HEAP_BASE;
             self.next_selector = WIN16_HEAP_FIRST_SEL;
         }
-        let rounded = size.max(1).wrapping_add(0xFFF) & !0xFFF;
+        let page_rounded = size.max(1).wrapping_add(0xFFF) & !0xFFF;
+        let mapped = page_rounded.max(SEGMENT);
         let base = self.next_base;
         let sel = self.next_selector;
-        mmu.map(base, rounded, Perm::R | Perm::W | Perm::X);
+        mmu.map(base, mapped, Perm::R | Perm::W | Perm::X);
         cpu.define_selector(sel, base);
         self.blocks.insert(sel, (base, size));
-        self.next_base = self.next_base.wrapping_add(rounded);
+        if std::env::var("UD_NE_HEAP_DEBUG").is_ok() {
+            eprintln!(
+                "win16_heap: alloc sel={sel:#06x} base={base:#010x}..{:#010x} \
+                 (asked={size:#x}, mapped={mapped:#x})",
+                base.wrapping_add(mapped)
+            );
+        }
+        self.next_base = self.next_base.wrapping_add(mapped);
         self.next_selector = self.next_selector.wrapping_add(8);
         sel
     }
@@ -1402,8 +1429,14 @@ fn stub_global_alloc(
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // PASCAL: wFlags pushed first (SP+8), dwBytes (4) last (SP+4).
+    let flags = cpu.stack_word(mmu, 8).unwrap_or(0);
     let size = cpu.stack_dword(mmu, 4).unwrap_or(0);
     let sel = state.win16_heap.alloc(cpu, mmu, size);
+    if std::env::var("UD_NE_HEAP_DEBUG").is_ok() {
+        eprintln!(
+            "  GlobalAlloc(flags={flags:#06x}, size={size:#x}) → sel={sel:#06x}"
+        );
+    }
     Ok(u32::from(sel))
 }
 
@@ -1416,8 +1449,16 @@ fn stub_global_realloc(
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // PASCAL: hMem (SP+10), dwBytes (4) (SP+6), wFlags (SP+4).
+    let h_mem = cpu.stack_word(mmu, 10).unwrap_or(0);
     let size = cpu.stack_dword(mmu, 6).unwrap_or(0);
+    let flags = cpu.stack_word(mmu, 4).unwrap_or(0);
     let sel = state.win16_heap.alloc(cpu, mmu, size);
+    if std::env::var("UD_NE_HEAP_DEBUG").is_ok() {
+        eprintln!(
+            "  GlobalReAlloc(hMem={h_mem:#06x}, size={size:#x}, flags={flags:#06x}) \
+             → sel={sel:#06x}"
+        );
+    }
     Ok(u32::from(sel))
 }
 
