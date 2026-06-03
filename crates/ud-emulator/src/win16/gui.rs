@@ -210,6 +210,115 @@ impl GuiState {
     }
 }
 
+/// Parse a 16-bit `DLGTEMPLATE` resource into its title and control list.
+/// Best-effort: a short or malformed template yields whatever was decoded
+/// so far (this is pure data extraction — it never errors).
+#[must_use]
+pub fn parse_dialog_template(data: &[u8]) -> (String, Vec<DialogControl>) {
+    let rd16 = |d: &[u8], o: usize| -> u16 {
+        d.get(o..o + 2)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    // Header: DWORD style, BYTE cdit, WORD x,y,cx,cy.
+    let style = u32::from(rd16(data, 0)) | (u32::from(rd16(data, 2)) << 16);
+    let cdit = *data.get(4).unwrap_or(&0);
+    // 4 (style) + 1 (cdit) + 8 (x,y,cx,cy).
+    let mut p = 13usize;
+    // menu (sz_or_ord), then class (sz_or_ord).
+    p = skip_sz_or_ord(data, p);
+    p = skip_sz_or_ord(data, p);
+    // title (NUL-terminated string).
+    let (title, np) = read_sz(data, p);
+    p = np;
+    // DS_SETFONT (0x40) → WORD pointsize + typeface sz.
+    if style & 0x40 != 0 {
+        p += 2;
+        p = read_sz(data, p).1;
+    }
+    let mut controls = Vec::new();
+    for _ in 0..cdit {
+        // DLGITEMTEMPLATE: WORD x,y,cx,cy; WORD id; DWORD style.
+        if p + 14 > data.len() {
+            break;
+        }
+        let id = rd16(data, p + 8);
+        let cstyle = u32::from(rd16(data, p + 10)) | (u32::from(rd16(data, p + 12)) << 16);
+        p += 14;
+        // class (sz_or_ord — predefined classes are a single 0x80-0x85 byte).
+        let (class, np) = read_class(data, p);
+        p = np;
+        // text (sz_or_ord).
+        let (text, np) = read_text(data, p);
+        p = np;
+        // BYTE cbCreationData, then that many extra bytes.
+        let extra = *data.get(p).unwrap_or(&0) as usize;
+        p += 1 + extra;
+        controls.push(DialogControl {
+            id,
+            class,
+            text,
+            style: cstyle,
+        });
+    }
+    (title, controls)
+}
+
+/// Read a NUL-terminated string; returns it and the index past the NUL.
+fn read_sz(data: &[u8], p: usize) -> (String, usize) {
+    let mut end = p;
+    while end < data.len() && data[end] != 0 {
+        end += 1;
+    }
+    let s = String::from_utf8_lossy(&data[p..end]).into_owned();
+    (s, (end + 1).min(data.len().max(p)))
+}
+
+/// Skip a header `sz_or_ord` field (menu / class). `0x00` = none (1 byte);
+/// `0xFF` = ordinal (3 bytes); otherwise a NUL-terminated string.
+fn skip_sz_or_ord(data: &[u8], p: usize) -> usize {
+    match data.get(p) {
+        Some(0) => p + 1,
+        Some(0xFF) => p + 3,
+        Some(_) => read_sz(data, p).1,
+        None => p,
+    }
+}
+
+/// Read a control's class: a predefined-class ordinal byte (0x80-0x85) or
+/// a class-name string.
+fn read_class(data: &[u8], p: usize) -> (String, usize) {
+    match data.get(p) {
+        Some(&b) if b & 0x80 != 0 => {
+            let name = match b {
+                0x80 => "Button",
+                0x81 => "Edit",
+                0x82 => "Static",
+                0x83 => "ListBox",
+                0x84 => "ScrollBar",
+                0x85 => "ComboBox",
+                _ => "?",
+            };
+            (name.to_string(), p + 1)
+        }
+        Some(_) => read_sz(data, p),
+        None => (String::new(), p),
+    }
+}
+
+/// Read a control's text: `0xFF` + WORD ordinal, or a NUL-terminated string.
+fn read_text(data: &[u8], p: usize) -> (String, usize) {
+    match data.get(p) {
+        Some(0xFF) => {
+            let ord = data
+                .get(p + 1..p + 3)
+                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+            (format!("#{ord}"), p + 3)
+        }
+        Some(_) => read_sz(data, p),
+        None => (String::new(), p),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

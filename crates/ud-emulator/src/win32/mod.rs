@@ -569,6 +569,10 @@ pub struct HostState {
     /// Resources parsed from a loaded NE module, for `FindResource` /
     /// `LoadResource`. The `HRSRC` handed out is the 1-based index.
     pub resources: Vec<crate::win16::LoadedResource>,
+    /// Set by `EndDialog` to signal the active modal dialog should close,
+    /// carrying its result code. Polled by the `DialogBox` driver.
+    pub dialog_ended: bool,
+    pub dialog_result: i16,
     /// Optional per-run instruction budget. Decremented at each
     /// top-of-loop iteration in [`run_until_sentinel`] (both
     /// instruction steps and stub dispatches count). When it
@@ -664,6 +668,8 @@ impl Default for HostState {
             string_resources: BTreeMap::new(),
             atoms: Vec::new(),
             resources: Vec::new(),
+            dialog_ended: false,
+            dialog_result: 0,
             active_pid: 1,
             next_pid: 2,
             next_child_image_base: 0,

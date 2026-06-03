@@ -394,7 +394,7 @@ impl Cpu {
     }
 
     /// Linear base of segment `s`.
-    fn seg_base(&self, s: Seg) -> u32 {
+    pub(crate) fn seg_base(&self, s: Seg) -> u32 {
         match s {
             Seg::Es => self.es_base,
             Seg::Cs => self.cs_base,
@@ -449,7 +449,7 @@ impl Cpu {
     }
 
     /// Selector currently in `seg` (only CS/DS/ES/SS tracked).
-    fn segment_selector(&self, seg: Seg) -> u16 {
+    pub(crate) fn segment_selector(&self, seg: Seg) -> u16 {
         match seg {
             Seg::Cs => self.cs_sel,
             Seg::Ds => self.ds_sel,

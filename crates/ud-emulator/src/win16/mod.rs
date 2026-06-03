@@ -218,6 +218,14 @@ fn register_user(registry: &mut Registry) {
     registry.register_far_pascal("user", "@291", stub_set_windows_hook_ex, 10);
     // USER.57 RegisterClass(lpWndClass far) → ATOM.
     registry.register_far_pascal("user", "@57", stub_register_class, 4);
+    // USER.87 DialogBox(hInst, lpTemplate far, hWndParent, lpDialogFunc far).
+    registry.register_far_pascal("user", "@87", stub_dialog_box, 12);
+    // USER.88 EndDialog(hDlg, nResult).
+    registry.register_far_pascal("user", "@88", stub_end_dialog, 4);
+    // USER.292 UnhookWindowsHookEx(hHook far) → BOOL.
+    registry.register_far_pascal("user", "@292", stub_ret1_2word, 4);
+    // USER.1 MessageBox(hWnd, lpText far, lpCaption far, wType) → int.
+    registry.register_far_pascal("user", "@1", stub_message_box, 12);
     // USER.404 GetClassInfo(hInst, lpClassName far, lpWndClass far) → BOOL.
     registry.register_far_pascal("user", "@404", stub_get_class_info, 10);
     // USER.268 GlobalAddAtom(lpString far) → ATOM.
@@ -393,6 +401,10 @@ fn register_kernel(registry: &mut Registry) {
     registry.register_far_pascal("kernel", "@47", stub_get_module_handle, 4);
     // KERNEL.36 GetCurrentTask() → hTask.
     registry.register_far_pascal("kernel", "@36", stub_get_current_task, 0);
+    // KERNEL.55 Catch(lpCatchBuf) / KERNEL.56 Throw(lpCatchBuf, nThrowBack)
+    // — MFC/C setjmp / longjmp.
+    registry.register_far_pascal("kernel", "@55", stub_catch, 4);
+    registry.register_far_pascal("kernel", "@56", stub_throw, 6);
     // KERNEL.107 SetErrorMode(word) → previous mode (0).
     registry.register_far_pascal("kernel", "@107", stub_ret0_1word, 2);
     // KERNEL.132 GetWinFlags() → system capability flags.
@@ -686,6 +698,244 @@ fn stub_free_resource(
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     Ok(0)
+}
+
+/// `KERNEL.55 Catch(lpCatchBuf)` — MFC/C `setjmp`. Saves the resume
+/// context (return `CS:IP`, `SS:SP`, `BP`, `SI`, `DI`, `DS`, `ES`) into
+/// the caller's opaque buffer and returns 0. A later [`stub_throw`]
+/// restores it. The buffer layout is private to this pair.
+fn stub_catch(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    use crate::emulator::isa_int::Seg;
+    let ret_off = cpu.stack_word(mmu, 0).unwrap_or(0);
+    let ret_seg = cpu.stack_word(mmu, 2).unwrap_or(0);
+    let buf_off = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let buf_seg = cpu.stack_word(mmu, 6).unwrap_or(0);
+    let buf = cpu.far_to_linear(buf_seg, buf_off);
+    // SP the guest will have once Catch returns and cleans its 4 arg
+    // bytes: current SP + 4 (far return addr) + 4 (arg).
+    let sp_after = (cpu.regs.get16(Reg16::Sp)).wrapping_add(8);
+    let w = |mmu: &mut Mmu, off: u32, v: u16| {
+        let _ = mmu.store16(buf.wrapping_add(off), v);
+    };
+    w(mmu, 0, sp_after);
+    w(mmu, 2, cpu.segment_selector(Seg::Ss));
+    w(mmu, 4, cpu.regs.get16(Reg16::Bp));
+    w(mmu, 6, cpu.regs.get16(Reg16::Si));
+    w(mmu, 8, cpu.regs.get16(Reg16::Di));
+    w(mmu, 10, cpu.segment_selector(Seg::Ds));
+    w(mmu, 12, cpu.segment_selector(Seg::Es));
+    w(mmu, 14, ret_off);
+    w(mmu, 16, ret_seg);
+    Ok(0)
+}
+
+/// `KERNEL.56 Throw(lpCatchBuf, nThrowBack)` — MFC/C `longjmp`. Restores
+/// the context saved by [`stub_catch`] and resumes at the Catch site with
+/// `AX = nThrowBack`. Implemented by restoring the registers and crafting
+/// the stack so the dispatcher's far-return lands at the saved `CS:IP`.
+fn stub_throw(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    use crate::emulator::isa_int::Seg;
+    // PASCAL: lpCatchBuf (SP+6), nThrowBack (SP+4).
+    let throwback = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let buf_off = cpu.stack_word(mmu, 6).unwrap_or(0);
+    let buf_seg = cpu.stack_word(mmu, 8).unwrap_or(0);
+    let buf = cpu.far_to_linear(buf_seg, buf_off);
+    let r = |mmu: &Mmu, off: u32| mmu.load16(buf.wrapping_add(off)).unwrap_or(0);
+    let saved_sp = r(mmu, 0);
+    let saved_ss = r(mmu, 2);
+    let saved_bp = r(mmu, 4);
+    let saved_si = r(mmu, 6);
+    let saved_di = r(mmu, 8);
+    let saved_ds = r(mmu, 10);
+    let saved_es = r(mmu, 12);
+    let ret_off = r(mmu, 14);
+    let ret_seg = r(mmu, 16);
+    cpu.regs.set16(Reg16::Bp, saved_bp);
+    cpu.regs.set16(Reg16::Si, saved_si);
+    cpu.regs.set16(Reg16::Di, saved_di);
+    cpu.load_segment(Seg::Ds, saved_ds);
+    cpu.load_segment(Seg::Es, saved_es);
+    // Craft the stack so the dispatcher's far-return (which pops CS:IP and
+    // cleans Throw's 6 arg bytes) lands at ret_seg:ret_off with SP =
+    // saved_sp: final SP = sp_new + 4 + 6, so sp_new = saved_sp - 10.
+    let sp_new = saved_sp.wrapping_sub(10);
+    cpu.set_ss_sp(saved_ss, sp_new);
+    let ss_base = cpu.seg_base(Seg::Ss);
+    let _ = mmu.store16(ss_base.wrapping_add(u32::from(sp_new)), ret_off);
+    let _ = mmu.store16(
+        ss_base.wrapping_add(u32::from(sp_new)).wrapping_add(2),
+        ret_seg,
+    );
+    // Returned in AX (DX cleared) — the value Catch "returns" the 2nd time.
+    Ok(u32::from(throwback))
+}
+
+/// `USER.1 MessageBox(hWnd, lpText, lpCaption, wType)` → record the prompt
+/// in the GUI transcript and answer affirmatively (IDOK/IDYES) so the
+/// installer proceeds.
+fn stub_message_box(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL (12 bytes): hWnd(SP+14), lpText far(SP+10), lpCaption far(SP+6),
+    // wType(SP+4).
+    let wtype = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let cap_lin = far_arg_linear(cpu, mmu, 6);
+    let text_lin = far_arg_linear(cpu, mmu, 10);
+    let caption = String::from_utf8_lossy(&read_guest_cstr(mmu, cap_lin, 512)).into_owned();
+    let text = String::from_utf8_lossy(&read_guest_cstr(mmu, text_lin, 2048)).into_owned();
+    // Affirmative default per button set (low nibble of wType).
+    let result: u16 = match wtype & 0x000F {
+        3 | 4 => 6, // MB_YESNO[CANCEL] → IDYES
+        5 => 4,     // MB_RETRYCANCEL → IDRETRY
+        _ => 1,     // → IDOK
+    };
+    state.message_box_log.push(format!("[{caption}] {text}"));
+    state.gui.events.push(gui::GuiEvent::MessageBox {
+        caption,
+        text,
+        flags: wtype,
+        result,
+    });
+    Ok(u32::from(result))
+}
+
+/// `WM_INITDIALOG` / `WM_COMMAND` message ids.
+const WM_INITDIALOG: u16 = 0x0110;
+const WM_COMMAND: u16 = 0x0111;
+
+/// `USER.87 DialogBox(hInstance, lpTemplate, hWndParent, lpDialogFunc)` →
+/// run a modal dialog. We parse its template into the headless GUI model,
+/// invoke the dialog procedure for `WM_INITDIALOG`, then auto-drive it by
+/// posting the default command until it calls `EndDialog`. Returns the
+/// `EndDialog` result.
+fn stub_dialog_box(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL (12 bytes): hInstance(SP+14), lpTemplate far(off SP+10/sel SP+12),
+    // hWndParent(SP+8), lpDialogFunc far(off SP+4/sel SP+6).
+    let proc_off = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let proc_sel = cpu.stack_word(mmu, 6).unwrap_or(0);
+    let tmpl_off = cpu.stack_word(mmu, 10).unwrap_or(0);
+    let tmpl_sel = cpu.stack_word(mmu, 12).unwrap_or(0);
+
+    // Resolve the template id (integer resource or a name string).
+    let want = if tmpl_sel == 0 {
+        ud_format::ne::ResId::Int(tmpl_off)
+    } else {
+        let lin = cpu.far_to_linear(tmpl_sel, tmpl_off);
+        ud_format::ne::ResId::Name(
+            String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 256)).into_owned(),
+        )
+    };
+    // Find the RT_DIALOG (type 5) resource whose name matches.
+    let dlg = state
+        .resources
+        .iter()
+        .find(|r| r.type_id == ud_format::ne::ResId::Int(5) && res_id_eq(&r.name_id, &want))
+        .map(|r| r.data.clone());
+    let (title, controls) = dlg
+        .as_deref()
+        .map_or_else(|| (String::new(), Vec::new()), gui::parse_dialog_template);
+    state.gui.events.push(gui::GuiEvent::DialogStart {
+        title,
+        controls: controls.clone(),
+    });
+
+    // Driving the dialog procedure requires MFC's HWND→CWnd handle map
+    // (populated by its CBT hook during real window creation), which we
+    // don't yet emulate — the proc dereferences a null CWnd on
+    // WM_INITDIALOG. So by default we only record the dialog and report
+    // success (IDOK), letting the installer's main flow proceed. Set
+    // UD_NE_DRIVE_DIALOG=1 to attempt the (currently incomplete) drive.
+    if std::env::var("UD_NE_DRIVE_DIALOG").is_ok() {
+        let hdlg = state.gui.alloc_hwnd();
+        state.dialog_ended = false;
+        state.dialog_result = 0;
+        deliver_message(
+            cpu,
+            mmu,
+            registry,
+            state,
+            proc_sel,
+            proc_off,
+            hdlg,
+            WM_INITDIALOG,
+            0,
+            0,
+        )?;
+        let mut order: Vec<u16> = controls
+            .iter()
+            .filter(|c| c.class.eq_ignore_ascii_case("Button") && c.style & 0x0001 != 0)
+            .map(|c| c.id)
+            .collect();
+        order.extend([1u16, 2u16]); // IDOK, IDCANCEL
+        for &id in &order {
+            if state.dialog_ended {
+                break;
+            }
+            deliver_message(
+                cpu, mmu, registry, state, proc_sel, proc_off, hdlg, WM_COMMAND, id, 0,
+            )?;
+        }
+        return Ok(u32::from(state.dialog_result as u16));
+    }
+    let _ = (proc_sel, proc_off);
+    Ok(1) // IDOK
+}
+
+/// Deliver one window message to a guest dialog/window procedure
+/// (`hwnd, msg, wParam, lParam`) via the FAR PASCAL callback path.
+#[allow(clippy::too_many_arguments)]
+fn deliver_message(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &mut Registry,
+    state: &mut HostState,
+    proc_sel: u16,
+    proc_off: u16,
+    hwnd: u16,
+    msg: u16,
+    wparam: u16,
+    lparam: u32,
+) -> Result<u32, Win32Error> {
+    let args = [hwnd, msg, wparam, (lparam >> 16) as u16, lparam as u16];
+    call_guest_far16(cpu, mmu, registry, state, proc_sel, proc_off, &args).map_err(|e| {
+        Win32Error::InvalidArgument {
+            stub: "DialogBox/dlgproc",
+            reason: e.to_string(),
+        }
+    })
+}
+
+/// `USER.88 EndDialog(hDlg, nResult)` — mark the active modal dialog as
+/// finished with `nResult`; the `DialogBox` driver returns it.
+fn stub_end_dialog(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hDlg (SP+6), nResult (SP+4).
+    let result = cpu.stack_word(mmu, 4).unwrap_or(0);
+    state.dialog_ended = true;
+    state.dialog_result = result as i16;
+    Ok(1)
 }
 
 /// First global atom value (matches Win16's `MAXINTATOM`).
