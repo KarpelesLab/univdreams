@@ -617,8 +617,12 @@ fn far_arg_linear(cpu: &Cpu, mmu: &Mmu, byte_off: u32) -> u32 {
     cpu.far_to_linear((v >> 16) as u16, v as u16)
 }
 
-/// `KERNEL.137 FatalAppExit(uAction, lpMessageText)` — the app is
-/// aborting. Record the message (it never returns on real Windows).
+/// `KERNEL.137 FatalAppExit(uAction, lpMessageText)` — the app has
+/// already surfaced its failure (typically via `MessageBox` before
+/// the call) and is asking Windows to terminate it. Record the
+/// optional message and request a clean run-loop exit so the
+/// install-monitor report shows the app's `FatalAppExit` exit
+/// rather than a synthetic trap.
 fn stub_fatal_app_exit(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -627,12 +631,21 @@ fn stub_fatal_app_exit(
 ) -> Result<u32, Win32Error> {
     // PASCAL: uAction(SP+8), lpMessageText far(SP+4).
     let lin = far_arg_linear(cpu, mmu, 4);
-    let msg = String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 1024)).into_owned();
-    state.message_box_log.push(format!("FatalAppExit: {msg}"));
-    Err(Win32Error::InvalidArgument {
-        stub: "FatalAppExit",
-        reason: msg,
-    })
+    let msg = if lin == 0 {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 1024)).into_owned()
+    };
+    if msg.is_empty() {
+        state.message_box_log.push("FatalAppExit".into());
+    } else {
+        state
+            .message_box_log
+            .push(format!("FatalAppExit: {msg}"));
+    }
+    state.exit_requested = Some(0);
+    state.cur_process_mut().exit_code = Some(0);
+    Ok(0)
 }
 
 /// `KERNEL.90 lstrlen(lpString far)` → the string length.
