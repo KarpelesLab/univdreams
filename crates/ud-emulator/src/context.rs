@@ -257,6 +257,14 @@ impl VirtualFs {
         Some(pos)
     }
 
+    /// Current file pointer position for `handle`, or `None`
+    /// if the handle is unknown. Used by the DOS `INT 21h
+    /// AH=0x42 LSeek` `SEEK_CUR` path.
+    #[must_use]
+    pub fn tell(&self, handle: u32) -> Option<u64> {
+        self.open.get(&handle).map(|fh| fh.pos)
+    }
+
     /// Current size of the file the handle refers to.
     /// Returns `None` if the handle is unknown.
     #[must_use]

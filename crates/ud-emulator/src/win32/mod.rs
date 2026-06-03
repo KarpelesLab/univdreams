@@ -577,6 +577,13 @@ pub struct HostState {
     pub gui: crate::win16::gui::GuiState,
     /// Win16 global heap — `GlobalAlloc`/`GlobalLock` backing store.
     pub win16_heap: crate::win16::Win16Heap,
+    /// DOS file handle table (`INT 21h` `AH=0x3C/3D/3E/3F/40/42`).
+    /// Maps the 16-bit DOS handle the guest sees to a 32-bit VFS
+    /// handle. Allocated starting at 5 since handles 0..4 are the
+    /// standard streams (stdin / stdout / stderr / stdaux / stdprn).
+    pub dos_handles: BTreeMap<u16, u32>,
+    /// Next free DOS handle for the table above. Starts at 5.
+    pub next_dos_handle: u16,
     /// `RT_STRING` resources parsed from a loaded NE module, keyed by
     /// string id, for `LoadString`.
     pub string_resources: std::collections::BTreeMap<u16, String>,
@@ -688,6 +695,8 @@ impl Default for HostState {
             processes,
             gui: crate::win16::gui::GuiState::default(),
             win16_heap: crate::win16::Win16Heap::default(),
+            dos_handles: BTreeMap::new(),
+            next_dos_handle: 5,
             string_resources: BTreeMap::new(),
             atoms: Vec::new(),
             resources: Vec::new(),

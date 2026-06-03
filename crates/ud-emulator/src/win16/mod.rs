@@ -415,10 +415,10 @@ fn stub_ret1_1word(
 /// service the common ones and clear the carry flag (success);
 /// anything unrecognised clears carry and returns 0 so a probe doesn't
 /// derail the run.
-pub fn service_interrupt(num: u8, cpu: &mut Cpu, _mmu: &mut Mmu, _state: &mut HostState) -> bool {
+pub fn service_interrupt(num: u8, cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) -> bool {
     match num {
         0x21 => {
-            dos_int21(cpu);
+            dos_int21(cpu, mmu, state);
             true
         }
         // INT 3 (breakpoint) / INT 0x3F (Win16 inter-segment call thunk,
@@ -429,7 +429,7 @@ pub fn service_interrupt(num: u8, cpu: &mut Cpu, _mmu: &mut Mmu, _state: &mut Ho
 }
 
 /// Minimal DOS `INT 21h` dispatcher keyed on `AH`.
-fn dos_int21(cpu: &mut Cpu) {
+fn dos_int21(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
     let ah = cpu.regs.get8(Reg8::Ah);
     if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
         eprintln!("DOS INT21 AH={ah:#04x}");
@@ -458,10 +458,184 @@ fn dos_int21(cpu: &mut Cpu) {
             cpu.regs.set16(Reg16::Cx, 0);
             cpu.regs.set16(Reg16::Dx, 0);
         }
+        // AH=0x3C Create or truncate file: CX=attrs, DS:DX=path → AX=handle.
+        // AH=0x3D Open existing file:    AL=mode, DS:DX=path → AX=handle.
+        0x3C | 0x3D => dos_open_or_create(cpu, mmu, state, ah == 0x3C),
+        // AH=0x3E Close file: BX=handle.
+        0x3E => dos_close(cpu, state),
+        // AH=0x3F Read from file:  BX=handle, CX=count, DS:DX=buf → AX=bytes.
+        0x3F => dos_read(cpu, mmu, state),
+        // AH=0x40 Write to file:   BX=handle, CX=count, DS:DX=buf → AX=bytes.
+        0x40 => dos_write(cpu, mmu, state),
+        // AH=0x42 LSeek: AL=origin (0=SET,1=CUR,2=END), BX=handle,
+        // CX:DX=offset → DX:AX=new pos.
+        0x42 => dos_seek(cpu, state),
         // Anything else: report success with AX cleared. The startup
         // code stores the result but does not branch on it here.
         _ => cpu.regs.set16(Reg16::Ax, 0),
     }
+}
+
+/// Build the linear address `DS:DX` points at, the canonical DOS
+/// pointer for path / buffer arguments to `INT 21h` services.
+fn dos_ds_dx_linear(cpu: &Cpu) -> u32 {
+    let ds = cpu.segment_selector(crate::emulator::isa_int::Seg::Ds);
+    let dx = cpu.regs.get16(Reg16::Dx);
+    cpu.far_to_linear(ds, dx)
+}
+
+/// Read a DOS-style NUL-terminated path string at `addr` (max 260).
+/// Maps backslashes through verbatim — [`crate::context::VirtualFs`]
+/// normalises on insert / lookup.
+fn read_dos_path(mmu: &Mmu, addr: u32) -> String {
+    String::from_utf8_lossy(&read_guest_cstr(mmu, addr, 260)).into_owned()
+}
+
+/// Set the carry flag and place a DOS error code in AX. Callers use
+/// `0x02` (file not found), `0x06` (invalid handle), `0x1D`
+/// (write fault), per the `INT 21h` error-code conventions.
+fn dos_error(cpu: &mut Cpu, code: u16) {
+    cpu.regs.flags.cf = true;
+    cpu.regs.set16(Reg16::Ax, code);
+}
+
+/// `INT 21h AH=0x3C/3D` — open or create. Allocates the next free
+/// DOS handle and routes the underlying file through the VFS so the
+/// install-monitor's VFS-writes report captures everything the guest
+/// writes.
+fn dos_open_or_create(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState, create: bool) {
+    use crate::context::FileAccess;
+    let path_lin = dos_ds_dx_linear(cpu);
+    let path = read_dos_path(mmu, path_lin);
+    if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
+        let ds = cpu.segment_selector(crate::emulator::isa_int::Seg::Ds);
+        let dx = cpu.regs.get16(Reg16::Dx);
+        let al = cpu.regs.get8(Reg8::Al);
+        eprintln!(
+            "  DOS {} DS:DX={ds:#06x}:{dx:#06x} lin={path_lin:#x} AL={al:#04x} path={path:?}",
+            if create { "create" } else { "open" }
+        );
+    }
+    if path.is_empty() {
+        dos_error(cpu, 0x02); // file not found
+        return;
+    }
+    let access = if create {
+        FileAccess::ReadWrite
+    } else {
+        match cpu.regs.get8(Reg8::Al) & 0x07 {
+            0 => FileAccess::Read,
+            1 => FileAccess::Write,
+            2 => FileAccess::ReadWrite,
+            _ => FileAccess::Read,
+        }
+    };
+    let vfs = state
+        .context
+        .vfs
+        .get_or_insert_with(crate::context::VirtualFs::new);
+    if create {
+        vfs.write_path(&path, Vec::new());
+    }
+    let Some(vh) = vfs.open(&path, access) else {
+        dos_error(cpu, 0x02); // file not found
+        return;
+    };
+    let dh = state.next_dos_handle;
+    state.next_dos_handle = state.next_dos_handle.wrapping_add(1);
+    state.dos_handles.insert(dh, vh);
+    cpu.regs.set16(Reg16::Ax, dh);
+    if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
+        eprintln!(
+            "DOS {} '{path}' → dh={dh:#06x} vh={vh:#x}",
+            if create { "create" } else { "open" }
+        );
+    }
+}
+
+fn dos_close(cpu: &mut Cpu, state: &mut HostState) {
+    let dh = cpu.regs.get16(Reg16::Bx);
+    if let Some(vh) = state.dos_handles.remove(&dh) {
+        if let Some(vfs) = state.context.vfs.as_mut() {
+            vfs.close(vh);
+        }
+        cpu.regs.set16(Reg16::Ax, 0);
+    } else {
+        dos_error(cpu, 0x06); // invalid handle
+    }
+}
+
+fn dos_read(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
+    let dh = cpu.regs.get16(Reg16::Bx);
+    let count = usize::from(cpu.regs.get16(Reg16::Cx));
+    let buf_lin = dos_ds_dx_linear(cpu);
+    let Some(&vh) = state.dos_handles.get(&dh) else {
+        dos_error(cpu, 0x06);
+        return;
+    };
+    let Some(vfs) = state.context.vfs.as_mut() else {
+        dos_error(cpu, 0x06);
+        return;
+    };
+    let mut tmp = vec![0u8; count];
+    let n = vfs.read_handle(vh, &mut tmp).unwrap_or(0);
+    for (i, &b) in tmp[..n].iter().enumerate() {
+        let _ = mmu.store8(buf_lin.wrapping_add(i as u32), b);
+    }
+    cpu.regs.set16(Reg16::Ax, n as u16);
+}
+
+fn dos_write(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
+    let dh = cpu.regs.get16(Reg16::Bx);
+    let count = usize::from(cpu.regs.get16(Reg16::Cx));
+    let buf_lin = dos_ds_dx_linear(cpu);
+    let Some(&vh) = state.dos_handles.get(&dh) else {
+        dos_error(cpu, 0x06);
+        return;
+    };
+    let mut data = vec![0u8; count];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = mmu.load8(buf_lin.wrapping_add(i as u32)).unwrap_or(0);
+    }
+    let Some(vfs) = state.context.vfs.as_mut() else {
+        dos_error(cpu, 0x06);
+        return;
+    };
+    let n = vfs.write_handle(vh, &data).unwrap_or(0);
+    cpu.regs.set16(Reg16::Ax, n as u16);
+}
+
+fn dos_seek(cpu: &mut Cpu, state: &mut HostState) {
+    let dh = cpu.regs.get16(Reg16::Bx);
+    let origin = cpu.regs.get8(Reg8::Al);
+    let off = (u32::from(cpu.regs.get16(Reg16::Cx)) << 16) | u32::from(cpu.regs.get16(Reg16::Dx));
+    let signed_off = off as i32;
+    let Some(&vh) = state.dos_handles.get(&dh) else {
+        dos_error(cpu, 0x06);
+        return;
+    };
+    let Some(vfs) = state.context.vfs.as_mut() else {
+        dos_error(cpu, 0x06);
+        return;
+    };
+    let new_pos = match origin {
+        0 => signed_off.max(0) as u64,
+        1 => {
+            let cur = vfs.tell(vh).unwrap_or(0) as i64;
+            (cur + i64::from(signed_off)).max(0) as u64
+        }
+        2 => {
+            let end = vfs.size(vh).unwrap_or(0) as i64;
+            (end + i64::from(signed_off)).max(0) as u64
+        }
+        _ => {
+            dos_error(cpu, 0x01); // invalid function
+            return;
+        }
+    };
+    vfs.seek(vh, new_pos);
+    cpu.regs.set16(Reg16::Ax, (new_pos & 0xFFFF) as u16);
+    cpu.regs.set16(Reg16::Dx, ((new_pos >> 16) & 0xFFFF) as u16);
 }
 
 /// `KERNEL` (KRNL286/KRNL386) ordinal stubs.
@@ -1720,7 +1894,9 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.regs.flags.cf = true;
         cpu.regs.set8(Reg8::Ah, 0x30); // get DOS version
-        dos_int21(&mut cpu);
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        dos_int21(&mut cpu, &mut mmu, &mut state);
         assert_eq!(cpu.regs.get8(Reg8::Al), 6, "DOS major version in AL");
         assert!(!cpu.regs.flags.cf, "carry cleared on success");
     }
@@ -1729,7 +1905,9 @@ mod tests {
     fn dos_get_current_drive_returns_c() {
         let mut cpu = Cpu::new();
         cpu.regs.set8(Reg8::Ah, 0x19);
-        dos_int21(&mut cpu);
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        dos_int21(&mut cpu, &mut mmu, &mut state);
         assert_eq!(cpu.regs.get8(Reg8::Al), 2, "drive C: (0=A)");
     }
 

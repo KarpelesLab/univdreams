@@ -995,6 +995,20 @@ impl Sandbox {
         self.host
             .modules
             .insert(name.to_ascii_lowercase(), crate::ne::WIN16_SEG_BASE);
+        // Stage the EXE's own bytes into the VFS at the path
+        // `GetModuleFileName` reports. Win16 installers (StuffIt
+        // SITEX10, classic InstallShield, …) routinely fopen their
+        // own EXE to seek past the loaded module image and read an
+        // appended archive of bundled files. Without the EXE in the
+        // VFS the open returns ENOFILE and the installer falls into a
+        // null-pointer fast-fail.
+        let self_path = format!("C:\\{}", name.to_uppercase());
+        let vfs = self
+            .host
+            .context
+            .vfs
+            .get_or_insert_with(crate::context::VirtualFs::new);
+        vfs.insert(&self_path, bytes.to_vec());
         // Parse string + general resources for LoadString / FindResource.
         if let Ok(ne) = ud_format::ne::NeFile::parse(bytes) {
             self.host.string_resources = ne.string_resources();
