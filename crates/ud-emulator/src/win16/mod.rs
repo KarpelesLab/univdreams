@@ -470,6 +470,18 @@ fn dos_int21(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
         // AH=0x42 LSeek: AL=origin (0=SET,1=CUR,2=END), BX=handle,
         // CX:DX=offset → DX:AX=new pos.
         0x42 => dos_seek(cpu, state),
+        // AH=0x43 Get/Set file attributes. AL=0 returns CX=attrs;
+        // AL=1 sets them. For VFS files we always return
+        // FILE_ATTRIBUTE_ARCHIVE (0x20) and accept any set.
+        0x43 => dos_file_attribs(cpu, mmu, state),
+        // AH=0x44 IOCTL: AL=subfn. The MSVC-Win16 CRT calls this with
+        // AL=0 immediately after open to discover whether the handle
+        // is a device or a file — the result governs whether _filbuf
+        // honours EOF semantics or treats the handle as an unbounded
+        // character stream. Reporting "device" turns sequential
+        // reads into an infinite EOF-less loop, so report "file on
+        // drive C" instead.
+        0x44 => dos_ioctl(cpu, state),
         // Anything else: report success with AX cleared. The startup
         // code stores the result but does not branch on it here.
         _ => cpu.regs.set16(Reg16::Ax, 0),
@@ -583,6 +595,9 @@ fn dos_read(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
         let _ = mmu.store8(buf_lin.wrapping_add(i as u32), b);
     }
     cpu.regs.set16(Reg16::Ax, n as u16);
+    if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
+        eprintln!("  DOS read dh={dh:#06x} count={count} -> n={n}");
+    }
 }
 
 fn dos_write(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
@@ -603,6 +618,55 @@ fn dos_write(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
     };
     let n = vfs.write_handle(vh, &data).unwrap_or(0);
     cpu.regs.set16(Reg16::Ax, n as u16);
+}
+
+/// `INT 21h AH=0x43` — Get/Set file attributes. The MSVC Win16
+/// CRT's `_open` calls this with `AL=0` right after opening to
+/// confirm the file is reachable; returning `FILE_ATTRIBUTE_ARCHIVE`
+/// keeps the CRT on its happy path. We ignore `AL=1` writes since
+/// the VFS doesn't track DOS attribute bits.
+fn dos_file_attribs(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
+    let al = cpu.regs.get8(Reg8::Al);
+    let path_lin = dos_ds_dx_linear(cpu);
+    let path = read_dos_path(mmu, path_lin);
+    if path.is_empty() {
+        dos_error(cpu, 0x02);
+        return;
+    }
+    let vfs = state
+        .context
+        .vfs
+        .get_or_insert_with(crate::context::VirtualFs::new);
+    if !vfs.contains(&path) {
+        dos_error(cpu, 0x02);
+        return;
+    }
+    if al == 0 {
+        cpu.regs.set16(Reg16::Cx, 0x0020);
+        cpu.regs.set16(Reg16::Ax, 0x0020);
+    } else {
+        cpu.regs.set16(Reg16::Ax, 0);
+    }
+}
+
+/// `INT 21h AH=0x44 IOCTL` — only the `AL=0` "get device info"
+/// subfunction is meaningful for the CRT-startup flow. For a VFS
+/// file we report: regular file, drive C (bits 0..5 = 2), no special
+/// flags, no EOF-on-input. Other subfunctions clear AX and CF.
+fn dos_ioctl(cpu: &mut Cpu, state: &mut HostState) {
+    let al = cpu.regs.get8(Reg8::Al);
+    if al != 0x00 {
+        cpu.regs.set16(Reg16::Ax, 0);
+        return;
+    }
+    let dh = cpu.regs.get16(Reg16::Bx);
+    if !state.dos_handles.contains_key(&dh) {
+        dos_error(cpu, 0x06);
+        return;
+    }
+    // Bit 15 = 0 (file, not device); bits 0..5 = 2 (drive C).
+    cpu.regs.set16(Reg16::Dx, 0x0002);
+    cpu.regs.set16(Reg16::Ax, 0x0002);
 }
 
 fn dos_seek(cpu: &mut Cpu, state: &mut HostState) {
@@ -636,6 +700,9 @@ fn dos_seek(cpu: &mut Cpu, state: &mut HostState) {
     vfs.seek(vh, new_pos);
     cpu.regs.set16(Reg16::Ax, (new_pos & 0xFFFF) as u16);
     cpu.regs.set16(Reg16::Dx, ((new_pos >> 16) & 0xFFFF) as u16);
+    if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
+        eprintln!("  DOS seek dh={dh:#06x} origin={origin} off={signed_off} -> pos={new_pos}");
+    }
 }
 
 /// `KERNEL` (KRNL286/KRNL386) ordinal stubs.
