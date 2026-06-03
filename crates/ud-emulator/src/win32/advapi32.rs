@@ -405,8 +405,7 @@ fn write_reg_value(
         0
     };
     if pcb != 0 {
-        mmu.store32(pcb, needed)
-            .map_err(|t| trap(stub_name, t))?;
+        mmu.store32(pcb, needed).map_err(|t| trap(stub_name, t))?;
     }
     if lp_data == 0 {
         return Ok(ERROR_SUCCESS);
@@ -452,7 +451,15 @@ fn stub_reg_query_value_ex(
         .and_then(|r| r.path_of(hkey).map(|p| (r, p.to_string())))
         .and_then(|(r, key_path)| r.get_value(&key_path, &value_name).cloned());
     if let Some(value) = lookup {
-        return write_reg_value(mmu, &value, lp_type, lp_data, pcb, false, "RegQueryValueExA");
+        return write_reg_value(
+            mmu,
+            &value,
+            lp_type,
+            lp_data,
+            pcb,
+            false,
+            "RegQueryValueExA",
+        );
     }
     if pcb != 0 {
         let _ = mmu.store32(pcb, 0);

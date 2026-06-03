@@ -1404,6 +1404,21 @@ impl Cpu {
             0xAE => self.string_scas(mmu, /*sized_dword*/ false),
             0xAF => self.string_scas(mmu, /*sized_dword*/ true),
 
+            // 0xD7 — XLAT/XLATB: AL = [seg:(B/EBX + AL)]
+            0xD7 => {
+                let al = u32::from(self.regs.get8(Reg8::Al));
+                let ea = if self.addr16() {
+                    u32::from(self.regs.get16(Reg16::Bx)).wrapping_add(al) & 0xFFFF
+                } else {
+                    self.regs.get32(Reg32::Ebx).wrapping_add(al)
+                };
+                let seg = self.seg_override.unwrap_or(Seg::Ds);
+                let lin = ea.wrapping_add(self.seg_base(seg));
+                let b = mmu.load8(lin)?;
+                self.regs.set8(Reg8::Al, b);
+                Ok(StepOk::Continued)
+            }
+
             // 0xA8 — TEST al, imm8
             0xA8 => {
                 let imm = self.fetch_imm8(mmu)?;

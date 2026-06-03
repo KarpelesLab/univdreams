@@ -208,9 +208,9 @@ pub mod ne;
 pub mod pe;
 pub mod runtime;
 pub mod sched;
-pub mod win16;
 #[cfg(feature = "trace")]
 pub mod trace;
+pub mod win16;
 pub mod win32;
 
 pub use context::{

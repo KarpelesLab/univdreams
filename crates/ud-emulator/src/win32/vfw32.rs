@@ -1663,7 +1663,13 @@ mod tests {
         let fcc_video = u32::from_le_bytes(*b"VIDC");
         let fcc_cvid = u32::from_le_bytes(*b"cvid");
         let hic = ic_open(
-            &mut cpu, &mut mmu, &mut registry, &mut state, fcc_video, fcc_cvid, 1,
+            &mut cpu,
+            &mut mmu,
+            &mut registry,
+            &mut state,
+            fcc_video,
+            fcc_cvid,
+            1,
         )
         .unwrap();
         assert_ne!(hic, 0);
@@ -1747,7 +1753,13 @@ mod tests {
         let fcc_video = u32::from_le_bytes(*b"VIDC");
         let fcc_iv41 = u32::from_le_bytes(*b"IV41");
         let hic = ic_open(
-            &mut cpu, &mut mmu, &mut registry, &mut state, fcc_video, fcc_iv41, 1,
+            &mut cpu,
+            &mut mmu,
+            &mut registry,
+            &mut state,
+            fcc_video,
+            fcc_iv41,
+            1,
         )
         .unwrap();
         assert_ne!(hic, 0);
@@ -1787,7 +1799,16 @@ mod tests {
         install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
         state.default_driver_proc = dpv;
         let fcc_unknown = u32::from_le_bytes(*b"XXXX");
-        let hic = ic_open(&mut cpu, &mut mmu, &mut registry, &mut state, 0, fcc_unknown, 1).unwrap();
+        let hic = ic_open(
+            &mut cpu,
+            &mut mmu,
+            &mut registry,
+            &mut state,
+            0,
+            fcc_unknown,
+            1,
+        )
+        .unwrap();
         // Flip canned to 0.
         install_canned_driver_proc(&mut mmu, dpv, 0);
         let bytes = ic_get_info(&mut cpu, &mut mmu, &mut registry, &mut state, hic, 64).unwrap();
@@ -2050,8 +2071,15 @@ mod tests {
         // it would write into a real buffer).
         install_canned_driver_proc(&mut mmu, dpv, 128);
         let mut empty: Vec<u8> = Vec::new();
-        let r = ic_get_state(&mut cpu, &mut mmu, &mut registry, &mut state, hic, &mut empty)
-            .expect("zero-length probe should succeed");
+        let r = ic_get_state(
+            &mut cpu,
+            &mut mmu,
+            &mut registry,
+            &mut state,
+            hic,
+            &mut empty,
+        )
+        .expect("zero-length probe should succeed");
         assert_eq!(r, 128);
     }
 }

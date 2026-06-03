@@ -259,6 +259,25 @@ pub struct NeEntry {
     pub movable: bool,
 }
 
+/// A resource type or name id: either an integer (`MAKEINTRESOURCE`) or a
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResId {
+    Int(u16),
+    Name(String),
+}
+
+/// One entry in the NE resource table, with a slice into the file.
+#[derive(Debug, Clone)]
+pub struct NeResource {
+    pub type_id: ResId,
+    pub name_id: ResId,
+    /// Absolute file offset of the resource data.
+    pub file_offset: u32,
+    /// Length of the resource data in bytes.
+    pub length: u32,
+}
+
 /// A parsed NE module. `raw` is the verbatim input and the
 /// authoritative source for [`Self::write_to_vec`]; the decoded views
 /// are for presentation.
@@ -379,6 +398,143 @@ impl NeFile {
     #[must_use]
     pub fn module_description(&self) -> Option<&str> {
         self.nonresident_names.first().map(|n| n.name.as_str())
+    }
+
+    /// Parse the full resource table into a flat list of resources, each
+    /// with its decoded type and name id and a slice into [`Self::raw`].
+    /// Returns an empty list when the module has no resource table.
+    #[must_use]
+    pub fn resources(&self) -> Vec<NeResource> {
+        let mut out = Vec::new();
+        let base = self.e_lfanew as usize + self.header.resource_table_off as usize;
+        let raw = &self.raw;
+        if self.header.resource_table_off == 0 || base + 2 > raw.len() {
+            return out;
+        }
+        let rd16 = |o: usize| -> Option<u16> {
+            raw.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+        };
+        // A resource id is either an integer (high bit set) or an offset,
+        // relative to the resource-table base, to a length-prefixed name.
+        let decode_id = |v: u16| -> ResId {
+            if v & 0x8000 != 0 {
+                ResId::Int(v & 0x7fff)
+            } else {
+                let o = base + v as usize;
+                match raw.get(o) {
+                    Some(&len) => {
+                        let s = raw.get(o + 1..o + 1 + len as usize).unwrap_or(&[]);
+                        ResId::Name(String::from_utf8_lossy(s).into_owned())
+                    }
+                    None => ResId::Name(String::new()),
+                }
+            }
+        };
+        let Some(align_shift) = rd16(base) else {
+            return out;
+        };
+        let mut p = base + 2;
+        while let Some(type_raw) = rd16(p) {
+            if type_raw == 0 {
+                break;
+            }
+            let Some(count) = rd16(p + 2) else { break };
+            let type_id = decode_id(type_raw);
+            let mut ni = p + 8;
+            for _ in 0..count {
+                let off_units = rd16(ni).unwrap_or(0);
+                let len_units = rd16(ni + 2).unwrap_or(0);
+                let name_raw = rd16(ni + 6).unwrap_or(0);
+                out.push(NeResource {
+                    type_id: type_id.clone(),
+                    name_id: decode_id(name_raw),
+                    file_offset: u32::from(off_units) << align_shift,
+                    length: u32::from(len_units) << align_shift,
+                });
+                ni += 12;
+            }
+            p += 8 + 12 * count as usize;
+        }
+        out
+    }
+
+    /// Parse the `RT_STRING` (type `0x8006`) resources into a map from
+    /// string id → text.
+    ///
+    /// Win16 packs string-table strings into bundles of 16: resource id
+    /// `b` (1-based) holds string ids `(b-1)*16 ..= (b-1)*16 + 15`. Each
+    /// bundle is 16 `[u8 len][len bytes]` Pascal strings (a zero length
+    /// means "no string at that id"). Returns an empty map if the module
+    /// has no resource table or no string resources.
+    #[must_use]
+    pub fn string_resources(&self) -> std::collections::BTreeMap<u16, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let base = self.e_lfanew as usize + self.header.resource_table_off as usize;
+        let raw = &self.raw;
+        // resource_table_off == 0 means "no resource table".
+        if self.header.resource_table_off == 0 || base + 2 > raw.len() {
+            return out;
+        }
+        let rd16 = |o: usize| -> Option<u16> {
+            raw.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+        };
+        // The resource table opens with rscAlignShift, then a list of
+        // TYPEINFO records terminated by a zero type id.
+        let Some(align_shift) = rd16(base) else {
+            return out;
+        };
+        let mut p = base + 2;
+        while let Some(type_id) = rd16(p) {
+            if type_id == 0 {
+                break;
+            }
+            let Some(count) = rd16(p + 2) else { break };
+            // TYPEINFO header is 8 bytes; then `count` 12-byte NAMEINFO.
+            let mut ni = p + 8;
+            if type_id == 0x8006 {
+                for bundle_ix in 0..count as usize {
+                    let Some(off_units) = rd16(ni) else { break };
+                    let res_off = (off_units as usize) << align_shift;
+                    let bundle_id = rd16(ni + 6).unwrap_or(0) & 0x7fff;
+                    parse_string_bundle(raw, res_off, bundle_id, &mut out);
+                    let _ = bundle_ix;
+                    ni += 12;
+                }
+            }
+            p += 8 + 12 * count as usize;
+        }
+        out
+    }
+}
+
+/// Decode one 16-string `RT_STRING` bundle at `res_off`; `bundle_id` is
+/// the resource's (integer) id, so the first string's id is
+/// `(bundle_id - 1) * 16`.
+fn parse_string_bundle(
+    raw: &[u8],
+    res_off: usize,
+    bundle_id: u16,
+    out: &mut std::collections::BTreeMap<u16, String>,
+) {
+    if bundle_id == 0 {
+        return;
+    }
+    let first_id = (bundle_id as usize - 1) * 16;
+    let mut o = res_off;
+    for i in 0..16 {
+        let Some(&len) = raw.get(o) else { break };
+        o += 1;
+        let len = len as usize;
+        let Some(bytes) = raw.get(o..o + len) else {
+            break;
+        };
+        o += len;
+        if len > 0 {
+            let id = first_id + i;
+            if let Ok(id) = u16::try_from(id) {
+                out.insert(id, String::from_utf8_lossy(bytes).into_owned());
+            }
+        }
     }
 }
 

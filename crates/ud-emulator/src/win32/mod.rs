@@ -560,6 +560,15 @@ pub struct HostState {
     pub gui: crate::win16::gui::GuiState,
     /// Win16 global heap — `GlobalAlloc`/`GlobalLock` backing store.
     pub win16_heap: crate::win16::Win16Heap,
+    /// `RT_STRING` resources parsed from a loaded NE module, keyed by
+    /// string id, for `LoadString`.
+    pub string_resources: std::collections::BTreeMap<u16, String>,
+    /// Global atom table (`GlobalAddAtom`/`GlobalFindAtom`/…): interned
+    /// strings; the atom for index `i` is `0xC000 + i`.
+    pub atoms: Vec<String>,
+    /// Resources parsed from a loaded NE module, for `FindResource` /
+    /// `LoadResource`. The `HRSRC` handed out is the 1-based index.
+    pub resources: Vec<crate::win16::LoadedResource>,
     /// Optional per-run instruction budget. Decremented at each
     /// top-of-loop iteration in [`run_until_sentinel`] (both
     /// instruction steps and stub dispatches count). When it
@@ -652,6 +661,9 @@ impl Default for HostState {
             processes,
             gui: crate::win16::gui::GuiState::default(),
             win16_heap: crate::win16::Win16Heap::default(),
+            string_resources: BTreeMap::new(),
+            atoms: Vec::new(),
+            resources: Vec::new(),
             active_pid: 1,
             next_pid: 2,
             next_child_image_base: 0,

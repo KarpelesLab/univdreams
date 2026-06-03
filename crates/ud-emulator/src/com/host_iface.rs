@@ -1122,16 +1122,36 @@ fn release(
 /// Generic `E_NOTIMPL` stub for an N-arg IFilterGraph method.
 /// Each method has a distinct registration so the trace event
 /// names the slot.
-fn notimpl_1(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
+fn notimpl_1(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &mut Registry,
+) -> Result<u32, Win32Error> {
     Ok(E_NOTIMPL)
 }
-fn notimpl_2(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
+fn notimpl_2(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &mut Registry,
+) -> Result<u32, Win32Error> {
     Ok(E_NOTIMPL)
 }
-fn notimpl_3(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
+fn notimpl_3(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &mut Registry,
+) -> Result<u32, Win32Error> {
     Ok(E_NOTIMPL)
 }
-fn notimpl_4(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &mut Registry) -> Result<u32, Win32Error> {
+fn notimpl_4(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &mut Registry,
+) -> Result<u32, Win32Error> {
     Ok(E_NOTIMPL)
 }
 

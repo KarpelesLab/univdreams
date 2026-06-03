@@ -64,6 +64,8 @@ impl Win16Heap {
 /// Real Windows hands back the module's DGROUP selector; any stable
 /// non-zero value works for a single-task sandbox.
 pub const WIN16_HINSTANCE: u16 = 0x0100;
+/// Synthetic current-task handle (`GetCurrentTask`).
+pub const WIN16_HTASK: u16 = 0x0200;
 /// `SW_SHOWNORMAL` — the default `nCmdShow` for a launched app.
 const SW_SHOWNORMAL: u16 = 1;
 
@@ -116,6 +118,13 @@ pub fn register_all(registry: &mut Registry) {
     register_kernel(registry);
     register_user(registry);
     register_gdi(registry);
+    register_commdlg(registry);
+}
+
+/// `COMMDLG` (common dialogs) ordinal stubs.
+fn register_commdlg(registry: &mut Registry) {
+    // COMMDLG.27 GetFileTitle(lpszFile far, lpszTitle far, cbBuf word).
+    registry.register_far_pascal("commdlg", "@27", stub_get_file_title, 10);
 }
 
 /// `GDI` ordinal stubs.
@@ -131,6 +140,8 @@ fn register_gdi(registry: &mut Registry) {
     registry.register_far_pascal("gdi", "@66", stub_create_object, 4);
     // GDI.61 CreatePen(style, width, COLORREF) → HPEN.
     registry.register_far_pascal("gdi", "@61", stub_create_object, 8);
+    // GDI.69 DeleteObject(hObject) → BOOL success.
+    registry.register_far_pascal("gdi", "@69", stub_ret1_1word, 2);
 }
 
 /// Generic GDI object factory → a fresh unique object handle. The
@@ -198,6 +209,19 @@ fn register_user(registry: &mut Registry) {
     registry.register_far_pascal("user", "@173", stub_create_object, 6);
     // USER.174 LoadIcon(hInstance, lpIconName far) → HICON.
     registry.register_far_pascal("user", "@174", stub_create_object, 6);
+    // USER.266 SetMessageQueue(cMsg) → BOOL success. We have no real queue
+    // sizing, so always succeed (non-zero).
+    registry.register_far_pascal("user", "@266", stub_ret1_1word, 2);
+    // USER.176 LoadString(hInst, uID, lpBuffer far, nBufferMax) → length.
+    registry.register_far_pascal("user", "@176", stub_load_string, 10);
+    // USER.291 SetWindowsHookEx(idHook, lpfn far, hMod, hTask) → HHOOK.
+    registry.register_far_pascal("user", "@291", stub_set_windows_hook_ex, 10);
+    // USER.57 RegisterClass(lpWndClass far) → ATOM.
+    registry.register_far_pascal("user", "@57", stub_register_class, 4);
+    // USER.404 GetClassInfo(hInst, lpClassName far, lpWndClass far) → BOOL.
+    registry.register_far_pascal("user", "@404", stub_get_class_info, 10);
+    // USER.268 GlobalAddAtom(lpString far) → ATOM.
+    registry.register_far_pascal("user", "@268", stub_global_add_atom, 4);
 }
 
 /// `USER.180 GetSysColor(nIndex)` → a plausible 3-D grey scheme.
@@ -360,6 +384,36 @@ fn register_kernel(registry: &mut Registry) {
     registry.register_far_pascal("kernel", "@20", stub_global_size, 2);
     // KERNEL.49 GetModuleFileName(hInst, lpFilename far, nSize) → length.
     registry.register_far_pascal("kernel", "@49", stub_get_module_filename, 8);
+    // KERNEL.131 GetExePtr(handle) → the owning module handle. Echo the
+    // segment/handle back (non-zero) so the caller treats it as valid.
+    registry.register_far_pascal("kernel", "@131", stub_echo_1word, 2);
+    // KERNEL.89 lstrcat(lpString1 far, lpString2 far) → lpString1.
+    registry.register_far_pascal("kernel", "@89", stub_lstrcat, 8);
+    // KERNEL.47 GetModuleHandle(lpModuleName far) → hModule.
+    registry.register_far_pascal("kernel", "@47", stub_get_module_handle, 4);
+    // KERNEL.36 GetCurrentTask() → hTask.
+    registry.register_far_pascal("kernel", "@36", stub_get_current_task, 0);
+    // KERNEL.107 SetErrorMode(word) → previous mode (0).
+    registry.register_far_pascal("kernel", "@107", stub_ret0_1word, 2);
+    // KERNEL.132 GetWinFlags() → system capability flags.
+    registry.register_far_pascal("kernel", "@132", stub_get_win_flags, 0);
+    // Resource access: FindResource/LoadResource/LockResource/…
+    registry.register_far_pascal("kernel", "@60", stub_find_resource, 10);
+    registry.register_far_pascal("kernel", "@61", stub_load_resource, 4);
+    registry.register_far_pascal("kernel", "@62", stub_lock_resource, 2);
+    registry.register_far_pascal("kernel", "@63", stub_free_resource, 2);
+    registry.register_far_pascal("kernel", "@65", stub_sizeof_resource, 4);
+}
+
+/// Generic FAR PASCAL stub returning its single word argument unchanged
+/// (handle/selector echo functions like `GetExePtr`).
+fn stub_echo_1word(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(u32::from(cpu.stack_word(mmu, 4).unwrap_or(0)))
 }
 
 /// `KERNEL.49 GetModuleFileName(hInst, lpFilename, nSize)` — write a
@@ -391,6 +445,361 @@ fn write_guest_cstr(mmu: &mut Mmu, addr: u32, max: u16, text: &[u8]) -> Result<u
     }
     let _ = mmu.store8(addr.wrapping_add(limit as u32), 0);
     Ok(limit as u32)
+}
+
+/// Read a NUL-terminated guest string at linear `addr` (capped).
+fn read_guest_cstr(mmu: &Mmu, addr: u32, max: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..max as u32 {
+        match mmu.load8(addr.wrapping_add(i)) {
+            Ok(0) | Err(_) => break,
+            Ok(b) => out.push(b),
+        }
+    }
+    out
+}
+
+/// Resolve a FAR PASCAL far-pointer arg (segment:offset packed as a stack
+/// dword, offset in the low word) to a linear address.
+fn far_arg_linear(cpu: &Cpu, mmu: &Mmu, byte_off: u32) -> u32 {
+    let v = cpu.stack_dword(mmu, byte_off).unwrap_or(0);
+    cpu.far_to_linear((v >> 16) as u16, v as u16)
+}
+
+/// `KERNEL.89 lstrcat(lpString1, lpString2)` → append string2 to string1
+/// in place; returns the far pointer to string1 (DX:AX).
+fn stub_lstrcat(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: lpString1 pushed first (SP+8), lpString2 last (SP+4).
+    let dst_ptr = cpu.stack_dword(mmu, 8).unwrap_or(0);
+    let dst_lin = cpu.far_to_linear((dst_ptr >> 16) as u16, dst_ptr as u16);
+    let src_lin = far_arg_linear(cpu, mmu, 4);
+    let src = read_guest_cstr(mmu, src_lin, 0x4000);
+    // Find the existing terminator of the destination.
+    let mut end = dst_lin;
+    while !matches!(mmu.load8(end), Ok(0) | Err(_)) {
+        end = end.wrapping_add(1);
+    }
+    for (i, &b) in src.iter().enumerate() {
+        let _ = mmu.store8(end.wrapping_add(i as u32), b);
+    }
+    let _ = mmu.store8(end.wrapping_add(src.len() as u32), 0);
+    Ok(dst_ptr)
+}
+
+/// A FAR PASCAL default window procedure (`WndProc(hWnd, msg, wParam,
+/// lParam)` — 10 arg bytes in Win16). Stands in for the "original" window
+/// proc of predefined control classes that MFC subclasses; returns 0.
+fn stub_def_window_proc(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// Far pointer (`selector:offset`) to the default window procedure thunk,
+/// registering it on first use. Callable by the guest via the import
+/// selector that maps onto the registry's thunk region.
+fn default_wndproc_farptr(registry: &mut Registry) -> (u16, u16) {
+    let thunk = registry.register_far_pascal("user", "@_defwndproc", stub_def_window_proc, 10);
+    (
+        crate::ne::IMPORT_SELECTOR,
+        (thunk - crate::win32::THUNK_BASE) as u16,
+    )
+}
+
+/// `USER.404 GetClassInfo(hInstance, lpClassName, lpWndClass)` → BOOL. We
+/// report every queried class as registered and fill the caller's
+/// `WNDCLASS` with a default window procedure so MFC's subclassing of
+/// predefined controls has a valid proc to chain to.
+fn stub_get_class_info(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hInstance (SP+10), lpClassName far (SP+6), lpWndClass far (SP+4).
+    let out = far_arg_linear(cpu, mmu, 4);
+    let (sel, off) = default_wndproc_farptr(registry);
+    // Win16 WNDCLASS: style@0, lpfnWndProc@2 (off@2, sel@4).
+    let _ = mmu.load16(out); // touch to fault early if unmapped
+    let _ = mmu.store16(out, 0); // style
+    let _ = mmu.store16(out.wrapping_add(2), off);
+    let _ = mmu.store16(out.wrapping_add(4), sel);
+    Ok(1)
+}
+
+/// `USER.57 RegisterClass(lpWndClass far)` → an ATOM. Parses the Win16
+/// `WNDCLASS` (16-bit `style`), records the class + its window procedure
+/// in the headless GUI model, and returns a non-zero atom.
+fn stub_register_class(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let wc = far_arg_linear(cpu, mmu, 4);
+    // Win16 WNDCLASS: style WORD@0, lpfnWndProc FAR@2, cbClsExtra@6,
+    // cbWndExtra@8, hInstance@10, hIcon@12, hCursor@14, hbrBackground@16,
+    // lpszMenuName FAR@18, lpszClassName FAR@22.
+    let style = u32::from(mmu.load16(wc).unwrap_or(0));
+    let wndproc_off = mmu.load16(wc.wrapping_add(2)).unwrap_or(0);
+    let wndproc_sel = mmu.load16(wc.wrapping_add(4)).unwrap_or(0);
+    let name_off = mmu.load16(wc.wrapping_add(22)).unwrap_or(0);
+    let name_sel = mmu.load16(wc.wrapping_add(24)).unwrap_or(0);
+    let name_lin = cpu.far_to_linear(name_sel, name_off);
+    let name = String::from_utf8_lossy(&read_guest_cstr(mmu, name_lin, 256)).into_owned();
+    state
+        .gui
+        .register_class(&name, wndproc_sel, wndproc_off, style);
+    Ok(u32::from(state.gui.alloc_obj_handle()))
+}
+
+/// `USER.291 SetWindowsHookEx(idHook, lpfn, hMod, hTask)` → an HHOOK. We
+/// don't actually dispatch hooks, but MFC stores the handle to unhook on
+/// exit, so return a unique non-zero handle.
+fn stub_set_windows_hook_ex(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(u32::from(state.gui.alloc_obj_handle()))
+}
+
+/// A resource parsed from the loaded NE module, with its data.
+#[derive(Debug, Clone)]
+pub struct LoadedResource {
+    pub type_id: ud_format::ne::ResId,
+    pub name_id: ud_format::ne::ResId,
+    pub data: Vec<u8>,
+}
+
+/// Read a FAR PASCAL resource-id argument (a `segment:offset` packed as a
+/// stack dword): a zero selector means an integer id in the offset,
+/// otherwise the offset points at a NUL-terminated name string.
+fn res_id_arg(cpu: &Cpu, mmu: &Mmu, byte_off: u32) -> ud_format::ne::ResId {
+    use ud_format::ne::ResId;
+    let v = cpu.stack_dword(mmu, byte_off).unwrap_or(0);
+    let selector = (v >> 16) as u16;
+    if selector == 0 {
+        ResId::Int(v as u16)
+    } else {
+        let lin = cpu.far_to_linear(selector, v as u16);
+        ResId::Name(String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 256)).into_owned())
+    }
+}
+
+/// Compare two resource ids, treating names case-insensitively (Win16
+/// resource lookup is case-insensitive).
+fn res_id_eq(a: &ud_format::ne::ResId, b: &ud_format::ne::ResId) -> bool {
+    use ud_format::ne::ResId;
+    match (a, b) {
+        (ResId::Int(x), ResId::Int(y)) => x == y,
+        (ResId::Name(x), ResId::Name(y)) => x.eq_ignore_ascii_case(y),
+        _ => false,
+    }
+}
+
+/// `KERNEL.60 FindResource(hModule, lpName, lpType)` → an HRSRC (the
+/// 1-based resource index, 0 if not found).
+fn stub_find_resource(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hModule (SP+10), lpName far (SP+6), lpType far (SP+4).
+    let want_type = res_id_arg(cpu, mmu, 4);
+    let want_name = res_id_arg(cpu, mmu, 6);
+    let hrsrc = state
+        .resources
+        .iter()
+        .position(|r| res_id_eq(&r.type_id, &want_type) && res_id_eq(&r.name_id, &want_name))
+        .map_or(0, |i| i as u32 + 1);
+    Ok(hrsrc)
+}
+
+/// `KERNEL.61 LoadResource(hModule, hResInfo)` → an HGLOBAL holding a copy
+/// of the resource bytes (0 if the handle is invalid).
+fn stub_load_resource(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hModule (SP+6), hResInfo (SP+4).
+    let hrsrc = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let Some(res) = state.resources.get(hrsrc.wrapping_sub(1) as usize) else {
+        return Ok(0);
+    };
+    let data = res.data.clone();
+    let sel = state.win16_heap.alloc(cpu, mmu, data.len() as u32);
+    let base = cpu.far_to_linear(sel, 0);
+    for (i, &b) in data.iter().enumerate() {
+        let _ = mmu.store8(base.wrapping_add(i as u32), b);
+    }
+    Ok(u32::from(sel))
+}
+
+/// `KERNEL.62 LockResource(hResData)` → a far pointer to the resource
+/// bytes. `hResData` is the HGLOBAL selector from `LoadResource`, so the
+/// pointer is simply `selector:0`.
+fn stub_lock_resource(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let sel = _cpu.stack_word(_mmu, 4).unwrap_or(0);
+    // DX:AX = selector:offset → far pointer to offset 0 of the block.
+    Ok(u32::from(sel) << 16)
+}
+
+/// `KERNEL.65 SizeofResource(hModule, hResInfo)` → the resource length.
+fn stub_sizeof_resource(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let hrsrc = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let size = state
+        .resources
+        .get(hrsrc.wrapping_sub(1) as usize)
+        .map_or(0, |r| r.data.len() as u32);
+    Ok(size)
+}
+
+/// `KERNEL.63 FreeResource(hResData)` → 0 (we leave the global block
+/// mapped; nothing to do).
+fn stub_free_resource(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// First global atom value (matches Win16's `MAXINTATOM`).
+const ATOM_BASE: u16 = 0xC000;
+
+/// `USER.268 GlobalAddAtom(lpString far)` → an ATOM. Interns the string in
+/// the global atom table (case-insensitive) and returns its atom.
+fn stub_global_add_atom(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let lin = far_arg_linear(cpu, mmu, 4);
+    let s = String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 256)).into_owned();
+    let atom = match state.atoms.iter().position(|a| a.eq_ignore_ascii_case(&s)) {
+        Some(i) => ATOM_BASE + i as u16,
+        None => {
+            state.atoms.push(s);
+            ATOM_BASE + (state.atoms.len() as u16 - 1)
+        }
+    };
+    Ok(u32::from(atom))
+}
+
+/// `KERNEL.132 GetWinFlags()` → the system capability flags (DWORD).
+/// Report protected mode, a 386, enhanced mode and an FPU.
+fn stub_get_win_flags(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // WF_PMODE | WF_CPU386 | WF_ENHANCED | WF_80x87.
+    Ok(0x0001 | 0x0004 | 0x0020 | 0x0400)
+}
+
+/// `KERNEL.36 GetCurrentTask()` → the current task handle (HTASK). We run
+/// a single synthetic task.
+fn stub_get_current_task(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(u32::from(WIN16_HTASK))
+}
+
+/// `KERNEL.47 GetModuleHandle(lpModuleName far)` → the module handle. If
+/// the pointer's selector is 0, Win16 treats the offset as a handle and
+/// echoes it; otherwise we return our single module's hInstance.
+fn stub_get_module_handle(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let v = cpu.stack_dword(mmu, 4).unwrap_or(0);
+    let selector = (v >> 16) as u16;
+    if selector == 0 {
+        return Ok(u32::from(v as u16));
+    }
+    Ok(u32::from(WIN16_HINSTANCE))
+}
+
+/// `USER.176 LoadString(hInstance, uID, lpBuffer, nBufferMax)` → copy a
+/// string-table resource into `lpBuffer`; returns the length copied (0 if
+/// the id is absent).
+fn stub_load_string(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: hInstance (SP+12), uID (SP+10), lpBuffer far (SP+6), nMax (SP+4).
+    let n_max = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let buf_lin = far_arg_linear(cpu, mmu, 6);
+    let uid = cpu.stack_word(mmu, 10).unwrap_or(0);
+    let text = state
+        .string_resources
+        .get(&uid)
+        .cloned()
+        .unwrap_or_default();
+    if n_max == 0 {
+        return Ok(0);
+    }
+    write_guest_cstr(mmu, buf_lin, n_max, text.as_bytes())
+}
+
+/// `COMMDLG.27 GetFileTitle(lpszFile, lpszTitle, cbBuf)` → copy just the
+/// filename portion of a path into `lpszTitle`; returns 0 on success.
+fn stub_get_file_title(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: lpszFile (SP+10), lpszTitle (SP+6), cbBuf (SP+4).
+    let cb_buf = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let title_lin = far_arg_linear(cpu, mmu, 6);
+    let file_lin = far_arg_linear(cpu, mmu, 10);
+    let path = read_guest_cstr(mmu, file_lin, 0x1000);
+    // The title is the run after the last path separator (\ / :).
+    let start = path
+        .iter()
+        .rposition(|&b| b == b'\\' || b == b'/' || b == b':')
+        .map_or(0, |p| p + 1);
+    let title = &path[start..];
+    if u32::from(cb_buf) <= title.len() as u32 {
+        // Buffer too small: return required size (incl. terminator).
+        return Ok(title.len() as u32 + 1);
+    }
+    write_guest_cstr(mmu, title_lin, cb_buf, title)?;
+    Ok(0)
 }
 
 /// `KERNEL.20 GlobalSize(hMem)` → the requested size of the block.

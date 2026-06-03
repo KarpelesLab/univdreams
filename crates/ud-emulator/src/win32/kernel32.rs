@@ -1638,7 +1638,9 @@ fn stub_load_library_a(
     //    sandbox's mounted filesystem rather than disk. Handles
     //    qtcf.dll's delay-load resolver calling LoadLibraryA on
     //    CoreFoundation.dll from inside qts's CRT init.
-    Ok(crate::runtime::load_dll_dynamic(cpu, mmu, registry, state, &name))
+    Ok(crate::runtime::load_dll_dynamic(
+        cpu, mmu, registry, state, &name,
+    ))
 }
 
 /// Resolve a `LoadLibrary*` request against `state.modules`.
@@ -4911,7 +4913,9 @@ fn stub_load_library_w(
     if cached != 0 {
         return Ok(cached);
     }
-    Ok(crate::runtime::load_dll_dynamic(cpu, mmu, registry, state, &name))
+    Ok(crate::runtime::load_dll_dynamic(
+        cpu, mmu, registry, state, &name,
+    ))
 }
 
 /// `BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED)`.
@@ -5266,7 +5270,9 @@ fn stub_load_library_ex_a(
     if cached != 0 {
         return Ok(cached);
     }
-    Ok(crate::runtime::load_dll_dynamic(cpu, mmu, registry, state, &name))
+    Ok(crate::runtime::load_dll_dynamic(
+        cpu, mmu, registry, state, &name,
+    ))
 }
 
 /// `BOOL WriteConsoleA(HANDLE, const VOID*, DWORD nNumberOfChars,
