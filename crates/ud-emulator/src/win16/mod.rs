@@ -358,6 +358,39 @@ fn register_kernel(registry: &mut Registry) {
     registry.register_far_pascal("kernel", "@19", stub_ret0_1word, 2);
     // KERNEL.20 GlobalSize(hMem) → block size in bytes (DX:AX).
     registry.register_far_pascal("kernel", "@20", stub_global_size, 2);
+    // KERNEL.49 GetModuleFileName(hInst, lpFilename far, nSize) → length.
+    registry.register_far_pascal("kernel", "@49", stub_get_module_filename, 8);
+}
+
+/// `KERNEL.49 GetModuleFileName(hInst, lpFilename, nSize)` — write a
+/// plausible module path into the guest buffer and return its length.
+fn stub_get_module_filename(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL stack: nSize (SP+4), lpFilename off (SP+6) / sel (SP+8).
+    let n_size = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let off = cpu.stack_word(mmu, 6).unwrap_or(0);
+    let sel = cpu.stack_word(mmu, 8).unwrap_or(0);
+    let lin = cpu.far_to_linear(sel, off);
+    write_guest_cstr(mmu, lin, n_size, b"C:\\SITEX10.EXE")
+}
+
+/// Write `text` (NUL-terminated) into a guest buffer of `max` bytes at
+/// linear `addr`; returns the number of characters written (excluding
+/// the terminator).
+fn write_guest_cstr(mmu: &mut Mmu, addr: u32, max: u16, text: &[u8]) -> Result<u32, Win32Error> {
+    if max == 0 {
+        return Ok(0);
+    }
+    let limit = usize::from(max).saturating_sub(1).min(text.len());
+    for (i, &b) in text.iter().take(limit).enumerate() {
+        let _ = mmu.store8(addr.wrapping_add(i as u32), b);
+    }
+    let _ = mmu.store8(addr.wrapping_add(limit as u32), 0);
+    Ok(limit as u32)
 }
 
 /// `KERNEL.20 GlobalSize(hMem)` → the requested size of the block.
