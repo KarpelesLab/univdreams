@@ -749,6 +749,7 @@ impl Cpu {
         // pipeline can spot unaligned text and
         // write-then-execute regions.
         mmu.coverage.record_exec(entry_eip, 1);
+        mmu.dbg_eip = entry_eip;
         // Trace-exec sub-feature: emit a per-instruction event
         // when the runtime has flipped exec-trace on.
         #[cfg(feature = "trace-exec")]
@@ -2738,12 +2739,25 @@ impl Cpu {
                 opcode: 0x8F,
             });
         }
-        let v = self.pop32(mmu)?;
-        let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
-        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
-        let op = self.seg_apply(op);
-        write_operand32(op, v, &mut self.regs, mmu)?;
+        // POP the value first (the stack pointer must settle before the
+        // destination effective address is computed for SP-relative
+        // forms), then store it at the operand — 16-bit wide under the
+        // operand-size rules, 32-bit otherwise.
+        if self.op_size_16() {
+            let v = self.pop16(mmu)?;
+            let bytes = self.peek_after_modrm(mmu, 16)?;
+            let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
+            self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+            let op = self.seg_apply(op);
+            write_operand16(op, v, &mut self.regs, mmu)?;
+        } else {
+            let v = self.pop32(mmu)?;
+            let bytes = self.peek_after_modrm(mmu, 16)?;
+            let (op, consumed) = self.resolve_modrm(mr, &bytes)?;
+            self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+            let op = self.seg_apply(op);
+            write_operand32(op, v, &mut self.regs, mmu)?;
+        }
         Ok(StepOk::Continued)
     }
 

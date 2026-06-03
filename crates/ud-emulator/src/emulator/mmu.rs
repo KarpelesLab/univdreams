@@ -106,6 +106,10 @@ pub struct Mmu {
     /// self-modifying regions. See
     /// [`crate::coverage::CoverageMap`] for the contract.
     pub coverage: crate::coverage::CoverageMap,
+    /// Debugging aid: the EIP of the instruction currently executing,
+    /// set by the interpreter so memory watchpoints can report the
+    /// faulting instruction. Not load-bearing.
+    pub dbg_eip: u32,
 }
 
 impl Default for Mmu {
@@ -126,6 +130,7 @@ impl Mmu {
             #[cfg(feature = "trace")]
             trace: crate::trace::TraceState::new(),
             coverage: crate::coverage::CoverageMap::default(),
+            dbg_eip: 0,
         }
     }
 
@@ -293,6 +298,16 @@ impl Mmu {
     }
 
     fn put_byte(&mut self, addr: u32, value: u8) -> Result<(), Trap> {
+        if let Ok(w) = std::env::var("UD_NE_WATCH") {
+            if let Ok(watch) = u32::from_str_radix(w.trim_start_matches("0x"), 16) {
+                if addr == watch || addr == watch.wrapping_add(1) {
+                    eprintln!(
+                        "WATCH [{addr:#x}] = {value:#04x} at eip={:#x}",
+                        self.dbg_eip
+                    );
+                }
+            }
+        }
         let page_idx = (addr >> PAGE_SHIFT) as usize;
         let page = self.pages[page_idx]
             .as_mut()
