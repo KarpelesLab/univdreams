@@ -264,6 +264,10 @@ fn register_user(registry: &mut Registry) {
     registry.register_far_pascal("user", "@66", stub_ret_handle_1word, 2);
     // USER.68 ReleaseDC(hWnd, hDC) — release the screen DC; return 1.
     registry.register_far_pascal("user", "@68", stub_ret1_2word, 4);
+    // USER.69 SetCursor(hCursor) → previous HCURSOR. Callers want a
+    // non-zero handle they can pass back later to "restore" the cursor;
+    // a fixed synthetic handle is fine for a sandboxed installer.
+    registry.register_far_pascal("user", "@69", stub_ret_handle_1word, 2);
     // USER.179 GetSystemMetrics(index).
     registry.register_far_pascal("user", "@179", stub_get_system_metrics, 2);
     // USER.180 GetSysColor(index) → COLORREF.
@@ -285,6 +289,14 @@ fn register_user(registry: &mut Registry) {
     registry.register_far_pascal("user", "@87", stub_dialog_box, 12);
     // USER.88 EndDialog(hDlg, nResult).
     registry.register_far_pascal("user", "@88", stub_end_dialog, 4);
+    // USER.89 CreateDialog(hInst, lpTemplate far, hWndParent, lpDialogFunc far)
+    // → HWND. Modeless variant: record the dialog like DialogBox but
+    // return a synthetic HWND instead of running the message pump.
+    registry.register_far_pascal("user", "@89", stub_create_dialog, 12);
+    // USER.42 ShowWindow(hWnd, nCmdShow) → previously-visible BOOL. We
+    // have no real window manager, but the installer just wants
+    // confirmation; return 1.
+    registry.register_far_pascal("user", "@42", stub_ret1_2word, 4);
     // USER.292 UnhookWindowsHookEx(hHook far) → BOOL.
     registry.register_far_pascal("user", "@292", stub_ret1_2word, 4);
     // USER.1 MessageBox(hWnd, lpText far, lpCaption far, wType) → int.
@@ -477,6 +489,13 @@ fn register_kernel(registry: &mut Registry) {
     registry.register_far_pascal("kernel", "@20", stub_global_size, 2);
     // KERNEL.49 GetModuleFileName(hInst, lpFilename far, nSize) → length.
     registry.register_far_pascal("kernel", "@49", stub_get_module_filename, 8);
+    // KERNEL.134 GetWindowsDirectory(lpBuffer far, uSize) → length.
+    // SITEX10 plants temp files under the Windows directory; a
+    // plausible "C:\\WINDOWS" satisfies its bookkeeping.
+    registry.register_far_pascal("kernel", "@134", stub_get_windows_directory, 6);
+    // KERNEL.135 GetSystemDirectory(lpBuffer far, uSize) → length.
+    // Same shape as @134 but resolves the system directory.
+    registry.register_far_pascal("kernel", "@135", stub_get_system_directory, 6);
     // KERNEL.131 GetExePtr(handle) → the owning module handle. Echo the
     // segment/handle back (non-zero) so the caller treats it as valid.
     registry.register_far_pascal("kernel", "@131", stub_echo_1word, 2);
@@ -531,6 +550,37 @@ fn stub_get_module_filename(
     let sel = cpu.stack_word(mmu, 8).unwrap_or(0);
     let lin = cpu.far_to_linear(sel, off);
     write_guest_cstr(mmu, lin, n_size, b"C:\\SITEX10.EXE")
+}
+
+/// `KERNEL.134 GetWindowsDirectory(lpBuffer far, uSize)` — write
+/// `"C:\\WINDOWS"` into the guest buffer and return its length.
+fn stub_get_windows_directory(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL: uSize (SP+4), lpBuffer off (SP+6) / sel (SP+8).
+    let n_size = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let off = cpu.stack_word(mmu, 6).unwrap_or(0);
+    let sel = cpu.stack_word(mmu, 8).unwrap_or(0);
+    let lin = cpu.far_to_linear(sel, off);
+    write_guest_cstr(mmu, lin, n_size, b"C:\\WINDOWS")
+}
+
+/// `KERNEL.135 GetSystemDirectory(lpBuffer far, uSize)` — write
+/// `"C:\\WINDOWS\\SYSTEM"` into the guest buffer and return its length.
+fn stub_get_system_directory(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let n_size = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let off = cpu.stack_word(mmu, 6).unwrap_or(0);
+    let sel = cpu.stack_word(mmu, 8).unwrap_or(0);
+    let lin = cpu.far_to_linear(sel, off);
+    write_guest_cstr(mmu, lin, n_size, b"C:\\WINDOWS\\SYSTEM")
 }
 
 /// Write `text` (NUL-terminated) into a guest buffer of `max` bytes at
@@ -1322,6 +1372,48 @@ fn stub_end_dialog(
     state.dialog_ended = true;
     state.dialog_result = result as i16;
     Ok(1)
+}
+
+/// `USER.89 CreateDialog(hInst, lpTemplate far, hWndParent, lpDialogFunc far)`
+/// — the modeless counterpart of [`stub_dialog_box`]. Resolve the
+/// template against `state.resources`, log it as a `DialogStart` GUI
+/// event so the install-monitor transcript captures the surface the
+/// installer brings up, and return a freshly minted synthetic `HWND`.
+///
+/// Without a host-side message pump the dialog procedure never runs;
+/// the installer is expected to drive it itself via `IsDialogMessage`
+/// + `PeekMessage` or via direct `SendMessage` calls. Modeless dialogs
+/// in SITEX10 are progress / status windows the caller only treats
+/// as a non-zero handle to pass to later `ShowWindow` / `DestroyWindow`
+/// calls.
+fn stub_create_dialog(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    // PASCAL (12 bytes): hInstance(SP+14), lpTemplate far(SP+10/SP+12),
+    // hWndParent(SP+8), lpDialogFunc far(SP+4/SP+6).
+    let tmpl_off = cpu.stack_word(mmu, 10).unwrap_or(0);
+    let tmpl_sel = cpu.stack_word(mmu, 12).unwrap_or(0);
+    let want = if tmpl_sel == 0 {
+        ud_format::ne::ResId::Int(tmpl_off)
+    } else {
+        let lin = cpu.far_to_linear(tmpl_sel, tmpl_off);
+        ud_format::ne::ResId::Name(
+            String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 256)).into_owned(),
+        )
+    };
+    let dlg = state
+        .resources
+        .iter()
+        .find(|r| r.type_id == ud_format::ne::ResId::Int(5) && res_id_eq(&r.name_id, &want))
+        .map(|r| r.data.clone());
+    let (title, controls) = dlg
+        .as_deref()
+        .map_or_else(|| (String::new(), Vec::new()), gui::parse_dialog_template);
+    state.gui.events.push(gui::GuiEvent::DialogStart { title, controls });
+    Ok(u32::from(state.gui.alloc_hwnd()))
 }
 
 /// First global atom value (matches Win16's `MAXINTATOM`).

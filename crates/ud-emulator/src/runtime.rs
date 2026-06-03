@@ -1018,13 +1018,27 @@ impl Sandbox {
         // compares against stored values; our memory layout (synthetic
         // import selectors patched in by relocation) can never match, so it
         // aborts with "This copy of Setup has been changed without
-        // authorization". With UD_NE_PATCH_TAMPER=1, redirect the two
-        // leading `jnz <err>` (75 05) of the verify routine (seg2:0x2e01,
-        // 0x2e21) to their pass targets so the check succeeds. In-memory
-        // only — the on-disk file is untouched.
+        // authorization". With UD_NE_PATCH_TAMPER=1, force-bypass each
+        // tamper gate by rewriting its leading `75 rel` (JNZ on
+        // failure/show-messagebox-when-zero) to `EB rel` (unconditional
+        // skip to the success continuation).
+        //
+        // Sites and their pass-target relative offsets:
+        //   seg2:0x2e01 / 0x2e21 — InitInstance integrity verify.
+        //   seg2:0x2ea3 — re-runs in the Install-button click handler.
+        //   seg2:0x2ef5 — the actual `if(SI==0) show_tamper_messagebox`
+        //                  guard; bypasses the GUI loop where the
+        //                  messagebox re-fires per Install click.
+        //
+        // In-memory only — the on-disk file is untouched.
         if std::env::var("UD_NE_PATCH_TAMPER").is_ok() {
             let seg2 = crate::ne::WIN16_SEG_BASE + crate::ne::WIN16_SEG_STRIDE;
-            for (off, rel) in [(0x2e01u32, 0x14u8), (0x2e21, 0x29)] {
+            for (off, rel) in [
+                (0x2e01u32, 0x14u8),
+                (0x2e21, 0x29),
+                (0x2ea3, 0x26),
+                (0x2ef5, 0x4b),
+            ] {
                 let lin = seg2 + off;
                 if self.mmu.load8(lin) == Ok(0x75) {
                     let _ = self.mmu.store8(lin, 0xEB);
