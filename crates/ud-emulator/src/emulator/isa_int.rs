@@ -1263,21 +1263,37 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
 
-            // 0x98 — CWDE: sign-extend ax into eax
+            // 0x98 — CBW (16-bit: sign-extend al→ax) / CWDE (32-bit:
+            // sign-extend ax→eax).
             0x98 => {
-                let v = self.regs.get16(Reg16::Ax) as i16 as i32 as u32;
-                self.regs.set32(Reg32::Eax, v);
+                if self.op_size_16() {
+                    let v = self.regs.get8(Reg8::Al) as i8 as i16 as u16;
+                    self.regs.set16(Reg16::Ax, v);
+                } else {
+                    let v = self.regs.get16(Reg16::Ax) as i16 as i32 as u32;
+                    self.regs.set32(Reg32::Eax, v);
+                }
                 Ok(StepOk::Continued)
             }
-            // 0x99 — CDQ: sign-extend eax into edx:eax
+            // 0x99 — CWD (16-bit: sign-extend ax→dx:ax) / CDQ (32-bit:
+            // sign-extend eax→edx:eax).
             0x99 => {
-                let v = self.regs.get32(Reg32::Eax);
-                let sign = if (v & 0x8000_0000) != 0 {
-                    0xFFFF_FFFF
+                if self.op_size_16() {
+                    let sign = if self.regs.get16(Reg16::Ax) & 0x8000 != 0 {
+                        0xFFFF
+                    } else {
+                        0
+                    };
+                    self.regs.set16(Reg16::Dx, sign);
                 } else {
-                    0
-                };
-                self.regs.set32(Reg32::Edx, sign);
+                    let v = self.regs.get32(Reg32::Eax);
+                    let sign = if (v & 0x8000_0000) != 0 {
+                        0xFFFF_FFFF
+                    } else {
+                        0
+                    };
+                    self.regs.set32(Reg32::Edx, sign);
+                }
                 Ok(StepOk::Continued)
             }
 
@@ -1670,6 +1686,31 @@ impl Cpu {
                 self.regs.eip = self.regs.eip.wrapping_add(disp);
                 Ok(StepOk::Continued)
             }
+            // 0xE0 LOOPNE / 0xE1 LOOPE / 0xE2 LOOP rel8. Decrement the
+            // count register (CX/ECX per address size) and jump if it's
+            // non-zero (and, for E0/E1, the ZF condition holds).
+            0xE0 | 0xE1 | 0xE2 => {
+                let disp = sign_ext_8_to_32(self.fetch_imm8(mmu)?);
+                let count = if self.addr16() {
+                    let c = self.regs.get16(Reg16::Cx).wrapping_sub(1);
+                    self.regs.set16(Reg16::Cx, c);
+                    u32::from(c)
+                } else {
+                    let c = self.regs.get32(Reg32::Ecx).wrapping_sub(1);
+                    self.regs.set32(Reg32::Ecx, c);
+                    c
+                };
+                let cond = match op {
+                    0xE0 => count != 0 && !self.regs.flags.zf, // LOOPNE
+                    0xE1 => count != 0 && self.regs.flags.zf,  // LOOPE
+                    _ => count != 0,                           // LOOP
+                };
+                if cond {
+                    self.regs.eip = self.regs.eip.wrapping_add(disp);
+                }
+                Ok(StepOk::Continued)
+            }
+
             // 0xE3 — JCXZ/JECXZ rel8 (jump if CX/ECX == 0). The tested
             // register follows the address size.
             0xE3 => {
