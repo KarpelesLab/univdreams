@@ -3074,7 +3074,7 @@ fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
                 hwnd, class, title, ..
             } => println!("    CreateWindow hwnd={hwnd:#06x} [{class}] {title:?}"),
             GuiEvent::ShowWindow { hwnd, cmd } => {
-                println!("    ShowWindow hwnd={hwnd:#06x} cmd={cmd}")
+                println!("    ShowWindow hwnd={hwnd:#06x} cmd={cmd}");
             }
             GuiEvent::MessageBox {
                 caption,
@@ -3090,12 +3090,13 @@ fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
             }
             GuiEvent::DialogEnd { result } => println!("    DialogEnd -> {result}"),
             GuiEvent::SetWindowText { hwnd, text } => {
-                println!("    SetWindowText hwnd={hwnd:#06x} {text:?}")
+                println!("    SetWindowText hwnd={hwnd:#06x} {text:?}");
             }
         }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn monitor_install(
     input: &Path,
     max_instructions: u64,
