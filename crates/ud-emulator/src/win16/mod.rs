@@ -28,6 +28,8 @@ const WIN16_HEAP_BASE: u32 = 0x0040_0000;
 /// First selector handed out for a `GlobalAlloc` block (avoids the
 /// segment numbers, HINSTANCE, import/PSP/sentinel selectors).
 const WIN16_HEAP_FIRST_SEL: u16 = 0x0200;
+/// Per-block window size: a Win16 selector addresses up to 64 KiB.
+const WIN16_HEAP_WINDOW: u32 = 0x0001_0000;
 
 /// A simple Win16 global heap. Each `GlobalAlloc` gets its own linear
 /// window and a unique selector (handle == selector, GMEM_FIXED-style);
@@ -42,19 +44,21 @@ pub struct Win16Heap {
 
 impl Win16Heap {
     /// Allocate `size` bytes: map a fresh window, assign a selector,
-    /// register it on the CPU, and return the selector (the handle).
+    /// register it on the CPU, and return the selector (the handle). Each
+    /// block gets a full 64 KiB window — a Win16 selector addresses up to
+    /// 64 KiB, and programs routinely read/write the whole segment.
     fn alloc(&mut self, cpu: &mut Cpu, mmu: &mut Mmu, size: u32) -> u16 {
         if self.next_base < WIN16_HEAP_BASE {
             self.next_base = WIN16_HEAP_BASE;
             self.next_selector = WIN16_HEAP_FIRST_SEL;
         }
-        let rounded = size.max(1).wrapping_add(0xFFF) & !0xFFF;
+        let window = WIN16_HEAP_WINDOW.max(size.wrapping_add(0xFFF) & !0xFFF);
         let base = self.next_base;
         let sel = self.next_selector;
-        mmu.map(base, rounded, Perm::R | Perm::W | Perm::X);
+        mmu.map(base, window, Perm::R | Perm::W | Perm::X);
         cpu.define_selector(sel, base);
         self.blocks.insert(sel, (base, size));
-        self.next_base = self.next_base.wrapping_add(rounded);
+        self.next_base = self.next_base.wrapping_add(window);
         self.next_selector = self.next_selector.wrapping_add(8);
         sel
     }
@@ -68,27 +72,26 @@ impl Win16Heap {
         let Some(&(old_base, old_size)) = self.blocks.get(&sel) else {
             return self.alloc(cpu, mmu, new_size);
         };
-        let old_rounded = old_size.max(1).wrapping_add(0xFFF) & !0xFFF;
-        if new_size <= old_rounded {
+        // Fits in the existing 64 KiB window → resize in place.
+        if new_size <= WIN16_HEAP_WINDOW {
             self.blocks.insert(sel, (old_base, new_size));
             return sel;
         }
-        // Grow: move to a fresh window (the next block sits right after the
-        // old one, so we can't extend in place) and copy the old contents.
-        let new_rounded = new_size.max(1).wrapping_add(0xFFF) & !0xFFF;
+        // Huge (>64 KiB) grow: move to a fresh window and copy the contents.
+        let new_window = new_size.wrapping_add(0xFFF) & !0xFFF;
         if self.next_base < WIN16_HEAP_BASE {
             self.next_base = WIN16_HEAP_BASE;
             self.next_selector = WIN16_HEAP_FIRST_SEL;
         }
         let new_base = self.next_base;
-        mmu.map(new_base, new_rounded, Perm::R | Perm::W | Perm::X);
+        mmu.map(new_base, new_window, Perm::R | Perm::W | Perm::X);
         for i in 0..old_size.min(new_size) {
             let b = mmu.load8(old_base.wrapping_add(i)).unwrap_or(0);
             let _ = mmu.store8(new_base.wrapping_add(i), b);
         }
         cpu.define_selector(sel, new_base); // same selector, new base
         self.blocks.insert(sel, (new_base, new_size));
-        self.next_base = self.next_base.wrapping_add(new_rounded);
+        self.next_base = self.next_base.wrapping_add(new_window);
         sel
     }
 }
@@ -257,12 +260,18 @@ fn register_user(registry: &mut Registry) {
     registry.register_far_pascal("user", "@87", stub_dialog_box, 12);
     // USER.88 EndDialog(hDlg, nResult).
     registry.register_far_pascal("user", "@88", stub_end_dialog, 4);
+    // USER.89 CreateDialog(hInst, lpTemplate far, hWndParent, lpDialogFunc far).
+    registry.register_far_pascal("user", "@89", stub_create_dialog, 12);
     // USER.292 UnhookWindowsHookEx(hHook far) → BOOL.
     registry.register_far_pascal("user", "@292", stub_ret1_2word, 4);
     // USER.1 MessageBox(hWnd, lpText far, lpCaption far, wType) → int.
     registry.register_far_pascal("user", "@1", stub_message_box, 12);
     // USER.229 GetTopWindow(hWnd) → first child HWND (none in our model).
     registry.register_far_pascal("user", "@229", stub_ret0_1word, 2);
+    // USER.69 SetCursor(hCursor) → previous HCURSOR.
+    registry.register_far_pascal("user", "@69", stub_create_object, 2);
+    // USER.42 ShowWindow(hWnd, nCmdShow) → previous visibility.
+    registry.register_far_pascal("user", "@42", stub_ret1_2word, 4);
     // USER.262 GetWindow(hWnd, uCmd) → related HWND (none in our model).
     registry.register_far_pascal("user", "@262", stub_ret0_1word, 4);
     // USER.32 GetWindowRect(hWnd, lpRect far).
@@ -660,6 +669,33 @@ fn register_kernel(registry: &mut Registry) {
     registry.register_far_pascal("kernel", "@62", stub_lock_resource, 2);
     registry.register_far_pascal("kernel", "@63", stub_free_resource, 2);
     registry.register_far_pascal("kernel", "@65", stub_sizeof_resource, 4);
+    // KERNEL.134 GetWindowsDirectory / KERNEL.135 GetSystemDirectory.
+    registry.register_far_pascal("kernel", "@134", stub_get_windows_dir, 6);
+    registry.register_far_pascal("kernel", "@135", stub_get_system_dir, 6);
+}
+
+/// `KERNEL.134 GetWindowsDirectory(lpBuffer far, uSize)` → "C:\\WINDOWS".
+fn stub_get_windows_dir(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let n = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let buf = far_arg_linear(cpu, mmu, 6);
+    write_guest_cstr(mmu, buf, n, b"C:\\WINDOWS")
+}
+
+/// `KERNEL.135 GetSystemDirectory(lpBuffer far, uSize)` → "C:\\WINDOWS\\SYSTEM".
+fn stub_get_system_dir(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let n = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let buf = far_arg_linear(cpu, mmu, 6);
+    write_guest_cstr(mmu, buf, n, b"C:\\WINDOWS\\SYSTEM")
 }
 
 /// Generic FAR PASCAL stub returning its single word argument unchanged
@@ -1289,6 +1325,59 @@ const WM_COMMAND: u16 = 0x0111;
 /// invoke the dialog procedure for `WM_INITDIALOG`, then auto-drive it by
 /// posting the default command until it calls `EndDialog`. Returns the
 /// `EndDialog` result.
+/// `USER.89 CreateDialog(hInstance, lpTemplate, hWndParent, lpDialogFunc)`
+/// → HWND of a *modeless* dialog (e.g. the install progress box). Records
+/// it, creates its controls, attaches the MFC CWnd and delivers
+/// WM_INITDIALOG, then returns the window handle (the program pumps it
+/// itself). Off the drive path it just records the dialog.
+fn stub_create_dialog(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let proc_off = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let proc_sel = cpu.stack_word(mmu, 6).unwrap_or(0);
+    let tmpl_off = cpu.stack_word(mmu, 10).unwrap_or(0);
+    let tmpl_sel = cpu.stack_word(mmu, 12).unwrap_or(0);
+    let this_sel = cpu.segment_selector(crate::emulator::isa_int::Seg::Es);
+    let this_off = cpu.regs.get16(Reg16::Bx);
+    let want = if tmpl_sel == 0 {
+        ud_format::ne::ResId::Int(tmpl_off)
+    } else {
+        let lin = cpu.far_to_linear(tmpl_sel, tmpl_off);
+        ud_format::ne::ResId::Name(
+            String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 256)).into_owned(),
+        )
+    };
+    let dlg = state
+        .resources
+        .iter()
+        .find(|r| r.type_id == ud_format::ne::ResId::Int(5) && res_id_eq(&r.name_id, &want))
+        .map(|r| r.data.clone());
+    let (title, controls) = dlg
+        .as_deref()
+        .map_or_else(|| (String::new(), Vec::new()), gui::parse_dialog_template);
+    state.gui.events.push(gui::GuiEvent::DialogStart {
+        title,
+        controls: controls.clone(),
+    });
+    let hdlg = state.gui.alloc_hwnd();
+    // Record the controls so GetDlgItem on the modeless dialog resolves
+    // (the installer updates the progress text via SetDlgItemText). We
+    // don't run the dialog procedure here — a modeless dialog is pumped by
+    // the program's own message loop, and the progress UI isn't needed for
+    // the extraction to proceed.
+    for c in &controls {
+        let chwnd = state
+            .gui
+            .create_window(&c.class, &c.text, hdlg, c.id, c.style);
+        state.dialog_items.insert(c.id, chwnd);
+    }
+    let _ = (proc_sel, proc_off, this_sel, this_off, registry);
+    Ok(u32::from(hdlg))
+}
+
 fn stub_dialog_box(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
