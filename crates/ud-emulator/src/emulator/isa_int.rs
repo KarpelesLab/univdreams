@@ -3608,8 +3608,10 @@ impl Cpu {
         let size = self.string_size(sized_dword);
         let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
-            let src = this.regs.get32(Reg32::Esi);
-            let dst = this.regs.get32(Reg32::Edi);
+            // CMPS compares `(DS|override):SI` against `ES:DI`; both indices
+            // get their segment base applied (str_si_addr/str_di_addr).
+            let src = this.str_si_addr(true);
+            let dst = this.str_di_addr();
             match size {
                 StringSize::B8 => {
                     let a = mmu.load8(src)?;
@@ -3627,7 +3629,7 @@ impl Cpu {
                     let _ = alu_sub_32(a, b, &mut this.regs.flags);
                 }
             }
-            this.regs.set32(Reg32::Esi, src.wrapping_add(step as u32));
+            this.str_advance(Reg16::Si, Reg32::Esi, step);
             this.str_advance(Reg16::Di, Reg32::Edi, step);
             Ok(())
         };
