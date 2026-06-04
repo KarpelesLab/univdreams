@@ -180,6 +180,12 @@ fn register_gdi(registry: &mut Registry) {
     registry.register_far_pascal("gdi", "@69", stub_ret1_1word, 2);
     // GDI.87 GetStockObject(fnObject) → HGDIOBJ.
     registry.register_far_pascal("gdi", "@87", stub_create_object, 2);
+    // GDI.442 CreateDIBitmap(hdc, lpbmih, init, lpInit, lpbmi, usage) → HBITMAP.
+    registry.register_far_pascal("gdi", "@442", stub_create_object, 20);
+    // GDI.36 CreateCompatibleDC(hdc) / GDI.72 CreateBitmap / GDI.444
+    // SetDIBits / GDI.27 BitBlt — bitmap plumbing the splash uses.
+    registry.register_far_pascal("gdi", "@36", stub_create_object, 2);
+    registry.register_far_pascal("gdi", "@72", stub_create_object, 10);
 }
 
 /// Generic GDI object factory → a fresh unique object handle. The
@@ -937,9 +943,10 @@ fn stub_find_resource(
     state: &mut HostState,
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
-    // PASCAL: hModule (SP+10), lpName far (SP+6), lpType far (SP+4).
+    // PASCAL far pointers don't overlap: lpType far (SP+4), lpName far
+    // (SP+8), hModule (SP+12).
     let want_type = res_id_arg(cpu, mmu, 4);
-    let want_name = res_id_arg(cpu, mmu, 6);
+    let want_name = res_id_arg(cpu, mmu, 8);
     let hrsrc = state
         .resources
         .iter()
