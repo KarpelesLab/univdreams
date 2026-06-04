@@ -257,6 +257,21 @@ impl VirtualFs {
         Some(pos)
     }
 
+    /// Seek by `off` relative to `whence` (0 = SET, 1 = CUR, 2 = END,
+    /// matching DOS `INT 21h/42h` / C `SEEK_*`). Returns the new absolute
+    /// position, or `None` if the handle is unknown.
+    pub fn seek_handle(&mut self, handle: u32, off: i32, whence: u8) -> Option<u64> {
+        let base = match whence {
+            1 => self.open.get(&handle)?.pos as i64,
+            2 => self.size(handle)? as i64,
+            _ => 0,
+        };
+        let pos = (base + i64::from(off)).max(0) as u64;
+        let fh = self.open.get_mut(&handle)?;
+        fh.pos = pos;
+        Some(pos)
+    }
+
     /// Current size of the file the handle refers to.
     /// Returns `None` if the handle is unknown.
     #[must_use]

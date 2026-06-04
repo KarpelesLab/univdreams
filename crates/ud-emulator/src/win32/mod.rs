@@ -579,6 +579,13 @@ pub struct HostState {
     /// Button/checkbox check state, keyed by control HWND (`BM_GETCHECK` /
     /// `BM_SETCHECK` / `CheckDlgButton`).
     pub dialog_checks: std::collections::BTreeMap<u16, u16>,
+    /// DOS (INT 21h) file handle → VFS handle, plus the next DOS handle to
+    /// hand out (3-4 are the std streams).
+    pub dos_files: std::collections::BTreeMap<u16, u32>,
+    pub next_dos_handle: u16,
+    /// DOS Disk Transfer Address (selector:offset) set via INT 21h/1Ah,
+    /// where FindFirst/FindNext write the directory entry.
+    pub dos_dta: (u16, u16),
     /// Optional per-run instruction budget. Decremented at each
     /// top-of-loop iteration in [`run_until_sentinel`] (both
     /// instruction steps and stub dispatches count). When it
@@ -678,6 +685,10 @@ impl Default for HostState {
             dialog_result: 0,
             dialog_items: BTreeMap::new(),
             dialog_checks: BTreeMap::new(),
+            dos_files: BTreeMap::new(),
+            next_dos_handle: 5,
+            // Default DTA is the PSP's command-tail area (PSP:0x80).
+            dos_dta: (crate::ne::PSP_SELECTOR, 0x80),
             active_pid: 1,
             next_pid: 2,
             next_child_image_base: 0,
@@ -1572,6 +1583,9 @@ pub fn dispatch_stub(
     };
     // Run the host-side stub.
     let ret = (entry.func)(cpu, mmu, state, registry)?;
+    if cpu.is_code16() && std::env::var("UD_NE_STUB_DEBUG").is_ok() {
+        eprintln!("STUB {}!{} -> {ret:#x}", entry.dll, entry.name);
+    }
     if state.trace_stubs {
         let (call_site_eip, args) = snapshot.clone().unwrap_or((0, Vec::new()));
         let args_str = args

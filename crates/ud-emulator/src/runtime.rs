@@ -983,6 +983,20 @@ impl Sandbox {
         self.host
             .modules
             .insert(name.to_ascii_lowercase(), crate::ne::WIN16_SEG_BASE);
+        // Stage the module's own bytes in the VFS at the path
+        // GetModuleFileName reports (C:\SITEX10.EXE), so an installer that
+        // opens and reads itself (to copy its payload out by file offset)
+        // sees the real image rather than an empty file. Gated: with the
+        // real bytes present the installer's *file-based* integrity check
+        // runs (and currently faults), so only do this when explicitly
+        // driving the install — the default path keeps reaching the dialog.
+        if std::env::var("UD_NE_PATCH_TAMPER").is_ok() {
+            self.host
+                .context
+                .vfs
+                .get_or_insert_with(Default::default)
+                .write_path("C:\\SITEX10.EXE", bytes.to_vec());
+        }
         // Parse string + general resources for LoadString / FindResource.
         if let Ok(ne) = ud_format::ne::NeFile::parse(bytes) {
             self.host.string_resources = ne.string_resources();

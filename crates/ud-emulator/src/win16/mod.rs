@@ -58,6 +58,39 @@ impl Win16Heap {
         self.next_selector = self.next_selector.wrapping_add(8);
         sel
     }
+
+    /// Resize the block at `sel`, **keeping the same selector** (handle).
+    /// Win16 programs check that `GlobalReAlloc` returns the original handle
+    /// (the memory may move underneath, but the handle is stable). If it
+    /// fits in the already-mapped window, update in place; otherwise map a
+    /// fresh window, copy the data, and rebase the selector to it.
+    fn realloc(&mut self, cpu: &mut Cpu, mmu: &mut Mmu, sel: u16, new_size: u32) -> u16 {
+        let Some(&(old_base, old_size)) = self.blocks.get(&sel) else {
+            return self.alloc(cpu, mmu, new_size);
+        };
+        let old_rounded = old_size.max(1).wrapping_add(0xFFF) & !0xFFF;
+        if new_size <= old_rounded {
+            self.blocks.insert(sel, (old_base, new_size));
+            return sel;
+        }
+        // Grow: move to a fresh window (the next block sits right after the
+        // old one, so we can't extend in place) and copy the old contents.
+        let new_rounded = new_size.max(1).wrapping_add(0xFFF) & !0xFFF;
+        if self.next_base < WIN16_HEAP_BASE {
+            self.next_base = WIN16_HEAP_BASE;
+            self.next_selector = WIN16_HEAP_FIRST_SEL;
+        }
+        let new_base = self.next_base;
+        mmu.map(new_base, new_rounded, Perm::R | Perm::W | Perm::X);
+        for i in 0..old_size.min(new_size) {
+            let b = mmu.load8(old_base.wrapping_add(i)).unwrap_or(0);
+            let _ = mmu.store8(new_base.wrapping_add(i), b);
+        }
+        cpu.define_selector(sel, new_base); // same selector, new base
+        self.blocks.insert(sel, (new_base, new_size));
+        self.next_base = self.next_base.wrapping_add(new_rounded);
+        sel
+    }
 }
 
 /// Synthetic instance handle handed to the task (Win16 `HINSTANCE`).
@@ -337,10 +370,10 @@ fn stub_ret1_1word(
 /// service the common ones and clear the carry flag (success);
 /// anything unrecognised clears carry and returns 0 so a probe doesn't
 /// derail the run.
-pub fn service_interrupt(num: u8, cpu: &mut Cpu, _mmu: &mut Mmu, _state: &mut HostState) -> bool {
+pub fn service_interrupt(num: u8, cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) -> bool {
     match num {
         0x21 => {
-            dos_int21(cpu);
+            dos_int21(cpu, mmu, state);
             true
         }
         // INT 3 (breakpoint) / INT 0x3F (Win16 inter-segment call thunk,
@@ -350,14 +383,17 @@ pub fn service_interrupt(num: u8, cpu: &mut Cpu, _mmu: &mut Mmu, _state: &mut Ho
     }
 }
 
-/// Minimal DOS `INT 21h` dispatcher keyed on `AH`.
-fn dos_int21(cpu: &mut Cpu) {
+/// DOS `INT 21h` dispatcher. Handles the version/date stubs plus the file
+/// I/O handle functions (open/create/read/write/seek/close/mkdir), wired
+/// to the [`crate::context::VirtualFs`] so an installer's extraction writes
+/// land where `--dump-vfs` can collect them.
+fn dos_int21(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
+    use crate::emulator::isa_int::Seg;
     let ah = cpu.regs.get8(Reg8::Ah);
     if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
         eprintln!("DOS INT21 AH={ah:#04x}");
     }
-    // Default to "success": clear the carry flag.
-    cpu.regs.flags.cf = false;
+    cpu.regs.flags.cf = false; // default: success
     match ah {
         // AH=0x30 Get DOS version → AL=major, AH=minor, BX:CX OEM/serial.
         0x30 => {
@@ -370,6 +406,46 @@ fn dos_int21(cpu: &mut Cpu) {
         0x19 => cpu.regs.set8(Reg8::Al, 2),
         // AH=0x25 Set interrupt vector — accept and ignore.
         0x25 => {}
+        // AH=0x1A Set DTA (DS:DX) — remember where FindFirst writes.
+        0x1A => {
+            state.dos_dta = (cpu.segment_selector(Seg::Ds), cpu.regs.get16(Reg16::Dx));
+        }
+        // AH=0x2F Get DTA → ES:BX.
+        0x2F => {
+            cpu.set_segment_reg(0 /* ES */, state.dos_dta.0);
+            cpu.regs.set16(Reg16::Bx, state.dos_dta.1);
+        }
+        // AH=0x4E FindFirst(DS:DX pathspec, CX attr) → fill the DTA with the
+        // matching file's directory entry (notably its size at +0x1A) so a
+        // copy/CRC loop reads the right number of bytes.
+        0x4E => {
+            let lin = cpu
+                .seg_base(Seg::Ds)
+                .wrapping_add(u32::from(cpu.regs.get16(Reg16::Dx)));
+            let spec = String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 260)).into_owned();
+            // Resolve a concrete match (exact path, or first VFS file whose
+            // base name matches a `*.*`-style pattern's directory).
+            let size = state
+                .context
+                .vfs
+                .as_ref()
+                .and_then(|v| dos_find_match(v, &spec));
+            match size {
+                Some((name, sz)) => {
+                    let dta = cpu.far_to_linear(state.dos_dta.0, state.dos_dta.1);
+                    let _ = mmu.store8(dta.wrapping_add(0x15), 0x20); // attr=archive
+                    for o in [0x16u32, 0x18] {
+                        let _ = mmu.store16(dta.wrapping_add(o), 0);
+                    }
+                    let _ = mmu.store16(dta.wrapping_add(0x1A), sz as u16);
+                    let _ = mmu.store16(dta.wrapping_add(0x1C), (sz >> 16) as u16);
+                    write_guest_cstr(mmu, dta.wrapping_add(0x1E), 13, name.as_bytes()).ok();
+                }
+                None => dos_fail(cpu, 18), // no more files
+            }
+        }
+        // AH=0x4F FindNext — single match only; report "no more files".
+        0x4F => dos_fail(cpu, 18),
         // AH=0x35 Get interrupt vector → ES:BX = 0:0.
         0x35 => {
             cpu.regs.set16(Reg16::Bx, 0);
@@ -380,10 +456,151 @@ fn dos_int21(cpu: &mut Cpu) {
             cpu.regs.set16(Reg16::Cx, 0);
             cpu.regs.set16(Reg16::Dx, 0);
         }
-        // Anything else: report success with AX cleared. The startup
-        // code stores the result but does not branch on it here.
+        // AH=0x39 MkDir(DS:DX path) — the VFS is flat; just succeed.
+        0x39 | 0x3B | 0x3A => {}
+        // AH=0x43 Get/Set file attributes — succeed (AL=0 get → CX attr 0).
+        0x43 => cpu.regs.set16(Reg16::Cx, 0x20),
+        // AH=0x3C Create / AH=0x3D Open file (DS:DX path) → AX = handle.
+        0x3C | 0x3D => {
+            let lin = cpu
+                .seg_base(Seg::Ds)
+                .wrapping_add(u32::from(cpu.regs.get16(Reg16::Dx)));
+            let path = String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 260)).into_owned();
+            if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
+                eprintln!(
+                    "DOS {} {path:?}",
+                    if ah == 0x3C { "create" } else { "open" }
+                );
+            }
+            let access = if ah == 0x3C {
+                crate::context::FileAccess::Write
+            } else {
+                crate::context::FileAccess::ReadWrite
+            };
+            let vfs = state.context.vfs.get_or_insert_with(Default::default);
+            // Create truncates; Open requires the file to exist for read.
+            if ah == 0x3C {
+                vfs.write_path(&path, Vec::new());
+            }
+            match vfs.open(&path, access) {
+                Some(vh) => {
+                    let h = state.next_dos_handle;
+                    state.next_dos_handle = state.next_dos_handle.wrapping_add(1);
+                    state.dos_files.insert(h, vh);
+                    cpu.regs.set16(Reg16::Ax, h);
+                }
+                None => dos_fail(cpu, 2), // ENOENT
+            }
+        }
+        // AH=0x3E Close(BX handle).
+        0x3E => {
+            let h = cpu.regs.get16(Reg16::Bx);
+            if let Some(vh) = state.dos_files.remove(&h) {
+                if let Some(vfs) = state.context.vfs.as_mut() {
+                    vfs.close(vh);
+                }
+            }
+        }
+        // AH=0x3F Read(BX, CX bytes, DS:DX buf) → AX = bytes read.
+        0x3F => {
+            let h = cpu.regs.get16(Reg16::Bx);
+            let cnt = usize::from(cpu.regs.get16(Reg16::Cx));
+            let lin = cpu
+                .seg_base(Seg::Ds)
+                .wrapping_add(u32::from(cpu.regs.get16(Reg16::Dx)));
+            let mut buf = vec![0u8; cnt];
+            let n = state
+                .dos_files
+                .get(&h)
+                .copied()
+                .and_then(|vh| state.context.vfs.as_mut()?.read_handle(vh, &mut buf))
+                .unwrap_or(0);
+            for (i, &b) in buf.iter().take(n).enumerate() {
+                let _ = mmu.store8(lin.wrapping_add(i as u32), b);
+            }
+            if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
+                eprintln!("DOS read h={h} want={cnt} got={n}");
+            }
+            cpu.regs.set16(Reg16::Ax, n as u16);
+        }
+        // AH=0x40 Write(BX, CX bytes, DS:DX buf) → AX = bytes written.
+        0x40 => {
+            let h = cpu.regs.get16(Reg16::Bx);
+            let cnt = usize::from(cpu.regs.get16(Reg16::Cx));
+            let lin = cpu
+                .seg_base(Seg::Ds)
+                .wrapping_add(u32::from(cpu.regs.get16(Reg16::Dx)));
+            let data: Vec<u8> = (0..cnt)
+                .map(|i| mmu.load8(lin.wrapping_add(i as u32)).unwrap_or(0))
+                .collect();
+            let n = state
+                .dos_files
+                .get(&h)
+                .copied()
+                .and_then(|vh| state.context.vfs.as_mut()?.write_handle(vh, &data))
+                .unwrap_or(0);
+            cpu.regs.set16(Reg16::Ax, n as u16);
+        }
+        // AH=0x42 LSeek(BX, AL whence, CX:DX offset) → DX:AX = new position.
+        0x42 => {
+            let h = cpu.regs.get16(Reg16::Bx);
+            let whence = cpu.regs.get8(Reg8::Al);
+            let off =
+                (u32::from(cpu.regs.get16(Reg16::Cx)) << 16) | u32::from(cpu.regs.get16(Reg16::Dx));
+            let pos = state
+                .dos_files
+                .get(&h)
+                .copied()
+                .and_then(|vh| {
+                    state
+                        .context
+                        .vfs
+                        .as_mut()?
+                        .seek_handle(vh, off as i32, whence)
+                })
+                .unwrap_or(0);
+            if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
+                eprintln!("DOS seek h={h} whence={whence} off={off:#x} -> {pos:#x}");
+            }
+            cpu.regs.set16(Reg16::Ax, pos as u16);
+            cpu.regs.set16(Reg16::Dx, (pos >> 16) as u16);
+        }
+        // Anything else: report success with AX cleared.
         _ => cpu.regs.set16(Reg16::Ax, 0),
     }
+}
+
+/// DOS error return: set carry and the error code in AX.
+fn dos_fail(cpu: &mut Cpu, code: u16) {
+    cpu.regs.flags.cf = true;
+    cpu.regs.set16(Reg16::Ax, code);
+}
+
+/// Resolve a DOS `FindFirst` pathspec to a `(basename, size)` match in the
+/// VFS. Handles an exact path, and a `*`/`?` pattern by matching the first
+/// file sharing the spec's directory prefix.
+fn dos_find_match(vfs: &crate::context::VirtualFs, spec: &str) -> Option<(String, u32)> {
+    let base = |p: &str| {
+        p.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(p)
+            .to_ascii_uppercase()
+    };
+    if !spec.contains('*') && !spec.contains('?') {
+        return vfs.read(spec).map(|b| (base(spec), b.len() as u32));
+    }
+    // Wildcard: compare directory prefixes case-insensitively, treating
+    // '\' and '/' the same.
+    let norm = |s: &str| s.replace('\\', "/").to_ascii_lowercase();
+    let dir = norm(spec.rsplit_once(['\\', '/']).map_or("", |(d, _)| d));
+    for (path, len) in vfs.list() {
+        let p = norm(path);
+        let pdir = p.rsplit_once('/').map_or("", |(d, _)| d);
+        if pdir == dir.trim_start_matches(|c| c == 'c' || c == ':' || c == '/') {
+            return Some((base(path), len as u32));
+        }
+    }
+    None
 }
 
 /// `KERNEL` (KRNL286/KRNL386) ordinal stubs.
@@ -692,6 +909,9 @@ fn stub_find_resource(
         .iter()
         .position(|r| res_id_eq(&r.type_id, &want_type) && res_id_eq(&r.name_id, &want_name))
         .map_or(0, |i| i as u32 + 1);
+    if std::env::var("UD_NE_STUB_DEBUG").is_ok() {
+        eprintln!("FindResource type={want_type:?} name={want_name:?} -> {hrsrc}");
+    }
     Ok(hrsrc)
 }
 
@@ -1416,8 +1636,9 @@ fn stub_global_realloc(
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
     // PASCAL: hMem (SP+10), dwBytes (4) (SP+6), wFlags (SP+4).
+    let h_mem = cpu.stack_word(mmu, 10).unwrap_or(0);
     let size = cpu.stack_dword(mmu, 6).unwrap_or(0);
-    let sel = state.win16_heap.alloc(cpu, mmu, size);
+    let sel = state.win16_heap.realloc(cpu, mmu, h_mem, size);
     Ok(u32::from(sel))
 }
 
@@ -1504,7 +1725,9 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.regs.flags.cf = true;
         cpu.regs.set8(Reg8::Ah, 0x30); // get DOS version
-        dos_int21(&mut cpu);
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        dos_int21(&mut cpu, &mut mmu, &mut state);
         assert_eq!(cpu.regs.get8(Reg8::Al), 6, "DOS major version in AL");
         assert!(!cpu.regs.flags.cf, "carry cleared on success");
     }
@@ -1513,7 +1736,9 @@ mod tests {
     fn dos_get_current_drive_returns_c() {
         let mut cpu = Cpu::new();
         cpu.regs.set8(Reg8::Ah, 0x19);
-        dos_int21(&mut cpu);
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        dos_int21(&mut cpu, &mut mmu, &mut state);
         assert_eq!(cpu.regs.get8(Reg8::Al), 2, "drive C: (0=A)");
     }
 
