@@ -46,8 +46,14 @@ pub fn decompile_pe_to_text(pe: &PeFile) -> String {
 
 #[allow(clippy::too_many_lines)]
 fn build_pe_module(pe: &PeFile) -> Module {
+    // Names match the convention `ud_arch_x86::codec::register`'s
+    // factory uses (and what `build_module::build_module` emits for
+    // ELF), so `resolve_arch_codec` finds the codec without extra
+    // aliasing. "i386" not "x86" — the former is what the codec
+    // factory and ELF EM_386 path use; emitting "x86" stranded
+    // every 32-bit PE in the source round-trip path.
     let arch = match pe.coff.machine {
-        IMAGE_FILE_MACHINE_I386 => "x86",
+        IMAGE_FILE_MACHINE_I386 => "i386",
         IMAGE_FILE_MACHINE_AMD64 => "x86_64",
         _ => "unknown",
     };

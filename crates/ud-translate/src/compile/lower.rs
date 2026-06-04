@@ -560,22 +560,35 @@ fn lower_stmts_into(
                 out.extend_from_slice(&jcc);
             }
             Stmt::Call {
+                name,
                 bytes,
                 direct_target,
                 ..
             } => {
                 out.extend_from_slice(bytes);
                 if let Some(target) = direct_target {
-                    // For x86, bytes is the arg-setup prefix
-                    // and we always append the regenerated
-                    // `call rel32`. For BPF, bytes (when
-                    // present) already contains the full
-                    // 8-byte call — append encode_call only
-                    // when bytes was empty (byte-drop cleared
-                    // it). The codec's
-                    // `direct_call_bytes_contain_call` flag
-                    // distinguishes the two conventions.
-                    let need_append = bytes.is_empty() || !arch.direct_call_bytes_contain_call();
+                    // For x86, `bytes` is normally the arg-setup
+                    // prefix and we always append the regenerated
+                    // `call rel32`. Two carve-outs:
+                    //
+                    //  - Tail calls (`name` starts with `tail_`)
+                    //    encode as `JMP rel32` and the pinned
+                    //    `bytes` IS that JMP — appending another
+                    //    `call rel32` would double-emit 5 bytes
+                    //    and overflow the function's slot.
+                    //  - BPF stores the full 8-byte call in `bytes`
+                    //    so its `direct_call_bytes_contain_call` is
+                    //    `true`; we only append when byte-drop
+                    //    cleared `bytes`.
+                    let is_tail = name.starts_with("tail_");
+                    let need_append = if is_tail {
+                        // Tail call: only re-emit if byte-drop
+                        // cleared the JMP. Otherwise the pinned
+                        // bytes already cover it.
+                        bytes.is_empty()
+                    } else {
+                        bytes.is_empty() || !arch.direct_call_bytes_contain_call()
+                    };
                     if need_append {
                         let func_addr = base_addr.ok_or_else(|| LowerError::GotoNeedsAddress {
                             fn_name: fn_name.to_string(),
@@ -587,15 +600,24 @@ fn lower_stmts_into(
                                 stmt_index: i,
                             }
                         })?;
-                        let call_bytes = arch
-                            .encode_call(call_ip, *target, EncodeHints::default())
-                            .map_err(|e| LowerError::ArchEncode {
-                                fn_name: fn_name.to_string(),
-                                stmt_index: i,
-                                operation: "call",
-                                message: e.to_string(),
-                            })?;
-                        out.extend_from_slice(&call_bytes);
+                        let regen_bytes = if is_tail {
+                            arch.encode_jump(call_ip, *target, EncodeHints::default())
+                                .map_err(|e| LowerError::ArchEncode {
+                                    fn_name: fn_name.to_string(),
+                                    stmt_index: i,
+                                    operation: "tail_jump",
+                                    message: e.to_string(),
+                                })?
+                        } else {
+                            arch.encode_call(call_ip, *target, EncodeHints::default())
+                                .map_err(|e| LowerError::ArchEncode {
+                                    fn_name: fn_name.to_string(),
+                                    stmt_index: i,
+                                    operation: "call",
+                                    message: e.to_string(),
+                                })?
+                        };
+                        out.extend_from_slice(&regen_bytes);
                     }
                 }
             }
