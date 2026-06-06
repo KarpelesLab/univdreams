@@ -76,7 +76,7 @@ pub struct Cpu {
     /// [`Cpu::set_fs_base`]. References:
     /// Intel SDM Vol. 1 §3.4.4 (segment registers in 32-bit
     /// flat mode); Microsoft "TEB" documentation for FS use.
-    fs_base: u32,
+    pub(crate) fs_base: u32,
     gs_base: u32,
     /// x87 FPU control word — stored as a 16-bit shadow so a
     /// codec's `fnstcw m16 ; (modify) ; fldcw m16` boilerplate
@@ -203,6 +203,10 @@ pub struct Cpu {
     /// flat 32-bit Win32 path, where all the machinery below is inert
     /// (all bases 0, default size 32-bit) so behaviour is unchanged.
     code16: bool,
+    /// amd64 long mode: the executor decodes/runs 64-bit instructions
+    /// (`regs.gp64`/`regs.rip`, REX prefixes, RIP-relative). Mutually
+    /// exclusive with `code16`; `false` for every Windows / i386 path.
+    pub(crate) long64: bool,
     /// Current segment selectors (the 16-bit tokens loaded into the
     /// segment registers). Only meaningful in `code16` mode; used so
     /// `far call`/`push cs` can save the real selector.
@@ -259,6 +263,7 @@ impl Cpu {
             instr_limit: DEFAULT_INSTR_LIMIT,
             op_size_16: false,
             addr_size_16: false,
+            long64: false,
             rep_prefix: None,
             seg_override: None,
             fs_base: 0,
@@ -371,6 +376,19 @@ impl Cpu {
     /// Block). The runtime calls this after mapping the TEB.
     pub fn set_fs_base(&mut self, base: u32) {
         self.fs_base = base;
+    }
+
+    /// Enter (or leave) amd64 long mode. The executor then decodes 64-bit
+    /// instructions against `regs.gp64` / `regs.rip`. The Linux loader sets
+    /// this for an `EM_X86_64` image.
+    pub fn set_long64(&mut self, on: bool) {
+        self.long64 = on;
+    }
+
+    /// True iff the CPU is in amd64 long mode.
+    #[must_use]
+    pub fn is_long64(&self) -> bool {
+        self.long64
     }
 
     /// Configure the linear base of the GS segment. Almost always
@@ -728,6 +746,11 @@ impl Cpu {
     /// [`StepOk::Halted`] when the instruction was a `ret` and
     /// the popped return address was [`RET_SENTINEL`].
     pub fn step(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+        // amd64 long mode runs a separate decode/execute path that leaves
+        // the 32-bit machinery below entirely untouched.
+        if self.long64 {
+            return self.step_long64(mmu);
+        }
         // Reset per-instruction prefix state.
         self.op_size_16 = false;
         self.addr_size_16 = false;

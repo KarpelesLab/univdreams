@@ -11,14 +11,16 @@
 //! additional adapters once their CPU back-ends exist.
 
 pub mod abi;
+pub mod guest;
 pub mod loader;
 
 use std::collections::BTreeMap;
 
 use crate::context::{FileAccess, VirtualFs};
-use crate::emulator::{Cpu, Mmu, Perm};
+use crate::emulator::{Mmu, Perm};
 
 use abi::{LinuxAbi, Sysno};
+use guest::GuestCpu;
 
 // Negative errno values returned to the guest.
 const ENOENT: i64 = -2;
@@ -84,7 +86,7 @@ impl LinuxKernel {
     pub fn dispatch(
         &mut self,
         abi: &dyn LinuxAbi,
-        cpu: &mut Cpu,
+        cpu: &mut dyn GuestCpu,
         mmu: &mut Mmu,
         vfs: &mut VirtualFs,
     ) {

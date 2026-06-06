@@ -2827,14 +2827,14 @@ fn monitor_install_elf(
         .and_then(|s| s.to_str())
         .unwrap_or("a.out");
 
-    // Only i386 ELFs have a working executor today.
-    if !ud_emulator::linux::loader::is_runnable_i386(bytes) {
+    // i386, x86-64 and aarch64 static ELFs have executors.
+    if !ud_emulator::linux::loader::is_runnable(bytes) {
         let machine = ud_format::elf::Elf64File::parse(bytes)
             .map(|e| e.ehdr.e_machine)
             .unwrap_or(0);
         anyhow::bail!(
             "ELF executor for e_machine={machine} is not implemented yet \
-             (only i386 / EM_386 runs); {} cannot be executed",
+             (i386 / x86-64 / aarch64 run); {} cannot be executed",
             input.display()
         );
     }
@@ -2850,7 +2850,10 @@ fn monitor_install_elf(
         .load_linux_elf(stem, bytes)
         .with_context(|| format!("ELF load {}", input.display()))?;
     let run = sandbox.run_linux();
-    let instructions = sandbox.cpu.instr_count;
+    let instructions = sandbox
+        .aarch64
+        .as_ref()
+        .map_or(sandbox.cpu.instr_count, |c| c.instr_count);
 
     // Dump VFS writes if requested.
     if let Some(dump_root) = dump_vfs {

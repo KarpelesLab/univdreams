@@ -6,7 +6,7 @@
 //! jumps to. Dynamic executables (`PT_INTERP`) are rejected — that needs
 //! the runtime linker, which is a separate phase.
 
-use ud_format::elf::{Elf64File, EM_386};
+use ud_format::elf::{Elf64File, EM_386, EM_AARCH64, EM_X86_64};
 
 use crate::emulator::{Mmu, Perm};
 
@@ -140,9 +140,11 @@ pub fn load_static(
         return Err(LoadError::NoLoadable);
     }
 
-    // 2) Map the stack and build argc/argv/envp/auxv at the top.
+    // 2) Map the stack and build argc/argv/envp/auxv at the top. The word
+    // size of the vector follows the arch's pointer width.
     mmu.map(STACK_TOP - STACK_SIZE, STACK_SIZE, Perm::R | Perm::W);
-    let stack_ptr = build_stack(mmu, &elf, argv, envp)?;
+    let ptr64 = matches!(elf.ehdr.e_machine, EM_X86_64 | EM_AARCH64);
+    let stack_ptr = build_stack(mmu, &elf, argv, envp, ptr64)?;
 
     Ok(ElfImage {
         entry: elf.ehdr.e_entry as u32,
@@ -153,11 +155,21 @@ pub fn load_static(
 }
 
 /// True iff `bytes` is an ELF this loader recognises as a Linux i386
-/// executable (the only arch the interpreter can currently run).
+/// executable.
 #[must_use]
 pub fn is_runnable_i386(bytes: &[u8]) -> bool {
     Elf64File::parse(bytes)
         .is_ok_and(|e| e.ehdr.e_machine == EM_386 && matches!(e.ehdr.e_type, ET_EXEC | ET_DYN))
+}
+
+/// True iff `bytes` is a static ELF whose `e_machine` an interpreter
+/// back-end exists for (i386, x86-64, or aarch64).
+#[must_use]
+pub fn is_runnable(bytes: &[u8]) -> bool {
+    Elf64File::parse(bytes).is_ok_and(|e| {
+        matches!(e.ehdr.e_machine, EM_386 | EM_X86_64 | EM_AARCH64)
+            && matches!(e.ehdr.e_type, ET_EXEC | ET_DYN)
+    })
 }
 
 fn seg_perm(p_flags: u32) -> Perm {
@@ -174,13 +186,19 @@ fn seg_perm(p_flags: u32) -> Perm {
     perm
 }
 
-/// Write the initial stack and return the final `esp` (points at `argc`).
+/// Write the initial stack and return the final `sp` (points at `argc`).
+///
+/// `ptr64` selects the word size of the argc/argv/envp/auxv vector: 8-byte
+/// for x86-64 / aarch64, 4-byte for i386. The string area and AT_RANDOM
+/// block are byte-addressed identically either way.
 fn build_stack(
     mmu: &mut Mmu,
     elf: &Elf64File,
     argv: &[&str],
     envp: &[&str],
+    ptr64: bool,
 ) -> Result<u32, LoadError> {
+    let word = if ptr64 { 8u32 } else { 4u32 };
     let mut sp = STACK_TOP;
     let mut push_bytes = |mmu: &mut Mmu, data: &[u8]| -> u32 {
         sp -= data.len() as u32;
@@ -227,13 +245,17 @@ fn build_stack(
     // Size of the main vector (words): argc + argv + NULL + envp + NULL
     // + auxv pairs.
     let words = 1 + (argv_ptrs.len() + 1) + (envp_ptrs.len() + 1) + auxv.len() * 2;
-    let total = (words * 4) as u32;
-    // 16-byte align the base so esp at entry is aligned.
-    let mut esp = (sp - total) & !0xF;
-    let base = esp;
+    let total = words as u32 * word;
+    // 16-byte align the base so sp at entry is aligned.
+    let mut wsp = (sp - total) & !0xF;
+    let base = wsp;
     let mut put = |mmu: &mut Mmu, v: u32| {
-        let _ = mmu.write_initializer(esp, &v.to_le_bytes());
-        esp += 4;
+        if ptr64 {
+            let _ = mmu.write_initializer(wsp, &u64::from(v).to_le_bytes());
+        } else {
+            let _ = mmu.write_initializer(wsp, &v.to_le_bytes());
+        }
+        wsp += word;
     };
     put(mmu, argv_ptrs.len() as u32); // argc
     for p in &argv_ptrs {

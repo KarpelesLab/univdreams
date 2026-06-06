@@ -97,6 +97,12 @@ pub struct Sandbox {
     /// code). Default/empty for Windows runs; populated by
     /// [`Sandbox::load_linux_elf`].
     pub linux: crate::linux::LinuxKernel,
+    /// `e_machine` of the loaded Linux ELF (selects the run loop / ABI).
+    /// `0` until [`Sandbox::load_linux_elf`] runs.
+    pub linux_machine: u16,
+    /// The aarch64 CPU, allocated lazily when an `EM_AARCH64` image loads
+    /// (the x86 [`Cpu`] cannot host that ISA).
+    pub aarch64: Option<Box<crate::emulator::aarch64::Aarch64Cpu>>,
 }
 
 impl Default for Sandbox {
@@ -337,6 +343,8 @@ impl Sandbox {
             registry,
             host,
             linux: crate::linux::LinuxKernel::default(),
+            linux_machine: 0,
+            aarch64: None,
         }
     }
 
@@ -352,6 +360,8 @@ impl Sandbox {
             registry: Registry::new(),
             host: HostState::default(),
             linux: crate::linux::LinuxKernel::default(),
+            linux_machine: 0,
+            aarch64: None,
         }
     }
 
@@ -368,13 +378,36 @@ impl Sandbox {
         name: &str,
         bytes: &[u8],
     ) -> Result<crate::linux::loader::ElfImage, crate::Error> {
+        use ud_format::elf::{EM_386, EM_AARCH64, EM_X86_64};
         let argv = [name];
         let envp: [&str; 0] = [];
         let image = crate::linux::loader::load_static(&mut self.mmu, bytes, &argv, &envp)
             .map_err(|e| crate::Error::NeLoader(e.to_string()))?;
-        self.cpu.set_code16(false);
-        self.cpu.regs.set_esp(image.stack_ptr);
-        self.cpu.regs.eip = image.entry;
+        self.linux_machine = image.machine;
+        match image.machine {
+            EM_X86_64 => {
+                // x86-64 long mode on the shared x86 CPU.
+                self.cpu.set_code16(false);
+                self.cpu.set_long64(true);
+                self.cpu.regs.gp64 = [0; 16];
+                self.cpu.regs.gp64[4] = u64::from(image.stack_ptr); // rsp
+                self.cpu.regs.rip = u64::from(image.entry);
+            }
+            EM_AARCH64 => {
+                let mut cpu = Box::new(crate::emulator::aarch64::Aarch64Cpu::new());
+                cpu.sp = u64::from(image.stack_ptr);
+                cpu.pc = u64::from(image.entry);
+                self.aarch64 = Some(cpu);
+            }
+            // EM_386 and anything else default to the 32-bit path.
+            _ => {
+                debug_assert_eq!(image.machine, EM_386);
+                self.cpu.set_code16(false);
+                self.cpu.set_long64(false);
+                self.cpu.regs.set_esp(image.stack_ptr);
+                self.cpu.regs.eip = image.entry;
+            }
+        }
         self.linux.init(image.brk);
         self.host
             .context
@@ -391,17 +424,29 @@ impl Sandbox {
     /// # Errors
     /// [`crate::Error::Trap`] for a CPU fault that isn't the syscall gate.
     pub fn run_linux(&mut self) -> Result<i32, crate::Error> {
-        use crate::emulator::isa_int::StepOk;
-        use crate::emulator::Trap;
-        let abi = crate::linux::abi::I386Abi;
-        let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
+        use ud_format::elf::{EM_AARCH64, EM_X86_64};
         let mut vfs = self
             .host
             .context
             .vfs
             .take()
             .unwrap_or_else(crate::context::VirtualFs::new);
-        let result = loop {
+        let result = match self.linux_machine {
+            EM_X86_64 => self.run_linux_amd64(&mut vfs),
+            EM_AARCH64 => self.run_linux_aarch64(&mut vfs),
+            _ => self.run_linux_i386(&mut vfs),
+        };
+        self.host.context.vfs = Some(vfs);
+        result
+    }
+
+    /// i386 run loop: services the `int 0x80` gate via [`I386Abi`].
+    fn run_linux_i386(&mut self, vfs: &mut crate::context::VirtualFs) -> Result<i32, crate::Error> {
+        use crate::emulator::isa_int::StepOk;
+        use crate::emulator::Trap;
+        let abi = crate::linux::abi::I386Abi;
+        let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
+        loop {
             if self.cpu.instr_count >= budget {
                 break Ok(self.linux.exit_code.unwrap_or(-1));
             }
@@ -409,17 +454,71 @@ impl Sandbox {
                 Ok(StepOk::Continued) => {}
                 Ok(StepOk::Halted) => break Ok(self.linux.exit_code.unwrap_or(0)),
                 Err(Trap::SoftwareInterrupt { num: 0x80, .. }) => {
-                    self.linux
-                        .dispatch(&abi, &mut self.cpu, &mut self.mmu, &mut vfs);
+                    self.linux.dispatch(&abi, &mut self.cpu, &mut self.mmu, vfs);
                     if let Some(code) = self.linux.exit_code {
                         break Ok(code);
                     }
                 }
                 Err(t) => break Err(crate::Error::Trap(t)),
             }
+        }
+    }
+
+    /// x86-64 run loop: steps the long-mode CPU and services the `syscall`
+    /// gate ([`Trap::Syscall`]) via [`Amd64Abi`].
+    fn run_linux_amd64(&mut self, vfs: &mut crate::context::VirtualFs) -> Result<i32, crate::Error> {
+        use crate::emulator::isa_int::StepOk;
+        use crate::emulator::Trap;
+        let abi = crate::linux::abi::Amd64Abi;
+        let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
+        loop {
+            if self.cpu.instr_count >= budget {
+                break Ok(self.linux.exit_code.unwrap_or(-1));
+            }
+            match self.cpu.step(&mut self.mmu) {
+                Ok(StepOk::Continued) => {}
+                Ok(StepOk::Halted) => break Ok(self.linux.exit_code.unwrap_or(0)),
+                Err(Trap::Syscall { .. }) => {
+                    self.linux.dispatch(&abi, &mut self.cpu, &mut self.mmu, vfs);
+                    if let Some(code) = self.linux.exit_code {
+                        break Ok(code);
+                    }
+                }
+                Err(t) => break Err(crate::Error::Trap(t)),
+            }
+        }
+    }
+
+    /// aarch64 run loop: steps the [`Aarch64Cpu`] and services the `svc`
+    /// gate ([`Trap::Syscall`]) via [`Aarch64Abi`].
+    fn run_linux_aarch64(
+        &mut self,
+        vfs: &mut crate::context::VirtualFs,
+    ) -> Result<i32, crate::Error> {
+        use crate::emulator::isa_int::StepOk;
+        use crate::emulator::Trap;
+        let abi = crate::linux::abi::Aarch64Abi;
+        let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
+        let Some(cpu) = self.aarch64.as_mut() else {
+            return Err(crate::Error::NeLoader("no aarch64 CPU loaded".into()));
         };
-        self.host.context.vfs = Some(vfs);
-        result
+        loop {
+            if cpu.instr_count >= budget {
+                break Ok(self.linux.exit_code.unwrap_or(-1));
+            }
+            match cpu.step(&mut self.mmu) {
+                Ok(StepOk::Continued) => {}
+                Ok(StepOk::Halted) => break Ok(self.linux.exit_code.unwrap_or(0)),
+                Err(Trap::Syscall { .. }) => {
+                    self.linux
+                        .dispatch(&abi, cpu.as_mut(), &mut self.mmu, vfs);
+                    if let Some(code) = self.linux.exit_code {
+                        break Ok(code);
+                    }
+                }
+                Err(t) => break Err(crate::Error::Trap(t)),
+            }
+        }
     }
 
     /// Builder-style seed setter for the `msvcrt!rand` LCG.

@@ -12,8 +12,7 @@
 //! are provided so those adapters are a small addition once their CPU
 //! back-ends exist — the kernel engine itself needs no changes.
 
-use crate::emulator::regs::Reg32;
-use crate::emulator::Cpu;
+use super::guest::GuestCpu;
 
 /// Canonical syscall identity used inside the kernel engine. Per-arch
 /// number tables map onto this; the engine switches on it.
@@ -58,14 +57,15 @@ pub enum Sysno {
     Ignored,
 }
 
-/// The adapter a [`LinuxKernel`](super::LinuxKernel) talks to.
+/// The adapter a [`LinuxKernel`](super::LinuxKernel) talks to. Works over
+/// a [`GuestCpu`] so any arch back-end plugs in.
 pub trait LinuxAbi {
     /// Raw syscall number from the arch's number register.
-    fn syscall_nr(&self, cpu: &Cpu) -> u64;
+    fn syscall_nr(&self, cpu: &dyn GuestCpu) -> u64;
     /// The six argument registers, in canonical order.
-    fn syscall_args(&self, cpu: &Cpu) -> [u64; 6];
+    fn syscall_args(&self, cpu: &dyn GuestCpu) -> [u64; 6];
     /// Write the return value (or `-errno`) to the arch's result register.
-    fn set_return(&self, cpu: &mut Cpu, ret: i64);
+    fn set_return(&self, cpu: &mut dyn GuestCpu, ret: i64);
     /// Map a raw syscall number to the canonical [`Sysno`].
     fn map_syscall(&self, nr: u64) -> Option<Sysno>;
     /// Pointer width — 32 for i386, 64 for x86-64 / aarch64.
@@ -73,26 +73,27 @@ pub trait LinuxAbi {
 }
 
 /// Linux/i386 ABI: `int 0x80`, number in `eax`, args in
-/// `ebx, ecx, edx, esi, edi, ebp`, return in `eax`.
+/// `ebx, ecx, edx, esi, edi, ebp`, return in `eax`. (Canonical x86 reg
+/// indices: eax=0, ecx=1, edx=2, ebx=3, ebp=5, esi=6, edi=7.)
 #[derive(Debug, Default, Clone, Copy)]
 pub struct I386Abi;
 
 impl LinuxAbi for I386Abi {
-    fn syscall_nr(&self, cpu: &Cpu) -> u64 {
-        u64::from(cpu.regs.get32(Reg32::Eax))
+    fn syscall_nr(&self, cpu: &dyn GuestCpu) -> u64 {
+        cpu.reg(0)
     }
-    fn syscall_args(&self, cpu: &Cpu) -> [u64; 6] {
+    fn syscall_args(&self, cpu: &dyn GuestCpu) -> [u64; 6] {
         [
-            u64::from(cpu.regs.get32(Reg32::Ebx)),
-            u64::from(cpu.regs.get32(Reg32::Ecx)),
-            u64::from(cpu.regs.get32(Reg32::Edx)),
-            u64::from(cpu.regs.get32(Reg32::Esi)),
-            u64::from(cpu.regs.get32(Reg32::Edi)),
-            u64::from(cpu.regs.get32(Reg32::Ebp)),
+            cpu.reg(3),
+            cpu.reg(1),
+            cpu.reg(2),
+            cpu.reg(6),
+            cpu.reg(7),
+            cpu.reg(5),
         ]
     }
-    fn set_return(&self, cpu: &mut Cpu, ret: i64) {
-        cpu.regs.set32(Reg32::Eax, ret as u32);
+    fn set_return(&self, cpu: &mut dyn GuestCpu, ret: i64) {
+        cpu.set_reg(0, ret as u64);
     }
     fn map_syscall(&self, nr: u64) -> Option<Sysno> {
         Some(match nr {
@@ -187,6 +188,35 @@ impl Amd64Abi {
     }
 }
 
+/// Linux/x86-64 ABI: `syscall` (0F 05), number in `rax`, args in
+/// `rdi, rsi, rdx, r10, r8, r9`, return in `rax`. (Canonical x86-64 reg
+/// indices: rax=0, rcx=1, rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7,
+/// r8=8, r9=9, r10=10.)
+impl LinuxAbi for Amd64Abi {
+    fn syscall_nr(&self, cpu: &dyn GuestCpu) -> u64 {
+        cpu.reg(0)
+    }
+    fn syscall_args(&self, cpu: &dyn GuestCpu) -> [u64; 6] {
+        [
+            cpu.reg(7),
+            cpu.reg(6),
+            cpu.reg(2),
+            cpu.reg(10),
+            cpu.reg(8),
+            cpu.reg(9),
+        ]
+    }
+    fn set_return(&self, cpu: &mut dyn GuestCpu, ret: i64) {
+        cpu.set_reg(0, ret as u64);
+    }
+    fn map_syscall(&self, nr: u64) -> Option<Sysno> {
+        Self::map(nr)
+    }
+    fn ptr_bits(&self) -> u8 {
+        64
+    }
+}
+
 /// Linux/aarch64 ABI table (generic Linux syscall numbers). Inert until
 /// an aarch64 executor exists.
 #[derive(Debug, Default, Clone, Copy)]
@@ -195,6 +225,7 @@ pub struct Aarch64Abi;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emulator::regs::Reg32;
     use crate::emulator::Cpu;
 
     #[test]
@@ -261,5 +292,32 @@ impl Aarch64Abi {
             226 => Sysno::Mprotect,
             _ => return None,
         })
+    }
+}
+
+/// Linux/aarch64 ABI: `svc #0`, number in `x8`, args in `x0..x5`,
+/// return in `x0`. (Canonical aarch64 reg indices are simply `x0..x30`.)
+impl LinuxAbi for Aarch64Abi {
+    fn syscall_nr(&self, cpu: &dyn GuestCpu) -> u64 {
+        cpu.reg(8)
+    }
+    fn syscall_args(&self, cpu: &dyn GuestCpu) -> [u64; 6] {
+        [
+            cpu.reg(0),
+            cpu.reg(1),
+            cpu.reg(2),
+            cpu.reg(3),
+            cpu.reg(4),
+            cpu.reg(5),
+        ]
+    }
+    fn set_return(&self, cpu: &mut dyn GuestCpu, ret: i64) {
+        cpu.set_reg(0, ret as u64);
+    }
+    fn map_syscall(&self, nr: u64) -> Option<Sysno> {
+        Self::map(nr)
+    }
+    fn ptr_bits(&self) -> u8 {
+        64
     }
 }
