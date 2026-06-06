@@ -951,3 +951,103 @@ fn replicate(elem: u64, esize: u32, datasize: u32) -> u64 {
         result & mask_bits(datasize)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emulator::Perm;
+
+    /// Map a code page at `0x1000`, write `words` there, and run them through
+    /// a fresh CPU until `count` instructions retire or a trap occurs.
+    fn run(words: &[u32], count: usize) -> Aarch64Cpu {
+        let mut mmu = Mmu::new();
+        mmu.map(0x1000, 0x1000, Perm::R | Perm::W | Perm::X);
+        mmu.map(0x2000, 0x1000, Perm::R | Perm::W); // scratch data
+        for (i, w) in words.iter().enumerate() {
+            mmu.store32(0x1000 + (i as u32) * 4, *w).unwrap();
+        }
+        let mut cpu = Aarch64Cpu::new();
+        cpu.pc = 0x1000;
+        for _ in 0..count {
+            if cpu.step(&mut mmu).is_err() {
+                break;
+            }
+        }
+        cpu
+    }
+
+    fn movz(rd: u32, imm16: u32, hw: u32) -> u32 {
+        0xD280_0000 | (hw << 21) | (imm16 << 5) | rd
+    }
+    fn movk(rd: u32, imm16: u32, hw: u32) -> u32 {
+        0xF280_0000 | (hw << 21) | (imm16 << 5) | rd
+    }
+
+    #[test]
+    fn movz_movk_compose_a_64bit_constant() {
+        // x0 = 0x1234, then insert 0xABCD at bits[31:16] → 0xABCD1234.
+        let cpu = run(&[movz(0, 0x1234, 0), movk(0, 0xABCD, 1)], 2);
+        assert_eq!(cpu.x[0], 0xABCD_1234);
+    }
+
+    #[test]
+    fn add_sub_immediate_and_flags() {
+        // x1 = 5; x2 = x1 + 10 = 15; subs x3 = x2 - 15 = 0 (sets Z).
+        let add = |rd: u32, rn: u32, imm: u32| 0x9100_0000 | (imm << 10) | (rn << 5) | rd;
+        let subs = |rd: u32, rn: u32, imm: u32| 0xF100_0000 | (imm << 10) | (rn << 5) | rd;
+        let cpu = run(&[movz(1, 5, 0), add(2, 1, 10), subs(3, 2, 15)], 3);
+        assert_eq!(cpu.x[2], 15);
+        assert_eq!(cpu.x[3], 0);
+        assert!(cpu.nzcv.z, "SUBS of equal values sets Z");
+    }
+
+    #[test]
+    fn logical_immediate_and_orr() {
+        // x0 = 0xFF; and x1 = x0 & 0x0F = 0x0F; orr x2 = x1 | 0xF0 = 0xFF.
+        // AND/ORR immediate use the bitmask encoding; 0x0F = (N=0,immr=0,imms=3)
+        // for a 32-bit element of 4 low bits.
+        // 64-bit logical immediates set N=1 (bit22); imms = (ones-1).
+        let andi: u32 = 0x9240_0C00 | (0 << 5) | 1; // and x1, x0, #0xF (imms=3)
+        let orri: u32 = 0xB240_1C00 | (1 << 5) | 2; // orr x2, x1, #0xFF (imms=7)
+        let cpu = run(&[movz(0, 0xFF, 0), andi, orri], 3);
+        assert_eq!(cpu.x[1], 0x0F);
+        assert_eq!(cpu.x[2], 0xFF);
+    }
+
+    #[test]
+    fn store_then_load_pair_round_trips() {
+        // x0=0x1111, x1=0x2222; stp to [x5]; ldp back into x3,x4. Rt2 is
+        // encoded at bits[14:10], base register at bits[9:5].
+        let stp: u32 = 0xA900_0000 | (1 << 10) | (5 << 5); // stp x0,x1,[x5,#0]
+        let ldp: u32 = 0xA940_0000 | (4 << 10) | (5 << 5) | 3; // ldp x3,x4,[x5,#0]
+        let cpu = run(
+            &[
+                movz(0, 0x1111, 0),
+                movz(1, 0x2222, 0),
+                movz(5, 0x2000, 0),
+                stp,
+                ldp,
+            ],
+            5,
+        );
+        assert_eq!(cpu.x[3], 0x1111);
+        assert_eq!(cpu.x[4], 0x2222);
+    }
+
+    #[test]
+    fn add_with_carry_sets_carry_and_overflow() {
+        // u64 wrap → carry.
+        let (_r, _n, _z, c, _v) = add_with_carry(u64::MAX, 1, 0, true);
+        assert!(c, "0xFFFF.. + 1 carries");
+        // signed overflow: i64::MAX + 1.
+        let (_r, _n, _z, _c, v) = add_with_carry(0x7FFF_FFFF_FFFF_FFFF, 1, 0, true);
+        assert!(v, "i64::MAX + 1 overflows");
+    }
+
+    #[test]
+    fn decode_bit_masks_simple_low_nibble() {
+        // N=0, imms=3, immr=0, 64-bit → low 4 bits set, replicated every 8.
+        let (wmask, _t) = decode_bit_masks(0, 3, 0, true, 64).unwrap();
+        assert_eq!(wmask & 0xFF, 0x0F);
+    }
+}

@@ -466,15 +466,20 @@ impl Sandbox {
 
     /// x86-64 run loop: steps the long-mode CPU and services the `syscall`
     /// gate ([`Trap::Syscall`]) via [`Amd64Abi`].
-    fn run_linux_amd64(&mut self, vfs: &mut crate::context::VirtualFs) -> Result<i32, crate::Error> {
+    fn run_linux_amd64(
+        &mut self,
+        vfs: &mut crate::context::VirtualFs,
+    ) -> Result<i32, crate::Error> {
         use crate::emulator::isa_int::StepOk;
         use crate::emulator::Trap;
         let abi = crate::linux::abi::Amd64Abi;
         let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
+        let trace = std::env::var("UD_LINUX_TRACE").is_ok();
         loop {
             if self.cpu.instr_count >= budget {
                 break Ok(self.linux.exit_code.unwrap_or(-1));
             }
+            let rip = self.cpu.regs.rip;
             match self.cpu.step(&mut self.mmu) {
                 Ok(StepOk::Continued) => {}
                 Ok(StepOk::Halted) => break Ok(self.linux.exit_code.unwrap_or(0)),
@@ -484,7 +489,15 @@ impl Sandbox {
                         break Ok(code);
                     }
                 }
-                Err(t) => break Err(crate::Error::Trap(t)),
+                Err(t) => {
+                    if trace {
+                        eprintln!(
+                            "amd64 trap at rip={rip:#018x} (#{}): {t}",
+                            self.cpu.instr_count
+                        );
+                    }
+                    break Err(crate::Error::Trap(t));
+                }
             }
         }
     }
@@ -510,8 +523,7 @@ impl Sandbox {
                 Ok(StepOk::Continued) => {}
                 Ok(StepOk::Halted) => break Ok(self.linux.exit_code.unwrap_or(0)),
                 Err(Trap::Syscall { .. }) => {
-                    self.linux
-                        .dispatch(&abi, cpu.as_mut(), &mut self.mmu, vfs);
+                    self.linux.dispatch(&abi, cpu.as_mut(), &mut self.mmu, vfs);
                     if let Some(code) = self.linux.exit_code {
                         break Ok(code);
                     }

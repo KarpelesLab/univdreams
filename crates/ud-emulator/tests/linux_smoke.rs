@@ -169,6 +169,59 @@ fn static_aarch64_write_exit() {
 }
 
 #[test]
+fn static_aarch64_adrp_add_write() {
+    // Mirrors clang -O2 aarch64 codegen for taking a string's address:
+    //   adrp x1, msg ; add x1, x1, :lo12:msg
+    // (the simpler movz/movk smoke test does not exercise ADRP/ADD-imm).
+    const EM_AARCH64: u16 = 183;
+    let msg = b"hi\n";
+    let code_off = EHDR64 + PHDR64; // 120
+    let code_len: u64 = 36; // 9 instructions
+    let entry = LOAD64 + code_off; // 0x400078
+    let msg_addr = LOAD64 + code_off + code_len; // 0x40009c
+
+    let movz =
+        |rd: u32, imm16: u32, hw: u32| -> u32 { 0xD280_0000 | (hw << 21) | (imm16 << 5) | rd };
+    // adrp x1, msg  (pc of this insn = entry + 2*4)
+    let pc_adrp = entry + 8;
+    let imm = ((msg_addr & !0xfff) as i64 - (pc_adrp & !0xfff) as i64) >> 12;
+    let immlo = (imm as u32) & 0x3;
+    let immhi = ((imm as u32) >> 2) & 0x7ffff;
+    let adrp = 0x9000_0000 | (immlo << 29) | (immhi << 5) | 1; // Rd = x1
+                                                               // add x1, x1, #(msg_addr & 0xfff)
+    let add = 0x9100_0000 | (((msg_addr as u32) & 0xfff) << 10) | (1 << 5) | 1;
+
+    let words: [u32; 9] = [
+        movz(8, 64, 0),               // x8 = 64 (write)
+        movz(0, 1, 0),                // x0 = 1  (fd)
+        adrp,                         // x1 = page(msg)
+        add,                          // x1 += msg & 0xfff
+        movz(2, msg.len() as u32, 0), // x2 = 3 (len)
+        0xD400_0001,                  // svc #0
+        movz(8, 93, 0),               // x8 = 93 (exit)
+        movz(0, 0, 0),                // x0 = 0
+        0xD400_0001,                  // svc #0
+    ];
+    let mut code = Vec::new();
+    for w in words {
+        code.extend_from_slice(&w.to_le_bytes());
+    }
+    assert_eq!(code.len() as u64, code_len);
+
+    let elf = build_elf64(EM_AARCH64, &code, msg);
+    let mut sb = Sandbox::new_linux();
+    sb.host.instruction_budget = Some(1_000_000);
+    sb.load_linux_elf("hi", &elf).expect("load aarch64 ELF");
+    let exit = sb.run_linux().expect("run");
+
+    assert_eq!(
+        sb.linux.stdout, b"hi\n",
+        "captured stdout (adrp+add addressing)"
+    );
+    assert_eq!(exit, 0, "exit code");
+}
+
+#[test]
 fn static_i386_write_exit() {
     let msg = b"hi\n";
     let code_off = EHDR + PHDR;

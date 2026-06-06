@@ -115,7 +115,7 @@ pub struct Cpu {
     /// in host endianness; the helpers in `isa_sse` deal in
     /// 64-bit halves so we can avoid `u128` arithmetic where
     /// the architectural definition is per-lane.
-    pub xmm: [u128; 8],
+    pub xmm: [u128; 16],
     /// Upper 128 bits of the YMM register file `ymm0..ymm7`.
     /// `ymm[i]` is the 256-bit value `(ymm_high[i] << 128) |
     /// xmm[i]`; legacy SSE writes leave `ymm_high` untouched
@@ -272,7 +272,7 @@ impl Cpu {
             fpu: super::isa_fpu::FpuState::new(),
             mmx: [0u64; 8],
             mmx_dispatch_count: 0,
-            xmm: [0u128; 8],
+            xmm: [0u128; 16],
             ymm_high: [0u128; 8],
             sse_dispatch_count: 0,
             avx_dispatch_count: 0,

@@ -52,6 +52,10 @@ pub enum Sysno {
     RtSigaction,
     RtSigprocmask,
     Time,
+    ClockGettime,
+    Gettimeofday,
+    Futex,
+    Getrandom,
     /// Recognised but intentionally a no-op-success for static-binary
     /// startup (TLS / threading setup we don't model).
     Ignored,
@@ -132,6 +136,11 @@ impl LinuxAbi for I386Abi {
             300 => Sysno::Newfstatat, // fstatat64
             311 => Sysno::SetRobustList,
             252 => Sysno::ExitGroup,
+            265 => Sysno::ClockGettime,
+            78 => Sysno::Gettimeofday,
+            240 => Sysno::Futex,
+            355 => Sysno::Getrandom,
+            340 => Sysno::Ignored, // prlimit64
             _ => return None,
         })
     }
@@ -183,6 +192,13 @@ impl Amd64Abi {
             257 => Sysno::Openat,
             262 => Sysno::Newfstatat,
             273 => Sysno::SetRobustList,
+            228 => Sysno::ClockGettime,
+            96 => Sysno::Gettimeofday,
+            202 => Sysno::Futex,
+            204 => Sysno::Ignored, // sched_getaffinity
+            302 => Sysno::Ignored, // prlimit64
+            318 => Sysno::Getrandom,
+            334 => Sysno::Ignored, // rseq — restartable sequences, ignore
             _ => return None,
         })
     }
@@ -290,6 +306,11 @@ impl Aarch64Abi {
             215 => Sysno::Munmap,
             222 => Sysno::Mmap,
             226 => Sysno::Mprotect,
+            113 => Sysno::ClockGettime,
+            169 => Sysno::Gettimeofday,
+            98 => Sysno::Futex,
+            278 => Sysno::Getrandom,
+            261 => Sysno::Ignored, // prlimit64
             _ => return None,
         })
     }

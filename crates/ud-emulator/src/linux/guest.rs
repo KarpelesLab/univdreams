@@ -19,6 +19,10 @@ pub trait GuestCpu {
     fn pc(&self) -> u64;
     /// Set the program counter.
     fn set_pc(&mut self, v: u64);
+    /// Set the thread-local-storage base (amd64 `%fs` base via
+    /// `arch_prctl`; the aarch64 TLS pointer lives in `TPIDR_EL0`, set by
+    /// the guest itself, so this is a no-op there).
+    fn set_tls(&mut self, _base: u64) {}
 }
 
 /// The x86 interpreter exposes its 64-bit register file in long mode and
@@ -51,6 +55,9 @@ impl GuestCpu for Cpu {
         } else {
             self.regs.eip = v as u32;
         }
+    }
+    fn set_tls(&mut self, base: u64) {
+        self.set_fs_base(base as u32);
     }
 }
 

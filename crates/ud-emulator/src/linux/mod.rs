@@ -65,6 +65,11 @@ pub struct LinuxKernel {
     pub exit_code: Option<i32>,
     /// Syscalls we don't implement, surfaced in the report (name + count).
     pub unsupported: BTreeMap<String, u64>,
+    /// 64-bit guest? Set from the active ABI's pointer width; selects the
+    /// width of kernel-written structs (`timespec`, `timeval`).
+    ptr64: bool,
+    /// Rolling counter feeding `getrandom` so output is deterministic.
+    rng: u64,
 }
 
 impl LinuxKernel {
@@ -90,6 +95,7 @@ impl LinuxKernel {
         mmu: &mut Mmu,
         vfs: &mut VirtualFs,
     ) {
+        self.ptr64 = abi.ptr_bits() == 64;
         let nr = abi.syscall_nr(cpu);
         let a = abi.syscall_args(cpu);
         let Some(sys) = abi.map_syscall(nr) else {
@@ -97,7 +103,26 @@ impl LinuxKernel {
             abi.set_return(cpu, ENOSYS);
             return;
         };
+        let trace = std::env::var("UD_LINUX_TRACE").is_ok();
+        // arch_prctl(ARCH_SET_FS=0x1002, base) installs the amd64 TLS base
+        // on the CPU itself — handle it here where we hold the `cpu`.
+        if sys == Sysno::ArchPrctl {
+            if a[0] == 0x1002 {
+                cpu.set_tls(a[1]);
+            }
+            if trace {
+                eprintln!("syscall arch_prctl({:#x}, {:#x}) = 0", a[0], a[1]);
+            }
+            abi.set_return(cpu, 0);
+            return;
+        }
         let ret = self.run(sys, &a, mmu, vfs);
+        if trace {
+            eprintln!(
+                "syscall {sys:?}({:#x}, {:#x}, {:#x}) = {ret:#x}",
+                a[0], a[1], a[2]
+            );
+        }
         abi.set_return(cpu, ret);
     }
 
@@ -126,6 +151,10 @@ impl LinuxKernel {
             Sysno::Getppid => 0,
             Sysno::Getuid | Sysno::Geteuid | Sysno::Getgid | Sysno::Getegid => 0,
             Sysno::Time => 0,
+            Sysno::ClockGettime => self.sys_clock_gettime(a1, mmu),
+            Sysno::Gettimeofday => self.sys_gettimeofday(a0, mmu),
+            Sysno::Futex => 0, // uncontended: report success
+            Sysno::Getrandom => self.sys_getrandom(a0, a1, mmu),
             Sysno::Access => ENOENT,
             Sysno::Getcwd => self.sys_getcwd(a0, a1, mmu),
             Sysno::Ioctl => ENOTTY, // "not a terminal" → libc picks full buffering
@@ -305,6 +334,56 @@ impl LinuxKernel {
             return EFAULT;
         }
         i64::from(buf)
+    }
+
+    fn sys_clock_gettime(&self, ts: u32, mmu: &mut Mmu) -> i64 {
+        // struct timespec { time_t tv_sec; long tv_nsec; } — word size
+        // follows the guest's pointer width. A fixed epoch is fine for the
+        // programs we run (they only need monotonicity within a run, which
+        // a constant trivially satisfies).
+        self.write_time_pair(ts, 0, 0, mmu)
+    }
+
+    fn sys_gettimeofday(&self, tv: u32, mmu: &mut Mmu) -> i64 {
+        if tv == 0 {
+            return 0;
+        }
+        // struct timeval { time_t tv_sec; suseconds_t tv_usec; }
+        self.write_time_pair(tv, 0, 0, mmu)
+    }
+
+    /// Write a two-field time struct (`tv_sec`, `tv_nsec`/`tv_usec`) at the
+    /// guest's pointer width.
+    fn write_time_pair(&self, addr: u32, sec: u64, frac: u64, mmu: &mut Mmu) -> i64 {
+        let mut buf = Vec::new();
+        if self.ptr64 {
+            buf.extend_from_slice(&sec.to_le_bytes());
+            buf.extend_from_slice(&frac.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&(sec as u32).to_le_bytes());
+            buf.extend_from_slice(&(frac as u32).to_le_bytes());
+        }
+        if write_mem(mmu, addr, &buf).is_none() {
+            return EFAULT;
+        }
+        0
+    }
+
+    fn sys_getrandom(&mut self, buf: u32, len: u32, mmu: &mut Mmu) -> i64 {
+        // Deterministic pseudo-random bytes from a SplitMix64-style counter
+        // (reproducible across runs; not for cryptographic use).
+        let mut out = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.rng;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            out.push((z ^ (z >> 31)) as u8);
+        }
+        if write_mem(mmu, buf, &out).is_none() {
+            return EFAULT;
+        }
+        i64::from(len)
     }
 
     fn sys_stat_zero(&self, sys: Sysno, a: &[u64; 6], mmu: &mut Mmu) -> i64 {
