@@ -272,7 +272,15 @@ pub fn build_function(
                 && p.saves_after == dp.saves_after
                 && p.frame == dp.frame
                 && p.sub_esp == dp.sub_esp
-                && p.cf_protect == dp.cf_protect);
+                && p.cf_protect == dp.cf_protect
+                // frame_alt picks `mov ebp, esp` between the MSVC RM
+                // form (0x8b 0xec) and the GCC MR form (0x89 0xe5).
+                // Both encode the same operation, so the previous
+                // structural check let a GCC-style alt prologue
+                // match the MSVC default — and the compile-time
+                // autogen path then re-emitted the MSVC form,
+                // breaking byte-identity on mingw / GCC-i386 PEs.
+                && p.frame_alt == dp.frame_alt_encoding);
         let em = matches!(body.last(), Some(Stmt::Epilogue { params: Some(e), .. })
             if e.saves == de.saves
                 && e.leave == de.leave
@@ -5173,11 +5181,25 @@ fn emit_block_stmts(
             continue;
         }
         if let Some(m) = pattern_matches.get(&global_idx) {
-            for stmt in &m.stmts {
-                out.push(stmt.clone());
+            // Skip patterns that would overlap an arg-setup window
+            // already owned by call_at. Without this guard, a
+            // multi-instruction pattern like `mem_via_reg` (which
+            // folds `mov reg, [mem]; mov [esp], reg` into one
+            // `Stmt::Move`) consumes the `mov [esp], reg` AND emits
+            // its bytes via the Move, while the Call separately
+            // re-emits those same bytes via `setup_start..=call_idx-1`.
+            // The result is a 3-byte arg-setup that ends up in both
+            // statements — function bytes overflow their slot and
+            // the PE lower path errors with `OverlappingRaws`.
+            let overlaps_call_setup = (global_idx + 1..global_idx + m.consumed)
+                .any(|k| consumed_by_call.contains(&k));
+            if !overlaps_call_setup {
+                for stmt in &m.stmts {
+                    out.push(stmt.clone());
+                }
+                global_idx += m.consumed;
+                continue;
             }
-            global_idx += m.consumed;
-            continue;
         }
         if let Some(site) = call_at.get(&global_idx) {
             let setup_start = site.setup_start.max(prologue_consumed);
