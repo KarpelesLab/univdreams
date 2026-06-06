@@ -93,6 +93,10 @@ pub struct Sandbox {
     pub cpu: Cpu,
     pub registry: Registry,
     pub host: HostState,
+    /// Linux personality state (fd table, brk/mmap, captured output, exit
+    /// code). Default/empty for Windows runs; populated by
+    /// [`Sandbox::load_linux_elf`].
+    pub linux: crate::linux::LinuxKernel,
 }
 
 impl Default for Sandbox {
@@ -332,7 +336,90 @@ impl Sandbox {
             cpu,
             registry,
             host,
+            linux: crate::linux::LinuxKernel::default(),
         }
+    }
+
+    /// A bare sandbox for the **Linux** personality: a fresh empty MMU and
+    /// CPU with none of the Win32 arenas / TEB / stub registry mapped. The
+    /// ELF loader maps the program's own segments and stack; syscalls are
+    /// serviced by [`Self::run_linux`].
+    #[must_use]
+    pub fn new_linux() -> Self {
+        Sandbox {
+            mmu: Mmu::new(),
+            cpu: Cpu::new(),
+            registry: Registry::new(),
+            host: HostState::default(),
+            linux: crate::linux::LinuxKernel::default(),
+        }
+    }
+
+    /// Load a static Linux ELF executable: map its `PT_LOAD` segments and
+    /// stack, prime the CPU (flat 32-bit, `esp`/`eip`), and initialise the
+    /// kernel's process state. Ensures a [`VirtualFs`](crate::context::VirtualFs)
+    /// is attached so file syscalls have somewhere to land.
+    ///
+    /// # Errors
+    /// [`crate::Error::NeLoader`]-style wrapping of a
+    /// [`crate::linux::loader::LoadError`] (bad ELF, dynamic, etc.).
+    pub fn load_linux_elf(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<crate::linux::loader::ElfImage, crate::Error> {
+        let argv = [name];
+        let envp: [&str; 0] = [];
+        let image = crate::linux::loader::load_static(&mut self.mmu, bytes, &argv, &envp)
+            .map_err(|e| crate::Error::NeLoader(e.to_string()))?;
+        self.cpu.set_code16(false);
+        self.cpu.regs.set_esp(image.stack_ptr);
+        self.cpu.regs.eip = image.entry;
+        self.linux.init(image.brk);
+        self.host
+            .context
+            .vfs
+            .get_or_insert_with(crate::context::VirtualFs::new);
+        Ok(image)
+    }
+
+    /// Run the loaded Linux program until it calls `exit`/`exit_group`,
+    /// faults, or hits the instruction budget. Returns the exit code.
+    /// Captured stdout/stderr and any unsupported syscalls live in
+    /// `self.linux`.
+    ///
+    /// # Errors
+    /// [`crate::Error::Trap`] for a CPU fault that isn't the syscall gate.
+    pub fn run_linux(&mut self) -> Result<i32, crate::Error> {
+        use crate::emulator::isa_int::StepOk;
+        use crate::emulator::Trap;
+        let abi = crate::linux::abi::I386Abi;
+        let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
+        let mut vfs = self
+            .host
+            .context
+            .vfs
+            .take()
+            .unwrap_or_else(crate::context::VirtualFs::new);
+        let result = loop {
+            if self.cpu.instr_count >= budget {
+                break Ok(self.linux.exit_code.unwrap_or(-1));
+            }
+            match self.cpu.step(&mut self.mmu) {
+                Ok(StepOk::Continued) => {}
+                Ok(StepOk::Halted) => break Ok(self.linux.exit_code.unwrap_or(0)),
+                Err(Trap::SoftwareInterrupt { num: 0x80, .. }) => {
+                    self.linux
+                        .dispatch(&abi, &mut self.cpu, &mut self.mmu, &mut vfs);
+                    if let Some(code) = self.linux.exit_code {
+                        break Ok(code);
+                    }
+                }
+                Err(t) => break Err(crate::Error::Trap(t)),
+            }
+        };
+        self.host.context.vfs = Some(vfs);
+        result
     }
 
     /// Builder-style seed setter for the `msvcrt!rand` LCG.

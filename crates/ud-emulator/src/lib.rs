@@ -204,6 +204,7 @@ pub mod context;
 pub mod coverage;
 pub mod emulator;
 pub mod ffi;
+pub mod linux;
 pub mod ne;
 pub mod pe;
 pub mod runtime;

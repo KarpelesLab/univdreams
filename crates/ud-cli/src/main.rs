@@ -1556,7 +1556,10 @@ fn qtcodec_list(
         (0x668845b0u32, "theQuickTimeDispatcher prologue (32 bytes)"),
         (0x67356248u32, "cat[1] entry (8 bytes raw)"),
         (0x1004dcd0u32, "qtmlclient init flag (4 bytes)"),
-        (0x1004dcdcu32, "qtmlclient->theQuickTimeDispatcher (4 bytes)"),
+        (
+            0x1004dcdcu32,
+            "qtmlclient->theQuickTimeDispatcher (4 bytes)",
+        ),
         (0x10024220u32, "qtmlclient!RegisterComponent (16 bytes)"),
         (0x66884890u32, "cat[1].subtable stub (16 bytes)"),
         (0x67347000u32, "qts CRT-init flag (4 bytes)"),
@@ -1565,8 +1568,14 @@ fn qtcodec_list(
         (0x673851ecu32, "qts thread-data list head (4 bytes)"),
         (0x7FFD_DFF0u32, "page below TEB (32 bytes)"),
         (0x7FFD_E000u32, "TEB start (32 bytes)"),
-        (0x400380a0u32, "libdispatch IAT slot range (32 bytes incl _initterm)"),
-        (0x400380e0u32, "libdispatch IAT slot range (32 bytes incl pthread_setspecific @ +0x10)"),
+        (
+            0x400380a0u32,
+            "libdispatch IAT slot range (32 bytes incl _initterm)",
+        ),
+        (
+            0x400380e0u32,
+            "libdispatch IAT slot range (32 bytes incl pthread_setspecific @ +0x10)",
+        ),
     ];
     eprintln!("--- runtime CM state ---");
     for (a, label) in probe_addrs {
@@ -1582,7 +1591,11 @@ fn qtcodec_list(
             }
         }
         if ok {
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+            let hex: String = bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!("  0x{a:08x} ({label}): {hex}");
         } else {
             eprintln!("  0x{a:08x} ({label}): UNMAPPED");
@@ -2799,6 +2812,138 @@ fn monitor_install_ne(
     Ok(())
 }
 
+/// Run an ELF binary under the Linux syscall-emulation personality and
+/// report what it did (captured stdout/stderr, exit code, unsupported
+/// syscalls, files written to the VFS).
+fn monitor_install_elf(
+    input: &Path,
+    bytes: &[u8],
+    max_instructions: u64,
+    as_json: bool,
+    dump_vfs: Option<&Path>,
+) -> anyhow::Result<()> {
+    let stem = input
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("a.out");
+
+    // Only i386 ELFs have a working executor today.
+    if !ud_emulator::linux::loader::is_runnable_i386(bytes) {
+        let machine = ud_format::elf::Elf64File::parse(bytes)
+            .map(|e| e.ehdr.e_machine)
+            .unwrap_or(0);
+        anyhow::bail!(
+            "ELF executor for e_machine={machine} is not implemented yet \
+             (only i386 / EM_386 runs); {} cannot be executed",
+            input.display()
+        );
+    }
+
+    let mut sandbox = ud_emulator::Sandbox::new_linux();
+    sandbox.host.instruction_budget = Some(max_instructions);
+    sandbox
+        .context_mut()
+        .vfs
+        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+
+    let image = sandbox
+        .load_linux_elf(stem, bytes)
+        .with_context(|| format!("ELF load {}", input.display()))?;
+    let run = sandbox.run_linux();
+    let instructions = sandbox.cpu.instr_count;
+
+    // Dump VFS writes if requested.
+    if let Some(dump_root) = dump_vfs {
+        if let Some(vfs) = sandbox.context().vfs.as_ref() {
+            std::fs::create_dir_all(dump_root)
+                .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
+            for (vpath, _) in vfs.list() {
+                if vpath.ends_with("/.dir") {
+                    continue;
+                }
+                let out = dump_root.join(sanitise_vfs_path(vpath));
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                if let Some(data) = vfs.read(vpath) {
+                    std::fs::write(&out, data).ok();
+                }
+            }
+        }
+    }
+    let vfs_writes: Vec<(String, usize)> = sandbox
+        .context()
+        .vfs
+        .as_ref()
+        .map(|v| {
+            v.list()
+                .filter(|(p, _)| !p.ends_with("/.dir"))
+                .map(|(p, n)| (p.to_string(), n))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let k = &sandbox.linux;
+    let stdout = String::from_utf8_lossy(&k.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&k.stderr).into_owned();
+    let exit = match &run {
+        Ok(code) => Some(*code),
+        Err(_) => None,
+    };
+    let trap = run.as_ref().err().map(ToString::to_string);
+    let unsupported: Vec<(String, u64)> =
+        k.unsupported.iter().map(|(s, n)| (s.clone(), *n)).collect();
+
+    if as_json {
+        let v = serde_json::json!({
+            "input": input.display().to_string(),
+            "personality": "linux-i386",
+            "entry": format!("{:#010x}", image.entry),
+            "instructions_executed": instructions,
+            "instruction_budget": max_instructions,
+            "exit_code": exit,
+            "trap": trap,
+            "stdout": stdout,
+            "stderr": stderr,
+            "unsupported_syscalls": unsupported.iter()
+                .map(|(s, n)| serde_json::json!({"syscall": s, "count": n}))
+                .collect::<Vec<_>>(),
+            "vfs_writes": vfs_writes.iter()
+                .map(|(p, n)| serde_json::json!({"path": p, "bytes": n}))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("ud analyze --monitor (Linux/i386): {}", input.display());
+        println!("  entry: {:#010x}", image.entry);
+        println!("  instructions executed: {instructions} (budget {max_instructions})");
+        match (exit, &trap) {
+            (Some(c), _) => println!("  exit code: {c}"),
+            (None, Some(t)) => println!("  trapped: {t}"),
+            (None, None) => println!("  did not exit"),
+        }
+        if !unsupported.is_empty() {
+            println!("  unsupported syscalls:");
+            for (s, n) in &unsupported {
+                println!("    {s} ×{n}");
+            }
+        }
+        if !vfs_writes.is_empty() {
+            println!("  VFS files ({}):", vfs_writes.len());
+            for (p, n) in &vfs_writes {
+                println!("    {p} ({n} bytes)");
+            }
+        }
+        if !stdout.is_empty() {
+            println!("  ── stdout ──\n{stdout}");
+        }
+        if !stderr.is_empty() {
+            println!("  ── stderr ──\n{stderr}");
+        }
+    }
+    Ok(())
+}
+
 /// Render the headless GUI transcript as a readable text section.
 fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
     use ud_emulator::win16::gui::GuiEvent;
@@ -2863,6 +3008,10 @@ fn monitor_install(
             dump_vfs,
         );
     }
+    // ELF binaries run under the Linux personality (syscall emulation).
+    if ud_format::elf::is_elf(&bytes) {
+        return monitor_install_elf(input, &bytes, max_instructions, as_json, dump_vfs);
+    }
     // NE (16-bit Windows) installers run through the Win16 loader +
     // segmented executor. Detect before PE (both carry an `MZ` header).
     if ud_format::ne::is_ne(&bytes) {
@@ -2877,7 +3026,7 @@ fn monitor_install(
     }
     if !ud_format::pe::is_pe(&bytes) {
         anyhow::bail!(
-            "ud analyze --monitor requires a PE32, NE, or MSI binary; {} is neither",
+            "ud analyze --monitor requires a PE32, NE, ELF, or MSI binary; {} is neither",
             input.display()
         );
     }

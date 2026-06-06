@@ -1626,23 +1626,18 @@ impl Cpu {
                 mnemonic: "int3",
             }),
 
-            // 0xCD — INT imm8 → trap.
+            // 0xCD — INT imm8 → surface to the run loop as a software
+            // interrupt. The Win16 loop services DOS `INT 21h`; the Linux
+            // loop services `INT 0x80` (the i386 syscall gate). `eip`
+            // already points past the 2-byte `INT n`. A loop that doesn't
+            // recognise the vector turns it into an error, matching the
+            // old 32-bit "privileged opcode" outcome for a stray `INT`.
             0xCD => {
                 let num = self.fetch_imm8(mmu)?;
-                if self.code16 {
-                    // Software interrupts (DOS INT 21h, …) are serviced
-                    // by the run loop; `eip` already points past the
-                    // 2-byte `INT n`.
-                    Err(Trap::SoftwareInterrupt {
-                        num,
-                        eip: self.regs.eip,
-                    })
-                } else {
-                    Err(Trap::PrivilegedOpcode {
-                        eip: entry_eip,
-                        mnemonic: "int imm8",
-                    })
-                }
+                Err(Trap::SoftwareInterrupt {
+                    num,
+                    eip: self.regs.eip,
+                })
             }
 
             // 0xCF — IRETD → trap.
