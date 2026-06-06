@@ -87,6 +87,34 @@ const CHILD_HEAP_POOL_START: u32 = 0xA000_0000;
 const CHILD_HEAP_POOL_SIZE: u32 = 0x1000_0000; // 256 MiB → 16 children
 const CHILD_HEAP_POOL_END: u32 = CHILD_HEAP_POOL_START + CHILD_HEAP_POOL_SIZE;
 
+/// A guest thread under the amd64 Linux scheduler: its own [`Cpu`] (register
+/// file + `%fs` TLS base) over the process-shared [`Mmu`].
+struct AmdThread {
+    cpu: Cpu,
+    tid: i32,
+    /// `Some(addr)` while parked in `FUTEX_WAIT` on `addr`.
+    blocked_on: Option<u32>,
+    /// `CLONE_CHILD_CLEARTID` address: on thread exit, zero it and futex-wake
+    /// (this is what `pthread_join` waits on). `0` if unset.
+    clear_child_tid: u32,
+    exited: bool,
+}
+
+/// Wake up to `n` threads parked in `FUTEX_WAIT` on `addr`; returns the count.
+fn wake_futex(threads: &mut [AmdThread], addr: u32, n: i32) -> i32 {
+    let mut woke = 0;
+    for t in threads.iter_mut() {
+        if woke >= n {
+            break;
+        }
+        if t.blocked_on == Some(addr) {
+            t.blocked_on = None;
+            woke += 1;
+        }
+    }
+    woke
+}
+
 /// One sandbox instance per loaded codec DLL.
 pub struct Sandbox {
     pub mmu: Mmu,
@@ -464,42 +492,204 @@ impl Sandbox {
         }
     }
 
-    /// x86-64 run loop: steps the long-mode CPU and services the `syscall`
-    /// gate ([`Trap::Syscall`]) via [`Amd64Abi`].
+    /// x86-64 run loop with a cooperative **thread scheduler**.
+    ///
+    /// Each guest thread is a [`Cpu`] sharing the one [`Mmu`]; the scheduler
+    /// round-robins them with an instruction quantum and services the
+    /// `syscall` gate. `clone` (no `clone3`; glibc falls back) spawns a child
+    /// CPU with its own stack + `%fs` TLS base; `futex` blocks/wakes threads;
+    /// thread `exit` honours `CLONE_CHILD_CLEARTID` (zero + futex-wake) so
+    /// `pthread_join` returns; `exit_group` ends the whole process.
     fn run_linux_amd64(
         &mut self,
         vfs: &mut crate::context::VirtualFs,
     ) -> Result<i32, crate::Error> {
         use crate::emulator::isa_int::StepOk;
-        use crate::emulator::Trap;
-        let abi = crate::linux::abi::Amd64Abi;
+        use crate::emulator::{Cpu, Trap};
+        use crate::linux::abi::{Amd64Abi, LinuxAbi, Sysno};
+
+        // clone(2) flag bits we honour.
+        const CLONE_SETTLS: u64 = 0x0008_0000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+        const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+        let abi = Amd64Abi;
         let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
         let trace = std::env::var("UD_LINUX_TRACE").is_ok();
-        loop {
-            if self.cpu.instr_count >= budget {
-                break Ok(self.linux.exit_code.unwrap_or(-1));
+        const QUANTUM: u64 = 20_000;
+
+        // Thread 0 = main; take the prepared CPU out of `self.cpu`.
+        let main_cpu = std::mem::replace(&mut self.cpu, Cpu::new());
+        let mut threads: Vec<AmdThread> = vec![AmdThread {
+            cpu: main_cpu,
+            tid: 1,
+            blocked_on: None,
+            clear_child_tid: 0,
+            exited: false,
+        }];
+        let mut next_tid: i32 = 2;
+        let mut cur = 0usize;
+
+        let result = 'sched: loop {
+            if let Some(code) = self.linux.exit_code {
+                break 'sched Ok(code);
             }
-            let rip = self.cpu.regs.rip;
-            match self.cpu.step(&mut self.mmu) {
-                Ok(StepOk::Continued) => {}
-                Ok(StepOk::Halted) => break Ok(self.linux.exit_code.unwrap_or(0)),
-                Err(Trap::Syscall { .. }) => {
-                    self.linux.dispatch(&abi, &mut self.cpu, &mut self.mmu, vfs);
-                    if let Some(code) = self.linux.exit_code {
-                        break Ok(code);
+            let total: u64 = threads.iter().map(|t| t.cpu.instr_count).sum();
+            if total >= budget {
+                break 'sched Ok(self.linux.exit_code.unwrap_or(-1));
+            }
+
+            // Round-robin to the next runnable (not exited, not blocked) thread.
+            let n = threads.len();
+            let mut pick = None;
+            for off in 0..n {
+                let i = (cur + off) % n;
+                if !threads[i].exited && threads[i].blocked_on.is_none() {
+                    pick = Some(i);
+                    break;
+                }
+            }
+            let Some(idx) = pick else {
+                // Nothing runnable: clean finish if all exited, else deadlock.
+                let code = self.linux.exit_code.unwrap_or(0);
+                break 'sched Ok(code);
+            };
+            cur = (idx + 1) % n;
+            self.linux.current_tid = threads[idx].tid;
+
+            let start = threads[idx].cpu.instr_count;
+            let mut spawn: Option<AmdThread> = None;
+            loop {
+                if threads[idx].cpu.instr_count - start >= QUANTUM {
+                    break;
+                }
+                match threads[idx].cpu.step(&mut self.mmu) {
+                    Ok(StepOk::Continued) => {}
+                    Ok(StepOk::Halted) => {
+                        threads[idx].exited = true;
+                        break;
+                    }
+                    Err(Trap::Syscall { .. }) => {
+                        let nr = abi.syscall_nr(&threads[idx].cpu);
+                        let a = abi.syscall_args(&threads[idx].cpu);
+                        match abi.map_syscall(nr) {
+                            Some(Sysno::ExitGroup) => {
+                                self.linux.exit_code = Some(a[0] as i32);
+                                break;
+                            }
+                            Some(Sysno::Exit) => {
+                                threads[idx].exited = true;
+                                let cct = threads[idx].clear_child_tid;
+                                if cct != 0 {
+                                    let _ = self.mmu.store32(cct, 0);
+                                    wake_futex(&mut threads, cct, i32::MAX);
+                                }
+                                // If only the main thread is left having exited
+                                // with no exit_group, treat its code as final.
+                                if threads.iter().all(|t| t.exited) {
+                                    self.linux.exit_code.get_or_insert(0);
+                                }
+                                break;
+                            }
+                            Some(Sysno::Clone) => {
+                                let (flags, child_stack) = (a[0], a[1]);
+                                let (ptid, ctid, newtls) = (a[2] as u32, a[3] as u32, a[4]);
+                                let tid = next_tid;
+                                next_tid += 1;
+                                let mut child = threads[idx].cpu.clone();
+                                child.regs.gp64[0] = 0; // child sees rax = 0
+                                child.regs.gp64[4] = child_stack; // rsp
+                                if flags & CLONE_SETTLS != 0 {
+                                    child.set_fs_base(newtls as u32);
+                                }
+                                abi.set_return(&mut threads[idx].cpu, i64::from(tid));
+                                if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+                                    let _ = self.mmu.store32(ptid, tid as u32);
+                                }
+                                if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
+                                    let _ = self.mmu.store32(ctid, tid as u32);
+                                }
+                                let cct = if flags & CLONE_CHILD_CLEARTID != 0 {
+                                    ctid
+                                } else {
+                                    0
+                                };
+                                spawn = Some(AmdThread {
+                                    cpu: child,
+                                    tid,
+                                    blocked_on: None,
+                                    clear_child_tid: cct,
+                                    exited: false,
+                                });
+                                break;
+                            }
+                            Some(Sysno::Futex) => {
+                                let uaddr = a[0] as u32;
+                                let cmd = (a[1] as u32) & 0x7f;
+                                let val = a[2] as u32;
+                                match cmd {
+                                    0 | 9 => {
+                                        // WAIT: block iff the word still equals `val`.
+                                        if self.mmu.load32(uaddr).unwrap_or(!val) == val {
+                                            threads[idx].blocked_on = Some(uaddr);
+                                            abi.set_return(&mut threads[idx].cpu, 0);
+                                            break;
+                                        }
+                                        abi.set_return(&mut threads[idx].cpu, -11);
+                                        // EAGAIN
+                                    }
+                                    1 | 10 => {
+                                        let woke = wake_futex(&mut threads, uaddr, val as i32);
+                                        abi.set_return(&mut threads[idx].cpu, i64::from(woke));
+                                    }
+                                    _ => abi.set_return(&mut threads[idx].cpu, 0),
+                                }
+                            }
+                            Some(Sysno::SchedYield) => {
+                                abi.set_return(&mut threads[idx].cpu, 0);
+                                break;
+                            }
+                            _ => {
+                                self.linux.dispatch(
+                                    &abi,
+                                    &mut threads[idx].cpu,
+                                    &mut self.mmu,
+                                    vfs,
+                                );
+                                if self.linux.exit_code.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(t) => {
+                        if trace {
+                            eprintln!(
+                                "amd64 trap (tid {}) at rip={:#018x} (#{}): {t}",
+                                threads[idx].tid,
+                                threads[idx].cpu.regs.rip,
+                                threads[idx].cpu.instr_count
+                            );
+                        }
+                        if let Some(m) = threads.iter().find(|t| t.tid == 1) {
+                            self.cpu = m.cpu.clone();
+                        }
+                        break 'sched Err(crate::Error::Trap(t));
                     }
                 }
-                Err(t) => {
-                    if trace {
-                        eprintln!(
-                            "amd64 trap at rip={rip:#018x} (#{}): {t}",
-                            self.cpu.instr_count
-                        );
-                    }
-                    break Err(crate::Error::Trap(t));
-                }
             }
+            if let Some(child) = spawn {
+                threads.push(child);
+            }
+        };
+
+        // Restore the main thread's CPU for post-run inspection (instr count,
+        // captured state).
+        if let Some(m) = threads.into_iter().find(|t| t.tid == 1) {
+            self.cpu = m.cpu;
         }
+        result
     }
 
     /// aarch64 run loop: steps the [`Aarch64Cpu`] and services the `svc`

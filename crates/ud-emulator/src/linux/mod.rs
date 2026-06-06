@@ -70,6 +70,9 @@ pub struct LinuxKernel {
     ptr64: bool,
     /// Rolling counter feeding `getrandom` so output is deterministic.
     rng: u64,
+    /// TID of the thread currently being serviced (the amd64 scheduler sets
+    /// this before each dispatch; `gettid` returns it). `1` = main thread.
+    pub current_tid: i32,
 }
 
 impl LinuxKernel {
@@ -84,6 +87,7 @@ impl LinuxKernel {
         self.fds.insert(1, Fd::Stdout);
         self.fds.insert(2, Fd::Stderr);
         self.next_fd = 3;
+        self.current_tid = 1;
     }
 
     /// Service one syscall: read `(nr, args)` via `abi`, run it, write the
@@ -147,7 +151,8 @@ impl LinuxKernel {
             }
             Sysno::Fstat | Sysno::Stat | Sysno::Newfstatat => self.sys_stat_zero(sys, a, mmu),
             Sysno::Uname => self.sys_uname(a0, mmu),
-            Sysno::Getpid | Sysno::Gettid => 1,
+            Sysno::Getpid => 1,
+            Sysno::Gettid => i64::from(self.current_tid),
             Sysno::Getppid => 0,
             Sysno::Getuid | Sysno::Geteuid | Sysno::Getgid | Sysno::Getegid => 0,
             Sysno::Time => 0,
@@ -156,6 +161,10 @@ impl LinuxKernel {
             Sysno::Futex => 0, // uncontended: report success
             Sysno::Getrandom => self.sys_getrandom(a0, a1, mmu),
             Sysno::Readlinkat => ENOENT, // no symlinks in the VFS
+            Sysno::SchedYield => 0,
+            // clone/futex are serviced by the amd64 thread scheduler; on the
+            // single-threaded paths they degrade to "no threads".
+            Sysno::Clone => ENOSYS,
             Sysno::Access => ENOENT,
             Sysno::Getcwd => self.sys_getcwd(a0, a1, mmu),
             Sysno::Ioctl => ENOTTY, // "not a terminal" → libc picks full buffering

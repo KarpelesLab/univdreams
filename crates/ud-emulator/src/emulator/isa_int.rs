@@ -51,6 +51,11 @@ pub enum StepOk {
 /// CPU instance — owns its own register file. The [`Mmu`] is
 /// passed by mutable reference into every step so that one MMU
 /// can be reused across multiple emulator instances.
+///
+/// `Clone` snapshots the full architectural + instrumentation state; the
+/// Linux thread scheduler uses it to spawn a child thread that shares the
+/// parent's [`Mmu`] but has its own registers / `fs_base` (TLS).
+#[derive(Clone)]
 pub struct Cpu {
     pub regs: Regs,
     pub instr_count: u64,

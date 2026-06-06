@@ -57,6 +57,8 @@ pub enum Sysno {
     Futex,
     Getrandom,
     Readlinkat,
+    Clone,
+    SchedYield,
     /// Recognised but intentionally a no-op-success for static-binary
     /// startup (TLS / threading setup we don't model).
     Ignored,
@@ -202,6 +204,9 @@ impl Amd64Abi {
             318 => Sysno::Getrandom,
             334 => Sysno::Ignored, // rseq — restartable sequences, ignore
             267 => Sysno::Readlinkat,
+            56 => Sysno::Clone,
+            24 => Sysno::SchedYield,
+            28 => Sysno::Ignored, // madvise — advisory, safe to no-op
             _ => return None,
         })
     }

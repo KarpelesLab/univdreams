@@ -77,3 +77,43 @@ fn static_glibc_returns_exit_code() {
     let (_stdout, exit) = run(&elf);
     assert_eq!(exit, 42, "main()'s return becomes the process exit code");
 }
+
+#[test]
+fn static_glibc_pthreads_run_join_and_share_memory() {
+    // Three worker threads each bump a shared counter and return a value the
+    // main thread collects via pthread_join. Exercises clone (thread spawn,
+    // CLONE_VM shared memory, CLONE_SETTLS per-thread TLS), futex wait/wake,
+    // and CLONE_CHILD_CLEARTID join wakeups in the scheduler.
+    let src = r#"
+        #include <pthread.h>
+        #include <stdio.h>
+        static int counter = 0;
+        static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        static void *worker(void *arg) {
+            long id = (long)arg;
+            for (int i = 0; i < 1000; i++) {
+                pthread_mutex_lock(&lock);
+                counter++;
+                pthread_mutex_unlock(&lock);
+            }
+            return (void *)(id * 10);
+        }
+        int main(void) {
+            pthread_t t[3];
+            for (long i = 0; i < 3; i++) pthread_create(&t[i], NULL, worker, (void *)i);
+            long sum = 0;
+            for (int i = 0; i < 3; i++) { void *r; pthread_join(t[i], &r); sum += (long)r; }
+            printf("counter=%d sum=%ld\n", counter, sum);
+            return 0;
+        }
+    "#;
+    let Some(elf) = compile_static(src, "thr") else {
+        return;
+    };
+    let (stdout, exit) = run(&elf);
+    assert_eq!(
+        stdout, "counter=3000 sum=30\n",
+        "3 threads × 1000 increments under a mutex, join returns 0+10+20"
+    );
+    assert_eq!(exit, 0, "exit code");
+}
