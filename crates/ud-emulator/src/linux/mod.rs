@@ -155,6 +155,7 @@ impl LinuxKernel {
             Sysno::Gettimeofday => self.sys_gettimeofday(a0, mmu),
             Sysno::Futex => 0, // uncontended: report success
             Sysno::Getrandom => self.sys_getrandom(a0, a1, mmu),
+            Sysno::Readlinkat => ENOENT, // no symlinks in the VFS
             Sysno::Access => ENOENT,
             Sysno::Getcwd => self.sys_getcwd(a0, a1, mmu),
             Sysno::Ioctl => ENOTTY, // "not a terminal" → libc picks full buffering

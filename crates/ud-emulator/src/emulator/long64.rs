@@ -287,7 +287,9 @@ impl Cpu {
                 let a = self.rget(reg, 1, rex);
                 let b = self.op_get(rm, 1, rex, mmu)?;
                 let r = self.alu(op, a, b, 1);
-                self.rset(reg, 1, rex, r);
+                if op != 0x3A {
+                    self.rset(reg, 1, rex, r); // CMP (0x3A) sets flags only
+                }
                 Ok(StepOk::Continued)
             }
             0x03 | 0x0B | 0x13 | 0x1B | 0x23 | 0x2B | 0x33 | 0x3B => {
@@ -295,7 +297,9 @@ impl Cpu {
                 let a = self.rget(reg, osz, rex);
                 let b = self.op_get(rm, osz, rex, mmu)?;
                 let r = self.alu(op, a, b, osz);
-                self.rset(reg, osz, rex, r);
+                if op != 0x3B {
+                    self.rset(reg, osz, rex, r); // CMP (0x3B) sets flags only
+                }
                 Ok(StepOk::Continued)
             }
             // ALU al/eax, imm
@@ -983,6 +987,27 @@ impl Cpu {
                 }
                 Ok(StepOk::Continued)
             }
+            0xA3 | 0xAB | 0xB3 | 0xBB => {
+                // BT/BTS/BTR/BTC r/m, reg — bit index in the reg operand.
+                let (reg, rm) = self.modrm(mmu, p, 0)?;
+                let bit = self.rget(reg, osz, rex);
+                self.bit_op(rm, bit, op, osz, rex, mmu)?;
+                Ok(StepOk::Continued)
+            }
+            0xBA => {
+                // group 8: BT/BTS/BTR/BTC r/m, imm8 (ext 4/5/6/7).
+                let (ext, rm) = self.modrm(mmu, p, 1)?;
+                let imm = u64::from(self.fetch8(mmu)?);
+                // ext 4=BT(A3) 5=BTS(AB) 6=BTR(B3) 7=BTC(BB).
+                let synth = match ext & 7 {
+                    5 => 0xAB,
+                    6 => 0xB3,
+                    7 => 0xBB,
+                    _ => 0xA3,
+                };
+                self.bit_op(rm, imm, synth, osz, rex, mmu)?;
+                Ok(StepOk::Continued)
+            }
             0xC8..=0xCF => {
                 // BSWAP r32/r64
                 let r = (p.b() << 3) | (op - 0xC8);
@@ -1254,6 +1279,54 @@ impl Cpu {
             0xE => f.zf || (f.sf != f.of),
             _ => !f.zf && (f.sf == f.of),
         }
+    }
+
+    /// BT/BTS/BTR/BTC: test (and optionally modify) one bit. `synth` is the
+    /// reg-form opcode (0xA3 BT, 0xAB BTS, 0xB3 BTR, 0xBB BTC). CF receives
+    /// the original bit.
+    fn bit_op(
+        &mut self,
+        rm: Op,
+        bit: u64,
+        synth: u8,
+        size: u8,
+        rex: bool,
+        mmu: &mut Mmu,
+    ) -> Result<(), Trap> {
+        let bits = u64::from(size) * 8;
+        let (a, idx) = match rm {
+            Op::Reg(_) => (self.op_get(rm, size, rex, mmu)?, bit % bits),
+            // Memory: the bit string is byte-addressed; fold the high part of
+            // the index into the address and operate on the addressed unit.
+            Op::Mem(addr) => {
+                let byte_off = (bit / 8) & !(u64::from(size) - 1);
+                let a2 = Op::Mem(addr.wrapping_add(byte_off));
+                let v = self.op_get(a2, size, rex, mmu)?;
+                return self.bit_finish(a2, v, bit % bits, synth, size, rex, mmu);
+            }
+        };
+        self.bit_finish(rm, a, idx, synth, size, rex, mmu)
+    }
+
+    fn bit_finish(
+        &mut self,
+        rm: Op,
+        a: u64,
+        idx: u64,
+        synth: u8,
+        size: u8,
+        rex: bool,
+        mmu: &mut Mmu,
+    ) -> Result<(), Trap> {
+        let mask = 1u64 << idx;
+        self.regs.flags.cf = a & mask != 0;
+        let r = match synth {
+            0xAB => a | mask,   // BTS
+            0xB3 => a & !mask,  // BTR
+            0xBB => a ^ mask,   // BTC
+            _ => return Ok(()), // BT: no write-back
+        };
+        self.op_set(rm, size, rex, r, mmu)
     }
 
     // ---- string operations ----------------------------------------------

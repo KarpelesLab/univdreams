@@ -56,6 +56,7 @@ pub enum Sysno {
     Gettimeofday,
     Futex,
     Getrandom,
+    Readlinkat,
     /// Recognised but intentionally a no-op-success for static-binary
     /// startup (TLS / threading setup we don't model).
     Ignored,
@@ -141,6 +142,7 @@ impl LinuxAbi for I386Abi {
             240 => Sysno::Futex,
             355 => Sysno::Getrandom,
             340 => Sysno::Ignored, // prlimit64
+            305 => Sysno::Readlinkat,
             _ => return None,
         })
     }
@@ -199,6 +201,7 @@ impl Amd64Abi {
             302 => Sysno::Ignored, // prlimit64
             318 => Sysno::Getrandom,
             334 => Sysno::Ignored, // rseq — restartable sequences, ignore
+            267 => Sysno::Readlinkat,
             _ => return None,
         })
     }
@@ -311,6 +314,7 @@ impl Aarch64Abi {
             98 => Sysno::Futex,
             278 => Sysno::Getrandom,
             261 => Sysno::Ignored, // prlimit64
+            78 => Sysno::Readlinkat,
             _ => return None,
         })
     }
