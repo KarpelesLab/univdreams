@@ -26,12 +26,12 @@ use crate::emulator::{Cpu, Mmu};
 
 pub mod advapi32;
 pub mod comctl32;
+pub mod corefoundation;
 pub mod gdi32;
 pub mod kernel32;
 pub mod mfplat;
 pub mod msi;
 pub mod msiexec;
-pub mod corefoundation;
 pub mod msvcrt;
 pub mod ole32;
 pub mod pthread;

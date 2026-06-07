@@ -55,14 +55,14 @@ pub fn register(registry: &mut Registry) {
     registry.register_data(dll, "kCFAllocatorMallocZone", 0);
     registry.register_data(dll, "kCFAllocatorNull", 0);
     registry.register_data(dll, "kCFAllocatorUseContext", 0);
-    registry.register(dll, "CFAllocatorAllocate", stub_allocator_allocate as StubFn, 0);
-    registry.register(dll, "CFAllocatorDeallocate", stub_zero as StubFn, 0);
     registry.register(
         dll,
-        "CFAllocatorGetDefault",
-        stub_returns_zero as StubFn,
+        "CFAllocatorAllocate",
+        stub_allocator_allocate as StubFn,
         0,
     );
+    registry.register(dll, "CFAllocatorDeallocate", stub_zero as StubFn, 0);
+    registry.register(dll, "CFAllocatorGetDefault", stub_returns_zero as StubFn, 0);
     registry.register(
         dll,
         "CFAllocatorGetTypeID",
@@ -101,89 +101,39 @@ pub fn register(registry: &mut Registry) {
         stub_string_create as StubFn,
         0,
     );
-    registry.register(
-        dll,
-        "CFStringCreateCopy",
-        stub_returns_arg1 as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "CFStringGetTypeID",
-        stub_type_id_string as StubFn,
-        0,
-    );
+    registry.register(dll, "CFStringCreateCopy", stub_returns_arg1 as StubFn, 0);
+    registry.register(dll, "CFStringGetTypeID", stub_type_id_string as StubFn, 0);
     registry.register(dll, "CFStringGetLength", stub_returns_zero as StubFn, 0);
-    registry.register(
-        dll,
-        "CFStringGetCStringPtr",
-        stub_returns_zero as StubFn,
-        0,
-    );
+    registry.register(dll, "CFStringGetCStringPtr", stub_returns_zero as StubFn, 0);
     registry.register(
         dll,
         "CFStringGetCString",
         stub_string_get_cstring as StubFn,
         0,
     );
-    registry.register(
-        dll,
-        "CFStringCompare",
-        stub_returns_zero as StubFn,
-        0,
-    );
+    registry.register(dll, "CFStringCompare", stub_returns_zero as StubFn, 0);
 
     // ---- Numbers / Booleans ---------------------------------------
     registry.register_data(dll, "kCFBooleanTrue", 0);
     registry.register_data(dll, "kCFBooleanFalse", 0);
-    registry.register(
-        dll,
-        "CFNumberCreate",
-        stub_string_create as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "CFNumberGetTypeID",
-        stub_type_id_number as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "CFBooleanGetTypeID",
-        stub_type_id_boolean as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "CFNumberGetValue",
-        stub_zero as StubFn,
-        0,
-    );
+    registry.register(dll, "CFNumberCreate", stub_string_create as StubFn, 0);
+    registry.register(dll, "CFNumberGetTypeID", stub_type_id_number as StubFn, 0);
+    registry.register(dll, "CFBooleanGetTypeID", stub_type_id_boolean as StubFn, 0);
+    registry.register(dll, "CFNumberGetValue", stub_zero as StubFn, 0);
 
     // ---- Dictionary / Array ---------------------------------------
     registry.register_data(dll, "kCFTypeDictionaryKeyCallBacks", 0);
     registry.register_data(dll, "kCFTypeDictionaryValueCallBacks", 0);
     registry.register_data(dll, "kCFCopyStringDictionaryKeyCallBacks", 0);
     registry.register_data(dll, "kCFTypeArrayCallBacks", 0);
-    registry.register(
-        dll,
-        "CFDictionaryCreate",
-        stub_string_create as StubFn,
-        0,
-    );
+    registry.register(dll, "CFDictionaryCreate", stub_string_create as StubFn, 0);
     registry.register(
         dll,
         "CFDictionaryCreateMutable",
         stub_string_create as StubFn,
         0,
     );
-    registry.register(
-        dll,
-        "CFDictionaryGetValue",
-        stub_returns_zero as StubFn,
-        0,
-    );
+    registry.register(dll, "CFDictionaryGetValue", stub_returns_zero as StubFn, 0);
     registry.register(dll, "CFDictionarySetValue", stub_zero as StubFn, 0);
     registry.register(dll, "CFDictionaryAddValue", stub_zero as StubFn, 0);
     registry.register(
@@ -192,18 +142,8 @@ pub fn register(registry: &mut Registry) {
         stub_type_id_dictionary as StubFn,
         0,
     );
-    registry.register(
-        dll,
-        "CFArrayCreate",
-        stub_string_create as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "CFArrayCreateMutable",
-        stub_string_create as StubFn,
-        0,
-    );
+    registry.register(dll, "CFArrayCreate", stub_string_create as StubFn, 0);
+    registry.register(dll, "CFArrayCreateMutable", stub_string_create as StubFn, 0);
     registry.register(dll, "CFArrayAppendValue", stub_zero as StubFn, 0);
     registry.register(dll, "CFArrayGetCount", stub_returns_zero as StubFn, 0);
     registry.register(
@@ -212,20 +152,10 @@ pub fn register(registry: &mut Registry) {
         stub_returns_zero as StubFn,
         0,
     );
-    registry.register(
-        dll,
-        "CFArrayGetTypeID",
-        stub_type_id_array as StubFn,
-        0,
-    );
+    registry.register(dll, "CFArrayGetTypeID", stub_type_id_array as StubFn, 0);
 
     // ---- Data ------------------------------------------------------
-    registry.register(
-        dll,
-        "CFDataCreate",
-        stub_string_create as StubFn,
-        0,
-    );
+    registry.register(dll, "CFDataCreate", stub_string_create as StubFn, 0);
     registry.register(
         dll,
         "CFDataCreateWithBytesNoCopy",
@@ -237,12 +167,7 @@ pub fn register(registry: &mut Registry) {
     registry.register(dll, "CFDataGetTypeID", stub_type_id_data as StubFn, 0);
 
     // ---- Date ------------------------------------------------------
-    registry.register(
-        dll,
-        "CFDateCreate",
-        stub_string_create as StubFn,
-        0,
-    );
+    registry.register(dll, "CFDateCreate", stub_string_create as StubFn, 0);
     registry.register(dll, "CFDateGetTypeID", stub_type_id_date as StubFn, 0);
 
     // ---- URL -------------------------------------------------------
@@ -261,37 +186,17 @@ pub fn register(registry: &mut Registry) {
     registry.register(dll, "CFURLGetTypeID", stub_type_id_url as StubFn, 0);
 
     // ---- UUID / Bundle --------------------------------------------
-    registry.register(
-        dll,
-        "CFUUIDCreate",
-        stub_string_create as StubFn,
-        0,
-    );
+    registry.register(dll, "CFUUIDCreate", stub_string_create as StubFn, 0);
     registry.register(dll, "CFUUIDGetTypeID", stub_type_id_uuid as StubFn, 0);
-    registry.register(
-        dll,
-        "CFBundleCreate",
-        stub_string_create as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "CFBundleGetMainBundle",
-        stub_returns_zero as StubFn,
-        0,
-    );
+    registry.register(dll, "CFBundleCreate", stub_string_create as StubFn, 0);
+    registry.register(dll, "CFBundleGetMainBundle", stub_returns_zero as StubFn, 0);
     registry.register(
         dll,
         "CFBundleGetBundleWithIdentifier",
         stub_returns_zero as StubFn,
         0,
     );
-    registry.register(
-        dll,
-        "CFBundleCopyBundleURL",
-        stub_returns_zero as StubFn,
-        0,
-    );
+    registry.register(dll, "CFBundleCopyBundleURL", stub_returns_zero as StubFn, 0);
     registry.register(dll, "CFBundleGetTypeID", stub_type_id_bundle as StubFn, 0);
 
     // ---- Generic CFType -------------------------------------------
@@ -309,26 +214,11 @@ pub fn register(registry: &mut Registry) {
     registry.register(dll, "CFHash", stub_returns_zero as StubFn, 0);
 
     // ---- RunLoop (no-op) ------------------------------------------
-    registry.register(
-        dll,
-        "CFRunLoopGetCurrent",
-        stub_returns_one as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "CFRunLoopGetMain",
-        stub_returns_one as StubFn,
-        0,
-    );
+    registry.register(dll, "CFRunLoopGetCurrent", stub_returns_one as StubFn, 0);
+    registry.register(dll, "CFRunLoopGetMain", stub_returns_one as StubFn, 0);
     registry.register(dll, "CFRunLoopRun", stub_zero as StubFn, 0);
     registry.register(dll, "CFRunLoopStop", stub_zero as StubFn, 0);
-    registry.register(
-        dll,
-        "CFRunLoopRunInMode",
-        stub_returns_one as StubFn,
-        0,
-    );
+    registry.register(dll, "CFRunLoopRunInMode", stub_returns_one as StubFn, 0);
 
     // ---- Preferences (return NULL — no plist) ---------------------
     registry.register(
@@ -337,32 +227,12 @@ pub fn register(registry: &mut Registry) {
         stub_returns_zero as StubFn,
         0,
     );
-    registry.register(
-        dll,
-        "CFPreferencesSetAppValue",
-        stub_zero as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "CFPreferencesAppSynchronize",
-        stub_zero as StubFn,
-        0,
-    );
+    registry.register(dll, "CFPreferencesSetAppValue", stub_zero as StubFn, 0);
+    registry.register(dll, "CFPreferencesAppSynchronize", stub_zero as StubFn, 0);
 
     // ---- Locale / Timezone (return NULL — formatter takes default) -
-    registry.register(
-        dll,
-        "CFLocaleCopyCurrent",
-        stub_returns_zero as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "CFTimeZoneCopySystem",
-        stub_returns_zero as StubFn,
-        0,
-    );
+    registry.register(dll, "CFLocaleCopyCurrent", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "CFTimeZoneCopySystem", stub_returns_zero as StubFn, 0);
 
     // ---- Notification center (no-op) ------------------------------
     registry.register(
@@ -395,11 +265,7 @@ pub fn register(registry: &mut Registry) {
 
 /// Allocate a synthetic `CFTypeRef` from the heap arena, big
 /// enough to hold the CF magic tag and a type id.
-fn synth_cf_object(
-    state: &mut HostState,
-    mmu: &mut Mmu,
-    type_id: u32,
-) -> Result<u32, Win32Error> {
+fn synth_cf_object(state: &mut HostState, mmu: &mut Mmu, type_id: u32) -> Result<u32, Win32Error> {
     let addr = state.arena_alloc(16)?;
     mmu.store32(addr, CF_TAG)
         .map_err(|t| super::trap_to_win32_local("CF synth_object", t))?;
@@ -440,10 +306,10 @@ fn stub_allocator_allocate(
     state: &mut HostState,
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
-    let _alloc = arg_dword(cpu, mmu, 0)
-        .map_err(|t| super::trap_to_win32_local("CFAllocatorAllocate", t))?;
-    let size = arg_dword(cpu, mmu, 1)
-        .map_err(|t| super::trap_to_win32_local("CFAllocatorAllocate", t))?;
+    let _alloc =
+        arg_dword(cpu, mmu, 0).map_err(|t| super::trap_to_win32_local("CFAllocatorAllocate", t))?;
+    let size =
+        arg_dword(cpu, mmu, 1).map_err(|t| super::trap_to_win32_local("CFAllocatorAllocate", t))?;
     if size == 0 {
         return Ok(0);
     }
@@ -460,8 +326,8 @@ fn stub_string_get_cstring(
     _state: &mut HostState,
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
-    let buf = arg_dword(cpu, mmu, 1)
-        .map_err(|t| super::trap_to_win32_local("CFStringGetCString", t))?;
+    let buf =
+        arg_dword(cpu, mmu, 1).map_err(|t| super::trap_to_win32_local("CFStringGetCString", t))?;
     if buf != 0 {
         mmu.store8(buf, 0)
             .map_err(|t| super::trap_to_win32_local("CFStringGetCString", t))?;

@@ -909,9 +909,7 @@ fn stub_fatal_app_exit(
     if msg.is_empty() {
         state.message_box_log.push("FatalAppExit".into());
     } else {
-        state
-            .message_box_log
-            .push(format!("FatalAppExit: {msg}"));
+        state.message_box_log.push(format!("FatalAppExit: {msg}"));
     }
     state.exit_requested = Some(0);
     state.cur_process_mut().exit_code = Some(0);
@@ -1699,7 +1697,10 @@ fn stub_create_dialog(
     let (title, controls) = dlg
         .as_deref()
         .map_or_else(|| (String::new(), Vec::new()), gui::parse_dialog_template);
-    state.gui.events.push(gui::GuiEvent::DialogStart { title, controls });
+    state
+        .gui
+        .events
+        .push(gui::GuiEvent::DialogStart { title, controls });
     Ok(u32::from(state.gui.alloc_hwnd()))
 }
 
@@ -1846,9 +1847,7 @@ fn stub_global_alloc(
     let size = cpu.stack_dword(mmu, 4).unwrap_or(0);
     let sel = state.win16_heap.alloc(cpu, mmu, size);
     if std::env::var("UD_NE_HEAP_DEBUG").is_ok() {
-        eprintln!(
-            "  GlobalAlloc(flags={flags:#06x}, size={size:#x}) → sel={sel:#06x}"
-        );
+        eprintln!("  GlobalAlloc(flags={flags:#06x}, size={size:#x}) → sel={sel:#06x}");
     }
     Ok(u32::from(sel))
 }

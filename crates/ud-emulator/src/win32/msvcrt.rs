@@ -503,18 +503,8 @@ fn register_for_dll(registry: &mut Registry, dll: &str) {
     registry.register(dll, "___lc_codepage_func", stub_returns_zero as StubFn, 0);
     registry.register(dll, "__mb_cur_max_func", stub_returns_zero as StubFn, 0);
     registry.register(dll, "___mb_cur_max_func", stub_returns_zero as StubFn, 0);
-    registry.register(
-        dll,
-        "__lc_collate_cp_func",
-        stub_returns_zero as StubFn,
-        0,
-    );
-    registry.register(
-        dll,
-        "___lc_collate_cp_func",
-        stub_returns_zero as StubFn,
-        0,
-    );
+    registry.register(dll, "__lc_collate_cp_func", stub_returns_zero as StubFn, 0);
+    registry.register(dll, "___lc_collate_cp_func", stub_returns_zero as StubFn, 0);
 }
 
 /// Generic stub that returns the caller's first dword argument

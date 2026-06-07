@@ -1196,8 +1196,7 @@ fn preload_qt_runtime(sandbox: &mut ud_emulator::Sandbox) {
                     let head = 200;
                     let tail = 200;
                     let log_call = |c: &ud_emulator::win32::StubCall| {
-                        let args: Vec<String> =
-                            c.args.iter().map(|a| format!("{a:#x}")).collect();
+                        let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
                         let eip = c.call_site_eip;
                         eprintln!(
                             "    {eip:#010x} {}!{}({}) -> {:#x}",
@@ -1430,9 +1429,7 @@ fn qtcodec_register(
             let pool0 = sandbox.mmu.load32(recs).unwrap_or(0);
             if arr != 0 && pool0 != 0 {
                 let slot50 = sandbox.mmu.load32(arr.wrapping_add(0x50)).unwrap_or(0);
-                eprintln!(
-                    "  [record[0]+0x50]: 0x{slot50:08x}  pool[0]: 0x{pool0:08x}"
-                );
+                eprintln!("  [record[0]+0x50]: 0x{slot50:08x}  pool[0]: 0x{pool0:08x}");
             }
         }
     }
@@ -1478,12 +1475,7 @@ fn qtcodec_register(
                         for row in 0..7u32 {
                             let off = arr_ptr.wrapping_add(row * 16);
                             let bytes: Vec<String> = (0..16u32)
-                                .map(|i| {
-                                    format!(
-                                        "{:02x}",
-                                        sandbox.mmu.load8(off + i).unwrap_or(0)
-                                    )
-                                })
+                                .map(|i| format!("{:02x}", sandbox.mmu.load8(off + i).unwrap_or(0)))
                                 .collect();
                             eprintln!("    +{:#04x}: {}", row * 16, bytes.join(" "));
                         }

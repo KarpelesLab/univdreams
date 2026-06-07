@@ -5191,8 +5191,8 @@ fn emit_block_stmts(
             // The result is a 3-byte arg-setup that ends up in both
             // statements — function bytes overflow their slot and
             // the PE lower path errors with `OverlappingRaws`.
-            let overlaps_call_setup = (global_idx + 1..global_idx + m.consumed)
-                .any(|k| consumed_by_call.contains(&k));
+            let overlaps_call_setup =
+                (global_idx + 1..global_idx + m.consumed).any(|k| consumed_by_call.contains(&k));
             if !overlaps_call_setup {
                 for stmt in &m.stmts {
                     out.push(stmt.clone());
