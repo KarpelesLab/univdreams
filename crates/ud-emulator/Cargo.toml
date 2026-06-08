@@ -28,6 +28,12 @@ trace = []
 # `trace` is also enabled.
 trace-exec = ["trace"]
 
+# Opt-in KVM acceleration backend for the Linux personality (x86-64 guests
+# on a Linux x86-64 host with /dev/kvm). Off by default so the pure-software
+# interpreter stays the portable, dependency-light path; enabling `kvm` pulls
+# in the rust-vmm ioctl wrappers + libc for the guest-memory mmap.
+kvm = ["dep:libc", "dep:kvm-ioctls", "dep:kvm-bindings"]
+
 # docs.rs builds with `trace` + `trace-exec` enabled so the
 # trace-gated public items resolve in the rendered docs.
 [package.metadata.docs.rs]
@@ -55,6 +61,13 @@ cab = "0.6"
 # boxes) to JSON so an external "expect"-style driver can observe and
 # script a GUI program (e.g. an installer) non-interactively.
 serde = { version = "1", features = ["derive"] }
+
+# --- opt-in `kvm` feature only (see [features].kvm) ---
+# Guest-memory mmap + munmap for the KVM backend.
+libc = { version = "0.2", optional = true }
+# rust-vmm safe wrappers over the /dev/kvm ioctl ABI.
+kvm-ioctls = { version = "0.23", optional = true }
+kvm-bindings = { version = "0.13", optional = true, features = ["fam-wrappers"] }
 
 [dev-dependencies]
 # Fetched-fixture corpus runner (`tests/codec_corpus.rs`).

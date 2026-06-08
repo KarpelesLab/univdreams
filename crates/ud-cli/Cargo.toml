@@ -14,6 +14,12 @@ description = "The `ud` command-line driver for the univdreams suite."
 [lints]
 workspace = true
 
+[features]
+default = []
+# Opt-in KVM acceleration for the Linux personality (forwards to
+# `ud-emulator/kvm`). Linux x86-64 host with /dev/kvm only.
+kvm = ["ud-emulator/kvm"]
+
 [[bin]]
 name = "ud"
 path = "src/main.rs"

@@ -12,6 +12,8 @@
 
 pub mod abi;
 pub mod guest;
+#[cfg(feature = "kvm")]
+pub mod kvm;
 pub mod loader;
 pub mod mem;
 

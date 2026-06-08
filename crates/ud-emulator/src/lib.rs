@@ -189,7 +189,13 @@
 //! See `OxideAV/docs/winmf/winmf-emulator.md` (659 lines, 13
 //! sections) for the full design contract.
 
-#![forbid(unsafe_code)]
+// `unsafe` is denied crate-wide — the pure-software interpreter, loaders, and
+// Win32/Linux shims contain none. The single exception is the opt-in `kvm`
+// backend (`linux::kvm`), which must mmap guest memory and issue `/dev/kvm`
+// ioctls; that module carries a scoped `#![allow(unsafe_code)]` and every
+// block has a `// SAFETY:` note. Hence `deny` (locally overridable there)
+// rather than `forbid` (which is not).
+#![deny(unsafe_code)]
 // Mirror-from-oxideav-vfw allowances. Proper `Debug` impls and
 // clippy-pedantic cleanup land in follow-up commits once the
 // crate has been integrated with the decompile pipeline; the

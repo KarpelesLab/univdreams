@@ -444,6 +444,31 @@ impl Sandbox {
         Ok(image)
     }
 
+    /// Run an amd64 static ELF under **KVM** (native execution), servicing its
+    /// syscalls through the shared [`LinuxKernel`](crate::linux::LinuxKernel).
+    /// The ELF is loaded into the KVM guest-memory region directly, so this
+    /// does *not* require a prior [`Self::load_linux_elf`]. Returns the exit
+    /// code. Captured stdout/stderr live in `self.linux`.
+    ///
+    /// Only built with the `kvm` cargo feature (Linux x86-64 host).
+    ///
+    /// # Errors
+    /// [`crate::Error::NeLoader`]-wrapped string if KVM is unavailable or the
+    /// guest faults — the caller can fall back to [`Self::run_linux`].
+    #[cfg(feature = "kvm")]
+    pub fn run_linux_kvm(&mut self, name: &str, bytes: &[u8]) -> Result<i32, crate::Error> {
+        let mut vfs = self
+            .host
+            .context
+            .vfs
+            .take()
+            .unwrap_or_else(crate::context::VirtualFs::new);
+        let result = crate::linux::kvm::run(&mut self.linux, &mut vfs, bytes, name)
+            .map_err(|e| crate::Error::NeLoader(format!("kvm: {e}")));
+        self.host.context.vfs = Some(vfs);
+        result
+    }
+
     /// Run the loaded Linux program until it calls `exit`/`exit_group`,
     /// faults, or hits the instruction budget. Returns the exit code.
     /// Captured stdout/stderr and any unsupported syscalls live in

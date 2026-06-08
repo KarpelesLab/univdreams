@@ -152,6 +152,15 @@ enum Command {
         #[arg(long)]
         dump_vfs: Option<PathBuf>,
 
+        /// Run amd64 Linux ELFs natively under KVM (hardware
+        /// virtualization) instead of the software interpreter.
+        /// Requires a Linux x86-64 host with `/dev/kvm` and a
+        /// build with `--features kvm`; falls back to the
+        /// interpreter if KVM is unavailable or the guest can't
+        /// be run that way.
+        #[arg(long)]
+        kvm: bool,
+
         /// In monitor mode, silently ignore `DeleteFileA` and
         /// `RemoveDirectoryA` so the post-install rollback
         /// some installers do (cleanup of temp-dir MSIs after
@@ -829,6 +838,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             monitor,
             args,
             dump_vfs,
+            kvm,
             preserve_deletes,
             fail_soft,
             stage_vfs,
@@ -842,6 +852,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     args.as_deref(),
                     dump_vfs.as_deref(),
                     preserve_deletes,
+                    kvm,
                 )
             } else {
                 analyze(
@@ -2821,6 +2832,7 @@ fn monitor_install_elf(
     max_instructions: u64,
     as_json: bool,
     dump_vfs: Option<&Path>,
+    use_kvm: bool,
 ) -> anyhow::Result<()> {
     let stem = input
         .file_name()
@@ -2839,21 +2851,75 @@ fn monitor_install_elf(
         );
     }
 
-    let mut sandbox = ud_emulator::Sandbox::new_linux();
-    sandbox.host.instruction_budget = Some(max_instructions);
-    sandbox
-        .context_mut()
-        .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+    let entry = ud_format::elf::Elf64File::parse(bytes)
+        .map(|e| e.ehdr.e_entry as u32)
+        .unwrap_or(0);
+    #[cfg(feature = "kvm")]
+    let machine = ud_format::elf::Elf64File::parse(bytes)
+        .map(|e| e.ehdr.e_machine)
+        .unwrap_or(0);
 
-    let image = sandbox
-        .load_linux_elf(stem, bytes)
-        .with_context(|| format!("ELF load {}", input.display()))?;
-    let run = sandbox.run_linux();
-    let instructions = sandbox
-        .aarch64
-        .as_ref()
-        .map_or(sandbox.cpu.instr_count, |c| c.instr_count);
+    let new_sandbox = || {
+        let mut sb = ud_emulator::Sandbox::new_linux();
+        sb.host.instruction_budget = Some(max_instructions);
+        sb.context_mut()
+            .vfs
+            .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        sb
+    };
+    let mut sandbox = new_sandbox();
+
+    // Run the guest, optionally accelerated by KVM. `run_with_interp` is the
+    // portable software path; `--kvm` (amd64 only, when built with the feature)
+    // executes natively and falls back here on any error.
+    let run_with_interp = |sandbox: &mut ud_emulator::Sandbox| -> anyhow::Result<Result<i32, _>> {
+        sandbox
+            .load_linux_elf(stem, bytes)
+            .with_context(|| format!("ELF load {}", input.display()))?;
+        Ok(sandbox.run_linux())
+    };
+
+    #[allow(unused_assignments, unused_mut)]
+    let mut used_kvm = false;
+    let run;
+    #[cfg(feature = "kvm")]
+    {
+        const EM_X86_64: u16 = 62;
+        if use_kvm && machine == EM_X86_64 {
+            match sandbox.run_linux_kvm(stem, bytes) {
+                Ok(code) => {
+                    used_kvm = true;
+                    run = Ok(code);
+                }
+                Err(e) => {
+                    eprintln!("kvm: {e} — falling back to the interpreter");
+                    sandbox = new_sandbox();
+                    run = run_with_interp(&mut sandbox)?;
+                }
+            }
+        } else {
+            if use_kvm {
+                eprintln!("note: --kvm accelerates amd64 only; using the interpreter");
+            }
+            run = run_with_interp(&mut sandbox)?;
+        }
+    }
+    #[cfg(not(feature = "kvm"))]
+    {
+        if use_kvm {
+            eprintln!("note: this build lacks `--features kvm`; using the interpreter");
+        }
+        run = run_with_interp(&mut sandbox)?;
+    }
+
+    let instructions = if used_kvm {
+        0
+    } else {
+        sandbox
+            .aarch64
+            .as_ref()
+            .map_or(sandbox.cpu.instr_count, |c| c.instr_count)
+    };
 
     // Dump VFS writes if requested.
     if let Some(dump_root) = dump_vfs {
@@ -2901,7 +2967,7 @@ fn monitor_install_elf(
         let v = serde_json::json!({
             "input": input.display().to_string(),
             "personality": "linux-i386",
-            "entry": format!("{:#010x}", image.entry),
+            "entry": format!("{entry:#010x}"),
             "instructions_executed": instructions,
             "instruction_budget": max_instructions,
             "exit_code": exit,
@@ -2918,7 +2984,7 @@ fn monitor_install_elf(
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
         println!("ud analyze --monitor (Linux/i386): {}", input.display());
-        println!("  entry: {:#010x}", image.entry);
+        println!("  entry: {entry:#010x}");
         println!("  instructions executed: {instructions} (budget {max_instructions})");
         match (exit, &trap) {
             (Some(c), _) => println!("  exit code: {c}"),
@@ -2990,6 +3056,7 @@ fn monitor_install(
     extra_args: Option<&str>,
     dump_vfs: Option<&Path>,
     preserve_deletes: bool,
+    use_kvm: bool,
 ) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     // MSI compound-document magic — when the input is a .msi we
@@ -3013,7 +3080,7 @@ fn monitor_install(
     }
     // ELF binaries run under the Linux personality (syscall emulation).
     if ud_format::elf::is_elf(&bytes) {
-        return monitor_install_elf(input, &bytes, max_instructions, as_json, dump_vfs);
+        return monitor_install_elf(input, &bytes, max_instructions, as_json, dump_vfs, use_kvm);
     }
     // NE (16-bit Windows) installers run through the Win16 loader +
     // segmented executor. Detect before PE (both carry an `MZ` header).
