@@ -8,7 +8,8 @@
 
 use ud_format::elf::{Elf64File, EM_386, EM_AARCH64, EM_X86_64};
 
-use crate::emulator::{Mmu, Perm};
+use super::mem::GuestMem;
+use crate::emulator::Perm;
 
 /// `p_type` of a loadable segment.
 const PT_LOAD: u32 = 1;
@@ -88,7 +89,7 @@ impl std::fmt::Display for LoadError {
 /// [`LoadError`] if the file is unparsable, dynamically linked, has no
 /// loadable segments, or a segment's file range is out of bounds.
 pub fn load_static(
-    mmu: &mut Mmu,
+    mmu: &mut dyn GuestMem,
     bytes: &[u8],
     argv: &[&str],
     envp: &[&str],
@@ -192,7 +193,7 @@ fn seg_perm(p_flags: u32) -> Perm {
 /// for x86-64 / aarch64, 4-byte for i386. The string area and AT_RANDOM
 /// block are byte-addressed identically either way.
 fn build_stack(
-    mmu: &mut Mmu,
+    mmu: &mut dyn GuestMem,
     elf: &Elf64File,
     argv: &[&str],
     envp: &[&str],
@@ -200,7 +201,7 @@ fn build_stack(
 ) -> Result<u32, LoadError> {
     let word = if ptr64 { 8u32 } else { 4u32 };
     let mut sp = STACK_TOP;
-    let mut push_bytes = |mmu: &mut Mmu, data: &[u8]| -> u32 {
+    let mut push_bytes = |mmu: &mut dyn GuestMem, data: &[u8]| -> u32 {
         sp -= data.len() as u32;
         let _ = mmu.write_initializer(sp, data);
         sp
@@ -249,7 +250,7 @@ fn build_stack(
     // 16-byte align the base so sp at entry is aligned.
     let mut wsp = (sp - total) & !0xF;
     let base = wsp;
-    let mut put = |mmu: &mut Mmu, v: u32| {
+    let mut put = |mmu: &mut dyn GuestMem, v: u32| {
         if ptr64 {
             let _ = mmu.write_initializer(wsp, &u64::from(v).to_le_bytes());
         } else {

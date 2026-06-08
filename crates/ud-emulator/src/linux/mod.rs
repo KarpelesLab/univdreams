@@ -13,14 +13,16 @@
 pub mod abi;
 pub mod guest;
 pub mod loader;
+pub mod mem;
 
 use std::collections::BTreeMap;
 
 use crate::context::{FileAccess, VirtualFs};
-use crate::emulator::{Mmu, Perm};
+use crate::emulator::Perm;
 
 use abi::{LinuxAbi, Sysno};
 use guest::GuestCpu;
+use mem::GuestMem;
 
 // Negative errno values returned to the guest.
 const ENOENT: i64 = -2;
@@ -96,7 +98,7 @@ impl LinuxKernel {
         &mut self,
         abi: &dyn LinuxAbi,
         cpu: &mut dyn GuestCpu,
-        mmu: &mut Mmu,
+        mmu: &mut dyn GuestMem,
         vfs: &mut VirtualFs,
     ) {
         self.ptr64 = abi.ptr_bits() == 64;
@@ -131,7 +133,13 @@ impl LinuxKernel {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn run(&mut self, sys: Sysno, a: &[u64; 6], mmu: &mut Mmu, vfs: &mut VirtualFs) -> i64 {
+    fn run(
+        &mut self,
+        sys: Sysno,
+        a: &[u64; 6],
+        mmu: &mut dyn GuestMem,
+        vfs: &mut VirtualFs,
+    ) -> i64 {
         let (a0, a1, a2) = (a[0] as u32, a[1] as u32, a[2] as u32);
         match sys {
             Sysno::Write => self.sys_write(a0 as i32, a1, a2, mmu, vfs),
@@ -182,7 +190,14 @@ impl LinuxKernel {
 
     // ---- file descriptors ------------------------------------------------
 
-    fn sys_write(&mut self, fd: i32, buf: u32, len: u32, mmu: &Mmu, vfs: &mut VirtualFs) -> i64 {
+    fn sys_write(
+        &mut self,
+        fd: i32,
+        buf: u32,
+        len: u32,
+        mmu: &dyn GuestMem,
+        vfs: &mut VirtualFs,
+    ) -> i64 {
         let data = match read_mem(mmu, buf, len as usize) {
             Some(d) => d,
             None => return EFAULT,
@@ -201,7 +216,14 @@ impl LinuxKernel {
         }
     }
 
-    fn sys_writev(&mut self, fd: i32, iov: u32, cnt: u32, mmu: &Mmu, vfs: &mut VirtualFs) -> i64 {
+    fn sys_writev(
+        &mut self,
+        fd: i32,
+        iov: u32,
+        cnt: u32,
+        mmu: &dyn GuestMem,
+        vfs: &mut VirtualFs,
+    ) -> i64 {
         let mut total = 0i64;
         for i in 0..cnt {
             let base = iov.wrapping_add(i.wrapping_mul(8));
@@ -217,7 +239,14 @@ impl LinuxKernel {
         total
     }
 
-    fn sys_read(&mut self, fd: i32, buf: u32, len: u32, mmu: &mut Mmu, vfs: &mut VirtualFs) -> i64 {
+    fn sys_read(
+        &mut self,
+        fd: i32,
+        buf: u32,
+        len: u32,
+        mmu: &mut dyn GuestMem,
+        vfs: &mut VirtualFs,
+    ) -> i64 {
         match self.fds.get(&fd) {
             Some(Fd::Stdin) => 0, // EOF — no stdin
             Some(Fd::Vfs(h)) => {
@@ -232,7 +261,7 @@ impl LinuxKernel {
         }
     }
 
-    fn sys_open(&mut self, path: u32, flags: u32, mmu: &Mmu, vfs: &mut VirtualFs) -> i64 {
+    fn sys_open(&mut self, path: u32, flags: u32, mmu: &dyn GuestMem, vfs: &mut VirtualFs) -> i64 {
         let Some(p) = read_cstr(mmu, path, 4096) else {
             return EFAULT;
         };
@@ -278,7 +307,7 @@ impl LinuxKernel {
 
     // ---- memory ----------------------------------------------------------
 
-    fn sys_brk(&mut self, new: u32, mmu: &mut Mmu) -> i64 {
+    fn sys_brk(&mut self, new: u32, mmu: &mut dyn GuestMem) -> i64 {
         if new == 0 || new < self.brk {
             // Query, or a shrink we don't honour: report the current break.
             return i64::from(self.brk);
@@ -296,7 +325,14 @@ impl LinuxKernel {
         i64::from(self.brk)
     }
 
-    fn sys_mmap(&mut self, _addr: u32, len: u32, flags: u32, fd: i32, mmu: &mut Mmu) -> i64 {
+    fn sys_mmap(
+        &mut self,
+        _addr: u32,
+        len: u32,
+        flags: u32,
+        fd: i32,
+        mmu: &mut dyn GuestMem,
+    ) -> i64 {
         // MAP_ANONYMOUS = 0x20. We only serve anonymous mappings from a
         // bump arena; file-backed mmap (fd >= 0) is not modelled yet.
         if fd >= 0 && flags & 0x20 == 0 {
@@ -314,7 +350,7 @@ impl LinuxKernel {
 
     // ---- info ------------------------------------------------------------
 
-    fn sys_uname(&self, buf: u32, mmu: &mut Mmu) -> i64 {
+    fn sys_uname(&self, buf: u32, mmu: &mut dyn GuestMem) -> i64 {
         // struct utsname: 6 × 65-byte NUL-padded fields.
         let fields = [
             "Linux",
@@ -335,7 +371,7 @@ impl LinuxKernel {
         0
     }
 
-    fn sys_getcwd(&self, buf: u32, size: u32, mmu: &mut Mmu) -> i64 {
+    fn sys_getcwd(&self, buf: u32, size: u32, mmu: &mut dyn GuestMem) -> i64 {
         let cwd = b"/\0";
         if (size as usize) < cwd.len() {
             return -34; // ERANGE
@@ -346,7 +382,7 @@ impl LinuxKernel {
         i64::from(buf)
     }
 
-    fn sys_clock_gettime(&self, ts: u32, mmu: &mut Mmu) -> i64 {
+    fn sys_clock_gettime(&self, ts: u32, mmu: &mut dyn GuestMem) -> i64 {
         // struct timespec { time_t tv_sec; long tv_nsec; } — word size
         // follows the guest's pointer width. A fixed epoch is fine for the
         // programs we run (they only need monotonicity within a run, which
@@ -354,7 +390,7 @@ impl LinuxKernel {
         self.write_time_pair(ts, 0, 0, mmu)
     }
 
-    fn sys_gettimeofday(&self, tv: u32, mmu: &mut Mmu) -> i64 {
+    fn sys_gettimeofday(&self, tv: u32, mmu: &mut dyn GuestMem) -> i64 {
         if tv == 0 {
             return 0;
         }
@@ -364,7 +400,7 @@ impl LinuxKernel {
 
     /// Write a two-field time struct (`tv_sec`, `tv_nsec`/`tv_usec`) at the
     /// guest's pointer width.
-    fn write_time_pair(&self, addr: u32, sec: u64, frac: u64, mmu: &mut Mmu) -> i64 {
+    fn write_time_pair(&self, addr: u32, sec: u64, frac: u64, mmu: &mut dyn GuestMem) -> i64 {
         let mut buf = Vec::new();
         if self.ptr64 {
             buf.extend_from_slice(&sec.to_le_bytes());
@@ -379,7 +415,7 @@ impl LinuxKernel {
         0
     }
 
-    fn sys_getrandom(&mut self, buf: u32, len: u32, mmu: &mut Mmu) -> i64 {
+    fn sys_getrandom(&mut self, buf: u32, len: u32, mmu: &mut dyn GuestMem) -> i64 {
         // Deterministic pseudo-random bytes from a SplitMix64-style counter
         // (reproducible across runs; not for cryptographic use).
         let mut out = Vec::with_capacity(len as usize);
@@ -396,7 +432,7 @@ impl LinuxKernel {
         i64::from(len)
     }
 
-    fn sys_stat_zero(&self, sys: Sysno, a: &[u64; 6], mmu: &mut Mmu) -> i64 {
+    fn sys_stat_zero(&self, sys: Sysno, a: &[u64; 6], mmu: &mut dyn GuestMem) -> i64 {
         // Fill the caller's stat buffer with zeros and report success.
         // A zeroed stat reads as st_size=0, st_mode=0 — enough for libc's
         // buffering decision not to crash. Buffer pointer position differs
@@ -416,7 +452,7 @@ impl LinuxKernel {
 
 // ---- guest memory helpers ------------------------------------------------
 
-fn read_mem(mmu: &Mmu, addr: u32, len: usize) -> Option<Vec<u8>> {
+fn read_mem(mmu: &dyn GuestMem, addr: u32, len: usize) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
         out.push(mmu.load8(addr.wrapping_add(i as u32)).ok()?);
@@ -424,14 +460,14 @@ fn read_mem(mmu: &Mmu, addr: u32, len: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn write_mem(mmu: &mut Mmu, addr: u32, data: &[u8]) -> Option<()> {
+fn write_mem(mmu: &mut dyn GuestMem, addr: u32, data: &[u8]) -> Option<()> {
     for (i, &b) in data.iter().enumerate() {
         mmu.store8(addr.wrapping_add(i as u32), b).ok()?;
     }
     Some(())
 }
 
-fn read_cstr(mmu: &Mmu, addr: u32, max: usize) -> Option<String> {
+fn read_cstr(mmu: &dyn GuestMem, addr: u32, max: usize) -> Option<String> {
     let mut out = Vec::new();
     for i in 0..max as u32 {
         match mmu.load8(addr.wrapping_add(i)) {
