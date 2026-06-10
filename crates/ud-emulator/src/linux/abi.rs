@@ -56,12 +56,38 @@ pub enum Sysno {
     Gettimeofday,
     Futex,
     Getrandom,
+    Readlink,
     Readlinkat,
+    Getdents64,
+    Mkdir,
+    Mkdirat,
+    Unlink,
+    Unlinkat,
+    Rmdir,
+    Symlink,
+    Symlinkat,
+    Truncate,
+    Ftruncate,
     Clone,
     SchedYield,
     /// Recognised but intentionally a no-op-success for static-binary
     /// startup (TLS / threading setup we don't model).
     Ignored,
+}
+
+/// Byte offsets of the fields the kernel fills in a `stat` buffer, plus the
+/// total struct size. The `stat` struct layout is architecture-specific
+/// (i386 `stat64`, x86-64 `stat`, aarch64 `stat` all differ), so each ABI
+/// reports its own. `st_mode`/`st_blksize`/`st_nlink` are written as `u32`,
+/// `st_size`/`st_blocks` as `u64` (the union of all three layouts).
+#[derive(Debug, Clone, Copy)]
+pub struct StatLayout {
+    pub size: usize,
+    pub mode_off: usize,
+    pub nlink_off: usize,
+    pub size_off: usize,
+    pub blksize_off: usize,
+    pub blocks_off: usize,
 }
 
 /// The adapter a [`LinuxKernel`](super::LinuxKernel) talks to. Works over
@@ -77,6 +103,8 @@ pub trait LinuxAbi {
     fn map_syscall(&self, nr: u64) -> Option<Sysno>;
     /// Pointer width — 32 for i386, 64 for x86-64 / aarch64.
     fn ptr_bits(&self) -> u8;
+    /// Field offsets + size of this ABI's `stat` buffer.
+    fn stat_layout(&self) -> StatLayout;
 }
 
 /// Linux/i386 ABI: `int 0x80`, number in `eax`, args in
@@ -120,7 +148,19 @@ impl LinuxAbi for I386Abi {
             50 => Sysno::Getegid,
             54 => Sysno::Ioctl,
             64 => Sysno::Getppid,
-            85 => Sysno::Ignored, // readlink — accept as "0 bytes" for now
+            10 => Sysno::Unlink,
+            39 => Sysno::Mkdir,
+            40 => Sysno::Rmdir,
+            83 => Sysno::Symlink,
+            85 => Sysno::Readlink,
+            92 => Sysno::Truncate,
+            93 => Sysno::Ftruncate,
+            193 => Sysno::Truncate,  // truncate64
+            194 => Sysno::Ftruncate, // ftruncate64
+            220 => Sysno::Getdents64,
+            296 => Sysno::Mkdirat,
+            301 => Sysno::Unlinkat,
+            304 => Sysno::Symlinkat,
             91 => Sysno::Munmap,
             122 => Sysno::Uname,
             125 => Sysno::Mprotect,
@@ -150,6 +190,17 @@ impl LinuxAbi for I386Abi {
     }
     fn ptr_bits(&self) -> u8 {
         32
+    }
+    fn stat_layout(&self) -> StatLayout {
+        // struct stat64 (asm/stat.h): total 96 bytes.
+        StatLayout {
+            size: 96,
+            mode_off: 16,
+            nlink_off: 20,
+            size_off: 44,
+            blksize_off: 52,
+            blocks_off: 56,
+        }
     }
 }
 
@@ -204,6 +255,17 @@ impl Amd64Abi {
             318 => Sysno::Getrandom,
             334 => Sysno::Ignored, // rseq — restartable sequences, ignore
             267 => Sysno::Readlinkat,
+            76 => Sysno::Truncate,
+            77 => Sysno::Ftruncate,
+            83 => Sysno::Mkdir,
+            84 => Sysno::Rmdir,
+            87 => Sysno::Unlink,
+            88 => Sysno::Symlink,
+            89 => Sysno::Readlink,
+            217 => Sysno::Getdents64,
+            258 => Sysno::Mkdirat,
+            263 => Sysno::Unlinkat,
+            266 => Sysno::Symlinkat,
             56 => Sysno::Clone,
             24 => Sysno::SchedYield,
             28 => Sysno::Ignored, // madvise — advisory, safe to no-op
@@ -239,6 +301,17 @@ impl LinuxAbi for Amd64Abi {
     fn ptr_bits(&self) -> u8 {
         64
     }
+    fn stat_layout(&self) -> StatLayout {
+        // struct stat (x86-64 asm/stat.h): total 144 bytes.
+        StatLayout {
+            size: 144,
+            mode_off: 24,
+            nlink_off: 16,
+            size_off: 48,
+            blksize_off: 56,
+            blocks_off: 64,
+        }
+    }
 }
 
 /// Linux/aarch64 ABI table (generic Linux syscall numbers). Inert until
@@ -268,6 +341,32 @@ mod tests {
         assert_eq!(abi.map_syscall(9999), None);
         abi.set_return(&mut cpu, -38);
         assert_eq!(cpu.regs.get32(Reg32::Eax), (-38i32) as u32);
+    }
+
+    #[test]
+    fn stat_layouts_match_known_struct_sizes() {
+        // The three ABIs report architecture-correct stat struct geometry.
+        let i386 = I386Abi.stat_layout();
+        assert_eq!((i386.size, i386.mode_off, i386.size_off), (96, 16, 44));
+        let amd64 = Amd64Abi.stat_layout();
+        assert_eq!((amd64.size, amd64.mode_off, amd64.size_off), (144, 24, 48));
+        let a64 = Aarch64Abi.stat_layout();
+        assert_eq!((a64.size, a64.mode_off, a64.size_off), (128, 16, 48));
+        // Every field must fit inside its struct (u64 fields need 8 bytes).
+        for l in [i386, amd64, a64] {
+            assert!(l.size_off + 8 <= l.size && l.blocks_off + 8 <= l.size);
+            assert!(l.mode_off + 4 <= l.size && l.nlink_off + 4 <= l.size);
+        }
+    }
+
+    #[test]
+    fn new_dir_syscall_numbers_map() {
+        assert_eq!(I386Abi.map_syscall(220), Some(Sysno::Getdents64));
+        assert_eq!(I386Abi.map_syscall(85), Some(Sysno::Readlink));
+        assert_eq!(Amd64Abi::map(217), Some(Sysno::Getdents64));
+        assert_eq!(Amd64Abi::map(83), Some(Sysno::Mkdir));
+        assert_eq!(Aarch64Abi::map(61), Some(Sysno::Getdents64));
+        assert_eq!(Aarch64Abi::map(35), Some(Sysno::Unlinkat));
     }
 
     #[test]
@@ -320,6 +419,12 @@ impl Aarch64Abi {
             278 => Sysno::Getrandom,
             261 => Sysno::Ignored, // prlimit64
             78 => Sysno::Readlinkat,
+            45 => Sysno::Truncate,
+            46 => Sysno::Ftruncate,
+            61 => Sysno::Getdents64,
+            34 => Sysno::Mkdirat,
+            35 => Sysno::Unlinkat,
+            36 => Sysno::Symlinkat,
             _ => return None,
         })
     }
@@ -349,5 +454,16 @@ impl LinuxAbi for Aarch64Abi {
     }
     fn ptr_bits(&self) -> u8 {
         64
+    }
+    fn stat_layout(&self) -> StatLayout {
+        // struct stat (arm64 asm-generic): total 128 bytes.
+        StatLayout {
+            size: 128,
+            mode_off: 16,
+            nlink_off: 20,
+            size_off: 48,
+            blksize_off: 56,
+            blocks_off: 64,
+        }
     }
 }

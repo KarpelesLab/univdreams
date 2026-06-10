@@ -342,6 +342,119 @@ impl MountTable {
         self.handles.contains_key(&handle) || self.root.owns(handle)
     }
 
+    // ---- path metadata + directory operations ---------------------------
+
+    /// Stat an absolute path, routing to the overlay that owns it (else the
+    /// in-memory root, which synthesises directories from stored paths).
+    #[must_use]
+    pub fn stat_path(&mut self, abs: &str) -> Option<Attrs> {
+        if let Some((i, rel)) = self.resolve(abs) {
+            return self.overlays[i].fs.stat(&rel);
+        }
+        let (is_dir, size) = self.root.stat_node(abs)?;
+        Some(Attrs {
+            kind: if is_dir {
+                NodeKind::Dir
+            } else {
+                NodeKind::File
+            },
+            size,
+            mode: if is_dir { 0o755 } else { 0o644 },
+            mtime: 0,
+        })
+    }
+
+    /// List the directory at an absolute path. For the root, overlay mount
+    /// points that sit directly under `abs` also appear (so `/` shows `proc`,
+    /// `dev`, …). Errors `ENOTDIR` if `abs` is a file.
+    pub fn readdir_path(&mut self, abs: &str) -> std::io::Result<Vec<DirEntry>> {
+        if let Some((i, rel)) = self.resolve(abs) {
+            let mut entries = self.overlays[i].fs.readdir(&rel)?;
+            // Backends differ on whether they list "." / ".."; drop them here so
+            // the caller (getdents64) owns those uniformly.
+            entries.retain(|e| e.name != "." && e.name != "..");
+            return Ok(entries);
+        }
+        let mut out = match self.root.readdir(abs) {
+            Some(children) => children
+                .into_iter()
+                .map(|(name, is_dir)| DirEntry {
+                    name,
+                    kind: if is_dir {
+                        NodeKind::Dir
+                    } else {
+                        NodeKind::File
+                    },
+                })
+                .collect::<Vec<_>>(),
+            None => return Err(std::io::Error::from_raw_os_error(20)), // ENOTDIR
+        };
+        // Surface overlay mount points whose parent directory is `abs`.
+        let parent = norm_abs(abs);
+        for m in &self.overlays {
+            if let Some((dir, base)) = m.point.rsplit_once('/') {
+                let dir = if dir.is_empty() { "/" } else { dir };
+                if dir == parent && !out.iter().any(|e| e.name == base) {
+                    out.push(DirEntry {
+                        name: base.to_string(),
+                        kind: NodeKind::Dir,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn mkdir_path(&mut self, abs: &str, mode: u32) -> std::io::Result<()> {
+        if let Some((i, rel)) = self.resolve(abs) {
+            return self.overlays[i].fs.mkdir(&rel, mode);
+        }
+        Ok(()) // root directories are implicit
+    }
+
+    pub fn unlink_path(&mut self, abs: &str) -> std::io::Result<()> {
+        if let Some((i, rel)) = self.resolve(abs) {
+            return self.overlays[i].fs.unlink(&rel);
+        }
+        if self.root.remove(abs) {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(2)) // ENOENT
+        }
+    }
+
+    pub fn rmdir_path(&mut self, abs: &str) -> std::io::Result<()> {
+        if let Some((i, rel)) = self.resolve(abs) {
+            return self.overlays[i].fs.rmdir(&rel);
+        }
+        Ok(()) // root directories are implicit; nothing to remove
+    }
+
+    pub fn symlink_path(&mut self, target: &str, abs: &str) -> std::io::Result<()> {
+        if let Some((i, rel)) = self.resolve(abs) {
+            return self.overlays[i].fs.symlink(target, &rel);
+        }
+        Err(read_only_err()) // the in-memory root has no symlink concept
+    }
+
+    pub fn readlink_path(&mut self, abs: &str) -> std::io::Result<String> {
+        if let Some((i, rel)) = self.resolve(abs) {
+            return self.overlays[i].fs.readlink(&rel);
+        }
+        Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)) // EINVAL: not a link
+    }
+
+    pub fn truncate_path(&mut self, abs: &str, len: u64) -> std::io::Result<()> {
+        if let Some((i, rel)) = self.resolve(abs) {
+            return self.overlays[i].fs.truncate(&rel, len);
+        }
+        if self.root.truncate(abs, len) {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(2)) // ENOENT
+        }
+    }
+
     /// Flush every overlay mount, committing buffered writeback to its backing
     /// store. Best-effort: the first error is returned but all mounts are still
     /// attempted. The in-memory root needs no flush.
@@ -444,6 +557,50 @@ mod tests {
         assert!(t.open("/dev/nope", FileAccess::Read).is_none());
         // Root path still goes to the in-memory VFS.
         assert!(t.open("/etc/x", FileAccess::Read).is_none());
+    }
+
+    #[test]
+    fn root_dir_synthesis_stat_and_readdir() {
+        let mut t = MountTable::new();
+        t.insert("/work/a.txt", b"hello".to_vec());
+        t.insert("/work/sub/c.txt", b"xyz".to_vec());
+        // A stored file stats as a regular file with its byte length.
+        let a = t.stat_path("/work/a.txt").expect("file stat");
+        assert!(matches!(a.kind, NodeKind::File));
+        assert_eq!(a.size, 5);
+        // A path beneath which files live synthesises as a directory.
+        let d = t.stat_path("/work").expect("dir stat");
+        assert!(matches!(d.kind, NodeKind::Dir));
+        // readdir lists the immediate children: a file and a synthesised dir.
+        let mut names: Vec<_> = t
+            .readdir_path("/work")
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, matches!(e.kind, NodeKind::Dir)))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![("a.txt".to_string(), false), ("sub".to_string(), true)]
+        );
+        // readdir on a file is ENOTDIR.
+        assert!(t.readdir_path("/work/a.txt").is_err());
+    }
+
+    #[test]
+    fn root_readdir_surfaces_overlay_mount_points() {
+        let mut t = MountTable::new();
+        t.mount("/dev", Box::new(crate::fsmount::devfs::DevFs::new()));
+        let names: Vec<_> = t
+            .readdir_path("/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "dev"),
+            "mount point listed: {names:?}"
+        );
     }
 
     #[test]

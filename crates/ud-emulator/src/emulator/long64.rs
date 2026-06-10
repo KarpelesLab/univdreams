@@ -13,6 +13,70 @@ use super::isa_int::{Cpu, StepOk};
 use super::mmu::Mmu;
 use super::Trap;
 
+/// SSE2 shift-by-imm8. `op` is the 0F second byte (`0x71` word lanes, `0x72`
+/// dword lanes, `0x73` qword lanes + whole-register byte shifts), `sub` the
+/// ModRM.reg sub-opcode selecting direction, `v` the 128-bit register value,
+/// `sh` the shift count.
+///
+/// - `0x73`/`3` PSRLDQ, `0x73`/`7` PSLLDQ shift the **whole** register by
+///   `sh` bytes.
+/// - sub `2` = logical right, `4` = arithmetic right, `6` = logical left,
+///   applied per lane. Shift counts ≥ lane width saturate (0 for logical, all
+///   sign bits for arithmetic).
+fn sse_shift_imm(op: u8, sub: u8, v: u128, sh: u32) -> u128 {
+    if op == 0x73 && sub == 3 {
+        return if sh >= 16 { 0 } else { v >> (sh * 8) };
+    }
+    if op == 0x73 && sub == 7 {
+        return if sh >= 16 { 0 } else { v << (sh * 8) };
+    }
+    let lane_bits: u32 = match op {
+        0x71 => 16,
+        0x72 => 32,
+        _ => 64,
+    };
+    let mask: u128 = (1u128 << lane_bits) - 1;
+    let mut out = 0u128;
+    let mut i = 0;
+    while i < 128 / lane_bits {
+        let lane = (v >> (i * lane_bits)) & mask;
+        let res: u128 = match sub {
+            2 => {
+                if sh >= lane_bits {
+                    0
+                } else {
+                    lane >> sh
+                }
+            }
+            4 => {
+                let s = sh.min(lane_bits - 1);
+                let shifted = lane >> s;
+                if (lane >> (lane_bits - 1)) & 1 == 1 {
+                    let fill = if s == 0 {
+                        0
+                    } else {
+                        (mask << (lane_bits - s)) & mask
+                    };
+                    (shifted | fill) & mask
+                } else {
+                    shifted
+                }
+            }
+            6 => {
+                if sh >= lane_bits {
+                    0
+                } else {
+                    (lane << sh) & mask
+                }
+            }
+            _ => lane, // sub-op with no SSE2 meaning: leave the lane unchanged
+        };
+        out |= (res & mask) << (i * lane_bits);
+        i += 1;
+    }
+    out
+}
+
 /// A decoded operand: a register (index 0..15) or a resolved linear
 /// memory address.
 #[derive(Clone, Copy, Debug)]
@@ -555,6 +619,15 @@ impl Cpu {
 
             // ---- misc ----
             0x90 => Ok(StepOk::Continued), // NOP (also XCHG eax,eax)
+            0x91..=0x97 => {
+                // XCHG rAX, reg (reg = low 3 bits, REX.B extends).
+                let r = (p.b() << 3) | (op - 0x90);
+                let a = self.rget(0, osz, rex);
+                let b = self.rget(r, osz, rex);
+                self.rset(0, osz, rex, b);
+                self.rset(r, osz, rex, a);
+                Ok(StepOk::Continued)
+            }
             0x98 => {
                 // CWDE / CDQE (REX.W): sign-extend al->ax / eax->rax
                 let v = if osz == 8 {
@@ -893,6 +966,18 @@ impl Cpu {
                     out[i * 4..i * 4 + 4].copy_from_slice(&lanes[sel * 4..sel * 4 + 4]);
                 }
                 self.xmm[reg as usize] = u128::from_le_bytes(out);
+                Ok(StepOk::Continued)
+            }
+            0x71 | 0x72 | 0x73 => {
+                // SSE2 shift-by-imm8 groups (PSRLW/PSRAW/PSLLW, PSRLD/PSRAD/
+                // PSLLD, PSRLQ/PSRLDQ/PSLLQ/PSLLDQ). ModRM.reg selects the
+                // operation; the r/m xmm operand is shifted in place. glibc's
+                // SSE2 string/mem routines lean on PSRLDQ/PSLLDQ heavily.
+                let (sub, rm) = self.modrm(mmu, p, 1)?;
+                let imm = u32::from(self.fetch8(mmu)?);
+                let v = self.xmm_rm(rm, mmu)?;
+                let out = sse_shift_imm(op, sub, v, imm);
+                self.set_xmm_rm(rm, out, mmu)?;
                 Ok(StepOk::Continued)
             }
             0x80..=0x8F => {
@@ -1641,4 +1726,51 @@ fn sub(a: u64, b: u64, size: u8, borrow: bool) -> (u64, bool, bool) {
 /// `alu` helper expects (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP).
 fn grp1(ext: u8) -> u8 {
     (ext & 7) << 3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sse_shift_imm;
+
+    #[test]
+    fn psrldq_pslldq_shift_whole_register_by_bytes() {
+        let v = 0x0F0E_0D0C_0B0A_0908_0706_0504_0302_0100u128;
+        // PSRLDQ (0x73 /3): >> 1 byte.
+        assert_eq!(sse_shift_imm(0x73, 3, v, 1), v >> 8);
+        // PSLLDQ (0x73 /7): << 2 bytes.
+        assert_eq!(sse_shift_imm(0x73, 7, v, 2), v << 16);
+        // Count >= 16 clears the register.
+        assert_eq!(sse_shift_imm(0x73, 3, v, 16), 0);
+        assert_eq!(sse_shift_imm(0x73, 7, v, 99), 0);
+    }
+
+    #[test]
+    fn per_lane_logical_and_arithmetic_shifts() {
+        // PSRLW (0x71 /2): each 16-bit lane >> 4.
+        let w = 0x8000_8000_8000_8000_8000_8000_8000_8000u128;
+        assert_eq!(sse_shift_imm(0x71, 2, w, 4), 0x0800u128 * lane_rep16());
+        // PSRAW (0x71 /4): arithmetic >> keeps the sign bit.
+        assert_eq!(sse_shift_imm(0x71, 4, w, 4), 0xF800u128 * lane_rep16());
+        // PSLLD (0x72 /6): each 32-bit lane << 8.
+        let d = 0x0000_00FF_0000_00FF_0000_00FF_0000_00FFu128;
+        assert_eq!(sse_shift_imm(0x72, 6, d, 8), 0x0000_FF00u128 * lane_rep32());
+        // Over-wide logical shift zeroes the lanes.
+        assert_eq!(sse_shift_imm(0x71, 2, w, 16), 0);
+    }
+
+    fn lane_rep16() -> u128 {
+        // 0x0001 in each of the eight 16-bit lanes.
+        let mut x = 0u128;
+        for i in 0..8 {
+            x |= 1u128 << (i * 16);
+        }
+        x
+    }
+    fn lane_rep32() -> u128 {
+        let mut x = 0u128;
+        for i in 0..4 {
+            x |= 1u128 << (i * 32);
+        }
+        x
+    }
 }

@@ -16,6 +16,14 @@ use ud_emulator::Sandbox;
 /// Compile `src` with `gcc -static -O2`. Returns the ELF bytes, or `None`
 /// (with a printed reason) if the toolchain can't produce a static binary.
 fn compile_static(src: &str, name: &str) -> Option<Vec<u8>> {
+    compile_static_opt(src, name, "-O2")
+}
+
+/// Like [`compile_static`] but at a caller-chosen optimisation level. `-O0`
+/// is useful for tests that only need to exercise syscalls and shouldn't ride
+/// on the interpreter's SSE2-string codegen coverage (some `-O2` glibc tails
+/// reach byte-shift opcodes the software CPU doesn't model yet).
+fn compile_static_opt(src: &str, name: &str, opt: &str) -> Option<Vec<u8>> {
     // Work inside cargo's per-test temp area.
     let dir = std::env::temp_dir().join(format!("ud_glibc_{name}_{}", std::process::id()));
     if std::fs::create_dir_all(&dir).is_err() {
@@ -27,7 +35,7 @@ fn compile_static(src: &str, name: &str) -> Option<Vec<u8>> {
         return None;
     }
     let out = Command::new("gcc")
-        .args(["-static", "-O2", "-o"])
+        .args(["-static", opt, "-o"])
         .arg(&ofile)
         .arg(&cfile)
         .output();
@@ -89,6 +97,52 @@ fn static_glibc_reads_proc_and_dev() {
         "/proc + /dev served"
     );
     assert_eq!(exit, 0);
+}
+
+#[test]
+fn static_glibc_dir_syscalls_mkdir_stat_getdents() {
+    // Exercise the directory-aware syscalls against the in-memory root:
+    // mkdir, O_CREAT writes, real stat (size + S_ISREG), and getdents64 via
+    // opendir/readdir. Empty dirs aren't materialised in the flat namespace,
+    // so the created files (not the empty subdir) are what readdir reports.
+    let src = r#"
+        #include <stdio.h>
+        #include <dirent.h>
+        #include <sys/stat.h>
+        #include <fcntl.h>
+        #include <unistd.h>
+        #include <string.h>
+        int main(void) {
+            mkdir("/work", 0755);
+            int fd = open("/work/a.txt", O_RDWR | O_CREAT, 0644);
+            write(fd, "hello", 5); close(fd);
+            fd = open("/work/b.txt", O_RDWR | O_CREAT, 0644);
+            write(fd, "world!!", 7); close(fd);
+            struct stat st;
+            int sok = stat("/work/b.txt", &st) == 0;
+            DIR *d = opendir("/work");
+            int n = 0, saw_a = 0, saw_b = 0;
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d))) {
+                    n++;
+                    if (!strcmp(e->d_name, "a.txt")) saw_a = 1;
+                    if (!strcmp(e->d_name, "b.txt")) saw_b = 1;
+                }
+                closedir(d);
+            }
+            printf("size=%lld reg=%d n=%d a=%d b=%d\n",
+                   (long long)st.st_size, sok && S_ISREG(st.st_mode), n, saw_a, saw_b);
+            return 0;
+        }
+    "#;
+    let Some(elf) = compile_static_opt(src, "dirsys", "-O0") else {
+        return;
+    };
+    let (stdout, exit) = run(&elf);
+    // size=7 (b.txt), reg=1 (regular file), n=4 (. .. a.txt b.txt), both seen.
+    assert_eq!(stdout, "size=7 reg=1 n=4 a=1 b=1\n", "dir syscalls");
+    assert_eq!(exit, 0, "exit code");
 }
 
 #[test]

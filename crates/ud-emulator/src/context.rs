@@ -293,6 +293,78 @@ impl VirtualFs {
     pub fn owns(&self, handle: u32) -> bool {
         self.open.contains_key(&handle)
     }
+
+    /// Directory-aware stat over the flat namespace. Returns `(is_dir, size)`
+    /// for a path that is a stored file, or a *synthesised* directory (the
+    /// root, or any prefix beneath which a stored file lives). `None` if no
+    /// file or directory matches.
+    #[must_use]
+    pub fn stat_node(&self, path: &str) -> Option<(bool, u64)> {
+        let key = normalize_path(path);
+        if let Some(bytes) = self.files.get(&key) {
+            return Some((false, bytes.len() as u64));
+        }
+        if key.is_empty() || key == "/" {
+            return Some((true, 0));
+        }
+        let prefix = format!("{key}/");
+        if self.files.keys().any(|k| k.starts_with(&prefix)) {
+            return Some((true, 0));
+        }
+        None
+    }
+
+    /// List the immediate children of directory `path` as `(name, is_dir)`,
+    /// synthesising intermediate directories from stored paths. Returns `None`
+    /// if `path` names a stored file (not a directory).
+    #[must_use]
+    pub fn readdir(&self, path: &str) -> Option<Vec<(String, bool)>> {
+        let key = normalize_path(path);
+        if self.files.contains_key(&key) {
+            return None; // it is a file, not a directory
+        }
+        let prefix = if key.is_empty() || key == "/" {
+            String::new()
+        } else {
+            format!("{key}/")
+        };
+        let mut children: BTreeMap<String, bool> = BTreeMap::new();
+        for k in self.files.keys() {
+            let rest = if prefix.is_empty() {
+                k.trim_start_matches('/')
+            } else if let Some(r) = k.strip_prefix(&prefix) {
+                r
+            } else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            match rest.split_once('/') {
+                // A deeper path: the first segment is a subdirectory.
+                Some((seg, _)) => {
+                    children.entry(seg.to_string()).or_insert(true);
+                }
+                // A leaf: a regular file. A file shadows a same-named synth dir.
+                None => {
+                    children.insert(rest.to_string(), false);
+                }
+            }
+        }
+        Some(children.into_iter().collect())
+    }
+
+    /// Resize the file at `path` to `len` bytes (zero-extending a grow,
+    /// dropping the tail on a shrink). Returns `false` if no such file.
+    pub fn truncate(&mut self, path: &str, len: u64) -> bool {
+        match self.files.get_mut(&normalize_path(path)) {
+            Some(b) => {
+                b.resize(len as usize, 0);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Normalise a Windows-style path for case-insensitive lookup.

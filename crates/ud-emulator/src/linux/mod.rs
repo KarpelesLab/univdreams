@@ -21,9 +21,9 @@ use std::collections::BTreeMap;
 
 use crate::context::FileAccess;
 use crate::emulator::Perm;
-use crate::fsmount::MountTable;
+use crate::fsmount::{MountTable, NodeKind};
 
-use abi::{LinuxAbi, Sysno};
+use abi::{LinuxAbi, StatLayout, Sysno};
 use guest::GuestCpu;
 use mem::GuestMem;
 
@@ -34,6 +34,8 @@ const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
 const ENOTTY: i64 = -25;
 const ENOSYS: i64 = -38;
+const ENOTDIR: i64 = -20;
+const EISDIR: i64 = -21;
 
 /// A page size for `brk` / `mmap` rounding.
 const PAGE: u32 = 0x1000;
@@ -47,8 +49,18 @@ enum Fd {
     Stdin,
     Stdout,
     Stderr,
-    /// A table-minted file handle (`MountTable`).
-    Vfs(u32),
+    /// A table-minted file handle (`MountTable`), plus the normalised path it
+    /// was opened on (for `fstat` / `ftruncate`).
+    Vfs {
+        h: u32,
+        path: String,
+    },
+    /// An open directory: its normalised path and the `getdents64` cursor (the
+    /// index of the next entry to emit).
+    Dir {
+        path: String,
+        pos: usize,
+    },
 }
 
 /// The arch-agnostic Linux kernel engine: process memory bookkeeping, the
@@ -125,7 +137,7 @@ impl LinuxKernel {
             abi.set_return(cpu, 0);
             return;
         }
-        let ret = self.run(sys, &a, mmu, vfs);
+        let ret = self.run(sys, &a, mmu, vfs, abi.stat_layout());
         if trace {
             eprintln!(
                 "syscall {sys:?}({:#x}, {:#x}, {:#x}) = {ret:#x}",
@@ -142,6 +154,7 @@ impl LinuxKernel {
         a: &[u64; 6],
         mmu: &mut dyn GuestMem,
         vfs: &mut MountTable,
+        stat_layout: StatLayout,
     ) -> i64 {
         let (a0, a1, a2) = (a[0] as u32, a[1] as u32, a[2] as u32);
         match sys {
@@ -160,7 +173,22 @@ impl LinuxKernel {
                 self.exit_code = Some(a0 as i32);
                 0
             }
-            Sysno::Fstat | Sysno::Stat | Sysno::Newfstatat => self.sys_stat_zero(sys, a, mmu),
+            Sysno::Fstat | Sysno::Stat | Sysno::Newfstatat => {
+                self.sys_stat(sys, a, mmu, vfs, stat_layout)
+            }
+            Sysno::Getdents64 => self.sys_getdents64(a0 as i32, a1, a2, mmu, vfs),
+            Sysno::Mkdir => self.sys_mkdir(a0, mmu, vfs),
+            Sysno::Mkdirat => self.sys_mkdir(a1, mmu, vfs), // ignore dirfd; absolute paths
+            Sysno::Unlink => self.sys_unlink(a0, false, mmu, vfs),
+            Sysno::Rmdir => self.sys_unlink(a0, true, mmu, vfs),
+            // unlinkat(dirfd, path, flags); AT_REMOVEDIR = 0x200.
+            Sysno::Unlinkat => self.sys_unlink(a1, a2 & 0x200 != 0, mmu, vfs),
+            Sysno::Symlink => self.sys_symlink(a0, a1, mmu, vfs), // symlink(target, linkpath)
+            Sysno::Symlinkat => self.sys_symlink(a0, a2, mmu, vfs), // symlinkat(target, dirfd, link)
+            Sysno::Truncate => self.sys_truncate(a0, a[1], mmu, vfs),
+            Sysno::Ftruncate => self.sys_ftruncate(a0 as i32, a[1], vfs),
+            Sysno::Readlink => self.sys_readlinkat(a0, a1, a2, mmu, vfs),
+            Sysno::Readlinkat => self.sys_readlinkat(a1, a2, a[3] as u32, mmu, vfs),
             Sysno::Uname => self.sys_uname(a0, mmu),
             Sysno::Getpid => 1,
             Sysno::Gettid => i64::from(self.current_tid),
@@ -171,7 +199,6 @@ impl LinuxKernel {
             Sysno::Gettimeofday => self.sys_gettimeofday(a0, mmu),
             Sysno::Futex => 0, // uncontended: report success
             Sysno::Getrandom => self.sys_getrandom(a0, a1, mmu),
-            Sysno::Readlinkat => ENOENT, // no symlinks in the VFS
             Sysno::SchedYield => 0,
             // clone/futex are serviced by the amd64 thread scheduler; on the
             // single-threaded paths they degrade to "no threads".
@@ -214,8 +241,8 @@ impl LinuxKernel {
                 self.stderr.extend_from_slice(&data);
                 data.len() as i64
             }
-            Some(Fd::Vfs(h)) => vfs.write_handle(*h, &data).map_or(EBADF, |n| n as i64),
-            Some(Fd::Stdin) | None => EBADF,
+            Some(Fd::Vfs { h, .. }) => vfs.write_handle(*h, &data).map_or(EBADF, |n| n as i64),
+            Some(Fd::Stdin) | Some(Fd::Dir { .. }) | None => EBADF,
         }
     }
 
@@ -252,7 +279,7 @@ impl LinuxKernel {
     ) -> i64 {
         match self.fds.get(&fd) {
             Some(Fd::Stdin) => 0, // EOF — no stdin
-            Some(Fd::Vfs(h)) => {
+            Some(Fd::Vfs { h, .. }) => {
                 let mut tmp = vec![0u8; len as usize];
                 let n = vfs.read_handle(*h, &mut tmp).unwrap_or(0);
                 if write_mem(mmu, buf, &tmp[..n]).is_none() {
@@ -260,6 +287,8 @@ impl LinuxKernel {
                 }
                 n as i64
             }
+            // read() on a directory fd is EISDIR; the std streams are EBADF.
+            Some(Fd::Dir { .. }) => -21,
             Some(Fd::Stdout) | Some(Fd::Stderr) | None => EBADF,
         }
     }
@@ -274,6 +303,18 @@ impl LinuxKernel {
             1 => FileAccess::Write,
             _ => FileAccess::ReadWrite,
         };
+        // A directory open (explicit O_DIRECTORY=0x10000, or the path simply is
+        // one) gets a dir fd that serves getdents64 rather than a file handle.
+        let is_dir = flags & 0x1_0000 != 0
+            || vfs
+                .stat_path(&p)
+                .is_some_and(|att| matches!(att.kind, NodeKind::Dir));
+        if is_dir {
+            let fd = self.next_fd;
+            self.next_fd += 1;
+            self.fds.insert(fd, Fd::Dir { path: p, pos: 0 });
+            return i64::from(fd);
+        }
         if flags & 0x40 != 0 {
             vfs.write_path(&p, Vec::new()); // O_CREAT: ensure it exists
         }
@@ -281,7 +322,7 @@ impl LinuxKernel {
             Some(h) => {
                 let fd = self.next_fd;
                 self.next_fd += 1;
-                self.fds.insert(fd, Fd::Vfs(h));
+                self.fds.insert(fd, Fd::Vfs { h, path: p });
                 i64::from(fd)
             }
             None => ENOENT,
@@ -290,18 +331,18 @@ impl LinuxKernel {
 
     fn sys_close(&mut self, fd: i32, vfs: &mut MountTable) -> i64 {
         match self.fds.remove(&fd) {
-            Some(Fd::Vfs(h)) => {
+            Some(Fd::Vfs { h, .. }) => {
                 vfs.close(h);
                 0
             }
-            Some(_) => 0, // closing a std stream: accept
+            Some(_) => 0, // closing a std stream or dir fd: accept
             None => EBADF,
         }
     }
 
     fn sys_lseek(&mut self, fd: i32, off: i32, whence: u32, vfs: &mut MountTable) -> i64 {
         match self.fds.get(&fd) {
-            Some(Fd::Vfs(h)) => vfs
+            Some(Fd::Vfs { h, .. }) => vfs
                 .seek_handle(*h, off, whence as u8)
                 .map_or(EINVAL, |p| p as i64),
             _ => EINVAL,
@@ -435,21 +476,250 @@ impl LinuxKernel {
         i64::from(len)
     }
 
-    fn sys_stat_zero(&self, sys: Sysno, a: &[u64; 6], mmu: &mut dyn GuestMem) -> i64 {
-        // Fill the caller's stat buffer with zeros and report success.
-        // A zeroed stat reads as st_size=0, st_mode=0 — enough for libc's
-        // buffering decision not to crash. Buffer pointer position differs
-        // by syscall: fstat(fd, buf); stat(path, buf); newfstatat(dirfd,
-        // path, buf, flags).
-        let buf = match sys {
-            Sysno::Newfstatat => a[2] as u32,
-            _ => a[1] as u32,
+    /// `stat` / `fstat` / `newfstatat`: fill the caller's arch-specific stat
+    /// buffer with the file's real kind + size. Buffer + subject differ by
+    /// syscall: fstat(fd, buf); stat(path, buf); newfstatat(dirfd, path, buf,
+    /// flags).
+    fn sys_stat(
+        &self,
+        sys: Sysno,
+        a: &[u64; 6],
+        mmu: &mut dyn GuestMem,
+        vfs: &mut MountTable,
+        layout: StatLayout,
+    ) -> i64 {
+        // Resolve the subject and the destination buffer pointer.
+        let (kind, size, buf) = match sys {
+            Sysno::Fstat => {
+                let buf = a[1] as u32;
+                match self.fds.get(&(a[0] as i32)) {
+                    // A char-device stat for the std streams keeps isatty()/
+                    // libc buffering happy.
+                    Some(Fd::Stdin | Fd::Stdout | Fd::Stderr) => (NodeKind::CharDevice, 0, buf),
+                    Some(Fd::Vfs { path, .. }) => {
+                        let att = vfs.stat_path(path);
+                        (
+                            att.map_or(NodeKind::File, |x| x.kind),
+                            att.map_or(0, |x| x.size),
+                            buf,
+                        )
+                    }
+                    Some(Fd::Dir { path, .. }) => {
+                        let path = path.clone();
+                        (
+                            NodeKind::Dir,
+                            vfs.stat_path(&path).map_or(0, |x| x.size),
+                            buf,
+                        )
+                    }
+                    None => return EBADF,
+                }
+            }
+            sys => {
+                // stat(path, buf) | newfstatat(dirfd, path, buf, flags)
+                let (path_ptr, buf) = if sys == Sysno::Newfstatat {
+                    (a[1] as u32, a[2] as u32)
+                } else {
+                    (a[0] as u32, a[1] as u32)
+                };
+                let Some(p) = read_cstr(mmu, path_ptr, 4096) else {
+                    return EFAULT;
+                };
+                match vfs.stat_path(&p) {
+                    Some(att) => (att.kind, att.size, buf),
+                    None => return ENOENT,
+                }
+            }
         };
-        let zero = [0u8; 144];
-        if write_mem(mmu, buf, &zero).is_none() {
+        self.write_stat(buf, kind, size, layout, mmu)
+    }
+
+    /// Serialise a stat struct (zeros except the fields we model) per `layout`.
+    fn write_stat(
+        &self,
+        buf: u32,
+        kind: NodeKind,
+        size: u64,
+        layout: StatLayout,
+        mmu: &mut dyn GuestMem,
+    ) -> i64 {
+        // S_IF* type bits | a plausible permission set.
+        let mode: u32 = match kind {
+            NodeKind::Dir => 0o040_755,
+            NodeKind::Symlink => 0o120_777,
+            NodeKind::CharDevice => 0o020_666,
+            NodeKind::File => 0o100_644,
+        };
+        let mut b = vec![0u8; layout.size];
+        let put32 = |b: &mut [u8], off: usize, v: u32| {
+            b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let put64 = |b: &mut [u8], off: usize, v: u64| {
+            b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        put32(&mut b, layout.mode_off, mode);
+        put32(&mut b, layout.nlink_off, 1);
+        put64(&mut b, layout.size_off, size);
+        put32(&mut b, layout.blksize_off, 512);
+        put64(&mut b, layout.blocks_off, size.div_ceil(512));
+        if write_mem(mmu, buf, &b).is_none() {
             return EFAULT;
         }
         0
+    }
+
+    /// `getdents64(fd, dirp, count)`: emit `linux_dirent64` records for the
+    /// open directory's entries (plus `.`/`..`), resuming from the fd's cursor.
+    fn sys_getdents64(
+        &mut self,
+        fd: i32,
+        dirp: u32,
+        count: u32,
+        mmu: &mut dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let Some(Fd::Dir { path, pos }) = self.fds.get(&fd) else {
+            return ENOTDIR;
+        };
+        let (path, start) = (path.clone(), *pos);
+        let entries = match vfs.readdir_path(&path) {
+            Ok(e) => e,
+            Err(_) => return ENOTDIR,
+        };
+        // `.` and `..` lead, then the directory's own entries.
+        let mut all: Vec<(String, NodeKind)> = vec![
+            (".".to_string(), NodeKind::Dir),
+            ("..".to_string(), NodeKind::Dir),
+        ];
+        all.extend(entries.into_iter().map(|e| (e.name, e.kind)));
+
+        let mut off = 0u32;
+        let mut idx = start;
+        while idx < all.len() {
+            let (name, kind) = &all[idx];
+            let namelen = name.len() + 1; // include trailing NUL
+            let reclen = (((19 + namelen) + 7) & !7) as u32; // align8(d_ino..d_name + NUL)
+            if off + reclen > count {
+                break;
+            }
+            let rec_base = dirp.wrapping_add(off);
+            let d_type: u8 = match kind {
+                NodeKind::Dir => 4,
+                NodeKind::CharDevice => 2,
+                NodeKind::Symlink => 10,
+                NodeKind::File => 8,
+            };
+            // d_ino (8) | d_off (8) | d_reclen (2) | d_type (1) | name | NUL
+            let mut rec = Vec::with_capacity(reclen as usize);
+            rec.extend_from_slice(&((idx as u64) + 1).to_le_bytes());
+            rec.extend_from_slice(&((idx as u64) + 1).to_le_bytes());
+            rec.extend_from_slice(&(reclen as u16).to_le_bytes());
+            rec.push(d_type);
+            rec.extend_from_slice(name.as_bytes());
+            rec.resize(reclen as usize, 0); // NUL + alignment padding
+            if write_mem(mmu, rec_base, &rec).is_none() {
+                return EFAULT;
+            }
+            off += reclen;
+            idx += 1;
+        }
+        // No progress on a non-empty request → the buffer is too small.
+        if off == 0 && start < all.len() {
+            return EINVAL;
+        }
+        if let Some(Fd::Dir { pos, .. }) = self.fds.get_mut(&fd) {
+            *pos = idx;
+        }
+        i64::from(off)
+    }
+
+    fn sys_mkdir(&mut self, path: u32, mmu: &dyn GuestMem, vfs: &mut MountTable) -> i64 {
+        let Some(p) = read_cstr(mmu, path, 4096) else {
+            return EFAULT;
+        };
+        vfs.mkdir_path(&p, 0o755).map_or(EINVAL, |()| 0)
+    }
+
+    fn sys_unlink(
+        &mut self,
+        path: u32,
+        is_rmdir: bool,
+        mmu: &dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let Some(p) = read_cstr(mmu, path, 4096) else {
+            return EFAULT;
+        };
+        let r = if is_rmdir {
+            vfs.rmdir_path(&p)
+        } else {
+            vfs.unlink_path(&p)
+        };
+        r.map_or(ENOENT, |()| 0)
+    }
+
+    fn sys_symlink(
+        &mut self,
+        target: u32,
+        linkpath: u32,
+        mmu: &dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let (Some(t), Some(l)) = (read_cstr(mmu, target, 4096), read_cstr(mmu, linkpath, 4096))
+        else {
+            return EFAULT;
+        };
+        vfs.symlink_path(&t, &l).map_or(EINVAL, |()| 0)
+    }
+
+    fn sys_truncate(
+        &mut self,
+        path: u32,
+        len: u64,
+        mmu: &dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let Some(p) = read_cstr(mmu, path, 4096) else {
+            return EFAULT;
+        };
+        vfs.truncate_path(&p, len).map_or(ENOENT, |()| 0)
+    }
+
+    fn sys_ftruncate(&mut self, fd: i32, len: u64, vfs: &mut MountTable) -> i64 {
+        match self.fds.get(&fd) {
+            Some(Fd::Vfs { path, .. }) => {
+                let path = path.clone();
+                vfs.truncate_path(&path, len).map_or(EINVAL, |()| 0)
+            }
+            Some(Fd::Dir { .. }) => EISDIR,
+            _ => EBADF,
+        }
+    }
+
+    /// `readlink(path, buf, size)` / `readlinkat(dirfd, path, buf, size)`:
+    /// resolve a symlink (overlay-backed) into the caller's buffer.
+    fn sys_readlinkat(
+        &self,
+        path: u32,
+        buf: u32,
+        size: u32,
+        mmu: &mut dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let Some(p) = read_cstr(mmu, path, 4096) else {
+            return EFAULT;
+        };
+        let target = match vfs.readlink_path(&p) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => return EINVAL,
+            Err(_) => return ENOENT,
+        };
+        let bytes = target.as_bytes();
+        let n = bytes.len().min(size as usize);
+        if write_mem(mmu, buf, &bytes[..n]).is_none() {
+            return EFAULT;
+        }
+        n as i64
     }
 }
 
