@@ -294,8 +294,9 @@ pub fn run(
     let mut mem = KvmMem::new(MEM_SIZE as usize)?;
     let argv = [name];
     let envp: [&str; 0] = [];
-    let image =
-        loader::load_static(&mut mem, bytes, &argv, &envp).map_err(|e| format!("ELF load: {e}"))?;
+    // Dynamic binaries read their interpreter from the guest rootfs (`vfs`).
+    let image = loader::load_elf(&mut mem, Some(vfs), bytes, &argv, &envp)
+        .map_err(|e| format!("ELF load: {e}"))?;
     kernel.init(image.brk);
 
     build_page_tables(&mut mem);

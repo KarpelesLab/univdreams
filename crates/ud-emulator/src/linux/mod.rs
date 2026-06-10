@@ -90,6 +90,24 @@ pub struct LinuxKernel {
     /// TID of the thread currently being serviced (the amd64 scheduler sets
     /// this before each dispatch; `gettid` returns it). `1` = main thread.
     pub current_tid: i32,
+    /// Active file-backed mappings, for `MAP_SHARED` writeback on
+    /// `munmap`/`msync`.
+    file_maps: Vec<FileMapping>,
+}
+
+/// A file-backed `mmap` region we may need to flush back to the file.
+#[derive(Debug, Clone)]
+struct FileMapping {
+    base: u32,
+    len: u32,
+    /// Mount path the bytes came from.
+    path: String,
+    /// File offset the mapping starts at.
+    offset: u64,
+    /// Bytes that were actually backed by file content (the rest is BSS).
+    file_len: u32,
+    /// `MAP_SHARED` and writable → changes flush back to the file.
+    writeback: bool,
 }
 
 impl LinuxKernel {
@@ -166,9 +184,18 @@ impl LinuxKernel {
             Sysno::Close => self.sys_close(a0 as i32, vfs),
             Sysno::Lseek => self.sys_lseek(a0 as i32, a1 as i32, a2, vfs),
             Sysno::Brk => self.sys_brk(a0, mmu),
-            Sysno::Mmap => self.sys_mmap(a0, a1, a[3] as u32, a[4] as i32, mmu),
-            Sysno::Munmap => 0, // accept; we never reclaim the bump arena
-            Sysno::Mprotect => 0,
+            // mmap(addr, len, prot, flags, fd, offset). i386 uses mmap2 whose
+            // offset is in pages; amd64 mmap's is in bytes.
+            Sysno::Mmap => {
+                let off = if self.ptr64 {
+                    a[5]
+                } else {
+                    a[5].wrapping_mul(u64::from(PAGE))
+                };
+                self.sys_mmap(a0, a1, a2, a[3] as u32, a[4] as i32, off, mmu, vfs)
+            }
+            Sysno::Munmap => self.sys_munmap(a0, a1, mmu, vfs),
+            Sysno::Mprotect => self.sys_mprotect(a0, a1, a2, mmu),
             Sysno::Exit | Sysno::ExitGroup => {
                 self.exit_code = Some(a0 as i32);
                 0
@@ -369,27 +396,110 @@ impl LinuxKernel {
         i64::from(self.brk)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sys_mmap(
         &mut self,
-        _addr: u32,
+        addr: u32,
         len: u32,
+        prot: u32,
         flags: u32,
         fd: i32,
+        offset: u64,
         mmu: &mut dyn GuestMem,
+        vfs: &mut MountTable,
     ) -> i64 {
-        // MAP_ANONYMOUS = 0x20. We only serve anonymous mappings from a
-        // bump arena; file-backed mmap (fd >= 0) is not modelled yet.
-        if fd >= 0 && flags & 0x20 == 0 {
-            return ENOSYS;
-        }
+        const MAP_SHARED: u32 = 0x1;
+        const MAP_FIXED: u32 = 0x10;
+        const MAP_ANONYMOUS: u32 = 0x20;
         let size = page_up(len.max(1));
-        let base = self.mmap_top;
-        if base.checked_add(size).is_none_or(|end| end > MMAP_LIMIT) {
-            return -12; // ENOMEM
+
+        // Pick the base address: MAP_FIXED honors the request; otherwise grow
+        // the bump arena.
+        let base = if flags & MAP_FIXED != 0 {
+            addr & !(PAGE - 1)
+        } else {
+            let b = self.mmap_top;
+            if b.checked_add(size).is_none_or(|end| end > MMAP_LIMIT) {
+                return -12; // ENOMEM
+            }
+            self.mmap_top = b.wrapping_add(size);
+            b
+        };
+
+        if flags & MAP_ANONYMOUS != 0 || fd < 0 {
+            // Anonymous: stays RWX (permissive) so JIT/stack/heap all work.
+            mmu.map(base, size, Perm::R | Perm::W | Perm::X);
+            return i64::from(base);
         }
-        mmu.map(base, size, Perm::R | Perm::W | Perm::X);
-        self.mmap_top = base.wrapping_add(size);
+
+        // File-backed: populate the region from the fd's file, then enforce
+        // the requested protection.
+        let path = match self.fds.get(&fd) {
+            Some(Fd::Vfs { path, .. }) => path.clone(),
+            _ => return EBADF,
+        };
+        // Map writable to populate, then read [offset, offset+len) from the file.
+        mmu.map(base, size, Perm::R | Perm::W);
+        let data = read_file_region(vfs, &path, offset, len as usize);
+        let file_len = data.len() as u32;
+        if write_mem(mmu, base, &data).is_none() {
+            return EFAULT;
+        }
+        // Enforce the requested perms (text segments become R-X, etc.).
+        mmu.map(base, size, prot_to_perm(prot));
+
+        let writeback = (flags & MAP_SHARED != 0) && (prot & 0x2 != 0); // PROT_WRITE
+        self.file_maps.push(FileMapping {
+            base,
+            len: size,
+            path,
+            offset,
+            file_len,
+            writeback,
+        });
         i64::from(base)
+    }
+
+    fn sys_munmap(&mut self, addr: u32, len: u32, mmu: &dyn GuestMem, vfs: &mut MountTable) -> i64 {
+        let end = addr.wrapping_add(page_up(len));
+        // Flush + drop any file mapping that overlaps [addr, end).
+        let overlapping: Vec<FileMapping> = self
+            .file_maps
+            .iter()
+            .filter(|m| m.base < end && m.base.wrapping_add(m.len) > addr)
+            .cloned()
+            .collect();
+        for m in &overlapping {
+            self.flush_file_mapping(m, mmu, vfs);
+        }
+        self.file_maps
+            .retain(|m| !(m.base < end && m.base.wrapping_add(m.len) > addr));
+        // We don't reclaim the address range itself (bump arena), which is a
+        // benign leak for our short-lived guests.
+        0
+    }
+
+    fn sys_mprotect(&mut self, addr: u32, len: u32, prot: u32, mmu: &mut dyn GuestMem) -> i64 {
+        let start = addr & !(PAGE - 1);
+        let size = page_up(addr.wrapping_add(len)).wrapping_sub(start);
+        mmu.map(start, size, prot_to_perm(prot));
+        0
+    }
+
+    /// Write a `MAP_SHARED` mapping's current bytes back to its file (only the
+    /// file-backed prefix, never the BSS tail).
+    fn flush_file_mapping(&self, m: &FileMapping, mmu: &dyn GuestMem, vfs: &mut MountTable) {
+        if !m.writeback || m.file_len == 0 {
+            return;
+        }
+        let Some(bytes) = read_mem(mmu, m.base, m.file_len as usize) else {
+            return;
+        };
+        if let Some(h) = vfs.open(&m.path, FileAccess::ReadWrite) {
+            vfs.seek(h, m.offset);
+            let _ = vfs.write_handle(h, &bytes);
+            vfs.close(h);
+        }
     }
 
     // ---- info ------------------------------------------------------------
@@ -754,4 +864,39 @@ fn read_cstr(mmu: &dyn GuestMem, addr: u32, max: usize) -> Option<String> {
 
 const fn page_up(addr: u32) -> u32 {
     addr.wrapping_add(PAGE - 1) & !(PAGE - 1)
+}
+
+/// Map mmap `PROT_*` bits (READ=1, WRITE=2, EXEC=4) to MMU [`Perm`]. A
+/// `PROT_NONE` mapping still gets `R` so the guest can fault-free probe it
+/// (we don't model `PROT_NONE` guard pages).
+fn prot_to_perm(prot: u32) -> Perm {
+    let mut p = Perm::R;
+    if prot & 0x2 != 0 {
+        p = p | Perm::W;
+    }
+    if prot & 0x4 != 0 {
+        p = p | Perm::X;
+    }
+    p
+}
+
+/// Read up to `len` bytes of `path` starting at `offset` from the mount table
+/// (for file-backed `mmap`). Returns the bytes available (may be shorter than
+/// `len` at EOF).
+fn read_file_region(vfs: &mut MountTable, path: &str, offset: u64, len: usize) -> Vec<u8> {
+    let Some(h) = vfs.open(path, FileAccess::Read) else {
+        return Vec::new();
+    };
+    vfs.seek(h, offset);
+    let mut out = Vec::with_capacity(len);
+    let mut buf = vec![0u8; 64 * 1024];
+    while out.len() < len {
+        let want = (len - out.len()).min(buf.len());
+        match vfs.read_handle(h, &mut buf[..want]) {
+            Some(0) | None => break,
+            Some(n) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    vfs.close(h);
+    out
 }

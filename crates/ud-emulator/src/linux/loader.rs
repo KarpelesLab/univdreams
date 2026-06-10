@@ -1,10 +1,14 @@
-//! Static ELF loader for the Linux personality.
+//! ELF loader for the Linux personality.
 //!
-//! Maps an executable's `PT_LOAD` segments into the [`Mmu`] and builds the
-//! initial process stack (argc / argv / envp / auxv) per the System V
-//! i386 ABI, then reports the entry point and stack pointer the run loop
-//! jumps to. Dynamic executables (`PT_INTERP`) are rejected — that needs
-//! the runtime linker, which is a separate phase.
+//! Maps an executable's `PT_LOAD` segments into the MMU and builds the initial
+//! process stack (argc / argv / envp / auxv) per the System V ABI, then reports
+//! the entry point and stack pointer the run loop jumps to.
+//!
+//! Both **static** and **dynamically linked** (`PT_INTERP`) executables load:
+//! for a dynamic binary the interpreter (`ld-musl`, …) is read from the guest
+//! rootfs (the [`MountTable`](crate::fsmount::MountTable)), mapped at a fixed
+//! base, and execution starts in it with a full auxv (`AT_BASE`, `AT_PHDR`,
+//! `AT_ENTRY`, `AT_RANDOM`, …) so it can relocate and run the main object.
 
 use ud_format::elf::{Elf64File, EM_386, EM_AARCH64, EM_X86_64};
 
@@ -40,8 +44,23 @@ const AT_PHDR: u32 = 3;
 const AT_PHENT: u32 = 4;
 const AT_PHNUM: u32 = 5;
 const AT_PAGESZ: u32 = 6;
+const AT_BASE: u32 = 7;
 const AT_ENTRY: u32 = 9;
+const AT_UID: u32 = 11;
+const AT_EUID: u32 = 12;
+const AT_GID: u32 = 13;
+const AT_EGID: u32 = 14;
+const AT_CLKTCK: u32 = 17;
+const AT_SECURE: u32 = 23;
 const AT_RANDOM: u32 = 25;
+const AT_EXECFN: u32 = 31;
+
+/// Load bias for a position-independent (`ET_DYN`) **main** executable, and the
+/// fixed base for the **interpreter** (`ld-musl`). Chosen low so everything
+/// fits the 4 GiB MMU, and spaced apart from the mmap arena (`0x4000_0000`) and
+/// stack (`0xC000_0000`). The main exe + its `brk` heap live below the interp.
+const MAIN_DYN_BASE: u32 = 0x0100_0000;
+const INTERP_BASE: u32 = 0x3000_0000;
 
 /// The result of loading a static ELF: where to start executing, the
 /// initial stack pointer, and the program break.
@@ -59,8 +78,13 @@ pub struct ElfImage {
 pub enum LoadError {
     Parse(String),
     Dynamic,
+    /// A dynamic ELF named an interpreter we couldn't read from the rootfs.
+    InterpNotFound(String),
     NoLoadable,
-    SegmentOutOfRange { offset: u64, len: u64 },
+    SegmentOutOfRange {
+        offset: u64,
+        len: u64,
+    },
 }
 
 impl std::fmt::Display for LoadError {
@@ -69,8 +93,11 @@ impl std::fmt::Display for LoadError {
             LoadError::Parse(e) => write!(f, "ELF parse: {e}"),
             LoadError::Dynamic => write!(
                 f,
-                "dynamically-linked ELF (PT_INTERP) — only static binaries are supported"
+                "dynamically-linked ELF (PT_INTERP) needs a root filesystem (--rootfs) to load its interpreter"
             ),
+            LoadError::InterpNotFound(p) => {
+                write!(f, "interpreter {p:?} not found in the root filesystem")
+            }
             LoadError::NoLoadable => write!(f, "ELF has no PT_LOAD segments"),
             LoadError::SegmentOutOfRange { offset, len } => {
                 write!(
@@ -82,8 +109,9 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-/// Map `bytes` (a static ELF executable) into `mmu` and set up the
-/// initial stack from `argv` / `envp`. Returns the [`ElfImage`].
+/// Map `bytes` (a static ELF executable) into `mmu` and set up the initial
+/// stack. Convenience wrapper over [`load_elf`] with no filesystem — a
+/// dynamically linked ELF is rejected with [`LoadError::Dynamic`].
 ///
 /// # Errors
 /// [`LoadError`] if the file is unparsable, dynamically linked, has no
@@ -94,29 +122,128 @@ pub fn load_static(
     argv: &[&str],
     envp: &[&str],
 ) -> Result<ElfImage, LoadError> {
-    let elf = Elf64File::parse(bytes).map_err(|e| LoadError::Parse(e.to_string()))?;
+    load_elf(mmu, None, bytes, argv, envp)
+}
 
-    if elf.phdrs.iter().any(|p| p.p_type == PT_INTERP) {
+/// Map `bytes` into `mmu` and set up the initial process stack. Handles both
+/// **static** executables and **dynamically linked** ones (`PT_INTERP`): the
+/// interpreter (`ld-musl`, …) is read from `mounts` (the guest rootfs), mapped
+/// at [`INTERP_BASE`], and execution starts in it with a full auxv so it can
+/// relocate the main object and run it.
+///
+/// `mounts` is required for dynamic binaries; a dynamic ELF with `mounts =
+/// None` is rejected with [`LoadError::Dynamic`].
+///
+/// # Errors
+/// [`LoadError`] for parse failures, a dynamic binary with no rootfs, a
+/// missing/unreadable interpreter, no loadable segments, or an out-of-range
+/// segment.
+pub fn load_elf(
+    mmu: &mut dyn GuestMem,
+    mounts: Option<&mut crate::fsmount::MountTable>,
+    bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<ElfImage, LoadError> {
+    let elf = Elf64File::parse(bytes).map_err(|e| LoadError::Parse(e.to_string()))?;
+    let ptr64 = matches!(elf.ehdr.e_machine, EM_X86_64 | EM_AARCH64);
+
+    let interp_path = interp_of(&elf, bytes);
+    if interp_path.is_some() && mounts.is_none() {
         return Err(LoadError::Dynamic);
     }
 
-    // 1) Map every PT_LOAD: file bytes then zero-fill to memsz.
-    let mut brk = 0u32;
+    // The main object: PIE (`ET_DYN`) gets a load bias; a fixed-address
+    // executable maps at its own vaddrs.
+    let main_bias = if elf.ehdr.e_type == ET_DYN && interp_path.is_some() {
+        MAIN_DYN_BASE
+    } else {
+        0
+    };
+    let brk = map_segments(mmu, bytes, &elf, main_bias)?;
+
+    // Stack region.
+    mmu.map(STACK_TOP - STACK_SIZE, STACK_SIZE, Perm::R | Perm::W);
+
+    // AT_PHDR: where the program headers ended up in memory.
+    let e_phoff = elf.ehdr.e_phoff;
+    let phdr_vaddr = elf
+        .phdrs
+        .iter()
+        .find(|p| p.p_type == PT_LOAD && e_phoff >= p.p_offset && e_phoff < p.p_offset + p.p_filesz)
+        .map_or(0, |p| {
+            main_bias.wrapping_add((p.p_vaddr + (e_phoff - p.p_offset)) as u32)
+        });
+
+    let main_entry = main_bias.wrapping_add(elf.ehdr.e_entry as u32);
+
+    // Dynamic: load the interpreter and start execution in it.
+    let (entry, at_base) = if let Some(path) = interp_path {
+        let mounts = mounts.expect("checked above");
+        let interp_bytes = mounts
+            .read_file(&path)
+            .ok_or_else(|| LoadError::InterpNotFound(path.clone()))?;
+        let interp = Elf64File::parse(&interp_bytes)
+            .map_err(|e| LoadError::Parse(format!("interp {path}: {e}")))?;
+        map_segments(mmu, &interp_bytes, &interp, INTERP_BASE)?;
+        (
+            INTERP_BASE.wrapping_add(interp.ehdr.e_entry as u32),
+            Some(INTERP_BASE),
+        )
+    } else {
+        (main_entry, None)
+    };
+
+    let aux = AuxParams {
+        phdr: phdr_vaddr,
+        phent: u32::from(elf.ehdr.e_phentsize),
+        phnum: u32::from(elf.ehdr.e_phnum),
+        entry: main_entry,
+        base: at_base,
+    };
+    let stack_ptr = build_stack(mmu, argv, envp, ptr64, &aux)?;
+
+    Ok(ElfImage {
+        entry,
+        stack_ptr,
+        brk,
+        machine: elf.ehdr.e_machine,
+    })
+}
+
+/// The `PT_INTERP` path (the dynamic linker), if this ELF is dynamically
+/// linked.
+fn interp_of(elf: &Elf64File, bytes: &[u8]) -> Option<String> {
+    let ph = elf.phdrs.iter().find(|p| p.p_type == PT_INTERP)?;
+    let s = bytes.get(ph.p_offset as usize..(ph.p_offset + ph.p_filesz) as usize)?;
+    let s = s.split(|&b| b == 0).next().unwrap_or(s);
+    Some(String::from_utf8_lossy(s).into_owned())
+}
+
+/// Map every `PT_LOAD` of `elf` into `mmu`, offset by `bias` (0 for a
+/// fixed-address object). Populates file bytes then enforces the segment's
+/// permissions. Returns the page-aligned high-water mark (the program break /
+/// end of the object).
+fn map_segments(
+    mmu: &mut dyn GuestMem,
+    bytes: &[u8],
+    elf: &Elf64File,
+    bias: u32,
+) -> Result<u32, LoadError> {
+    let mut high = 0u32;
     let mut mapped_any = false;
     for ph in elf.phdrs.iter().filter(|p| p.p_type == PT_LOAD) {
         mapped_any = true;
-        let vaddr = ph.p_vaddr as u32;
+        let vaddr = (ph.p_vaddr as u32).wrapping_add(bias);
         let memsz = ph.p_memsz as u32;
         let filesz = ph.p_filesz as u32;
         let offset = ph.p_offset as usize;
 
-        // Page-align the mapping window [start, end).
         let start = vaddr & !(PAGE - 1);
         let end = (vaddr.wrapping_add(memsz).wrapping_add(PAGE - 1)) & !(PAGE - 1);
         let perm = seg_perm(ph.p_flags);
-        // Map writable first so the initializer can populate it; the
-        // guest then observes `perm`. (Our MMU stores perms per page; we
-        // set the final perm via a second map — map() overwrites perms.)
+        // Map writable first so the initializer can populate it; then enforce
+        // the segment's real perms (map() overwrites perms, keeps bytes).
         mmu.map(start, end.wrapping_sub(start), Perm::R | Perm::W | perm);
 
         let len = filesz as usize;
@@ -131,28 +258,14 @@ pub fn load_static(
                 offset: ph.p_offset,
                 len: ph.p_filesz,
             })?;
-        // Re-apply the segment's real perms (e.g. drop W for a RX text
-        // segment) now that it's populated.
         mmu.map(start, end.wrapping_sub(start), perm);
 
-        brk = brk.max(end);
+        high = high.max(end);
     }
     if !mapped_any {
         return Err(LoadError::NoLoadable);
     }
-
-    // 2) Map the stack and build argc/argv/envp/auxv at the top. The word
-    // size of the vector follows the arch's pointer width.
-    mmu.map(STACK_TOP - STACK_SIZE, STACK_SIZE, Perm::R | Perm::W);
-    let ptr64 = matches!(elf.ehdr.e_machine, EM_X86_64 | EM_AARCH64);
-    let stack_ptr = build_stack(mmu, &elf, argv, envp, ptr64)?;
-
-    Ok(ElfImage {
-        entry: elf.ehdr.e_entry as u32,
-        stack_ptr,
-        brk,
-        machine: elf.ehdr.e_machine,
-    })
+    Ok(high)
 }
 
 /// True iff `bytes` is an ELF this loader recognises as a Linux i386
@@ -187,6 +300,17 @@ fn seg_perm(p_flags: u32) -> Perm {
     perm
 }
 
+/// Auxiliary-vector values the caller computed from the loaded image(s).
+struct AuxParams {
+    phdr: u32,
+    phent: u32,
+    phnum: u32,
+    /// Entry point of the **main** object (not the interpreter).
+    entry: u32,
+    /// `AT_BASE` — the interpreter's load base, for a dynamic binary.
+    base: Option<u32>,
+}
+
 /// Write the initial stack and return the final `sp` (points at `argc`).
 ///
 /// `ptr64` selects the word size of the argc/argv/envp/auxv vector: 8-byte
@@ -194,10 +318,10 @@ fn seg_perm(p_flags: u32) -> Perm {
 /// block are byte-addressed identically either way.
 fn build_stack(
     mmu: &mut dyn GuestMem,
-    elf: &Elf64File,
     argv: &[&str],
     envp: &[&str],
     ptr64: bool,
+    aux: &AuxParams,
 ) -> Result<u32, LoadError> {
     let word = if ptr64 { 8u32 } else { 4u32 };
     let mut sp = STACK_TOP;
@@ -222,26 +346,28 @@ fn build_stack(
     }
     // 16 bytes for AT_RANDOM (glibc/musl stack-canary + TLS seed).
     let at_random = push_bytes(mmu, &[0x42u8; 16]);
+    // AT_EXECFN points at argv[0]'s string (the program path).
+    let execfn = argv_ptrs.first().copied().unwrap_or(0);
 
-    // AT_PHDR: virtual address of the program-header table. For the
-    // typical EXEC, the first PT_LOAD covers file offset 0, so the
-    // headers sit at that segment's vaddr + e_phoff.
-    let e_phoff = elf.ehdr.e_phoff;
-    let phdr_vaddr = elf
-        .phdrs
-        .iter()
-        .find(|p| p.p_type == PT_LOAD && e_phoff >= p.p_offset && e_phoff < p.p_offset + p.p_filesz)
-        .map_or(0, |p| (p.p_vaddr + (e_phoff - p.p_offset)) as u32);
-
-    let auxv: [(u32, u32); 7] = [
-        (AT_PHDR, phdr_vaddr),
-        (AT_PHENT, u32::from(elf.ehdr.e_phentsize)),
-        (AT_PHNUM, u32::from(elf.ehdr.e_phnum)),
+    let mut auxv: Vec<(u32, u32)> = vec![
+        (AT_PHDR, aux.phdr),
+        (AT_PHENT, aux.phent),
+        (AT_PHNUM, aux.phnum),
         (AT_PAGESZ, PAGE),
-        (AT_ENTRY, elf.ehdr.e_entry as u32),
+        (AT_ENTRY, aux.entry),
         (AT_RANDOM, at_random),
-        (AT_NULL, 0),
+        (AT_EXECFN, execfn),
+        (AT_CLKTCK, 100),
+        (AT_SECURE, 0),
+        (AT_UID, 0),
+        (AT_EUID, 0),
+        (AT_GID, 0),
+        (AT_EGID, 0),
     ];
+    if let Some(base) = aux.base {
+        auxv.push((AT_BASE, base));
+    }
+    auxv.push((AT_NULL, 0));
 
     // Size of the main vector (words): argc + argv + NULL + envp + NULL
     // + auxv pairs.
@@ -345,6 +471,94 @@ mod tests {
         e[52] = 3; // p_type PT_LOAD -> PT_INTERP
         assert!(matches!(
             load_static(&mut Mmu::new(), &e, &["x"], &[]),
+            Err(LoadError::Dynamic)
+        ));
+    }
+
+    /// An ELF32 `ET_DYN` with a second program header of type `PT_INTERP`
+    /// naming `interp`. The first PT_LOAD maps file offset 0 (covering the
+    /// headers + interp string + code) at vaddr 0 so it's a clean PIE.
+    fn tiny_dyn(code: &[u8], interp: &str) -> Vec<u8> {
+        let (ehdr, phdr) = (52u32, 32u32);
+        let phnum = 2u32;
+        let interp_off = ehdr + phdr * phnum; // 116
+        let mut interp_b = interp.as_bytes().to_vec();
+        interp_b.push(0);
+        let code_off = interp_off + interp_b.len() as u32;
+        let filesz = code_off + code.len() as u32;
+        let entry = code_off; // vaddr 0 base
+        let mut e = Vec::new();
+        e.extend_from_slice(&[0x7f, b'E', b'L', b'F', 1, 1, 1, 0]);
+        e.extend_from_slice(&[0u8; 8]);
+        e.extend_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
+        e.extend_from_slice(&3u16.to_le_bytes()); // e_machine = EM_386
+        e.extend_from_slice(&1u32.to_le_bytes());
+        e.extend_from_slice(&entry.to_le_bytes());
+        e.extend_from_slice(&ehdr.to_le_bytes()); // e_phoff
+        e.extend_from_slice(&0u32.to_le_bytes());
+        e.extend_from_slice(&0u32.to_le_bytes());
+        e.extend_from_slice(&(ehdr as u16).to_le_bytes());
+        e.extend_from_slice(&(phdr as u16).to_le_bytes());
+        e.extend_from_slice(&(phnum as u16).to_le_bytes());
+        e.extend_from_slice(&[0u8; 6]);
+        // phdr[0] PT_LOAD: file [0, filesz] at vaddr 0.
+        e.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        e.extend_from_slice(&0u32.to_le_bytes()); // p_offset
+        e.extend_from_slice(&0u32.to_le_bytes()); // p_vaddr
+        e.extend_from_slice(&0u32.to_le_bytes()); // p_paddr
+        e.extend_from_slice(&filesz.to_le_bytes());
+        e.extend_from_slice(&filesz.to_le_bytes());
+        e.extend_from_slice(&5u32.to_le_bytes()); // R|X
+        e.extend_from_slice(&0x1000u32.to_le_bytes());
+        // phdr[1] PT_INTERP.
+        e.extend_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        e.extend_from_slice(&interp_off.to_le_bytes()); // p_offset
+        e.extend_from_slice(&interp_off.to_le_bytes()); // p_vaddr
+        e.extend_from_slice(&interp_off.to_le_bytes()); // p_paddr
+        e.extend_from_slice(&(interp_b.len() as u32).to_le_bytes());
+        e.extend_from_slice(&(interp_b.len() as u32).to_le_bytes());
+        e.extend_from_slice(&4u32.to_le_bytes()); // R
+        e.extend_from_slice(&1u32.to_le_bytes());
+        debug_assert_eq!(e.len() as u32, interp_off);
+        e.extend_from_slice(&interp_b);
+        e.extend_from_slice(code);
+        e
+    }
+
+    #[test]
+    fn dynamic_loads_interp_from_mounts() {
+        use crate::fsmount::MountTable;
+        // The interpreter is just another tiny ELF placed in the rootfs.
+        let interp = tiny_elf(&[0x90, 0xc3]);
+        let interp_entry = u32::from_le_bytes(interp[24..28].try_into().unwrap());
+        let mut mounts = MountTable::new();
+        mounts.insert("/lib/myld", interp.clone());
+
+        let main = tiny_dyn(&[0xc3], "/lib/myld");
+        let mut mmu = Mmu::new();
+        let img = load_elf(&mut mmu, Some(&mut mounts), &main, &["prog"], &[]).expect("dyn load");
+
+        // Execution starts in the interpreter (mapped at INTERP_BASE).
+        assert_eq!(img.entry, INTERP_BASE.wrapping_add(interp_entry));
+        // The interpreter's first instruction is reachable in memory.
+        assert_eq!(mmu.load8(img.entry).unwrap(), 0x90);
+        // The main object was biased to MAIN_DYN_BASE; its entry byte (0xc3)
+        // sits at MAIN_DYN_BASE + code_off.
+        assert_eq!(img.machine, EM_386);
+    }
+
+    #[test]
+    fn dynamic_without_interp_in_mounts_errors() {
+        use crate::fsmount::MountTable;
+        let main = tiny_dyn(&[0xc3], "/lib/absent");
+        let mut mounts = MountTable::new();
+        assert!(matches!(
+            load_elf(&mut Mmu::new(), Some(&mut mounts), &main, &["p"], &[]),
+            Err(LoadError::InterpNotFound(_))
+        ));
+        // And with no rootfs at all, it's the friendlier Dynamic error.
+        assert!(matches!(
+            load_elf(&mut Mmu::new(), None, &main, &["p"], &[]),
             Err(LoadError::Dynamic)
         ));
     }

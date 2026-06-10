@@ -485,8 +485,16 @@ impl Sandbox {
         use ud_format::elf::{EM_386, EM_AARCH64, EM_X86_64};
         let argv = [name];
         let envp: [&str; 0] = [];
-        let image = crate::linux::loader::load_static(&mut self.mmu, bytes, &argv, &envp)
-            .map_err(|e| crate::Error::NeLoader(e.to_string()))?;
+        // The mount table must exist before loading so the dynamic linker
+        // (`PT_INTERP`) can be read from the guest rootfs.
+        let mounts = self
+            .host
+            .context
+            .vfs
+            .get_or_insert_with(crate::fsmount::MountTable::new);
+        let image =
+            crate::linux::loader::load_elf(&mut self.mmu, Some(mounts), bytes, &argv, &envp)
+                .map_err(|e| crate::Error::NeLoader(e.to_string()))?;
         self.linux_machine = image.machine;
         match image.machine {
             EM_X86_64 => {

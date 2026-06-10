@@ -342,6 +342,40 @@ impl MountTable {
         self.handles.contains_key(&handle) || self.root.owns(handle)
     }
 
+    /// Read an entire file by absolute path into memory, resolving symlinks
+    /// (up to a small depth). Works for the root and any overlay. Returns
+    /// `None` if the path can't be resolved or opened. Used by the dynamic ELF
+    /// loader to pull the interpreter / shared objects out of the rootfs.
+    #[must_use]
+    pub fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
+        let mut p = norm_abs(path);
+        for _ in 0..16 {
+            match self.stat_path(&p)? {
+                a if matches!(a.kind, NodeKind::Symlink) => {
+                    let target = self.readlink_path(&p).ok()?;
+                    p = if target.starts_with('/') {
+                        norm_abs(&target)
+                    } else {
+                        let dir = p.rsplit_once('/').map_or("", |(d, _)| d);
+                        norm_abs(&format!("{dir}/{target}"))
+                    };
+                }
+                _ => break,
+            }
+        }
+        let h = self.open(&p, FileAccess::Read)?;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Some(n) = self.read_handle(h, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        self.close(h);
+        Some(out)
+    }
+
     // ---- path metadata + directory operations ---------------------------
 
     /// Stat an absolute path, routing to the overlay that owns it (else the
