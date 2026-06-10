@@ -64,6 +64,10 @@ enum Fd {
         path: String,
         pos: usize,
     },
+    /// The read / write end of a pipe (index into `LinuxKernel::pipes`). Within
+    /// one process this is an in-memory byte buffer.
+    PipeRead(usize),
+    PipeWrite(usize),
 }
 
 /// The arch-agnostic Linux kernel engine: process memory bookkeeping, the
@@ -102,6 +106,8 @@ pub struct LinuxKernel {
     /// Process file-mode creation mask (`umask`). Cosmetic — we don't enforce
     /// permissions — but tracked so `umask` returns the previous value.
     umask: u32,
+    /// In-memory pipe buffers, referenced by [`Fd::PipeRead`] / [`Fd::PipeWrite`].
+    pipes: Vec<std::collections::VecDeque<u8>>,
 }
 
 /// A file-backed `mmap` region we may need to flush back to the file.
@@ -134,6 +140,32 @@ impl LinuxKernel {
         self.current_tid = 1;
         self.cwd = "/".to_string();
         self.umask = 0o022;
+        self.pipes.clear();
+    }
+
+    /// Read a NUL-terminated array of string pointers (`argv` / `envp`) from
+    /// guest memory at `addr`, honouring the guest pointer width.
+    pub fn read_str_array(&self, mmu: &dyn GuestMem, addr: u32) -> Vec<String> {
+        let mut out = Vec::new();
+        let step = if self.ptr64 { 8u32 } else { 4 };
+        let mut p = addr;
+        for _ in 0..4096 {
+            let ptr = if self.ptr64 {
+                mmu.load64(p).ok().map(|v| v as u32)
+            } else {
+                mmu.load32(p).ok()
+            };
+            match ptr {
+                Some(0) | None => break,
+                Some(sp) => {
+                    if let Some(s) = read_cstr(mmu, sp, 4096) {
+                        out.push(s);
+                    }
+                }
+            }
+            p = p.wrapping_add(step);
+        }
+        out
     }
 
     /// Service one syscall: read `(nr, args)` via `abi`, run it, write the
@@ -214,7 +246,8 @@ impl LinuxKernel {
             Sysno::Fstat | Sysno::Stat | Sysno::Lstat | Sysno::Newfstatat => {
                 self.sys_stat(sys, a, mmu, vfs, stat_layout)
             }
-            Sysno::Statx => self.sys_statx(a0 as i32, a1, a[4] as u32, mmu, vfs),
+            // statx(dirfd, path, flags, mask, buf)
+            Sysno::Statx => self.sys_statx(a0 as i32, a1, a2, a[4] as u32, mmu, vfs),
             Sysno::Getdents64 => self.sys_getdents64(a0 as i32, a1, a2, mmu, vfs),
             Sysno::Mkdir => self.sys_mkdirat(AT_FDCWD, a0, mmu, vfs),
             Sysno::Mkdirat => self.sys_mkdirat(a0 as i32, a1, mmu, vfs),
@@ -265,6 +298,7 @@ impl LinuxKernel {
             Sysno::Pread64 => self.sys_pread64(a0 as i32, a1, a2, a[3], vfs, mmu),
             Sysno::Pwrite64 => self.sys_pwrite64(a0 as i32, a1, a2, a[3], vfs, mmu),
             Sysno::Readv => self.sys_readv(a0 as i32, a1, a2, mmu, vfs),
+            Sysno::Pipe | Sysno::Pipe2 => self.sys_pipe(a0, mmu),
             Sysno::Getcwd => self.sys_getcwd(a0, a1, mmu),
             Sysno::Ioctl => ENOTTY, // "not a terminal" → libc picks full buffering
             Sysno::ArchPrctl => 0,
@@ -303,7 +337,11 @@ impl LinuxKernel {
                 data.len() as i64
             }
             Some(Fd::Vfs { h, .. }) => vfs.write_handle(*h, &data).map_or(EBADF, |n| n as i64),
-            Some(Fd::Stdin) | Some(Fd::Dir { .. }) | None => EBADF,
+            Some(&Fd::PipeWrite(i)) => {
+                self.pipes[i].extend(data.iter().copied());
+                data.len() as i64
+            }
+            Some(Fd::Stdin | Fd::Dir { .. } | Fd::PipeRead(_)) | None => EBADF,
         }
     }
 
@@ -364,9 +402,17 @@ impl LinuxKernel {
                 }
                 n as i64
             }
+            Some(&Fd::PipeRead(i)) => {
+                let n = (len as usize).min(self.pipes[i].len());
+                let bytes: Vec<u8> = self.pipes[i].drain(..n).collect();
+                if write_mem(mmu, buf, &bytes).is_none() {
+                    return EFAULT;
+                }
+                n as i64 // 0 when empty (treated as EOF in this single-process model)
+            }
             // read() on a directory fd is EISDIR; the std streams are EBADF.
-            Some(Fd::Dir { .. }) => -21,
-            Some(Fd::Stdout) | Some(Fd::Stderr) | None => EBADF,
+            Some(Fd::Dir { .. }) => EISDIR,
+            Some(Fd::Stdout | Fd::Stderr | Fd::PipeWrite(_)) | None => EBADF,
         }
     }
 
@@ -701,27 +747,33 @@ impl LinuxKernel {
         vfs: &mut MountTable,
         layout: StatLayout,
     ) -> i64 {
-        // Resolve the subject and the destination buffer pointer.
-        let (kind, size, buf) = match sys {
+        // Resolve the subject and the destination buffer pointer. `perm` is the
+        // file's real permission bits (so executability survives to the guest).
+        let (kind, size, perm, buf) = match sys {
             Sysno::Fstat => {
                 let buf = a[1] as u32;
                 match self.fds.get(&(a[0] as i32)) {
-                    // A char-device stat for the std streams keeps isatty()/
-                    // libc buffering happy.
-                    Some(Fd::Stdin | Fd::Stdout | Fd::Stderr) => (NodeKind::CharDevice, 0, buf),
+                    // A char-device stat for the std streams + pipes keeps
+                    // isatty()/libc buffering happy.
+                    Some(
+                        Fd::Stdin | Fd::Stdout | Fd::Stderr | Fd::PipeRead(_) | Fd::PipeWrite(_),
+                    ) => (NodeKind::CharDevice, 0, 0o666, buf),
                     Some(Fd::Vfs { path, .. }) => {
                         let att = vfs.stat_path(path);
                         (
                             att.map_or(NodeKind::File, |x| x.kind),
                             att.map_or(0, |x| x.size),
+                            att.map_or(0, |x| x.mode),
                             buf,
                         )
                     }
                     Some(Fd::Dir { path, .. }) => {
                         let path = path.clone();
+                        let att = vfs.stat_path(&path);
                         (
                             NodeKind::Dir,
-                            vfs.stat_path(&path).map_or(0, |x| x.size),
+                            att.map_or(0, |x| x.size),
+                            att.map_or(0, |x| x.mode),
                             buf,
                         )
                     }
@@ -729,22 +781,30 @@ impl LinuxKernel {
                 }
             }
             sys => {
-                // stat/lstat(path, buf) | newfstatat(dirfd, path, buf, flags)
-                let (dirfd, path_ptr, buf) = if sys == Sysno::Newfstatat {
-                    (a[0] as i32, a[1] as u32, a[2] as u32)
+                // stat/lstat(path, buf) | newfstatat(dirfd, path, buf, flags).
+                // AT_SYMLINK_NOFOLLOW = 0x100 (set by glibc's lstat()).
+                let (dirfd, path_ptr, buf, nofollow) = if sys == Sysno::Newfstatat {
+                    (a[0] as i32, a[1] as u32, a[2] as u32, a[3] & 0x100 != 0)
                 } else {
-                    (AT_FDCWD, a[0] as u32, a[1] as u32)
+                    (AT_FDCWD, a[0] as u32, a[1] as u32, sys == Sysno::Lstat)
                 };
                 let Some(p) = self.resolve_at(dirfd, path_ptr, mmu) else {
                     return EBADF;
                 };
-                match vfs.stat_path(&p) {
-                    Some(att) => (att.kind, att.size, buf),
+                // stat/newfstatat follow symlinks; lstat (or AT_SYMLINK_NOFOLLOW)
+                // does not.
+                let att = if nofollow {
+                    vfs.stat_path(&p)
+                } else {
+                    vfs.stat_follow(&p)
+                };
+                match att {
+                    Some(att) => (att.kind, att.size, att.mode, buf),
                     None => return ENOENT,
                 }
             }
         };
-        self.write_stat(buf, kind, size, layout, mmu)
+        self.write_stat(buf, kind, size, perm, layout, mmu)
     }
 
     /// `statx(dirfd, path, flags, mask, buf)`: fill the architecture-independent
@@ -754,6 +814,7 @@ impl LinuxKernel {
         &self,
         dirfd: i32,
         path: u32,
+        flags: u32,
         buf: u32,
         mmu: &mut dyn GuestMem,
         vfs: &mut MountTable,
@@ -761,15 +822,16 @@ impl LinuxKernel {
         let Some(p) = self.resolve_at(dirfd, path, mmu) else {
             return EBADF;
         };
-        let Some(att) = vfs.stat_path(&p) else {
+        // AT_SYMLINK_NOFOLLOW = 0x100.
+        let att = if flags & 0x100 != 0 {
+            vfs.stat_path(&p)
+        } else {
+            vfs.stat_follow(&p)
+        };
+        let Some(att) = att else {
             return ENOENT;
         };
-        let mode: u16 = match att.kind {
-            NodeKind::Dir => 0o040_755,
-            NodeKind::Symlink => 0o120_777,
-            NodeKind::CharDevice => 0o020_666,
-            NodeKind::File => 0o100_644,
-        };
+        let mode = stat_mode(att.kind, att.mode) as u16;
         let mut b = [0u8; 256];
         // STATX_BASIC_STATS = 0x7ff (type,mode,nlink,uid,gid,atime,mtime,ctime,
         // ino,size,blocks).
@@ -805,21 +867,18 @@ impl LinuxKernel {
     }
 
     /// Serialise a stat struct (zeros except the fields we model) per `layout`.
+    /// `perm` is the file's permission bits; if zero we fall back to a sensible
+    /// default for the node kind.
     fn write_stat(
         &self,
         buf: u32,
         kind: NodeKind,
         size: u64,
+        perm: u32,
         layout: StatLayout,
         mmu: &mut dyn GuestMem,
     ) -> i64 {
-        // S_IF* type bits | a plausible permission set.
-        let mode: u32 = match kind {
-            NodeKind::Dir => 0o040_755,
-            NodeKind::Symlink => 0o120_777,
-            NodeKind::CharDevice => 0o020_666,
-            NodeKind::File => 0o100_644,
-        };
+        let mode = stat_mode(kind, perm);
         let mut b = vec![0u8; layout.size];
         let put32 = |b: &mut [u8], off: usize, v: u32| {
             b[off..off + 4].copy_from_slice(&v.to_le_bytes());
@@ -1028,6 +1087,21 @@ impl LinuxKernel {
         fd
     }
 
+    /// `pipe`/`pipe2(fds)`: create an in-memory pipe and write the read/write
+    /// fd pair to `fds[0]`/`fds[1]`.
+    fn sys_pipe(&mut self, fds_ptr: u32, mmu: &mut dyn GuestMem) -> i64 {
+        let idx = self.pipes.len();
+        self.pipes.push(std::collections::VecDeque::new());
+        let rfd = self.install_fd(Fd::PipeRead(idx));
+        let wfd = self.install_fd(Fd::PipeWrite(idx));
+        if write_mem(mmu, fds_ptr, &(rfd as u32).to_le_bytes()).is_none()
+            || write_mem(mmu, fds_ptr.wrapping_add(4), &(wfd as u32).to_le_bytes()).is_none()
+        {
+            return EFAULT;
+        }
+        0
+    }
+
     fn sys_dup(&mut self, oldfd: i32) -> i64 {
         match self.fds.get(&oldfd).cloned() {
             Some(v) => i64::from(self.install_fd(v)),
@@ -1148,6 +1222,28 @@ impl LinuxKernel {
         }
         total
     }
+}
+
+/// Compose a Unix `st_mode` from a node kind and its permission bits. A zero
+/// `perm` (filesystem reported nothing) falls back to a sensible default —
+/// importantly keeping the execute bits a shell checks before `execve`.
+fn stat_mode(kind: NodeKind, perm: u32) -> u32 {
+    let type_bits = match kind {
+        NodeKind::Dir => 0o040_000,
+        NodeKind::Symlink => 0o120_000,
+        NodeKind::CharDevice => 0o020_000,
+        NodeKind::File => 0o100_000,
+    };
+    let perm = if perm & 0o7777 != 0 {
+        perm & 0o7777
+    } else {
+        match kind {
+            NodeKind::Dir => 0o755,
+            NodeKind::Symlink => 0o777,
+            _ => 0o644,
+        }
+    };
+    type_bits | perm
 }
 
 /// Resolve a (possibly relative) `path` against `base` (an absolute dir),

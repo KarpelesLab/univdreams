@@ -342,17 +342,17 @@ impl MountTable {
         self.handles.contains_key(&handle) || self.root.owns(handle)
     }
 
-    /// Read an entire file by absolute path into memory, resolving symlinks
-    /// (up to a small depth). Works for the root and any overlay. Returns
-    /// `None` if the path can't be resolved or opened. Used by the dynamic ELF
-    /// loader to pull the interpreter / shared objects out of the rootfs.
+    /// Follow symlinks (up to a small depth) and return the absolute path of
+    /// the final target. Stops at the first non-symlink (or a dangling link).
     #[must_use]
-    pub fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
+    pub fn resolve_symlinks(&mut self, path: &str) -> String {
         let mut p = norm_abs(path);
         for _ in 0..16 {
-            match self.stat_path(&p)? {
-                a if matches!(a.kind, NodeKind::Symlink) => {
-                    let target = self.readlink_path(&p).ok()?;
+            match self.stat_path(&p) {
+                Some(a) if matches!(a.kind, NodeKind::Symlink) => {
+                    let Ok(target) = self.readlink_path(&p) else {
+                        break;
+                    };
                     p = if target.starts_with('/') {
                         norm_abs(&target)
                     } else {
@@ -363,6 +363,24 @@ impl MountTable {
                 _ => break,
             }
         }
+        p
+    }
+
+    /// Like [`stat_path`](Self::stat_path) but follows symlinks to their final
+    /// target (what `stat`, as opposed to `lstat`, reports).
+    #[must_use]
+    pub fn stat_follow(&mut self, abs: &str) -> Option<Attrs> {
+        let target = self.resolve_symlinks(abs);
+        self.stat_path(&target)
+    }
+
+    /// Read an entire file by absolute path into memory, resolving symlinks
+    /// (up to a small depth). Works for the root and any overlay. Returns
+    /// `None` if the path can't be resolved or opened. Used by the dynamic ELF
+    /// loader to pull the interpreter / shared objects out of the rootfs.
+    #[must_use]
+    pub fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
+        let p = self.resolve_symlinks(path);
         let h = self.open(&p, FileAccess::Read)?;
         let mut out = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];

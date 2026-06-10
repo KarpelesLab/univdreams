@@ -98,6 +98,13 @@ struct AmdThread {
     /// (this is what `pthread_join` waits on). `0` if unset.
     clear_child_tid: u32,
     exited: bool,
+    /// True for a child **process** (clone without `CLONE_THREAD`, or
+    /// `fork`/`vfork`) — these are reapable by `wait4`. False for a sibling
+    /// thread of the same process (`pthread_create`).
+    is_process: bool,
+    /// `Some((pid, status_ptr))` while parked in `wait4` for a child to exit
+    /// (`pid == -1` waits for any child).
+    waiting: Option<(i32, u32)>,
 }
 
 /// Wake up to `n` threads parked in `FUTEX_WAIT` on `addr`; returns the count.
@@ -113,6 +120,137 @@ fn wake_futex(threads: &mut [AmdThread], addr: u32, n: i32) -> i32 {
         }
     }
     woke
+}
+
+/// Format a normal-exit `wait4` status word: `(code & 0xff) << 8`.
+fn exit_status(code: i32) -> i32 {
+    (code & 0xff) << 8
+}
+
+/// Does the thread at `widx` have any child it could still wait on (a live
+/// child process or an unreaped zombie)?
+fn has_child(threads: &[AmdThread], widx: usize) -> bool {
+    threads
+        .iter()
+        .enumerate()
+        .any(|(i, t)| i != widx && t.is_process && !t.exited)
+}
+
+/// Try to satisfy the `wait4` parked on thread `widx` from `zombies`. On a
+/// match: write the status word, set the waiter's `rax` to the child tid, clear
+/// its `waiting`, and return true.
+fn reap_one(
+    threads: &mut [AmdThread],
+    zombies: &mut Vec<(i32, i32)>,
+    mmu: &mut crate::emulator::Mmu,
+    widx: usize,
+) -> bool {
+    let Some((want, status_ptr)) = threads[widx].waiting else {
+        return false;
+    };
+    let Some(pos) = zombies
+        .iter()
+        .position(|(tid, _)| want == -1 || want == *tid)
+    else {
+        return false;
+    };
+    let (tid, status) = zombies.remove(pos);
+    if status_ptr != 0 {
+        let _ = mmu.store32(status_ptr, status as u32);
+    }
+    threads[widx].cpu.regs.gp64[0] = tid as u64; // rax = reaped child tid
+    threads[widx].waiting = None;
+    true
+}
+
+/// Re-check every parked `wait4` against the zombie list (called after a child
+/// exits), reaping as many as match.
+fn reap_waiters(
+    threads: &mut [AmdThread],
+    zombies: &mut Vec<(i32, i32)>,
+    mmu: &mut crate::emulator::Mmu,
+) {
+    loop {
+        let mut progressed = false;
+        for i in 0..threads.len() {
+            if threads[i].waiting.is_some() && reap_one(threads, zombies, mmu, i) {
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
+/// Read a NUL-terminated C string from guest memory (for `execve`'s path arg).
+fn read_cstr_guest(mmu: &crate::emulator::Mmu, addr: u32) -> Option<String> {
+    let mut out = Vec::new();
+    for i in 0..4096u32 {
+        match mmu.load8(addr.wrapping_add(i)) {
+            Ok(0) => return Some(String::from_utf8_lossy(&out).into_owned()),
+            Ok(b) => out.push(b),
+            Err(_) => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Run `path argv…` to completion in a **fresh** [`Sandbox`] (its own address
+/// space), sharing the same root filesystem (`vfs` is moved in and back).
+/// Handles one level of `#!` shebang. Returns `(exit_code, stdout, stderr)`, or
+/// `None` if the program can't be read / loaded (the caller's `execve` then
+/// fails with `ENOENT`).
+fn exec_nested(
+    vfs: &mut crate::fsmount::MountTable,
+    path: &str,
+    argv: &[String],
+    envp: &[String],
+    budget: u64,
+) -> Option<(i32, Vec<u8>, Vec<u8>)> {
+    let bytes = vfs.read_file(path)?;
+
+    // Shebang: re-exec the named interpreter with the script as its argument.
+    if bytes.starts_with(b"#!") {
+        let line_end = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len());
+        let line = String::from_utf8_lossy(&bytes[2..line_end]);
+        let mut parts = line.split_whitespace();
+        let interp = parts.next()?.to_string();
+        let interp_arg = parts.next().map(ToString::to_string);
+        let mut new_argv = vec![interp.clone()];
+        if let Some(a) = interp_arg {
+            new_argv.push(a);
+        }
+        new_argv.push(path.to_string());
+        new_argv.extend(argv.iter().skip(1).cloned());
+        return exec_nested(vfs, &interp, &new_argv, envp, budget);
+    }
+
+    if !crate::linux::loader::is_runnable(&bytes) {
+        return None;
+    }
+
+    let mut child = Sandbox::new_linux();
+    child.host.instruction_budget = Some(budget);
+    child.linux_default_mounts = false;
+    let name = argv.first().cloned().unwrap_or_else(|| path.to_string());
+    child.linux_argv = argv.iter().skip(1).cloned().collect();
+    child.linux_env = envp.to_vec();
+    child.host.context.vfs = Some(std::mem::replace(vfs, crate::fsmount::MountTable::new()));
+    let code = match child.load_linux_elf(&name, &bytes) {
+        Ok(_) => child.run_linux().unwrap_or(-1),
+        Err(_) => 127,
+    };
+    *vfs = child
+        .host
+        .context
+        .vfs
+        .take()
+        .unwrap_or_else(crate::fsmount::MountTable::new);
+    Some((code, child.linux.stdout, child.linux.stderr))
 }
 
 /// Synthetic `/proc/cpuinfo` — one generic x86-64 CPU.
@@ -664,9 +802,13 @@ impl Sandbox {
             blocked_on: None,
             clear_child_tid: 0,
             exited: false,
+            is_process: true,
+            waiting: None,
         }];
         let mut next_tid: i32 = 2;
         let mut cur = 0usize;
+        // Reaped-but-not-yet-waited child processes: (tid, wait-status).
+        let mut zombies: Vec<(i32, i32)> = Vec::new();
 
         let result = 'sched: loop {
             if let Some(code) = self.linux.exit_code {
@@ -682,7 +824,10 @@ impl Sandbox {
             let mut pick = None;
             for off in 0..n {
                 let i = (cur + off) % n;
-                if !threads[i].exited && threads[i].blocked_on.is_none() {
+                if !threads[i].exited
+                    && threads[i].blocked_on.is_none()
+                    && threads[i].waiting.is_none()
+                {
                     pick = Some(i);
                     break;
                 }
@@ -711,32 +856,45 @@ impl Sandbox {
                         let nr = abi.syscall_nr(&threads[idx].cpu);
                         let a = abi.syscall_args(&threads[idx].cpu);
                         match abi.map_syscall(nr) {
-                            Some(Sysno::ExitGroup) => {
-                                self.linux.exit_code = Some(a[0] as i32);
-                                break;
-                            }
-                            Some(Sysno::Exit) => {
+                            Some(Sysno::ExitGroup | Sysno::Exit) => {
+                                let code = a[0] as i32;
                                 threads[idx].exited = true;
                                 let cct = threads[idx].clear_child_tid;
                                 if cct != 0 {
                                     let _ = self.mmu.store32(cct, 0);
                                     wake_futex(&mut threads, cct, i32::MAX);
                                 }
-                                // If only the main thread is left having exited
-                                // with no exit_group, treat its code as final.
+                                if threads[idx].tid == 1 {
+                                    // The main process exiting ends the run.
+                                    self.linux.exit_code = Some(code);
+                                } else if threads[idx].is_process {
+                                    // A child process: becomes a zombie for its
+                                    // parent's wait4, doesn't end the run.
+                                    zombies.push((threads[idx].tid, exit_status(code)));
+                                    reap_waiters(&mut threads, &mut zombies, &mut self.mmu);
+                                }
                                 if threads.iter().all(|t| t.exited) {
                                     self.linux.exit_code.get_or_insert(0);
                                 }
                                 break;
                             }
-                            Some(Sysno::Clone) => {
-                                let (flags, child_stack) = (a[0], a[1]);
+                            Some(kind @ (Sysno::Clone | Sysno::Fork | Sysno::Vfork)) => {
+                                // fork/vfork carry no args; clone gets flags +
+                                // child stack.
+                                const CLONE_THREAD: u64 = 0x0001_0000;
+                                const CLONE_VM: u64 = 0x0000_0100;
+                                let (flags, child_stack) = match kind {
+                                    Sysno::Clone => (a[0], a[1]),
+                                    _ => (0, 0),
+                                };
                                 let (ptid, ctid, newtls) = (a[2] as u32, a[3] as u32, a[4]);
                                 let tid = next_tid;
                                 next_tid += 1;
                                 let mut child = threads[idx].cpu.clone();
                                 child.regs.gp64[0] = 0; // child sees rax = 0
-                                child.regs.gp64[4] = child_stack; // rsp
+                                if child_stack != 0 {
+                                    child.regs.gp64[4] = child_stack; // rsp
+                                }
                                 if flags & CLONE_SETTLS != 0 {
                                     child.set_fs_base(newtls as u32);
                                 }
@@ -747,19 +905,97 @@ impl Sandbox {
                                 if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
                                     let _ = self.mmu.store32(ctid, tid as u32);
                                 }
-                                let cct = if flags & CLONE_CHILD_CLEARTID != 0 {
-                                    ctid
+                                if flags & CLONE_THREAD != 0 {
+                                    // A sibling thread: runs concurrently sharing
+                                    // this process's address space.
+                                    let cct = if flags & CLONE_CHILD_CLEARTID != 0 {
+                                        ctid
+                                    } else {
+                                        0
+                                    };
+                                    spawn = Some(AmdThread {
+                                        cpu: child,
+                                        tid,
+                                        blocked_on: None,
+                                        clear_child_tid: cct,
+                                        exited: false,
+                                        is_process: false,
+                                        waiting: None,
+                                    });
                                 } else {
-                                    0
-                                };
-                                spawn = Some(AmdThread {
-                                    cpu: child,
-                                    tid,
-                                    blocked_on: None,
-                                    clear_child_tid: cct,
-                                    exited: false,
-                                });
+                                    // A child **process**: run it to completion
+                                    // in its own copied address space, then it
+                                    // becomes a zombie for the parent's wait4.
+                                    // (CLONE_VM children get a copy too — they
+                                    // exec immediately, so it's equivalent.)
+                                    let _ = CLONE_VM;
+                                    let mut cmmu = self.mmu.fork_copy();
+                                    let st = self.run_amd64_child(
+                                        child,
+                                        &mut cmmu,
+                                        vfs,
+                                        budget,
+                                        &mut next_tid,
+                                    );
+                                    if let Some(code) = self.linux.exit_code {
+                                        // The child propagated a whole-process exit.
+                                        let _ = code;
+                                    }
+                                    zombies.push((tid, exit_status(st)));
+                                    reap_waiters(&mut threads, &mut zombies, &mut self.mmu);
+                                }
                                 break;
+                            }
+                            Some(Sysno::Execve) => {
+                                // Replace this thread's image: run the new
+                                // program to completion in a fresh address space
+                                // (its own Sandbox), then exit the thread with
+                                // that program's status.
+                                let path = read_cstr_guest(&self.mmu, a[0] as u32);
+                                let argv = self.linux.read_str_array(&self.mmu, a[1] as u32);
+                                let envp = self.linux.read_str_array(&self.mmu, a[2] as u32);
+                                if trace {
+                                    eprintln!("execve({path:?}, {argv:?})");
+                                }
+                                match path.and_then(|p| exec_nested(vfs, &p, &argv, &envp, budget))
+                                {
+                                    Some((code, out, err)) => {
+                                        self.linux.stdout.extend_from_slice(&out);
+                                        self.linux.stderr.extend_from_slice(&err);
+                                        threads[idx].exited = true;
+                                        if threads[idx].tid == 1 {
+                                            self.linux.exit_code = Some(code);
+                                        } else if threads[idx].is_process {
+                                            zombies.push((threads[idx].tid, exit_status(code)));
+                                            reap_waiters(&mut threads, &mut zombies, &mut self.mmu);
+                                        }
+                                        if threads.iter().all(|t| t.exited) {
+                                            self.linux.exit_code.get_or_insert(0);
+                                        }
+                                        break;
+                                    }
+                                    // exec failed (no such file): returns to caller.
+                                    None => abi.set_return(&mut threads[idx].cpu, -2),
+                                }
+                            }
+                            Some(Sysno::Wait4) => {
+                                let want = a[0] as i32;
+                                let status_ptr = a[1] as u32;
+                                let options = a[2] as u32;
+                                threads[idx].waiting = Some((want, status_ptr));
+                                if reap_one(&mut threads, &mut zombies, &mut self.mmu, idx) {
+                                    // Reaped immediately; rax already set.
+                                } else if options & 1 != 0 {
+                                    // WNOHANG: don't block.
+                                    threads[idx].waiting = None;
+                                    abi.set_return(&mut threads[idx].cpu, 0);
+                                } else if !has_child(&threads, idx) {
+                                    threads[idx].waiting = None;
+                                    abi.set_return(&mut threads[idx].cpu, -10); // ECHILD
+                                } else {
+                                    // Block until a child exits.
+                                    break;
+                                }
                             }
                             Some(Sysno::Futex) => {
                                 let uaddr = a[0] as u32;
@@ -827,6 +1063,109 @@ impl Sandbox {
             self.cpu = m.cpu;
         }
         result
+    }
+
+    /// Run a forked **child process** to completion in its own copied address
+    /// space (`mmu`), synchronously, and return its exit code. The `fork`
+    /// model: the parent blocks until the child finishes, which fits our single
+    /// shared-MMU engine. Handles the child's `execve` (a fresh nested
+    /// [`Sandbox`]), nested `fork`+`wait4`, and ordinary syscalls (which share
+    /// the kernel fd table + captured output). Concurrent *threads* inside a
+    /// forked child are not modelled (rare before `exec`).
+    fn run_amd64_child(
+        &mut self,
+        mut cpu: crate::emulator::Cpu,
+        mmu: &mut crate::emulator::Mmu,
+        vfs: &mut crate::fsmount::MountTable,
+        budget: u64,
+        next_pid: &mut i32,
+    ) -> i32 {
+        use crate::emulator::isa_int::StepOk;
+        use crate::emulator::Trap;
+        use crate::linux::abi::{Amd64Abi, LinuxAbi, Sysno};
+        const CLONE_SETTLS: u64 = 0x0008_0000;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        let abi = Amd64Abi;
+        let mut zombies: Vec<(i32, i32)> = Vec::new();
+        let mut steps = 0u64;
+        loop {
+            if steps >= budget {
+                return -1;
+            }
+            match cpu.step(mmu) {
+                Ok(StepOk::Continued) => steps += 1,
+                Ok(StepOk::Halted) => return 0,
+                Err(Trap::Syscall { .. }) => {
+                    steps += 1;
+                    let nr = abi.syscall_nr(&cpu);
+                    let a = abi.syscall_args(&cpu);
+                    match abi.map_syscall(nr) {
+                        Some(Sysno::Exit | Sysno::ExitGroup) => return a[0] as i32,
+                        Some(Sysno::Execve) => {
+                            let path = read_cstr_guest(mmu, a[0] as u32);
+                            let argv = self.linux.read_str_array(mmu, a[1] as u32);
+                            let envp = self.linux.read_str_array(mmu, a[2] as u32);
+                            match path.and_then(|p| exec_nested(vfs, &p, &argv, &envp, budget)) {
+                                Some((code, out, err)) => {
+                                    self.linux.stdout.extend_from_slice(&out);
+                                    self.linux.stderr.extend_from_slice(&err);
+                                    return code;
+                                }
+                                None => abi.set_return(&mut cpu, -2),
+                            }
+                        }
+                        Some(kind @ (Sysno::Fork | Sysno::Vfork | Sysno::Clone)) => {
+                            let (flags, child_stack) = match kind {
+                                Sysno::Clone => (a[0], a[1]),
+                                _ => (0, 0),
+                            };
+                            if flags & CLONE_THREAD != 0 {
+                                // A thread inside a forked child — not modelled.
+                                abi.set_return(&mut cpu, -38); // ENOSYS
+                            } else {
+                                let mut gchild = cpu.clone();
+                                gchild.regs.gp64[0] = 0;
+                                if child_stack != 0 {
+                                    gchild.regs.gp64[4] = child_stack;
+                                }
+                                if flags & CLONE_SETTLS != 0 {
+                                    gchild.set_fs_base(a[4] as u32);
+                                }
+                                let mut gmmu = mmu.fork_copy();
+                                let tid = *next_pid;
+                                *next_pid += 1;
+                                abi.set_return(&mut cpu, i64::from(tid));
+                                let st =
+                                    self.run_amd64_child(gchild, &mut gmmu, vfs, budget, next_pid);
+                                zombies.push((tid, exit_status(st)));
+                            }
+                        }
+                        Some(Sysno::Wait4) => {
+                            let want = a[0] as i32;
+                            let status_ptr = a[1] as u32;
+                            if let Some(pos) =
+                                zombies.iter().position(|(t, _)| want == -1 || want == *t)
+                            {
+                                let (t, s) = zombies.remove(pos);
+                                if status_ptr != 0 {
+                                    let _ = mmu.store32(status_ptr, s as u32);
+                                }
+                                abi.set_return(&mut cpu, i64::from(t));
+                            } else {
+                                abi.set_return(&mut cpu, -10); // ECHILD
+                            }
+                        }
+                        _ => {
+                            self.linux.dispatch(&abi, &mut cpu, mmu, vfs);
+                            if let Some(code) = self.linux.exit_code {
+                                return code;
+                            }
+                        }
+                    }
+                }
+                Err(_) => return -1, // child fault: report failure to the parent
+            }
+        }
     }
 
     /// aarch64 run loop: steps the [`Aarch64Cpu`] and services the `svc`

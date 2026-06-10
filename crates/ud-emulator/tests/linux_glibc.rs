@@ -179,6 +179,40 @@ fn static_glibc_cwd_dirfd_dup_access() {
 }
 
 #[test]
+fn static_glibc_fork_pipe_wait() {
+    // fork + pipe + waitpid against the in-memory root. The child writes to the
+    // pipe and exits with a code; the parent reaps it and reads the bytes. Our
+    // fork model runs the child synchronously to completion, and the pipe lives
+    // in the shared kernel, so this round-trips.
+    let src = r#"
+        #include <stdio.h>
+        #include <unistd.h>
+        #include <sys/wait.h>
+        int main(void) {
+            int p[2];
+            if (pipe(p)) { perror("pipe"); return 1; }
+            pid_t pid = fork();
+            if (pid == 0) {           // child
+                write(p[1], "hello", 5);
+                _exit(7);
+            }
+            int status = 0;
+            waitpid(pid, &status, 0);
+            char b[8] = {0};
+            int n = read(p[0], b, 5);
+            printf("got=%.*s status=%d\n", n, b, WEXITSTATUS(status));
+            return 0;
+        }
+    "#;
+    let Some(elf) = compile_static_opt(src, "forkpipe", "-O0") else {
+        return;
+    };
+    let (stdout, exit) = run(&elf);
+    assert_eq!(stdout, "got=hello status=7\n", "fork/pipe/waitpid");
+    assert_eq!(exit, 0);
+}
+
+#[test]
 fn static_glibc_hello_world() {
     let src = r#"
         #include <stdio.h>

@@ -119,6 +119,19 @@ impl Default for Mmu {
 }
 
 impl Mmu {
+    /// Deep-copy the mapped pages into a fresh MMU (for `fork`: the child gets
+    /// an independent address space). Trace / coverage start clean in the copy.
+    #[must_use]
+    pub fn fork_copy(&self) -> Mmu {
+        Mmu {
+            pages: self.pages.clone(),
+            #[cfg(feature = "trace")]
+            trace: crate::trace::TraceState::new(),
+            coverage: crate::coverage::CoverageMap::default(),
+            dbg_eip: self.dbg_eip,
+        }
+    }
+
     /// Create an empty 4 GiB address space. No pages are mapped.
     pub fn new() -> Self {
         // `Vec::resize_with` keeps the inner buffer sparse — only

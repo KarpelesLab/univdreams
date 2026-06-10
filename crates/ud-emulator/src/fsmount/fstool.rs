@@ -317,6 +317,14 @@ impl MountFs for FsToolMount {
             .map_err(to_io)
     }
 
+    fn readlink(&mut self, rel: &str) -> io::Result<String> {
+        let target = self
+            .fs
+            .read_symlink(&mut *self.dev, Path::new(rel))
+            .map_err(to_io)?;
+        Ok(target.to_string_lossy().into_owned())
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         if self.read_only {
             return Ok(());
