@@ -165,6 +165,66 @@ impl FsToolMount {
     }
 }
 
+/// Build a fresh **ext** image at `image_path` populated from `source_path`
+/// (a `.tar.gz`/`.tar`/directory — auto-detected), sized to fit the source
+/// plus `extra_bytes` of writable headroom (for e.g. package installs into the
+/// root). Only ext2/3/4 targets are supported here (the sizing planner is
+/// ext-specific); `fs_type` selects the variant. The image is flushed and
+/// closed — mount it afterwards with [`FsToolMount::open_image`].
+///
+/// # Errors
+/// I/O error creating the file, or an fstool error detecting / sizing /
+/// formatting / repacking the source.
+pub fn build_ext_image(
+    image_path: &Path,
+    fs_type: &str,
+    source_path: &Path,
+    extra_bytes: u64,
+) -> io::Result<()> {
+    use fstool::fs::ext::{Ext, FsKind};
+    use fstool::repack::{
+        ext_build_plan_for_source, walk_source_into_sink, FsSink, RepackSink, Source,
+    };
+
+    let kind = match fs_type {
+        "ext2" => FsKind::Ext2,
+        "ext3" => FsKind::Ext3,
+        _ => FsKind::Ext4, // "ext" | "ext4" | anything else
+    };
+    let spec = source_path.to_string_lossy();
+    let source = Source::detect(&spec).map_err(to_io)?;
+
+    // Walk once to size the filesystem for the source, then grow it to leave
+    // `extra_bytes` of free space so the mounted root is genuinely writable.
+    let block_size = 4096u32;
+    let plan = ext_build_plan_for_source(&source, block_size, kind).map_err(to_io)?;
+    let mut opts = plan.to_format_opts();
+    let source_bytes = u64::from(opts.blocks_count) * u64::from(block_size);
+    let want_bytes = source_bytes + extra_bytes;
+    let want_blocks = (want_bytes / u64::from(block_size)).min(u64::from(u32::MAX)) as u32;
+    if want_blocks > opts.blocks_count {
+        opts.blocks_count = (want_blocks / 8) * 8;
+        // ~one inode per 16 KiB of headroom so apk has inodes to spare.
+        let by_density = (u64::from(opts.blocks_count) * u64::from(block_size) / 16_384) as u32;
+        opts.inodes_count = opts.inodes_count.max(by_density);
+    }
+    // The backing file is freshly created (all-zero) and we sparsify holes.
+    opts.sparse = true;
+    opts.prezeroed = true;
+
+    let dev_bytes = u64::from(opts.blocks_count) * u64::from(block_size);
+    let mut dev = FileBackend::create(image_path, dev_bytes).map_err(to_io)?;
+    let mut fs = Ext::format_with(&mut dev, &opts).map_err(to_io)?;
+    {
+        let mut sink = FsSink::new(&mut fs, &mut dev);
+        walk_source_into_sink(&source, &mut sink).map_err(to_io)?;
+        // walk_source_into_sink leaves finishing to the caller.
+        sink.finish().map_err(to_io)?;
+    }
+    fs.flush(&mut dev).map_err(to_io)?;
+    Ok(())
+}
+
 fn map_kind(k: EntryKind) -> NodeKind {
     match k {
         EntryKind::Dir => NodeKind::Dir,
@@ -310,5 +370,67 @@ mod tests {
             assert_eq!(&buf, b"on disk");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn repack_tar_gz_into_ext4_root() {
+        // Build a tiny .tar.gz tree (regular file + nested dir + symlink) with
+        // the host `tar`, repack it into an ext4 image, then mount and verify
+        // the tree round-tripped. Skips when no `tar` is available.
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("ud_repack_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        if std::fs::create_dir_all(root.join("etc")).is_err() {
+            return;
+        }
+        std::fs::write(root.join("etc/release"), b"alpine-like 1.0\n").unwrap();
+        std::fs::write(root.join("bin_busybox"), b"#!busybox\n").unwrap();
+        // A symlink ls -> bin_busybox (skip the test if symlinks aren't allowed).
+        if std::os::unix::fs::symlink("bin_busybox", root.join("ls")).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let tarball = dir.join("rootfs.tar.gz");
+        let ok = Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&root)
+            .arg(".")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("SKIP: no working `tar` on this host");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let image = dir.join("root.ext4");
+        build_ext_image(&image, "ext4", &tarball, 8 << 20).expect("repack tar.gz -> ext4");
+
+        let mut fs = FsToolMount::open_image(&image, "ext4", false).expect("mount built image");
+        // Regular file content.
+        let a = fs.stat("/etc/release").expect("stat release");
+        assert!(matches!(a.kind, NodeKind::File));
+        let mut buf = vec![0u8; a.size as usize];
+        fs.read_at("/etc/release", 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"alpine-like 1.0\n");
+        // Symlink preserved.
+        let l = fs.stat("/ls").expect("stat symlink");
+        assert!(
+            matches!(l.kind, NodeKind::Symlink),
+            "ls is a symlink: {l:?}"
+        );
+        // Directory listing.
+        let names: Vec<_> = fs
+            .readdir("/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "etc"), "listed: {names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

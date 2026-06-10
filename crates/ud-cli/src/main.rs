@@ -182,6 +182,16 @@ enum Command {
         #[arg(long)]
         no_default_mounts: bool,
 
+        /// Populate the root from a filesystem image source and mount
+        /// it (writable) at `/`. SPEC is a local `*.tar.gz` / `*.tar` /
+        /// directory, or `alpine[:VERSION][/ARCH]` to fetch the Alpine
+        /// minirootfs from dl-cdn.alpinelinux.org (cached locally). The
+        /// source is repacked into a cached ext4 image on first use.
+        /// Requires `--features fstool`. Example:
+        /// `--rootfs alpine /bin/busybox`.
+        #[arg(long, value_name = "SPEC")]
+        rootfs: Option<String>,
+
         /// In monitor mode, silently ignore `DeleteFileA` and
         /// `RemoveDirectoryA` so the post-install rollback
         /// some installers do (cleanup of temp-dir MSIs after
@@ -863,6 +873,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             fs_type,
             mount,
             no_default_mounts,
+            rootfs,
             preserve_deletes,
             fail_soft,
             stage_vfs,
@@ -881,6 +892,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         fs_type,
                         mounts: mount,
                         no_default_mounts,
+                        rootfs,
                     },
                 )
             } else {
@@ -2890,7 +2902,134 @@ fn parse_mount_spec(
     }
 }
 
-/// Install `--fs-type` (root) and `--mount` overlays into the table.
+/// Default Alpine release fetched for `--rootfs alpine` (override with
+/// `alpine:VERSION`). The download branch is derived as `v<MAJ.MIN>`.
+#[cfg(feature = "fstool")]
+const DEFAULT_ALPINE_VERSION: &str = "3.21.0";
+
+/// Writable headroom added to a repacked `--rootfs` image, on top of the
+/// source size, so packages can be installed into the mounted root.
+#[cfg(feature = "fstool")]
+const ROOTFS_HEADROOM: u64 = 512 << 20;
+
+/// Cache directory for fetched tarballs and built rootfs images.
+#[cfg(feature = "fstool")]
+fn ud_cache_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("univdreams").join("rootfs")
+}
+
+/// Download `url` to `dest` (atomically via a temp file) unless it already
+/// exists.
+#[cfg(feature = "fstool")]
+fn fetch_cached(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+    if dest.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    eprintln!("ud: fetching {url}");
+    let resp = ureq::get(url)
+        .call()
+        .with_context(|| format!("GET {url}"))?;
+    let tmp = dest.with_extension("part");
+    {
+        let mut out = std::fs::File::create(&tmp)?;
+        std::io::copy(&mut resp.into_reader(), &mut out)?;
+    }
+    std::fs::rename(&tmp, dest)?;
+    Ok(())
+}
+
+/// Resolve a `--rootfs SPEC` to a local source path (tarball or directory).
+/// `alpine[:VERSION][/ARCH]` fetches the minirootfs; anything else is a local
+/// path used as-is.
+#[cfg(feature = "fstool")]
+fn resolve_rootfs_source(spec: &str) -> anyhow::Result<std::path::PathBuf> {
+    // alpine[:VERSION][/ARCH]
+    if spec == "alpine" || spec.starts_with("alpine:") || spec.starts_with("alpine/") {
+        let rest = &spec["alpine".len()..];
+        let (ver_part, arch) = match rest.split_once('/') {
+            Some((v, a)) => (v, a.to_string()),
+            None => (rest, "x86_64".to_string()),
+        };
+        let version = ver_part
+            .strip_prefix(':')
+            .filter(|v| !v.is_empty())
+            .unwrap_or(DEFAULT_ALPINE_VERSION);
+        // Branch v<MAJ.MIN> from the full version.
+        let branch = {
+            let mut it = version.split('.');
+            match (it.next(), it.next()) {
+                (Some(maj), Some(min)) => format!("v{maj}.{min}"),
+                _ => anyhow::bail!("invalid alpine version {version:?} (want MAJ.MIN.PATCH)"),
+            }
+        };
+        let file = format!("alpine-minirootfs-{version}-{arch}.tar.gz");
+        let url = format!("https://dl-cdn.alpinelinux.org/alpine/{branch}/releases/{arch}/{file}");
+        let dest = ud_cache_dir().join(&file);
+        fetch_cached(&url, &dest)?;
+        return Ok(dest);
+    }
+    let path = std::path::PathBuf::from(spec);
+    anyhow::ensure!(path.exists(), "--rootfs source not found: {spec}");
+    Ok(path)
+}
+
+/// Deterministic cache path for the ext4 image built from `source`, keyed on
+/// the source's path + size + mtime + headroom so it rebuilds when the source
+/// changes.
+#[cfg(feature = "fstool")]
+fn rootfs_image_path(source: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let canon = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let meta = std::fs::metadata(&canon)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    canon.hash(&mut h);
+    meta.len().hash(&mut h);
+    if let Ok(mtime) = meta.modified() {
+        if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+            dur.as_secs().hash(&mut h);
+        }
+    }
+    ROOTFS_HEADROOM.hash(&mut h);
+    let stem = canon
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("rootfs");
+    Ok(ud_cache_dir().join(format!("{stem}-{:016x}.ext4", h.finish())))
+}
+
+/// Build (if needed) and mount the `--rootfs` source as a writable ext4 root.
+#[cfg(feature = "fstool")]
+fn install_rootfs(table: &mut ud_emulator::fsmount::MountTable, spec: &str) -> anyhow::Result<()> {
+    use ud_emulator::fsmount::fstool::{build_ext_image, FsToolMount};
+    let source = resolve_rootfs_source(spec)?;
+    let image = rootfs_image_path(&source)?;
+    if !image.is_file() {
+        if let Some(parent) = image.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        eprintln!(
+            "ud: building rootfs image {} from {}",
+            image.display(),
+            source.display()
+        );
+        build_ext_image(&image, "ext4", &source, ROOTFS_HEADROOM)
+            .with_context(|| format!("repack {} -> ext4", source.display()))?;
+    }
+    // Mount writable so package installs into the root persist to the image.
+    let fm = FsToolMount::open_image(&image, "ext4", true)
+        .with_context(|| format!("mount rootfs image {}", image.display()))?;
+    table.mount("/", Box::new(fm));
+    Ok(())
+}
+
+/// Install `--rootfs` / `--fs-type` (root) and `--mount` overlays into the table.
 #[cfg(feature = "fstool")]
 fn install_fstool_mounts(
     table: &mut ud_emulator::fsmount::MountTable,
@@ -2898,7 +3037,10 @@ fn install_fstool_mounts(
     default_type: &str,
 ) -> anyhow::Result<()> {
     use ud_emulator::fsmount::fstool::FsToolMount;
-    if let Some(ty) = &fs.fs_type {
+    // `--rootfs` wins for `/`; otherwise `--fs-type` formats a fresh root.
+    if let Some(spec) = &fs.rootfs {
+        install_rootfs(table, spec)?;
+    } else if let Some(ty) = &fs.fs_type {
         let ty = resolve_fs_type(ty, default_type);
         let fm = FsToolMount::format_empty(&ty, 256 << 20)
             .with_context(|| format!("mkfs root --fs-type {ty}"))?;
@@ -2921,8 +3063,8 @@ fn install_fstool_mounts(
     fs: &FsOpts,
     _default_type: &str,
 ) -> anyhow::Result<()> {
-    if fs.fs_type.is_some() || !fs.mounts.is_empty() {
-        anyhow::bail!("--fs-type / --mount require a build with `--features fstool`");
+    if fs.fs_type.is_some() || !fs.mounts.is_empty() || fs.rootfs.is_some() {
+        anyhow::bail!("--fs-type / --mount / --rootfs require a build with `--features fstool`");
     }
     Ok(())
 }
@@ -3155,11 +3297,13 @@ fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
 }
 
 /// Filesystem options collected from `--fs-type` / `--mount` /
-/// `--no-default-mounts`.
+/// `--no-default-mounts` / `--rootfs`.
 struct FsOpts {
     fs_type: Option<String>,
     mounts: Vec<String>,
     no_default_mounts: bool,
+    /// `--rootfs SPEC`: populate `/` from a tarball/dir/`alpine:…` source.
+    rootfs: Option<String>,
 }
 
 fn monitor_install(

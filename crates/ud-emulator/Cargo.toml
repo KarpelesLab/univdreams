@@ -76,7 +76,12 @@ libc = { version = "0.2", optional = true }
 kvm-ioctls = { version = "0.23", optional = true }
 kvm-bindings = { version = "0.13", optional = true, features = ["fam-wrappers"] }
 # Real on-disk filesystems (ext/NTFS/FAT/…) for the `fstool` mount backend.
-fstool = { version = "0.4", optional = true, default-features = false }
+# `gzip` is enabled so we can repack `.tar.gz` sources (Alpine minirootfs, `.apk`
+# packages) into an ext4 root; the rest of fstool's archive/compression codecs
+# stay off.
+fstool = { version = "0.4", optional = true, default-features = false, features = [
+    "gzip",
+] }
 
 [dev-dependencies]
 # Fetched-fixture corpus runner (`tests/codec_corpus.rs`).
