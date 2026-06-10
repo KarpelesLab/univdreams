@@ -178,7 +178,7 @@ impl Sandbox {
     /// what's-written workflow.
     #[must_use]
     pub fn with_vfs(mut self, vfs: crate::context::VirtualFs) -> Self {
-        self.host.context.vfs = Some(vfs);
+        self.host.context.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         self
     }
 
@@ -440,7 +440,7 @@ impl Sandbox {
         self.host
             .context
             .vfs
-            .get_or_insert_with(crate::context::VirtualFs::new);
+            .get_or_insert_with(crate::fsmount::MountTable::new);
         Ok(image)
     }
 
@@ -462,7 +462,7 @@ impl Sandbox {
             .context
             .vfs
             .take()
-            .unwrap_or_else(crate::context::VirtualFs::new);
+            .unwrap_or_else(crate::fsmount::MountTable::new);
         let result = crate::linux::kvm::run(&mut self.linux, &mut vfs, bytes, name)
             .map_err(|e| crate::Error::NeLoader(format!("kvm: {e}")));
         self.host.context.vfs = Some(vfs);
@@ -483,7 +483,7 @@ impl Sandbox {
             .context
             .vfs
             .take()
-            .unwrap_or_else(crate::context::VirtualFs::new);
+            .unwrap_or_else(crate::fsmount::MountTable::new);
         let result = match self.linux_machine {
             EM_X86_64 => self.run_linux_amd64(&mut vfs),
             EM_AARCH64 => self.run_linux_aarch64(&mut vfs),
@@ -494,7 +494,7 @@ impl Sandbox {
     }
 
     /// i386 run loop: services the `int 0x80` gate via [`I386Abi`].
-    fn run_linux_i386(&mut self, vfs: &mut crate::context::VirtualFs) -> Result<i32, crate::Error> {
+    fn run_linux_i386(&mut self, vfs: &mut crate::fsmount::MountTable) -> Result<i32, crate::Error> {
         use crate::emulator::isa_int::StepOk;
         use crate::emulator::Trap;
         let abi = crate::linux::abi::I386Abi;
@@ -527,7 +527,7 @@ impl Sandbox {
     /// `pthread_join` returns; `exit_group` ends the whole process.
     fn run_linux_amd64(
         &mut self,
-        vfs: &mut crate::context::VirtualFs,
+        vfs: &mut crate::fsmount::MountTable,
     ) -> Result<i32, crate::Error> {
         use crate::emulator::isa_int::StepOk;
         use crate::emulator::{Cpu, Trap};
@@ -721,7 +721,7 @@ impl Sandbox {
     /// gate ([`Trap::Syscall`]) via [`Aarch64Abi`].
     fn run_linux_aarch64(
         &mut self,
-        vfs: &mut crate::context::VirtualFs,
+        vfs: &mut crate::fsmount::MountTable,
     ) -> Result<i32, crate::Error> {
         use crate::emulator::isa_int::StepOk;
         use crate::emulator::Trap;
@@ -2794,7 +2794,7 @@ mod tests {
         // Stage a child binary in the VFS.
         let dll_bytes = build_minimal_dll();
         let child_path = "c:\\setup\\helper.exe";
-        let mut vfs = crate::context::VirtualFs::new();
+        let mut vfs = crate::fsmount::MountTable::new();
         vfs.insert(child_path, dll_bytes);
         sb.host.context.vfs = Some(vfs);
 

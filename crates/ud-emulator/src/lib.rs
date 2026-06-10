@@ -210,6 +210,7 @@ pub mod context;
 pub mod coverage;
 pub mod emulator;
 pub mod ffi;
+pub mod fsmount;
 pub mod linux;
 pub mod ne;
 pub mod pe;

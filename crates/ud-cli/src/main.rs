@@ -1208,7 +1208,7 @@ fn qtcodec_register(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     for d in stage_vfs {
         let n = stage_dir_into_vfs(sandbox.context_mut(), d)
             .with_context(|| format!("stage {}", d.display()))?;
@@ -1332,7 +1332,7 @@ fn qtcodec_list(
     // context so we can carry their contents across.
     {
         let mut tmp_ctx = ud_emulator::context::Context {
-            vfs: Some(ud_emulator::context::VirtualFs::new()),
+            vfs: Some(ud_emulator::fsmount::MountTable::new()),
             ..ud_emulator::context::Context::default()
         };
         for d in stage_vfs {
@@ -1352,7 +1352,7 @@ fn qtcodec_list(
         let mut install_sb = ud_emulator::Sandbox::new();
         install_sb.host.trace_stubs = true;
         install_sb.host.instruction_budget = Some(max_instructions);
-        install_sb.context_mut().vfs = Some(staged_vfs.clone());
+        install_sb.context_mut().vfs = Some(ud_emulator::fsmount::MountTable::with_root(staged_vfs.clone()));
         install_sb.context_mut().registry = Some(staged_reg.clone());
         for msi_path in install_msi {
             let bytes =
@@ -1398,7 +1398,7 @@ fn qtcodec_list(
     let mut sandbox = ud_emulator::Sandbox::new();
     sandbox.host.trace_stubs = true;
     sandbox.host.instruction_budget = Some(max_instructions);
-    sandbox.context_mut().vfs = Some(staged_vfs);
+    sandbox.context_mut().vfs = Some(ud_emulator::fsmount::MountTable::with_root(staged_vfs));
     sandbox.context_mut().registry = Some(staged_reg);
     preload_qt_runtime(&mut sandbox);
 
@@ -1631,7 +1631,7 @@ fn qtcodec_call(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     for d in stage_vfs {
         let n = stage_dir_into_vfs(sandbox.context_mut(), d)
             .with_context(|| format!("stage {}", d.display()))?;
@@ -1715,7 +1715,7 @@ fn qtcodec_dispatch(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     for dir in stage_vfs {
         let n = stage_dir_into_vfs(sandbox.context_mut(), dir)
             .with_context(|| format!("stage {}", dir.display()))?;
@@ -2252,7 +2252,7 @@ fn analyze(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     for dir in stage_vfs {
         let n = stage_dir_into_vfs(sandbox.context_mut(), dir)
             .with_context(|| format!("stage {}", dir.display()))?;
@@ -2552,7 +2552,7 @@ fn monitor_msi_install(
         }
         // Also stage the MSI bytes at a path dispatch can find.
         sb_vfs.insert("c:/temp/install.msi", bytes.to_vec());
-        sandbox.context_mut().vfs = Some(sb_vfs);
+        sandbox.context_mut().vfs = Some(ud_emulator::fsmount::MountTable::with_root(sb_vfs));
         // Stage registry (clone via the all_values iter).
         let mut sb_reg = ud_emulator::context::VirtualRegistry::new();
         for (k, n, v) in registry.all_values() {
@@ -2694,7 +2694,7 @@ fn monitor_install_ne(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     sandbox
         .context_mut()
         .registry
@@ -2864,7 +2864,7 @@ fn monitor_install_elf(
         sb.host.instruction_budget = Some(max_instructions);
         sb.context_mut()
             .vfs
-            .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+            .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
         sb
     };
     let mut sandbox = new_sandbox();
@@ -3116,7 +3116,7 @@ fn monitor_install(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     sandbox
         .context_mut()
         .registry

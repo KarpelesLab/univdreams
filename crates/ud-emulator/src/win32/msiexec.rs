@@ -1289,7 +1289,7 @@ struct EmulatorInstallSink<'a> {
     /// are created as zero-byte markers (we don't unpack the
     /// CAB streams the MSI references); the path is what
     /// matters for "what would be installed" intel.
-    vfs: Option<&'a mut crate::context::VirtualFs>,
+    vfs: Option<&'a mut crate::fsmount::MountTable>,
     /// Virtual registry the install writes resolved keys into.
     registry: Option<&'a mut crate::context::VirtualRegistry>,
     /// Per-action chatter — flushed back into the host's

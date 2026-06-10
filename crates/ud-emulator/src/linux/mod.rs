@@ -19,8 +19,9 @@ pub mod mem;
 
 use std::collections::BTreeMap;
 
-use crate::context::{FileAccess, VirtualFs};
+use crate::context::FileAccess;
 use crate::emulator::Perm;
+use crate::fsmount::MountTable;
 
 use abi::{LinuxAbi, Sysno};
 use guest::GuestCpu;
@@ -46,7 +47,7 @@ enum Fd {
     Stdin,
     Stdout,
     Stderr,
-    /// A handle into the [`VirtualFs`].
+    /// A table-minted file handle (`MountTable`).
     Vfs(u32),
 }
 
@@ -101,7 +102,7 @@ impl LinuxKernel {
         abi: &dyn LinuxAbi,
         cpu: &mut dyn GuestCpu,
         mmu: &mut dyn GuestMem,
-        vfs: &mut VirtualFs,
+        vfs: &mut MountTable,
     ) {
         self.ptr64 = abi.ptr_bits() == 64;
         let nr = abi.syscall_nr(cpu);
@@ -140,7 +141,7 @@ impl LinuxKernel {
         sys: Sysno,
         a: &[u64; 6],
         mmu: &mut dyn GuestMem,
-        vfs: &mut VirtualFs,
+        vfs: &mut MountTable,
     ) -> i64 {
         let (a0, a1, a2) = (a[0] as u32, a[1] as u32, a[2] as u32);
         match sys {
@@ -198,7 +199,7 @@ impl LinuxKernel {
         buf: u32,
         len: u32,
         mmu: &dyn GuestMem,
-        vfs: &mut VirtualFs,
+        vfs: &mut MountTable,
     ) -> i64 {
         let data = match read_mem(mmu, buf, len as usize) {
             Some(d) => d,
@@ -224,7 +225,7 @@ impl LinuxKernel {
         iov: u32,
         cnt: u32,
         mmu: &dyn GuestMem,
-        vfs: &mut VirtualFs,
+        vfs: &mut MountTable,
     ) -> i64 {
         let mut total = 0i64;
         for i in 0..cnt {
@@ -247,7 +248,7 @@ impl LinuxKernel {
         buf: u32,
         len: u32,
         mmu: &mut dyn GuestMem,
-        vfs: &mut VirtualFs,
+        vfs: &mut MountTable,
     ) -> i64 {
         match self.fds.get(&fd) {
             Some(Fd::Stdin) => 0, // EOF — no stdin
@@ -263,7 +264,7 @@ impl LinuxKernel {
         }
     }
 
-    fn sys_open(&mut self, path: u32, flags: u32, mmu: &dyn GuestMem, vfs: &mut VirtualFs) -> i64 {
+    fn sys_open(&mut self, path: u32, flags: u32, mmu: &dyn GuestMem, vfs: &mut MountTable) -> i64 {
         let Some(p) = read_cstr(mmu, path, 4096) else {
             return EFAULT;
         };
@@ -287,7 +288,7 @@ impl LinuxKernel {
         }
     }
 
-    fn sys_close(&mut self, fd: i32, vfs: &mut VirtualFs) -> i64 {
+    fn sys_close(&mut self, fd: i32, vfs: &mut MountTable) -> i64 {
         match self.fds.remove(&fd) {
             Some(Fd::Vfs(h)) => {
                 vfs.close(h);
@@ -298,7 +299,7 @@ impl LinuxKernel {
         }
     }
 
-    fn sys_lseek(&mut self, fd: i32, off: i32, whence: u32, vfs: &mut VirtualFs) -> i64 {
+    fn sys_lseek(&mut self, fd: i32, off: i32, whence: u32, vfs: &mut MountTable) -> i64 {
         match self.fds.get(&fd) {
             Some(Fd::Vfs(h)) => vfs
                 .seek_handle(*h, off, whence as u8)

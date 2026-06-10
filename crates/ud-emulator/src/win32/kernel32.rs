@@ -5698,7 +5698,7 @@ fn stub_get_file_attributes_a(
         return Ok(0xFFFF_FFFF);
     }
     let name = read_cstr(mmu, p_name, 260)?;
-    let Some(vfs) = state.context.vfs.as_ref() else {
+    let Some(vfs) = state.context.vfs.as_mut() else {
         state.last_error = ERROR_FILE_NOT_FOUND;
         return Ok(0xFFFF_FFFF);
     };
@@ -5725,7 +5725,7 @@ fn stub_get_file_size(
 ) -> Result<u32, Win32Error> {
     let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetFileSize", t))?;
     let p_hi = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetFileSize", t))?;
-    if let Some(vfs) = state.context.vfs.as_ref() {
+    if let Some(vfs) = state.context.vfs.as_mut() {
         if let Some(sz) = vfs.size(h) {
             if p_hi != 0 {
                 mmu.store32(p_hi, (sz >> 32) as u32)

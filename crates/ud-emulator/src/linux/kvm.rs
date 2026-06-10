@@ -35,8 +35,8 @@
 use kvm_bindings::{kvm_msr_entry, kvm_segment, kvm_userspace_memory_region, Msrs};
 use kvm_ioctls::{Kvm, VcpuExit};
 
-use crate::context::VirtualFs;
 use crate::emulator::Trap;
+use crate::fsmount::MountTable;
 
 use super::abi::Amd64Abi;
 use super::guest::GuestCpu;
@@ -284,7 +284,7 @@ fn user_segment(selector: u16, code: bool) -> kvm_segment {
 /// caller falls back to the software interpreter.
 pub fn run(
     kernel: &mut LinuxKernel,
-    vfs: &mut VirtualFs,
+    vfs: &mut MountTable,
     bytes: &[u8],
     name: &str,
 ) -> Result<i32, String> {

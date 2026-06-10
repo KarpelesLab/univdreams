@@ -594,7 +594,7 @@ fn dos_fail(cpu: &mut Cpu, code: u16) {
 /// Resolve a DOS `FindFirst` pathspec to a `(basename, size)` match in the
 /// VFS. Handles an exact path, and a `*`/`?` pattern by matching the first
 /// file sharing the spec's directory prefix.
-fn dos_find_match(vfs: &crate::context::VirtualFs, spec: &str) -> Option<(String, u32)> {
+fn dos_find_match(vfs: &crate::fsmount::MountTable, spec: &str) -> Option<(String, u32)> {
     let base = |p: &str| {
         p.rsplit(['\\', '/'])
             .next()

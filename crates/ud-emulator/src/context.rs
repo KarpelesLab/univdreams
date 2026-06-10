@@ -34,10 +34,14 @@ use std::collections::BTreeMap;
 /// Top-level optional context layer. Owned by
 /// [`HostState`](crate::win32::HostState); each guest call to a
 /// Win32 stub backed by a virtual surface goes through here.
-#[derive(Debug, Default, Clone)]
+///
+/// (Not `Clone`: the filesystem is now a [`MountTable`](crate::fsmount::MountTable)
+/// which may carry non-cloneable overlay backends.)
+#[derive(Debug, Default)]
 pub struct Context {
-    /// In-memory filesystem, if attached.
-    pub vfs: Option<VirtualFs>,
+    /// Per-instance filesystem (a mount table whose default root is the
+    /// in-memory [`VirtualFs`]), if attached.
+    pub vfs: Option<crate::fsmount::MountTable>,
     /// In-memory registry, if attached.
     pub registry: Option<VirtualRegistry>,
 }
@@ -50,10 +54,10 @@ impl Context {
         Self::default()
     }
 
-    /// Builder: attach the given VFS.
+    /// Builder: attach the given VFS as the root of a fresh mount table.
     #[must_use]
     pub fn with_vfs(mut self, vfs: VirtualFs) -> Self {
-        self.vfs = Some(vfs);
+        self.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         self
     }
 
