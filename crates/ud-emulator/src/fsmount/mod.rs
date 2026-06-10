@@ -19,9 +19,8 @@
 //! their open handles borrow the filesystem *and* its block device for their
 //! whole lifetime, so no long-lived handle can be kept across other calls.
 
-// Synthetic backends (`procfs`, `devfs`) and the `fstool`-backed real-fs
-// backend are added in later phases; they implement [`MountFs`] and are
-// installed via [`MountTable::mount`].
+pub mod devfs;
+pub mod procfs;
 
 use std::collections::BTreeMap;
 
@@ -396,6 +395,26 @@ mod tests {
         assert!(t.owns(h));
         assert!(t.close(h));
         assert!(t.contains("/etc/hosts"));
+    }
+
+    #[test]
+    fn overlay_read_open_routes_to_backend() {
+        let mut t = MountTable::new();
+        t.mount("/dev", Box::new(crate::fsmount::devfs::DevFs::new()));
+        // Read-only open of an existing overlay device must succeed and route.
+        let h = t
+            .open("/dev/urandom", FileAccess::Read)
+            .expect("open urandom");
+        assert!(
+            h >= OVERLAY_HANDLE_BASE,
+            "overlay handle, not a root handle"
+        );
+        let mut buf = [0u8; 8];
+        assert_eq!(t.read_handle(h, &mut buf), Some(8));
+        // A non-existent device read-opens to nothing (not auto-created).
+        assert!(t.open("/dev/nope", FileAccess::Read).is_none());
+        // Root path still goes to the in-memory VFS.
+        assert!(t.open("/etc/x", FileAccess::Read).is_none());
     }
 
     #[test]

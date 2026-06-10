@@ -201,6 +201,32 @@ impl Mmu {
         }
     }
 
+    /// Coalesce contiguous mapped pages of equal permission into ascending
+    /// `(start, end_exclusive, perm)` ranges. The end is a `u64` so the final
+    /// region at the top of the address space doesn't wrap. Used to render
+    /// `/proc/self/maps`.
+    #[must_use]
+    pub fn regions(&self) -> Vec<(u32, u64, Perm)> {
+        let mut out = Vec::new();
+        let mut cur: Option<(u32, Perm)> = None;
+        for (i, slot) in self.pages.iter().enumerate() {
+            let addr = (i as u64) << PAGE_SHIFT;
+            match (cur, slot.as_ref().map(|p| p.perm)) {
+                (Some((_, perm)), Some(p)) if p == perm => {} // extend run
+                (Some((start, perm)), here) => {
+                    out.push((start, addr, perm));
+                    cur = here.map(|p| (addr as u32, p));
+                }
+                (None, Some(p)) => cur = Some((addr as u32, p)),
+                (None, None) => {}
+            }
+        }
+        if let Some((start, perm)) = cur {
+            out.push((start, (NUM_PAGES as u64) << PAGE_SHIFT, perm));
+        }
+        out
+    }
+
     /// Unmap a contiguous range of pages — the inverse of
     /// [`Self::map`]. `addr` and `size` are rounded down/up to
     /// page boundaries. Pages not currently mapped are silently

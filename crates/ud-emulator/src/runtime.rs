@@ -115,6 +115,77 @@ fn wake_futex(threads: &mut [AmdThread], addr: u32, n: i32) -> i32 {
     woke
 }
 
+/// Synthetic `/proc/cpuinfo` — one generic x86-64 CPU.
+const PROC_CPUINFO: &str = "processor\t: 0\nvendor_id\t: GenuineIntel\n\
+cpu family\t: 6\nmodel\t\t: 158\nmodel name\t: univdreams virtual CPU\n\
+flags\t\t: fpu tsc cmov mmx fxsr sse sse2\nbogomips\t: 8000.00\n\n";
+
+/// Synthetic `/proc/meminfo` — a fixed 2 GiB.
+const PROC_MEMINFO: &str = "MemTotal:        2097152 kB\nMemFree:         1048576 kB\n\
+MemAvailable:    1572864 kB\nBuffers:               0 kB\nCached:                0 kB\n";
+
+/// Install the default synthetic Linux mounts (`/proc`, `/dev`) into `mounts`,
+/// populating `/proc` from the current process image (`name`) and the mapped
+/// memory regions.
+fn install_linux_synthetic(
+    mounts: &mut crate::fsmount::MountTable,
+    regions: &[(u32, u64, crate::emulator::Perm)],
+    name: &str,
+) {
+    use crate::fsmount::{devfs::DevFs, procfs::ProcFs};
+
+    let exe = format!("/{}", name.trim_start_matches('/'));
+    let mut procfs = ProcFs::new();
+    procfs.set_file("/cpuinfo", PROC_CPUINFO.as_bytes().to_vec());
+    procfs.set_file("/meminfo", PROC_MEMINFO.as_bytes().to_vec());
+    procfs.set_file(
+        "/version",
+        b"Linux version 5.15.0 (univdreams) #1 SMP\n".to_vec(),
+    );
+    let mut cmdline = name.as_bytes().to_vec();
+    cmdline.push(0);
+    procfs.set_file("/self/cmdline", cmdline);
+    procfs.set_symlink("/self/exe", &exe);
+    procfs.set_file("/self/maps", ProcFs::render_maps(regions, &exe));
+    procfs.set_file(
+        "/self/stat",
+        format!("1 ({name}) R 0 1 1 0 -1 0 0 0 0 0 0 0\n").into_bytes(),
+    );
+
+    mounts.mount("/proc", Box::new(procfs));
+    mounts.mount("/dev", Box::new(DevFs::new()));
+}
+
+/// `PT_LOAD` regions of a static ELF as `(start, end, perm)` — renders
+/// `/proc/self/maps` for the KVM path (its flat guest memory has no useful
+/// page-granular region list).
+#[cfg(feature = "kvm")]
+fn elf_load_regions(bytes: &[u8]) -> Vec<(u32, u64, crate::emulator::Perm)> {
+    use crate::emulator::Perm;
+    let Ok(elf) = ud_format::elf::Elf64File::parse(bytes) else {
+        return Vec::new();
+    };
+    elf.phdrs
+        .iter()
+        .filter(|p| p.p_type == 1) // PT_LOAD
+        .map(|p| {
+            let mut perm = Perm::default();
+            if p.p_flags & 4 != 0 {
+                perm = perm | Perm::R;
+            }
+            if p.p_flags & 2 != 0 {
+                perm = perm | Perm::W;
+            }
+            if p.p_flags & 1 != 0 {
+                perm = perm | Perm::X;
+            }
+            let start = (p.p_vaddr as u32) & !0xFFF;
+            let end = (p.p_vaddr + p.p_memsz + 0xFFF) & !0xFFF;
+            (start, end, perm)
+        })
+        .collect()
+}
+
 /// One sandbox instance per loaded codec DLL.
 pub struct Sandbox {
     pub mmu: Mmu,
@@ -131,6 +202,9 @@ pub struct Sandbox {
     /// The aarch64 CPU, allocated lazily when an `EM_AARCH64` image loads
     /// (the x86 [`Cpu`] cannot host that ISA).
     pub aarch64: Option<Box<crate::emulator::aarch64::Aarch64Cpu>>,
+    /// Auto-mount synthetic `/proc` + `/dev` for Linux runs. Default `true`;
+    /// the CLI's `--no-default-mounts` clears it.
+    pub linux_default_mounts: bool,
 }
 
 impl Default for Sandbox {
@@ -373,6 +447,7 @@ impl Sandbox {
             linux: crate::linux::LinuxKernel::default(),
             linux_machine: 0,
             aarch64: None,
+            linux_default_mounts: true,
         }
     }
 
@@ -390,6 +465,7 @@ impl Sandbox {
             linux: crate::linux::LinuxKernel::default(),
             linux_machine: 0,
             aarch64: None,
+            linux_default_mounts: true,
         }
     }
 
@@ -441,6 +517,12 @@ impl Sandbox {
             .context
             .vfs
             .get_or_insert_with(crate::fsmount::MountTable::new);
+        if self.linux_default_mounts {
+            let regions = self.mmu.regions();
+            if let Some(mounts) = self.host.context.vfs.as_mut() {
+                install_linux_synthetic(mounts, &regions, name);
+            }
+        }
         Ok(image)
     }
 
@@ -463,6 +545,11 @@ impl Sandbox {
             .vfs
             .take()
             .unwrap_or_else(crate::fsmount::MountTable::new);
+        // The KVM loader runs inside `kvm::run`, so install the synthetic
+        // mounts here, deriving `/proc/self/maps` from the ELF's PT_LOADs.
+        if self.linux_default_mounts {
+            install_linux_synthetic(&mut vfs, &elf_load_regions(bytes), name);
+        }
         let result = crate::linux::kvm::run(&mut self.linux, &mut vfs, bytes, name)
             .map_err(|e| crate::Error::NeLoader(format!("kvm: {e}")));
         self.host.context.vfs = Some(vfs);
@@ -494,7 +581,10 @@ impl Sandbox {
     }
 
     /// i386 run loop: services the `int 0x80` gate via [`I386Abi`].
-    fn run_linux_i386(&mut self, vfs: &mut crate::fsmount::MountTable) -> Result<i32, crate::Error> {
+    fn run_linux_i386(
+        &mut self,
+        vfs: &mut crate::fsmount::MountTable,
+    ) -> Result<i32, crate::Error> {
         use crate::emulator::isa_int::StepOk;
         use crate::emulator::Trap;
         let abi = crate::linux::abi::I386Abi;

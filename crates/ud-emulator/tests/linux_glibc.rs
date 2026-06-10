@@ -55,6 +55,43 @@ fn run(bytes: &[u8]) -> (String, i32) {
 }
 
 #[test]
+fn static_glibc_reads_proc_and_dev() {
+    // The synthetic /proc and /dev mounts auto-installed for Linux runs:
+    // /proc/cpuinfo, /proc/self/maps, /dev/urandom (deterministic), /dev/null.
+    let src = r#"
+        #include <stdio.h>
+        #include <string.h>
+        #include <fcntl.h>
+        #include <unistd.h>
+        int main(void) {
+            char buf[256];
+            int f = open("/proc/cpuinfo", O_RDONLY);
+            int n = read(f, buf, 32); close(f);
+            buf[n > 0 ? n : 0] = 0;
+            int cpu_ok = (n > 0) && strstr(buf, "processor") != NULL;
+            f = open("/proc/self/maps", O_RDONLY);
+            n = read(f, buf, 32); close(f);
+            int maps_ok = (n > 0) && strstr(buf, "00400000") != NULL;
+            f = open("/dev/urandom", O_RDONLY);
+            unsigned char r = 0; int got = read(f, &r, 1); close(f);
+            f = open("/dev/null", O_WRONLY);
+            int w = write(f, "x", 1); close(f);
+            printf("cpu=%d maps=%d rand=%d null=%d\n", cpu_ok, maps_ok, got == 1, w == 1);
+            return 0;
+        }
+    "#;
+    let Some(elf) = compile_static(src, "procdev") else {
+        return;
+    };
+    let (stdout, exit) = run(&elf);
+    assert_eq!(
+        stdout, "cpu=1 maps=1 rand=1 null=1\n",
+        "/proc + /dev served"
+    );
+    assert_eq!(exit, 0);
+}
+
+#[test]
 fn static_glibc_hello_world() {
     let src = r#"
         #include <stdio.h>
