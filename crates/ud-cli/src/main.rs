@@ -139,8 +139,10 @@ enum Command {
         /// The string is prefixed with the input PE's filename
         /// so the installer sees `argv[0] = setup.exe` and
         /// `argv[1..] = <flags>`, matching how Windows
-        /// formats the real `GetCommandLineA` output.
-        #[arg(long)]
+        /// formats the real `GetCommandLineA` output. For Linux ELFs the
+        /// tokens become the guest `argv[1..]` (quote-aware), e.g.
+        /// `--args "-c 'echo hi'"`.
+        #[arg(long, allow_hyphen_values = true)]
         args: Option<String>,
 
         /// In monitor mode, after the run finishes write every
@@ -3069,11 +3071,67 @@ fn install_fstool_mounts(
     Ok(())
 }
 
+/// Split a `--args` string into argv tokens, honouring single and double
+/// quotes (so `sh -c 'echo hi'` becomes `["sh", "-c", "echo hi"]`).
+fn shell_split(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_tok = false;
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_tok = true;
+                }
+                c if c.is_whitespace() => {
+                    if in_tok {
+                        out.push(std::mem::take(&mut cur));
+                        in_tok = false;
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    in_tok = true;
+                }
+            },
+        }
+    }
+    if in_tok {
+        out.push(cur);
+    }
+    out
+}
+
+/// A minimal guest environment for the Linux personality (busybox / apk look
+/// at `PATH`, `HOME`, `TERM`).
+fn default_linux_env() -> Vec<String> {
+    [
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME=/root",
+        "TERM=dumb",
+        "PWD=/",
+        "USER=root",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
 fn monitor_install_elf(
     input: &Path,
     bytes: &[u8],
     max_instructions: u64,
     as_json: bool,
+    extra_args: Option<&str>,
     dump_vfs: Option<&Path>,
     use_kvm: bool,
     fs: &FsOpts,
@@ -3082,6 +3140,7 @@ fn monitor_install_elf(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("a.out");
+    let argv = shell_split(extra_args.unwrap_or(""));
 
     // i386, x86-64 and aarch64 static ELFs have executors.
     if !ud_emulator::linux::loader::is_runnable(bytes) {
@@ -3107,6 +3166,8 @@ fn monitor_install_elf(
         let mut sb = ud_emulator::Sandbox::new_linux();
         sb.host.instruction_budget = Some(max_instructions);
         sb.linux_default_mounts = !fs.no_default_mounts;
+        sb.linux_argv.clone_from(&argv);
+        sb.linux_env = default_linux_env();
         let table = sb
             .context_mut()
             .vfs
@@ -3343,6 +3404,7 @@ fn monitor_install(
             &bytes,
             max_instructions,
             as_json,
+            extra_args,
             dump_vfs,
             use_kvm,
             fs,

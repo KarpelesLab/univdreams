@@ -286,16 +286,15 @@ pub fn run(
     kernel: &mut LinuxKernel,
     vfs: &mut MountTable,
     bytes: &[u8],
-    name: &str,
+    argv: &[&str],
+    envp: &[&str],
 ) -> Result<i32, String> {
     let trace = std::env::var("UD_LINUX_TRACE").is_ok();
 
     // --- guest memory + load the ELF through the shared loader ---
     let mut mem = KvmMem::new(MEM_SIZE as usize)?;
-    let argv = [name];
-    let envp: [&str; 0] = [];
     // Dynamic binaries read their interpreter from the guest rootfs (`vfs`).
-    let image = loader::load_elf(&mut mem, Some(vfs), bytes, &argv, &envp)
+    let image = loader::load_elf(&mut mem, Some(vfs), bytes, argv, envp)
         .map_err(|e| format!("ELF load: {e}"))?;
     kernel.init(image.brk);
 

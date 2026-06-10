@@ -146,6 +146,39 @@ fn static_glibc_dir_syscalls_mkdir_stat_getdents() {
 }
 
 #[test]
+fn static_glibc_cwd_dirfd_dup_access() {
+    // chdir + getcwd + relative-path (AT_FDCWD) resolution + dup + access,
+    // against the in-memory root. Creating /work/foo.txt first materialises
+    // /work as a (synthesised) directory so chdir into it succeeds.
+    let src = r#"
+        #include <stdio.h>
+        #include <fcntl.h>
+        #include <unistd.h>
+        int main(void) {
+            int fd = open("/work/foo.txt", O_RDWR | O_CREAT, 0644);
+            write(fd, "hi", 2); close(fd);
+            chdir("/work");
+            char cwd[64] = {0}; getcwd(cwd, sizeof cwd);
+            int rfd = open("foo.txt", O_RDONLY);   // relative to cwd
+            char b[8] = {0}; int n = read(rfd, b, 7);
+            int dupfd = dup(rfd);
+            int acc = access("foo.txt", F_OK);      // exists
+            printf("cwd=%s read=%.*s acc=%d dup=%d\n", cwd, n, b, acc, dupfd > 2);
+            return 0;
+        }
+    "#;
+    let Some(elf) = compile_static_opt(src, "cwd", "-O0") else {
+        return;
+    };
+    let (stdout, exit) = run(&elf);
+    assert_eq!(
+        stdout, "cwd=/work read=hi acc=0 dup=1\n",
+        "cwd/dirfd/dup/access"
+    );
+    assert_eq!(exit, 0);
+}
+
+#[test]
 fn static_glibc_hello_world() {
     let src = r#"
         #include <stdio.h>

@@ -37,6 +37,9 @@ const ENOSYS: i64 = -38;
 const ENOTDIR: i64 = -20;
 const EISDIR: i64 = -21;
 
+/// `dirfd` value meaning "relative to the current working directory".
+const AT_FDCWD: i32 = -100;
+
 /// A page size for `brk` / `mmap` rounding.
 const PAGE: u32 = 0x1000;
 /// Base of the anonymous-`mmap` bump arena (grows up).
@@ -93,6 +96,12 @@ pub struct LinuxKernel {
     /// Active file-backed mappings, for `MAP_SHARED` writeback on
     /// `munmap`/`msync`.
     file_maps: Vec<FileMapping>,
+    /// Current working directory (normalised absolute path), for `getcwd` and
+    /// relative-path / `AT_FDCWD` resolution. Defaults to `/`.
+    cwd: String,
+    /// Process file-mode creation mask (`umask`). Cosmetic — we don't enforce
+    /// permissions — but tracked so `umask` returns the previous value.
+    umask: u32,
 }
 
 /// A file-backed `mmap` region we may need to flush back to the file.
@@ -123,6 +132,8 @@ impl LinuxKernel {
         self.fds.insert(2, Fd::Stderr);
         self.next_fd = 3;
         self.current_tid = 1;
+        self.cwd = "/".to_string();
+        self.umask = 0o022;
     }
 
     /// Service one syscall: read `(nr, args)` via `abi`, run it, write the
@@ -179,8 +190,8 @@ impl LinuxKernel {
             Sysno::Write => self.sys_write(a0 as i32, a1, a2, mmu, vfs),
             Sysno::Writev => self.sys_writev(a0 as i32, a1, a2, mmu, vfs),
             Sysno::Read => self.sys_read(a0 as i32, a1, a2, mmu, vfs),
-            Sysno::Open => self.sys_open(a0, a1, mmu, vfs),
-            Sysno::Openat => self.sys_open(a1, a2, mmu, vfs), // ignore dirfd; absolute paths
+            Sysno::Open => self.sys_openat(AT_FDCWD, a0, a1, mmu, vfs),
+            Sysno::Openat => self.sys_openat(a0 as i32, a1, a2, mmu, vfs),
             Sysno::Close => self.sys_close(a0 as i32, vfs),
             Sysno::Lseek => self.sys_lseek(a0 as i32, a1 as i32, a2, vfs),
             Sysno::Brk => self.sys_brk(a0, mmu),
@@ -200,22 +211,23 @@ impl LinuxKernel {
                 self.exit_code = Some(a0 as i32);
                 0
             }
-            Sysno::Fstat | Sysno::Stat | Sysno::Newfstatat => {
+            Sysno::Fstat | Sysno::Stat | Sysno::Lstat | Sysno::Newfstatat => {
                 self.sys_stat(sys, a, mmu, vfs, stat_layout)
             }
+            Sysno::Statx => self.sys_statx(a0 as i32, a1, a[4] as u32, mmu, vfs),
             Sysno::Getdents64 => self.sys_getdents64(a0 as i32, a1, a2, mmu, vfs),
-            Sysno::Mkdir => self.sys_mkdir(a0, mmu, vfs),
-            Sysno::Mkdirat => self.sys_mkdir(a1, mmu, vfs), // ignore dirfd; absolute paths
-            Sysno::Unlink => self.sys_unlink(a0, false, mmu, vfs),
-            Sysno::Rmdir => self.sys_unlink(a0, true, mmu, vfs),
+            Sysno::Mkdir => self.sys_mkdirat(AT_FDCWD, a0, mmu, vfs),
+            Sysno::Mkdirat => self.sys_mkdirat(a0 as i32, a1, mmu, vfs),
+            Sysno::Unlink => self.sys_unlinkat(AT_FDCWD, a0, false, mmu, vfs),
+            Sysno::Rmdir => self.sys_unlinkat(AT_FDCWD, a0, true, mmu, vfs),
             // unlinkat(dirfd, path, flags); AT_REMOVEDIR = 0x200.
-            Sysno::Unlinkat => self.sys_unlink(a1, a2 & 0x200 != 0, mmu, vfs),
-            Sysno::Symlink => self.sys_symlink(a0, a1, mmu, vfs), // symlink(target, linkpath)
-            Sysno::Symlinkat => self.sys_symlink(a0, a2, mmu, vfs), // symlinkat(target, dirfd, link)
+            Sysno::Unlinkat => self.sys_unlinkat(a0 as i32, a1, a2 & 0x200 != 0, mmu, vfs),
+            Sysno::Symlink => self.sys_symlinkat(a0, AT_FDCWD, a1, mmu, vfs),
+            Sysno::Symlinkat => self.sys_symlinkat(a0, a1 as i32, a2, mmu, vfs),
             Sysno::Truncate => self.sys_truncate(a0, a[1], mmu, vfs),
             Sysno::Ftruncate => self.sys_ftruncate(a0 as i32, a[1], vfs),
-            Sysno::Readlink => self.sys_readlinkat(a0, a1, a2, mmu, vfs),
-            Sysno::Readlinkat => self.sys_readlinkat(a1, a2, a[3] as u32, mmu, vfs),
+            Sysno::Readlink => self.sys_readlinkat(AT_FDCWD, a0, a1, a2, mmu, vfs),
+            Sysno::Readlinkat => self.sys_readlinkat(a0 as i32, a1, a2, a[3] as u32, mmu, vfs),
             Sysno::Uname => self.sys_uname(a0, mmu),
             Sysno::Getpid => 1,
             Sysno::Gettid => i64::from(self.current_tid),
@@ -227,10 +239,32 @@ impl LinuxKernel {
             Sysno::Futex => 0, // uncontended: report success
             Sysno::Getrandom => self.sys_getrandom(a0, a1, mmu),
             Sysno::SchedYield => 0,
+            Sysno::Nanosleep => 0, // time is frozen; sleeping is instantaneous
+            Sysno::Poll | Sysno::Ppoll => self.sys_poll(a0, a1, mmu),
             // clone/futex are serviced by the amd64 thread scheduler; on the
             // single-threaded paths they degrade to "no threads".
             Sysno::Clone => ENOSYS,
-            Sysno::Access => ENOENT,
+            // access(path, mode) / faccessat(dirfd, path, mode, flags): we
+            // don't enforce permissions, so "exists" == "accessible".
+            Sysno::Access => self.sys_faccessat(AT_FDCWD, a0, mmu, vfs),
+            Sysno::Faccessat => self.sys_faccessat(a0 as i32, a1, mmu, vfs),
+            Sysno::Fcntl => self.sys_fcntl(a0 as i32, a1, a2),
+            Sysno::Dup => self.sys_dup(a0 as i32),
+            Sysno::Dup2 => self.sys_dup2(a0 as i32, a1 as i32, vfs),
+            // dup3(old, new, flags) — flags (O_CLOEXEC) ignored.
+            Sysno::Dup3 => self.sys_dup2(a0 as i32, a1 as i32, vfs),
+            Sysno::Chdir => self.sys_chdir(a0, mmu, vfs),
+            Sysno::Fchdir => self.sys_fchdir(a0 as i32),
+            Sysno::Umask => {
+                let old = self.umask;
+                self.umask = a0 & 0o777;
+                i64::from(old)
+            }
+            // We don't enforce file modes / times; accept these as success.
+            Sysno::Fchmod | Sysno::Fchmodat | Sysno::Utimensat => 0,
+            Sysno::Pread64 => self.sys_pread64(a0 as i32, a1, a2, a[3], vfs, mmu),
+            Sysno::Pwrite64 => self.sys_pwrite64(a0 as i32, a1, a2, a[3], vfs, mmu),
+            Sysno::Readv => self.sys_readv(a0 as i32, a1, a2, mmu, vfs),
             Sysno::Getcwd => self.sys_getcwd(a0, a1, mmu),
             Sysno::Ioctl => ENOTTY, // "not a terminal" → libc picks full buffering
             Sysno::ArchPrctl => 0,
@@ -273,6 +307,23 @@ impl LinuxKernel {
         }
     }
 
+    /// Read one `struct iovec` (`{base, len}`) from the array at `iov`. The
+    /// element width follows the guest's pointer size: 16 bytes on 64-bit
+    /// (`u64` base + `u64` len), 8 bytes on 32-bit.
+    fn read_iovec(&self, iov: u32, i: u32, mmu: &dyn GuestMem) -> Option<(u32, u32)> {
+        if self.ptr64 {
+            let base = iov.wrapping_add(i.wrapping_mul(16));
+            let ptr = mmu.load64(base).ok()?;
+            let len = mmu.load64(base.wrapping_add(8)).ok()?;
+            Some((ptr as u32, len as u32))
+        } else {
+            let base = iov.wrapping_add(i.wrapping_mul(8));
+            let ptr = mmu.load32(base).ok()?;
+            let len = mmu.load32(base.wrapping_add(4)).ok()?;
+            Some((ptr, len))
+        }
+    }
+
     fn sys_writev(
         &mut self,
         fd: i32,
@@ -283,8 +334,7 @@ impl LinuxKernel {
     ) -> i64 {
         let mut total = 0i64;
         for i in 0..cnt {
-            let base = iov.wrapping_add(i.wrapping_mul(8));
-            let (Ok(ptr), Ok(len)) = (mmu.load32(base), mmu.load32(base.wrapping_add(4))) else {
+            let Some((ptr, len)) = self.read_iovec(iov, i, mmu) else {
                 return EFAULT;
             };
             let r = self.sys_write(fd, ptr, len, mmu, vfs);
@@ -320,9 +370,35 @@ impl LinuxKernel {
         }
     }
 
-    fn sys_open(&mut self, path: u32, flags: u32, mmu: &dyn GuestMem, vfs: &mut MountTable) -> i64 {
-        let Some(p) = read_cstr(mmu, path, 4096) else {
-            return EFAULT;
+    /// Resolve a guest path string against a `dirfd` (or the cwd for
+    /// `AT_FDCWD`) into a normalised absolute path. Returns `None` on a bad
+    /// pointer or an unknown `dirfd`.
+    fn resolve_at(&self, dirfd: i32, path_ptr: u32, mmu: &dyn GuestMem) -> Option<String> {
+        let p = read_cstr(mmu, path_ptr, 4096)?;
+        if p.starts_with('/') {
+            return Some(canonicalize("/", &p));
+        }
+        let base = if dirfd == AT_FDCWD {
+            self.cwd.clone()
+        } else {
+            match self.fds.get(&dirfd) {
+                Some(Fd::Dir { path, .. } | Fd::Vfs { path, .. }) => path.clone(),
+                _ => return None,
+            }
+        };
+        Some(canonicalize(&base, &p))
+    }
+
+    fn sys_openat(
+        &mut self,
+        dirfd: i32,
+        path: u32,
+        flags: u32,
+        mmu: &dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let Some(p) = self.resolve_at(dirfd, path, mmu) else {
+            return EBADF;
         };
         // O_WRONLY=1, O_RDWR=2, O_CREAT=0x40 (i386/x86-64 share these).
         let access = match flags & 0x3 {
@@ -526,14 +602,41 @@ impl LinuxKernel {
     }
 
     fn sys_getcwd(&self, buf: u32, size: u32, mmu: &mut dyn GuestMem) -> i64 {
-        let cwd = b"/\0";
+        let mut cwd = self.cwd.clone().into_bytes();
+        cwd.push(0);
         if (size as usize) < cwd.len() {
             return -34; // ERANGE
         }
-        if write_mem(mmu, buf, cwd).is_none() {
+        if write_mem(mmu, buf, &cwd).is_none() {
             return EFAULT;
         }
-        i64::from(buf)
+        // getcwd returns the length including the NUL on Linux.
+        cwd.len() as i64
+    }
+
+    fn sys_chdir(&mut self, path: u32, mmu: &dyn GuestMem, vfs: &mut MountTable) -> i64 {
+        let Some(p) = self.resolve_at(AT_FDCWD, path, mmu) else {
+            return EFAULT;
+        };
+        match vfs.stat_path(&p) {
+            Some(a) if matches!(a.kind, NodeKind::Dir) => {
+                self.cwd = p;
+                0
+            }
+            Some(_) => ENOTDIR,
+            None => ENOENT,
+        }
+    }
+
+    fn sys_fchdir(&mut self, fd: i32) -> i64 {
+        match self.fds.get(&fd) {
+            Some(Fd::Dir { path, .. }) => {
+                self.cwd = path.clone();
+                0
+            }
+            Some(_) => ENOTDIR,
+            None => EBADF,
+        }
     }
 
     fn sys_clock_gettime(&self, ts: u32, mmu: &mut dyn GuestMem) -> i64 {
@@ -626,14 +729,14 @@ impl LinuxKernel {
                 }
             }
             sys => {
-                // stat(path, buf) | newfstatat(dirfd, path, buf, flags)
-                let (path_ptr, buf) = if sys == Sysno::Newfstatat {
-                    (a[1] as u32, a[2] as u32)
+                // stat/lstat(path, buf) | newfstatat(dirfd, path, buf, flags)
+                let (dirfd, path_ptr, buf) = if sys == Sysno::Newfstatat {
+                    (a[0] as i32, a[1] as u32, a[2] as u32)
                 } else {
-                    (a[0] as u32, a[1] as u32)
+                    (AT_FDCWD, a[0] as u32, a[1] as u32)
                 };
-                let Some(p) = read_cstr(mmu, path_ptr, 4096) else {
-                    return EFAULT;
+                let Some(p) = self.resolve_at(dirfd, path_ptr, mmu) else {
+                    return EBADF;
                 };
                 match vfs.stat_path(&p) {
                     Some(att) => (att.kind, att.size, buf),
@@ -642,6 +745,63 @@ impl LinuxKernel {
             }
         };
         self.write_stat(buf, kind, size, layout, mmu)
+    }
+
+    /// `statx(dirfd, path, flags, mask, buf)`: fill the architecture-independent
+    /// `struct statx` (256 bytes) with the file's kind + size. musl uses statx
+    /// for `stat`/`lstat` on modern kernels.
+    fn sys_statx(
+        &self,
+        dirfd: i32,
+        path: u32,
+        buf: u32,
+        mmu: &mut dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let Some(p) = self.resolve_at(dirfd, path, mmu) else {
+            return EBADF;
+        };
+        let Some(att) = vfs.stat_path(&p) else {
+            return ENOENT;
+        };
+        let mode: u16 = match att.kind {
+            NodeKind::Dir => 0o040_755,
+            NodeKind::Symlink => 0o120_777,
+            NodeKind::CharDevice => 0o020_666,
+            NodeKind::File => 0o100_644,
+        };
+        let mut b = [0u8; 256];
+        // STATX_BASIC_STATS = 0x7ff (type,mode,nlink,uid,gid,atime,mtime,ctime,
+        // ino,size,blocks).
+        b[0..4].copy_from_slice(&0x7ffu32.to_le_bytes()); // stx_mask
+        b[4..8].copy_from_slice(&512u32.to_le_bytes()); // stx_blksize
+        b[16..20].copy_from_slice(&1u32.to_le_bytes()); // stx_nlink
+        b[28..30].copy_from_slice(&mode.to_le_bytes()); // stx_mode
+        b[40..48].copy_from_slice(&att.size.to_le_bytes()); // stx_size
+        b[48..56].copy_from_slice(&att.size.div_ceil(512).to_le_bytes()); // stx_blocks
+        if write_mem(mmu, buf, &b).is_none() {
+            return EFAULT;
+        }
+        0
+    }
+
+    /// `access`/`faccessat`: we don't enforce permissions, so a path that
+    /// exists is accessible.
+    fn sys_faccessat(
+        &self,
+        dirfd: i32,
+        path: u32,
+        mmu: &dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let Some(p) = self.resolve_at(dirfd, path, mmu) else {
+            return EBADF;
+        };
+        if vfs.stat_path(&p).is_some() {
+            0
+        } else {
+            ENOENT
+        }
     }
 
     /// Serialise a stat struct (zeros except the fields we model) per `layout`.
@@ -743,22 +903,29 @@ impl LinuxKernel {
         i64::from(off)
     }
 
-    fn sys_mkdir(&mut self, path: u32, mmu: &dyn GuestMem, vfs: &mut MountTable) -> i64 {
-        let Some(p) = read_cstr(mmu, path, 4096) else {
-            return EFAULT;
+    fn sys_mkdirat(
+        &mut self,
+        dirfd: i32,
+        path: u32,
+        mmu: &dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let Some(p) = self.resolve_at(dirfd, path, mmu) else {
+            return EBADF;
         };
         vfs.mkdir_path(&p, 0o755).map_or(EINVAL, |()| 0)
     }
 
-    fn sys_unlink(
+    fn sys_unlinkat(
         &mut self,
+        dirfd: i32,
         path: u32,
         is_rmdir: bool,
         mmu: &dyn GuestMem,
         vfs: &mut MountTable,
     ) -> i64 {
-        let Some(p) = read_cstr(mmu, path, 4096) else {
-            return EFAULT;
+        let Some(p) = self.resolve_at(dirfd, path, mmu) else {
+            return EBADF;
         };
         let r = if is_rmdir {
             vfs.rmdir_path(&p)
@@ -768,15 +935,18 @@ impl LinuxKernel {
         r.map_or(ENOENT, |()| 0)
     }
 
-    fn sys_symlink(
+    fn sys_symlinkat(
         &mut self,
         target: u32,
+        dirfd: i32,
         linkpath: u32,
         mmu: &dyn GuestMem,
         vfs: &mut MountTable,
     ) -> i64 {
-        let (Some(t), Some(l)) = (read_cstr(mmu, target, 4096), read_cstr(mmu, linkpath, 4096))
-        else {
+        let (Some(t), Some(l)) = (
+            read_cstr(mmu, target, 4096),
+            self.resolve_at(dirfd, linkpath, mmu),
+        ) else {
             return EFAULT;
         };
         vfs.symlink_path(&t, &l).map_or(EINVAL, |()| 0)
@@ -810,14 +980,15 @@ impl LinuxKernel {
     /// resolve a symlink (overlay-backed) into the caller's buffer.
     fn sys_readlinkat(
         &self,
+        dirfd: i32,
         path: u32,
         buf: u32,
         size: u32,
         mmu: &mut dyn GuestMem,
         vfs: &mut MountTable,
     ) -> i64 {
-        let Some(p) = read_cstr(mmu, path, 4096) else {
-            return EFAULT;
+        let Some(p) = self.resolve_at(dirfd, path, mmu) else {
+            return EBADF;
         };
         let target = match vfs.readlink_path(&p) {
             Ok(t) => t,
@@ -831,6 +1002,178 @@ impl LinuxKernel {
         }
         n as i64
     }
+
+    // ---- fd table ops ----------------------------------------------------
+
+    /// `fcntl(fd, cmd, arg)`: enough for musl/busybox startup. We don't model
+    /// O_CLOEXEC / file-status flags (no exec yet), so the descriptor-flag
+    /// commands are accepted and queried as 0; `F_DUPFD` duplicates the fd.
+    fn sys_fcntl(&mut self, fd: i32, cmd: u32, _arg: u32) -> i64 {
+        if !self.fds.contains_key(&fd) {
+            return EBADF;
+        }
+        match cmd {
+            0 | 1030 => self.sys_dup(fd), // F_DUPFD / F_DUPFD_CLOEXEC
+            1 | 3 => 0,                   // F_GETFD / F_GETFL → no flags
+            2 | 4 => 0,                   // F_SETFD / F_SETFL → accept
+            _ => 0,                       // other commands: accept
+        }
+    }
+
+    /// Allocate the lowest free fd ≥ 3 and put `value` there.
+    fn install_fd(&mut self, value: Fd) -> i32 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.fds.insert(fd, value);
+        fd
+    }
+
+    fn sys_dup(&mut self, oldfd: i32) -> i64 {
+        match self.fds.get(&oldfd).cloned() {
+            Some(v) => i64::from(self.install_fd(v)),
+            None => EBADF,
+        }
+    }
+
+    fn sys_dup2(&mut self, oldfd: i32, newfd: i32, vfs: &mut MountTable) -> i64 {
+        let Some(v) = self.fds.get(&oldfd).cloned() else {
+            return EBADF;
+        };
+        if oldfd == newfd {
+            return i64::from(newfd);
+        }
+        // Close whatever currently occupies newfd.
+        if let Some(Fd::Vfs { h, .. }) = self.fds.remove(&newfd) {
+            vfs.close(h);
+        }
+        self.fds.insert(newfd, v);
+        if newfd >= self.next_fd {
+            self.next_fd = newfd + 1;
+        }
+        i64::from(newfd)
+    }
+
+    /// `poll`/`ppoll`: we don't block, and regular files / the std streams are
+    /// always ready. Set each `revents` to its requested `events` and report
+    /// the count of ready fds.
+    fn sys_poll(&self, fds: u32, nfds: u32, mmu: &mut dyn GuestMem) -> i64 {
+        // struct pollfd { int fd; short events; short revents; } — 8 bytes.
+        let mut ready = 0i64;
+        for i in 0..nfds {
+            let base = fds.wrapping_add(i.wrapping_mul(8));
+            let Ok(events) = mmu.load16(base.wrapping_add(4)) else {
+                return EFAULT;
+            };
+            if write_mem(mmu, base.wrapping_add(6), &events.to_le_bytes()).is_none() {
+                return EFAULT;
+            }
+            if events != 0 {
+                ready += 1;
+            }
+        }
+        ready
+    }
+
+    fn sys_pread64(
+        &self,
+        fd: i32,
+        buf: u32,
+        len: u32,
+        offset: u64,
+        vfs: &mut MountTable,
+        mmu: &mut dyn GuestMem,
+    ) -> i64 {
+        let path = match self.fds.get(&fd) {
+            Some(Fd::Vfs { path, .. }) => path.clone(),
+            Some(Fd::Dir { .. }) => return EISDIR,
+            _ => return EBADF,
+        };
+        let data = read_file_region(vfs, &path, offset, len as usize);
+        if write_mem(mmu, buf, &data).is_none() {
+            return EFAULT;
+        }
+        data.len() as i64
+    }
+
+    fn sys_pwrite64(
+        &self,
+        fd: i32,
+        buf: u32,
+        len: u32,
+        offset: u64,
+        vfs: &mut MountTable,
+        mmu: &dyn GuestMem,
+    ) -> i64 {
+        let path = match self.fds.get(&fd) {
+            Some(Fd::Vfs { path, .. }) => path.clone(),
+            Some(Fd::Dir { .. }) => return EISDIR,
+            _ => return EBADF,
+        };
+        let Some(data) = read_mem(mmu, buf, len as usize) else {
+            return EFAULT;
+        };
+        if let Some(h) = vfs.open(&path, FileAccess::ReadWrite) {
+            vfs.seek(h, offset);
+            let n = vfs.write_handle(h, &data).unwrap_or(0);
+            vfs.close(h);
+            n as i64
+        } else {
+            EBADF
+        }
+    }
+
+    /// `readv(fd, iov, cnt)`: scatter read into the iovec array (mirror of
+    /// `sys_writev`).
+    fn sys_readv(
+        &mut self,
+        fd: i32,
+        iov: u32,
+        cnt: u32,
+        mmu: &mut dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let mut total = 0i64;
+        for i in 0..cnt {
+            let Some((ptr, len)) = self.read_iovec(iov, i, mmu) else {
+                return EFAULT;
+            };
+            let r = self.sys_read(fd, ptr, len, mmu, vfs);
+            if r < 0 {
+                return if total > 0 { total } else { r };
+            }
+            total += r;
+            if (r as u32) < len {
+                break; // short read: stop
+            }
+        }
+        total
+    }
+}
+
+/// Resolve a (possibly relative) `path` against `base` (an absolute dir),
+/// collapsing `.` / `..` and `//` into a clean absolute path. An absolute
+/// `path` ignores `base`.
+fn canonicalize(base: &str, path: &str) -> String {
+    let mut comps: Vec<&str> = Vec::new();
+    let first = if path.starts_with('/') { "" } else { base };
+    for seg in first.split('/').chain(path.split('/')) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                comps.pop();
+            }
+            other => comps.push(other),
+        }
+    }
+    if comps.is_empty() {
+        return "/".to_string();
+    }
+    let mut s = String::with_capacity(path.len() + base.len() + 1);
+    for c in &comps {
+        s.push('/');
+        s.push_str(c);
+    }
+    s
 }
 
 // ---- guest memory helpers ------------------------------------------------
@@ -899,4 +1242,25 @@ fn read_file_region(vfs: &mut MountTable, path: &str, offset: u64, len: usize) -
     }
     vfs.close(h);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize;
+
+    #[test]
+    fn canonicalize_resolves_dots_and_relatives() {
+        assert_eq!(canonicalize("/", "."), "/");
+        assert_eq!(canonicalize("/", "etc"), "/etc");
+        assert_eq!(canonicalize("/usr", "bin"), "/usr/bin");
+        assert_eq!(canonicalize("/usr/bin", ".."), "/usr");
+        assert_eq!(canonicalize("/usr/bin", "../lib"), "/usr/lib");
+        assert_eq!(canonicalize("/a/b/c", "../../x"), "/a/x");
+        // An absolute path ignores the base.
+        assert_eq!(canonicalize("/usr", "/etc/hosts"), "/etc/hosts");
+        // Collapse redundant separators and `.` segments.
+        assert_eq!(canonicalize("/", "a//b/./c"), "/a/b/c");
+        // `..` past the root clamps at root.
+        assert_eq!(canonicalize("/", "../.."), "/");
+    }
 }

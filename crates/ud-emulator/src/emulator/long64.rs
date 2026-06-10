@@ -980,6 +980,21 @@ impl Cpu {
                 self.set_xmm_rm(rm, out, mmu)?;
                 Ok(StepOk::Continued)
             }
+            0xA4 | 0xA5 | 0xAC | 0xAD => {
+                // SHLD / SHRD r/m, reg, (imm8 | CL) — double-precision shift.
+                // A4/AC take imm8; A5/AD take the count from CL. A4/A5 = SHLD
+                // (left), AC/AD = SHRD (right).
+                let imm8 = matches!(op, 0xA4 | 0xAC);
+                let (reg, rm) = self.modrm(mmu, p, u8::from(imm8))?;
+                let src = self.rget(reg, osz, rex);
+                let count = if imm8 {
+                    u64::from(self.fetch8(mmu)?)
+                } else {
+                    self.rget(1, 1, rex) // CL
+                };
+                self.shld_shrd(rm, src, count, osz, matches!(op, 0xA4 | 0xA5), mmu)?;
+                Ok(StepOk::Continued)
+            }
             0x80..=0x8F => {
                 let rel = self.fetch32(mmu)? as i32 as i64;
                 if self.cond(op & 0xF) {
@@ -1211,6 +1226,39 @@ impl Cpu {
         }
         let _ = bits;
         Ok(StepOk::Continued)
+    }
+
+    /// SHLD / SHRD: shift `rm` by `count`, feeding bits in from `src` (the
+    /// other register). `left` selects SHLD (toward the MSB) vs SHRD. Sets
+    /// SF/ZF/PF from the result; CF/OF are left approximate (matching the
+    /// plain shift helper).
+    fn shld_shrd(
+        &mut self,
+        rm: Op,
+        src: u64,
+        count: u64,
+        size: u8,
+        left: bool,
+        mmu: &mut Mmu,
+    ) -> Result<(), Trap> {
+        let bits = u32::from(size) * 8;
+        let c = (count as u32) & if size == 8 { 63 } else { 31 };
+        if c == 0 {
+            return Ok(());
+        }
+        let dst = mask(self.op_get(rm, size, true, mmu)?, size);
+        let src = mask(src, size);
+        // c is in 1..bits, so `bits - c` is also in 1..bits — no full-width
+        // shift (which would be UB in Rust).
+        let r = if left {
+            (dst << c) | (src >> (bits - c))
+        } else {
+            (dst >> c) | (src << (bits - c))
+        };
+        let r = mask(r, size);
+        self.op_set(rm, size, true, r, mmu)?;
+        self.szp(r, size);
+        Ok(())
     }
 
     // ---- arithmetic primitives ------------------------------------------

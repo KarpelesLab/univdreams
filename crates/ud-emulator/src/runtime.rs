@@ -205,6 +205,10 @@ pub struct Sandbox {
     /// Auto-mount synthetic `/proc` + `/dev` for Linux runs. Default `true`;
     /// the CLI's `--no-default-mounts` clears it.
     pub linux_default_mounts: bool,
+    /// Extra guest `argv` (after `argv[0]`, the program name) and the guest
+    /// environment. Empty by default; the CLI fills these from `--args`.
+    pub linux_argv: Vec<String>,
+    pub linux_env: Vec<String>,
 }
 
 impl Default for Sandbox {
@@ -448,6 +452,8 @@ impl Sandbox {
             linux_machine: 0,
             aarch64: None,
             linux_default_mounts: true,
+            linux_argv: Vec::new(),
+            linux_env: Vec::new(),
         }
     }
 
@@ -466,6 +472,8 @@ impl Sandbox {
             linux_machine: 0,
             aarch64: None,
             linux_default_mounts: true,
+            linux_argv: Vec::new(),
+            linux_env: Vec::new(),
         }
     }
 
@@ -483,8 +491,11 @@ impl Sandbox {
         bytes: &[u8],
     ) -> Result<crate::linux::loader::ElfImage, crate::Error> {
         use ud_format::elf::{EM_386, EM_AARCH64, EM_X86_64};
-        let argv = [name];
-        let envp: [&str; 0] = [];
+        // argv[0] is the program name, then any extra `--args`; envp is the
+        // configured guest environment.
+        let mut argv: Vec<&str> = vec![name];
+        argv.extend(self.linux_argv.iter().map(String::as_str));
+        let envp: Vec<&str> = self.linux_env.iter().map(String::as_str).collect();
         // The mount table must exist before loading so the dynamic linker
         // (`PT_INTERP`) can be read from the guest rootfs.
         let mounts = self
@@ -558,7 +569,10 @@ impl Sandbox {
         if self.linux_default_mounts {
             install_linux_synthetic(&mut vfs, &elf_load_regions(bytes), name);
         }
-        let result = crate::linux::kvm::run(&mut self.linux, &mut vfs, bytes, name)
+        let mut argv: Vec<&str> = vec![name];
+        argv.extend(self.linux_argv.iter().map(String::as_str));
+        let envp: Vec<&str> = self.linux_env.iter().map(String::as_str).collect();
+        let result = crate::linux::kvm::run(&mut self.linux, &mut vfs, bytes, &argv, &envp)
             .map_err(|e| crate::Error::NeLoader(format!("kvm: {e}")));
         self.host.context.vfs = Some(vfs);
         result
