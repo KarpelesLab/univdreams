@@ -17,11 +17,11 @@
 pub mod aarch64;
 pub mod decode;
 pub mod isa_avx;
-pub mod long64;
 pub mod isa_fpu;
 pub mod isa_int;
 pub mod isa_mmx;
 pub mod isa_sse;
+pub mod long64;
 pub mod mmu;
 pub mod regs;
 

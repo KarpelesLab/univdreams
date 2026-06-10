@@ -34,6 +34,13 @@ trace-exec = ["trace"]
 # in the rust-vmm ioctl wrappers + libc for the guest-memory mmap.
 kvm = ["dep:libc", "dep:kvm-ioctls", "dep:kvm-bindings"]
 
+# Opt-in real-filesystem mount backends (ext4 / NTFS / FAT / … images, mkfs)
+# via our `fstool` crate. Off by default — the mount table, in-memory root, and
+# synthetic /proc + /dev need no external crate; only `--fs-type` / `--mount`
+# of a real filesystem requires this. `default-features = false` drops the
+# archive/compression codecs we don't use.
+fstool = ["dep:fstool"]
+
 # docs.rs builds with `trace` + `trace-exec` enabled so the
 # trace-gated public items resolve in the rendered docs.
 [package.metadata.docs.rs]
@@ -68,6 +75,8 @@ libc = { version = "0.2", optional = true }
 # rust-vmm safe wrappers over the /dev/kvm ioctl ABI.
 kvm-ioctls = { version = "0.23", optional = true }
 kvm-bindings = { version = "0.13", optional = true, features = ["fam-wrappers"] }
+# Real on-disk filesystems (ext/NTFS/FAT/…) for the `fstool` mount backend.
+fstool = { version = "0.4", optional = true, default-features = false }
 
 [dev-dependencies]
 # Fetched-fixture corpus runner (`tests/codec_corpus.rs`).

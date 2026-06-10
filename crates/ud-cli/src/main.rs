@@ -161,6 +161,27 @@ enum Command {
         #[arg(long)]
         kvm: bool,
 
+        /// Back the root filesystem with a real on-disk format
+        /// (ext4 / ntfs / fat / exfat) via fstool instead of the
+        /// flat in-memory store. `auto` picks the per-OS default
+        /// (ext4 for a Linux ELF, NTFS for a PE). Requires a build
+        /// with `--features fstool`.
+        #[arg(long, value_name = "TYPE")]
+        fs_type: Option<String>,
+
+        /// Mount a filesystem at a path: `--mount <point>=<spec>`
+        /// (repeatable). `<spec>` is a type name (`ext4`, fresh
+        /// empty), `@<image>` (open a host image read-only), or
+        /// `@<image>:rw` (open writable, flush on exit). Requires
+        /// `--features fstool`. Example: `--mount /data=@disk.ext4`.
+        #[arg(long, value_name = "POINT=SPEC")]
+        mount: Vec<String>,
+
+        /// Don't auto-mount the synthetic `/proc` and `/dev` for
+        /// Linux runs.
+        #[arg(long)]
+        no_default_mounts: bool,
+
         /// In monitor mode, silently ignore `DeleteFileA` and
         /// `RemoveDirectoryA` so the post-install rollback
         /// some installers do (cleanup of temp-dir MSIs after
@@ -839,6 +860,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             args,
             dump_vfs,
             kvm,
+            fs_type,
+            mount,
+            no_default_mounts,
             preserve_deletes,
             fail_soft,
             stage_vfs,
@@ -853,6 +877,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     dump_vfs.as_deref(),
                     preserve_deletes,
                     kvm,
+                    &FsOpts {
+                        fs_type,
+                        mounts: mount,
+                        no_default_mounts,
+                    },
                 )
             } else {
                 analyze(
@@ -1352,7 +1381,9 @@ fn qtcodec_list(
         let mut install_sb = ud_emulator::Sandbox::new();
         install_sb.host.trace_stubs = true;
         install_sb.host.instruction_budget = Some(max_instructions);
-        install_sb.context_mut().vfs = Some(ud_emulator::fsmount::MountTable::with_root(staged_vfs.clone()));
+        install_sb.context_mut().vfs = Some(ud_emulator::fsmount::MountTable::with_root(
+            staged_vfs.clone(),
+        ));
         install_sb.context_mut().registry = Some(staged_reg.clone());
         for msi_path in install_msi {
             let bytes =
@@ -2826,6 +2857,76 @@ fn monitor_install_ne(
 /// Run an ELF binary under the Linux syscall-emulation personality and
 /// report what it did (captured stdout/stderr, exit code, unsupported
 /// syscalls, files written to the VFS).
+/// Resolve a `--fs-type` value, mapping `auto`/`default`/empty to the per-OS
+/// default (`ext4` for Linux, `ntfs` for Windows).
+#[cfg(feature = "fstool")]
+fn resolve_fs_type(ty: &str, default_type: &str) -> String {
+    if ty.is_empty() || ty == "auto" || ty == "default" {
+        default_type.to_string()
+    } else {
+        ty.to_string()
+    }
+}
+
+/// Parse one `--mount` right-hand side into an fstool mount. Grammar:
+/// `[type]@path[:rw]` opens a host image; a bare `type` formats a fresh empty
+/// 64 MiB filesystem.
+#[cfg(feature = "fstool")]
+fn parse_mount_spec(
+    src: &str,
+    default_type: &str,
+) -> anyhow::Result<ud_emulator::fsmount::fstool::FsToolMount> {
+    use ud_emulator::fsmount::fstool::FsToolMount;
+    if let Some((lhs, rhs)) = src.split_once('@') {
+        let ty = resolve_fs_type(lhs, default_type);
+        let (path, writeback) = rhs.strip_suffix(":rw").map_or((rhs, false), |p| (p, true));
+        Ok(FsToolMount::open_image(
+            std::path::Path::new(path),
+            &ty,
+            writeback,
+        )?)
+    } else {
+        Ok(FsToolMount::format_empty(src, 256 << 20)?)
+    }
+}
+
+/// Install `--fs-type` (root) and `--mount` overlays into the table.
+#[cfg(feature = "fstool")]
+fn install_fstool_mounts(
+    table: &mut ud_emulator::fsmount::MountTable,
+    fs: &FsOpts,
+    default_type: &str,
+) -> anyhow::Result<()> {
+    use ud_emulator::fsmount::fstool::FsToolMount;
+    if let Some(ty) = &fs.fs_type {
+        let ty = resolve_fs_type(ty, default_type);
+        let fm = FsToolMount::format_empty(&ty, 256 << 20)
+            .with_context(|| format!("mkfs root --fs-type {ty}"))?;
+        table.mount("/", Box::new(fm));
+    }
+    for spec in &fs.mounts {
+        let (point, src) = spec
+            .split_once('=')
+            .with_context(|| format!("--mount expects POINT=SPEC, got {spec:?}"))?;
+        let fm =
+            parse_mount_spec(src, default_type).with_context(|| format!("--mount {spec:?}"))?;
+        table.mount(point, Box::new(fm));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "fstool"))]
+fn install_fstool_mounts(
+    _table: &mut ud_emulator::fsmount::MountTable,
+    fs: &FsOpts,
+    _default_type: &str,
+) -> anyhow::Result<()> {
+    if fs.fs_type.is_some() || !fs.mounts.is_empty() {
+        anyhow::bail!("--fs-type / --mount require a build with `--features fstool`");
+    }
+    Ok(())
+}
+
 fn monitor_install_elf(
     input: &Path,
     bytes: &[u8],
@@ -2833,6 +2934,7 @@ fn monitor_install_elf(
     as_json: bool,
     dump_vfs: Option<&Path>,
     use_kvm: bool,
+    fs: &FsOpts,
 ) -> anyhow::Result<()> {
     let stem = input
         .file_name()
@@ -2859,15 +2961,18 @@ fn monitor_install_elf(
         .map(|e| e.ehdr.e_machine)
         .unwrap_or(0);
 
-    let new_sandbox = || {
+    let new_sandbox = || -> anyhow::Result<ud_emulator::Sandbox> {
         let mut sb = ud_emulator::Sandbox::new_linux();
         sb.host.instruction_budget = Some(max_instructions);
-        sb.context_mut()
+        sb.linux_default_mounts = !fs.no_default_mounts;
+        let table = sb
+            .context_mut()
             .vfs
             .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
-        sb
+        install_fstool_mounts(table, fs, "ext4")?;
+        Ok(sb)
     };
-    let mut sandbox = new_sandbox();
+    let mut sandbox = new_sandbox()?;
 
     // Run the guest, optionally accelerated by KVM. `run_with_interp` is the
     // portable software path; `--kvm` (amd64 only, when built with the feature)
@@ -2893,7 +2998,7 @@ fn monitor_install_elf(
                 }
                 Err(e) => {
                     eprintln!("kvm: {e} — falling back to the interpreter");
-                    sandbox = new_sandbox();
+                    sandbox = new_sandbox()?;
                     run = run_with_interp(&mut sandbox)?;
                 }
             }
@@ -3049,6 +3154,14 @@ fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
     }
 }
 
+/// Filesystem options collected from `--fs-type` / `--mount` /
+/// `--no-default-mounts`.
+struct FsOpts {
+    fs_type: Option<String>,
+    mounts: Vec<String>,
+    no_default_mounts: bool,
+}
+
 fn monitor_install(
     input: &Path,
     max_instructions: u64,
@@ -3057,6 +3170,7 @@ fn monitor_install(
     dump_vfs: Option<&Path>,
     preserve_deletes: bool,
     use_kvm: bool,
+    fs: &FsOpts,
 ) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     // MSI compound-document magic — when the input is a .msi we
@@ -3080,7 +3194,15 @@ fn monitor_install(
     }
     // ELF binaries run under the Linux personality (syscall emulation).
     if ud_format::elf::is_elf(&bytes) {
-        return monitor_install_elf(input, &bytes, max_instructions, as_json, dump_vfs, use_kvm);
+        return monitor_install_elf(
+            input,
+            &bytes,
+            max_instructions,
+            as_json,
+            dump_vfs,
+            use_kvm,
+            fs,
+        );
     }
     // NE (16-bit Windows) installers run through the Win16 loader +
     // segmented executor. Detect before PE (both carry an `MZ` header).

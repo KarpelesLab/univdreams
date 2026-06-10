@@ -1,0 +1,314 @@
+//! A real on-disk filesystem mounted into the table, backed by our `fstool`
+//! crate (ext2/3/4, NTFS, FAT, exFAT). Off by default — only built with the
+//! `fstool` cargo feature.
+//!
+//! The block device is either a fresh in-memory image ([`FsToolMount::format_empty`],
+//! i.e. mkfs) or a host filesystem image opened read-only / read-write
+//! ([`FsToolMount::open_image`]).
+//!
+//! fstool's open handles borrow the filesystem *and* the device for their
+//! lifetime, so every [`MountFs`] operation opens, seeks, does the I/O, and
+//! drops the handle within the call — never holding one across other ops.
+
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+use fstool::block::{BlockDevice, FileBackend, MemoryBackend};
+use fstool::fs::{EntryKind, FileMeta, FileSource, Filesystem, FilesystemFactory, OpenFlags};
+
+use super::{Attrs, DirEntry, MountFs, NodeKind};
+
+/// A mounted real filesystem: an fstool [`Filesystem`] over a block device.
+pub struct FsToolMount {
+    fs: Box<dyn Filesystem>,
+    dev: Box<dyn BlockDevice>,
+    read_only: bool,
+}
+
+impl std::fmt::Debug for FsToolMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FsToolMount(read_only={})", self.read_only)
+    }
+}
+
+fn to_io(e: fstool::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e.to_string())
+}
+
+/// Format a fresh empty filesystem of `fs_type` onto a `size`-byte `dev`.
+fn format_fs(
+    fs_type: &str,
+    dev: &mut dyn BlockDevice,
+    size: u64,
+) -> fstool::Result<Box<dyn Filesystem>> {
+    use fstool::fs::{exfat, ext, fat, ntfs};
+    // ext sizing must be set explicitly (its default is a 1 MiB image with no
+    // spare data blocks); 4 KiB blocks, one inode per 4 blocks.
+    let ext_opts = |kind| {
+        let block_size = 4096u32;
+        let blocks_count = (size / u64::from(block_size)).max(64) as u32;
+        ext::FormatOpts {
+            kind,
+            block_size,
+            blocks_count,
+            inodes_count: (blocks_count / 4).max(16),
+            ..Default::default()
+        }
+    };
+    Ok(match fs_type {
+        "ext2" => Box::new(ext::Ext::format(dev, &ext_opts(ext::FsKind::Ext2))?),
+        "ext3" => Box::new(ext::Ext::format(dev, &ext_opts(ext::FsKind::Ext3))?),
+        "ext" | "ext4" => Box::new(ext::Ext::format(dev, &ext_opts(ext::FsKind::Ext4))?),
+        "ntfs" => Box::new(ntfs::Ntfs::format(dev, &Default::default())?),
+        "fat" | "fat32" | "vfat" => {
+            // FAT's default opts leave total_sectors at 0; size it from the device.
+            let fat_opts = fat::FatFormatOpts {
+                total_sectors: (size / 512).min(u64::from(u32::MAX)) as u32,
+                ..Default::default()
+            };
+            Box::new(fat::Fat32::format(dev, &fat_opts)?)
+        }
+        "exfat" => Box::new(exfat::Exfat::format(dev, &Default::default())?),
+        other => {
+            return Err(fstool::Error::Unsupported(format!(
+                "unknown / unsupported filesystem type {other:?}"
+            )))
+        }
+    })
+}
+
+/// Open an existing filesystem of `fs_type` on `dev`.
+fn open_fs(fs_type: &str, dev: &mut dyn BlockDevice) -> fstool::Result<Box<dyn Filesystem>> {
+    use fstool::fs::{exfat, ext, fat, ntfs};
+    Ok(match fs_type {
+        "ext" | "ext2" | "ext3" | "ext4" => Box::new(ext::Ext::open(dev)?),
+        "ntfs" => Box::new(ntfs::Ntfs::open(dev)?),
+        "fat" | "fat32" | "vfat" => Box::new(fat::Fat32::open(dev)?),
+        "exfat" => Box::new(exfat::Exfat::open(dev)?),
+        other => {
+            return Err(fstool::Error::Unsupported(format!(
+                "unknown / unsupported filesystem type {other:?}"
+            )))
+        }
+    })
+}
+
+impl FsToolMount {
+    /// `mkfs`: format a fresh empty `fs_type` on an in-memory device of `size`
+    /// bytes (default 64 MiB if `size` is 0).
+    ///
+    /// # Errors
+    /// fstool error if the type is unknown or formatting fails.
+    pub fn format_empty(fs_type: &str, size: u64) -> io::Result<Self> {
+        let size = if size == 0 { 64 << 20 } else { size };
+        let mut dev = MemoryBackend::new(size);
+        let fs = format_fs(fs_type, &mut dev, size).map_err(to_io)?;
+        Ok(Self {
+            fs,
+            dev: Box::new(dev),
+            read_only: false,
+        })
+    }
+
+    /// `mkfs` onto a host file: create a fresh `size`-byte image at `path`,
+    /// format it as `fs_type`, and keep it writable so changes flush back to
+    /// the file on drop.
+    ///
+    /// # Errors
+    /// I/O error creating the file, or an fstool error formatting it.
+    pub fn format_image(path: &Path, fs_type: &str, size: u64) -> io::Result<Self> {
+        let size = if size == 0 { 64 << 20 } else { size };
+        let mut dev = FileBackend::create(path, size).map_err(to_io)?;
+        let fs = format_fs(fs_type, &mut dev, size).map_err(to_io)?;
+        Ok(Self {
+            fs,
+            dev: Box::new(dev),
+            read_only: false,
+        })
+    }
+
+    /// Open a host filesystem image. `writeback` keeps the device writable so
+    /// changes flush back to the file on drop; otherwise it is read-only.
+    ///
+    /// Reads are fully supported on real-world images. Writeback persistence is
+    /// solid for *in-place* edits and for images that `fstool` itself formatted
+    /// (see [`format_image`](Self::format_image)); persisting a *newly created*
+    /// inode back into an image produced by host `mke2fs` can leave metadata a
+    /// strict e2fsprogs reader won't follow — an `fstool`-crate gap, not a
+    /// routing one. Within a single run the new file reads back correctly.
+    ///
+    /// # Errors
+    /// I/O error opening the file, or an fstool error parsing the filesystem.
+    pub fn open_image(path: &Path, fs_type: &str, writeback: bool) -> io::Result<Self> {
+        if writeback {
+            let mut dev = FileBackend::open(path).map_err(to_io)?;
+            let fs = open_fs(fs_type, &mut dev).map_err(to_io)?;
+            Ok(Self {
+                fs,
+                dev: Box::new(dev),
+                read_only: false,
+            })
+        } else {
+            let mut dev = FileBackend::open_read_only(path).map_err(to_io)?;
+            let fs = open_fs(fs_type, &mut dev).map_err(to_io)?;
+            Ok(Self {
+                fs,
+                dev: Box::new(dev),
+                read_only: true,
+            })
+        }
+    }
+
+    /// Persist any buffered state to the backing device.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.fs.flush(&mut *self.dev).map_err(to_io)
+    }
+}
+
+fn map_kind(k: EntryKind) -> NodeKind {
+    match k {
+        EntryKind::Dir => NodeKind::Dir,
+        EntryKind::Symlink => NodeKind::Symlink,
+        EntryKind::Char | EntryKind::Block => NodeKind::CharDevice,
+        _ => NodeKind::File,
+    }
+}
+
+impl MountFs for FsToolMount {
+    fn stat(&mut self, rel: &str) -> Option<Attrs> {
+        let a = self.fs.getattr(&mut *self.dev, Path::new(rel)).ok()?;
+        Some(Attrs {
+            kind: map_kind(a.kind),
+            size: a.size,
+            mode: u32::from(a.mode),
+            mtime: u64::from(a.mtime),
+        })
+    }
+
+    fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let mut h = self
+            .fs
+            .open_file_ro(&mut *self.dev, Path::new(rel))
+            .map_err(to_io)?;
+        h.seek(SeekFrom::Start(off))?;
+        h.read(buf)
+    }
+
+    fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>> {
+        let entries = self
+            .fs
+            .list(&mut *self.dev, Path::new(rel))
+            .map_err(to_io)?;
+        Ok(entries
+            .into_iter()
+            .map(|e| DirEntry {
+                name: e.name,
+                kind: map_kind(e.kind),
+            })
+            .collect())
+    }
+
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn write_at(&mut self, rel: &str, off: u64, data: &[u8]) -> io::Result<usize> {
+        let mut h = self
+            .fs
+            .open_file_rw(
+                &mut *self.dev,
+                Path::new(rel),
+                OpenFlags {
+                    create: false,
+                    truncate: false,
+                    append: false,
+                },
+                None,
+            )
+            .map_err(to_io)?;
+        h.seek(SeekFrom::Start(off))?;
+        h.write(data)
+    }
+
+    fn create(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        self.fs
+            .create_file(
+                &mut *self.dev,
+                Path::new(rel),
+                FileSource::Zero(0),
+                FileMeta::with_mode(mode as u16),
+            )
+            .map_err(to_io)
+    }
+
+    fn mkdir(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        self.fs
+            .create_dir(
+                &mut *self.dev,
+                Path::new(rel),
+                FileMeta::with_mode(mode as u16),
+            )
+            .map_err(to_io)
+    }
+
+    fn truncate(&mut self, rel: &str, len: u64) -> io::Result<()> {
+        self.fs
+            .truncate(&mut *self.dev, Path::new(rel), len)
+            .map_err(to_io)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        FsToolMount::flush(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fsmount::MountFs;
+
+    #[test]
+    fn ext4_mkfs_create_write_read_list() {
+        let mut fs = FsToolMount::format_empty("ext4", 16 << 20).expect("mkfs ext4");
+        fs.create("/hello.txt", 0o644).expect("create");
+        assert_eq!(fs.write_at("/hello.txt", 0, b"hello world").unwrap(), 11);
+        let mut buf = [0u8; 11];
+        assert_eq!(fs.read_at("/hello.txt", 0, &mut buf).unwrap(), 11);
+        assert_eq!(&buf, b"hello world");
+        let a = fs.stat("/hello.txt").expect("stat");
+        assert_eq!(a.size, 11);
+        assert!(matches!(a.kind, NodeKind::File));
+        let names: Vec<_> = fs
+            .readdir("/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "hello.txt"), "listed: {names:?}");
+    }
+
+    #[test]
+    fn ext4_image_writeback_then_reopen() {
+        // Build a fresh ext4 image on a host file, write a file, drop it (flush),
+        // then reopen read-only and read the bytes back.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ud_fstool_wb_{}.img", std::process::id()));
+        {
+            let mut fs = FsToolMount::format_image(&path, "ext4", 16 << 20).expect("mkfs image");
+            fs.create("/persisted.txt", 0o644).expect("create");
+            assert_eq!(fs.write_at("/persisted.txt", 0, b"on disk").unwrap(), 7);
+            fs.flush().expect("flush");
+        }
+        {
+            let mut fs = FsToolMount::open_image(&path, "ext4", false).expect("reopen ro");
+            assert!(fs.read_only());
+            let mut buf = [0u8; 7];
+            assert_eq!(fs.read_at("/persisted.txt", 0, &mut buf).unwrap(), 7);
+            assert_eq!(&buf, b"on disk");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}

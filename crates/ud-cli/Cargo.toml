@@ -19,6 +19,9 @@ default = []
 # Opt-in KVM acceleration for the Linux personality (forwards to
 # `ud-emulator/kvm`). Linux x86-64 host with /dev/kvm only.
 kvm = ["ud-emulator/kvm"]
+# Opt-in real-filesystem mounts (ext4/NTFS/FAT images, mkfs) for `--fs-type` /
+# `--mount` (forwards to `ud-emulator/fstool`).
+fstool = ["ud-emulator/fstool"]
 
 [[bin]]
 name = "ud"

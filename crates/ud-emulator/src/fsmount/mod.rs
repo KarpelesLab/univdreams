@@ -20,6 +20,8 @@
 //! whole lifetime, so no long-lived handle can be kept across other calls.
 
 pub mod devfs;
+#[cfg(feature = "fstool")]
+pub mod fstool;
 pub mod procfs;
 
 use std::collections::BTreeMap;
@@ -99,6 +101,13 @@ pub trait MountFs: std::fmt::Debug {
     }
     fn readlink(&mut self, _rel: &str) -> std::io::Result<String> {
         Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    }
+
+    /// Persist any buffered state to the backing store. The default is a no-op
+    /// (in-memory / read-only backends have nothing to flush); a real
+    /// writeback filesystem overrides this to commit metadata + data.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -331,6 +340,26 @@ impl MountTable {
     #[must_use]
     pub fn owns(&self, handle: u32) -> bool {
         self.handles.contains_key(&handle) || self.root.owns(handle)
+    }
+
+    /// Flush every overlay mount, committing buffered writeback to its backing
+    /// store. Best-effort: the first error is returned but all mounts are still
+    /// attempted. The in-memory root needs no flush.
+    pub fn flush_all(&mut self) -> std::io::Result<()> {
+        let mut first_err = None;
+        for m in &mut self.overlays {
+            if let Err(e) = m.fs.flush() {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for MountTable {
+    fn drop(&mut self) {
+        // Commit writeback images on teardown even if no explicit flush ran.
+        let _ = self.flush_all();
     }
 }
 
