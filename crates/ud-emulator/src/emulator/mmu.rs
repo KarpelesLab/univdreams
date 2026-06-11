@@ -171,6 +171,23 @@ impl Mmu {
         }
     }
 
+    /// Like [`map`](Self::map) but **replaces** the pages with fresh zeroed
+    /// ones — the semantics of an anonymous (`MAP_ANONYMOUS`) mapping, which the
+    /// kernel always backs with zero pages even when it overlays a region that
+    /// was previously file-backed (e.g. the dynamic linker zeroing a `.bss`
+    /// tail it first mapped from the file).
+    pub fn map_zeroed(&mut self, addr: u32, size: u32, perm: Perm) {
+        if size == 0 {
+            return;
+        }
+        let start_page = (addr >> PAGE_SHIFT) as usize;
+        let end_addr = u64::from(addr) + u64::from(size);
+        let end_page = end_addr.div_ceil(PAGE_SIZE as u64).min(NUM_PAGES as u64) as usize;
+        for p in start_page..end_page {
+            self.pages[p] = Some(Page::zeroed(perm));
+        }
+    }
+
     /// True iff the page containing `addr` is mapped.
     pub fn is_mapped(&self, addr: u32) -> bool {
         self.pages[(addr >> PAGE_SHIFT) as usize].is_some()

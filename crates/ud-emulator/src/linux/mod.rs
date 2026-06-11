@@ -557,8 +557,10 @@ impl LinuxKernel {
         };
 
         if flags & MAP_ANONYMOUS != 0 || fd < 0 {
-            // Anonymous: stays RWX (permissive) so JIT/stack/heap all work.
-            mmu.map(base, size, Perm::R | Perm::W | Perm::X);
+            // Anonymous: fresh zero pages (RWX so JIT/stack/heap all work).
+            // Zeroing matters when MAP_FIXED overlays a previously file-backed
+            // region — e.g. the dynamic linker zeroing a segment's `.bss` tail.
+            mmu.map_zeroed(base, size, Perm::R | Perm::W | Perm::X);
             return i64::from(base);
         }
 

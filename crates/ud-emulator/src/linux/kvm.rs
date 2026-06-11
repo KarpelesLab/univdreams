@@ -166,6 +166,15 @@ impl GuestMem for KvmMem {
         // The whole 4 GiB is always present/identity-mapped; nothing to do.
     }
 
+    fn map_zeroed(&mut self, addr: u32, size: u32, _perm: crate::emulator::Perm) {
+        // Anonymous mapping: zero the range even if it held file data (e.g. the
+        // dynamic linker overlaying a `.bss` tail).
+        if let Ok(a) = self.check(addr, size as usize) {
+            // SAFETY: bounds checked above.
+            unsafe { std::ptr::write_bytes(self.base.add(a), 0, size as usize) };
+        }
+    }
+
     fn write_initializer(&mut self, addr: u32, data: &[u8]) -> Result<(), Trap> {
         let a = self.check(addr, data.len())?;
         // SAFETY: bounds checked above.

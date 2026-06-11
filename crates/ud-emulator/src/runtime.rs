@@ -1045,11 +1045,10 @@ impl Sandbox {
                             }
                             let regs = &threads[idx].cpu.regs.gp64;
                             eprintln!(
-                                "amd64 trap (tid {}) at rip={:#018x} (#{}): {t}\n  bytes: {bytes:02x?}\n  rax={:#x} rbx={:#x} rsi={:#x} rdi={:#x} rbp={:#x}",
+                                "amd64 trap (tid {}) at rip={:#018x} (#{}): {t}\n  bytes: {bytes:02x?}\n  gp64={regs:#x?}",
                                 threads[idx].tid,
                                 threads[idx].cpu.regs.rip,
                                 threads[idx].cpu.instr_count,
-                                regs[0], regs[3], regs[6], regs[7], regs[5],
                             );
                         }
                         if let Some(m) = threads.iter().find(|t| t.tid == 1) {

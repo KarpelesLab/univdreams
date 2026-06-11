@@ -39,6 +39,9 @@ pub trait GuestMem {
     /// Ensure `[addr, addr+size)` is present with at least `perm`. A flat
     /// backend that is already fully addressable may treat this as a no-op.
     fn map(&mut self, addr: u32, size: u32, perm: Perm);
+    /// Like [`map`](Self::map) but the range is backed by fresh **zero** pages
+    /// (anonymous-mapping semantics) even if it previously held data.
+    fn map_zeroed(&mut self, addr: u32, size: u32, perm: Perm);
     /// Populate memory at load time, ignoring write-permission bits (used by
     /// the loader to lay down read-only segments before the guest runs).
     ///
@@ -76,6 +79,9 @@ impl GuestMem for Mmu {
     }
     fn map(&mut self, addr: u32, size: u32, perm: Perm) {
         Mmu::map(self, addr, size, perm);
+    }
+    fn map_zeroed(&mut self, addr: u32, size: u32, perm: Perm) {
+        Mmu::map_zeroed(self, addr, size, perm);
     }
     fn write_initializer(&mut self, addr: u32, data: &[u8]) -> Result<(), Trap> {
         Mmu::write_initializer(self, addr, data)
