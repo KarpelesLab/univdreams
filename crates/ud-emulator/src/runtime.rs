@@ -1038,11 +1038,18 @@ impl Sandbox {
                     }
                     Err(t) => {
                         if trace {
+                            let rip = threads[idx].cpu.regs.rip as u32;
+                            let mut bytes = [0u8; 16];
+                            for (i, b) in bytes.iter_mut().enumerate() {
+                                *b = self.mmu.load8(rip.wrapping_add(i as u32)).unwrap_or(0);
+                            }
+                            let regs = &threads[idx].cpu.regs.gp64;
                             eprintln!(
-                                "amd64 trap (tid {}) at rip={:#018x} (#{}): {t}",
+                                "amd64 trap (tid {}) at rip={:#018x} (#{}): {t}\n  bytes: {bytes:02x?}\n  rax={:#x} rbx={:#x} rsi={:#x} rdi={:#x} rbp={:#x}",
                                 threads[idx].tid,
                                 threads[idx].cpu.regs.rip,
-                                threads[idx].cpu.instr_count
+                                threads[idx].cpu.instr_count,
+                                regs[0], regs[3], regs[6], regs[7], regs[5],
                             );
                         }
                         if let Some(m) = threads.iter().find(|t| t.tid == 1) {
