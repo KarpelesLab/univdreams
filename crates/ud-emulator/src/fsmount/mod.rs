@@ -46,6 +46,10 @@ pub struct Attrs {
     pub mode: u32,
     /// Modification time, seconds since the epoch.
     pub mtime: u64,
+    /// Inode number, or `0` when the backend has no per-path identity (the
+    /// kernel then synthesises one from the path). The dynamic linker dedups
+    /// libraries by inode, so distinct files must report distinct inodes.
+    pub inode: u64,
 }
 
 /// One entry returned by [`MountFs::readdir`].
@@ -413,6 +417,7 @@ impl MountTable {
             size,
             mode: if is_dir { 0o755 } else { 0o644 },
             mtime: 0,
+            inode: 0,
         })
     }
 

@@ -112,6 +112,11 @@ pub struct StatLayout {
     pub size_off: usize,
     pub blksize_off: usize,
     pub blocks_off: usize,
+    /// `st_dev` (8 bytes) and `st_ino` (8 bytes) offsets. The dynamic linker
+    /// dedups libraries by `(dev, ino)`, so these must be unique per file or it
+    /// aliases distinct `.so`s and drops their symbols.
+    pub dev_off: usize,
+    pub ino_off: usize,
 }
 
 /// The adapter a [`LinuxKernel`](super::LinuxKernel) talks to. Works over
@@ -252,6 +257,8 @@ impl LinuxAbi for I386Abi {
             size_off: 44,
             blksize_off: 52,
             blocks_off: 56,
+            dev_off: 0,
+            ino_off: 88,
         }
     }
 }
@@ -388,6 +395,8 @@ impl LinuxAbi for Amd64Abi {
             size_off: 48,
             blksize_off: 56,
             blocks_off: 64,
+            dev_off: 0,
+            ino_off: 8,
         }
     }
 }
@@ -560,6 +569,8 @@ impl LinuxAbi for Aarch64Abi {
             size_off: 48,
             blksize_off: 56,
             blocks_off: 64,
+            dev_off: 0,
+            ino_off: 8,
         }
     }
 }

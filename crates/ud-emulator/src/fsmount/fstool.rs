@@ -242,6 +242,7 @@ impl MountFs for FsToolMount {
             size: a.size,
             mode: u32::from(a.mode),
             mtime: u64::from(a.mtime),
+            inode: u64::from(a.inode),
         })
     }
 

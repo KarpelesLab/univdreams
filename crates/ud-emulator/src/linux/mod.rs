@@ -446,6 +446,14 @@ impl LinuxKernel {
         let Some(p) = self.resolve_at(dirfd, path, mmu) else {
             return EBADF;
         };
+        // Follow symlinks to the final target (unless O_NOFOLLOW=0x20000), so the
+        // opening e.g. `libz.so.1 -> libz.so.1.3.1` reads the real file rather
+        // than the link's target string.
+        let p = if flags & 0x2_0000 == 0 {
+            vfs.resolve_symlinks(&p)
+        } else {
+            p
+        };
         // O_WRONLY=1, O_RDWR=2, O_CREAT=0x40 (i386/x86-64 share these).
         let access = match flags & 0x3 {
             0 => FileAccess::Read,
@@ -747,33 +755,27 @@ impl LinuxKernel {
         vfs: &mut MountTable,
         layout: StatLayout,
     ) -> i64 {
-        // Resolve the subject and the destination buffer pointer. `perm` is the
-        // file's real permission bits (so executability survives to the guest).
-        let (kind, size, perm, buf) = match sys {
+        // Resolve the subject + destination buffer. `perm` is the file's real
+        // permission bits; `ino` is a stable per-path inode (the dynamic linker
+        // dedups libraries by inode, so distinct files must differ).
+        let (kind, size, perm, ino, buf) = match sys {
             Sysno::Fstat => {
+                let fd = a[0] as i32;
                 let buf = a[1] as u32;
-                match self.fds.get(&(a[0] as i32)) {
+                match self.fds.get(&fd) {
                     // A char-device stat for the std streams + pipes keeps
                     // isatty()/libc buffering happy.
                     Some(
                         Fd::Stdin | Fd::Stdout | Fd::Stderr | Fd::PipeRead(_) | Fd::PipeWrite(_),
-                    ) => (NodeKind::CharDevice, 0, 0o666, buf),
-                    Some(Fd::Vfs { path, .. }) => {
-                        let att = vfs.stat_path(path);
+                    ) => (NodeKind::CharDevice, 0, 0o666, u64::from(fd as u32), buf),
+                    Some(Fd::Vfs { path, .. } | Fd::Dir { path, .. }) => {
+                        let path = path.clone();
+                        let att = vfs.stat_path(&path);
                         (
                             att.map_or(NodeKind::File, |x| x.kind),
                             att.map_or(0, |x| x.size),
                             att.map_or(0, |x| x.mode),
-                            buf,
-                        )
-                    }
-                    Some(Fd::Dir { path, .. }) => {
-                        let path = path.clone();
-                        let att = vfs.stat_path(&path);
-                        (
-                            NodeKind::Dir,
-                            att.map_or(0, |x| x.size),
-                            att.map_or(0, |x| x.mode),
+                            inode_of(att, &path),
                             buf,
                         )
                     }
@@ -792,19 +794,27 @@ impl LinuxKernel {
                     return EBADF;
                 };
                 // stat/newfstatat follow symlinks; lstat (or AT_SYMLINK_NOFOLLOW)
-                // does not.
-                let att = if nofollow {
-                    vfs.stat_path(&p)
+                // does not. Inode keys on the resolved (followed) path so a link
+                // and its target share an inode, as on a real FS.
+                let target = if nofollow {
+                    p.clone()
                 } else {
-                    vfs.stat_follow(&p)
+                    vfs.resolve_symlinks(&p)
                 };
+                let att = vfs.stat_path(&target);
                 match att {
-                    Some(att) => (att.kind, att.size, att.mode, buf),
+                    Some(att) => (
+                        att.kind,
+                        att.size,
+                        att.mode,
+                        inode_of(Some(att), &target),
+                        buf,
+                    ),
                     None => return ENOENT,
                 }
             }
         };
-        self.write_stat(buf, kind, size, perm, layout, mmu)
+        self.write_stat(buf, kind, size, perm, ino, layout, mmu)
     }
 
     /// `statx(dirfd, path, flags, mask, buf)`: fill the architecture-independent
@@ -823,12 +833,12 @@ impl LinuxKernel {
             return EBADF;
         };
         // AT_SYMLINK_NOFOLLOW = 0x100.
-        let att = if flags & 0x100 != 0 {
-            vfs.stat_path(&p)
+        let target = if flags & 0x100 != 0 {
+            p.clone()
         } else {
-            vfs.stat_follow(&p)
+            vfs.resolve_symlinks(&p)
         };
-        let Some(att) = att else {
+        let Some(att) = vfs.stat_path(&target) else {
             return ENOENT;
         };
         let mode = stat_mode(att.kind, att.mode) as u16;
@@ -839,6 +849,7 @@ impl LinuxKernel {
         b[4..8].copy_from_slice(&512u32.to_le_bytes()); // stx_blksize
         b[16..20].copy_from_slice(&1u32.to_le_bytes()); // stx_nlink
         b[28..30].copy_from_slice(&mode.to_le_bytes()); // stx_mode
+        b[32..40].copy_from_slice(&inode_of(Some(att), &target).to_le_bytes()); // stx_ino
         b[40..48].copy_from_slice(&att.size.to_le_bytes()); // stx_size
         b[48..56].copy_from_slice(&att.size.div_ceil(512).to_le_bytes()); // stx_blocks
         if write_mem(mmu, buf, &b).is_none() {
@@ -869,12 +880,14 @@ impl LinuxKernel {
     /// Serialise a stat struct (zeros except the fields we model) per `layout`.
     /// `perm` is the file's permission bits; if zero we fall back to a sensible
     /// default for the node kind.
+    #[allow(clippy::too_many_arguments)]
     fn write_stat(
         &self,
         buf: u32,
         kind: NodeKind,
         size: u64,
         perm: u32,
+        ino: u64,
         layout: StatLayout,
         mmu: &mut dyn GuestMem,
     ) -> i64 {
@@ -886,6 +899,8 @@ impl LinuxKernel {
         let put64 = |b: &mut [u8], off: usize, v: u64| {
             b[off..off + 8].copy_from_slice(&v.to_le_bytes());
         };
+        put64(&mut b, layout.dev_off, 1); // st_dev: a single synthetic device
+        put64(&mut b, layout.ino_off, ino);
         put32(&mut b, layout.mode_off, mode);
         put32(&mut b, layout.nlink_off, 1);
         put64(&mut b, layout.size_off, size);
@@ -1221,6 +1236,27 @@ impl LinuxKernel {
             }
         }
         total
+    }
+}
+
+/// A stable, non-zero inode number for a path. The dynamic linker dedups
+/// libraries by `(st_dev, st_ino)`, so distinct files must report distinct
+/// inodes (returning 0 for everything aliases all `.so`s into one and drops
+/// their symbols). Keyed on the resolved path so a symlink and its target
+/// share an inode, as on a real filesystem.
+fn path_inode(path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    h.finish() | 1 // never zero
+}
+
+/// The real filesystem inode if the backend reported one, else a stable hash
+/// of the path (synthetic `/proc`/`/dev` and the in-memory root report 0).
+fn inode_of(att: Option<crate::fsmount::Attrs>, path: &str) -> u64 {
+    match att {
+        Some(a) if a.inode != 0 => a.inode,
+        _ => path_inode(path),
     }
 }
 

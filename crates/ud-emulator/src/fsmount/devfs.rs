@@ -55,6 +55,7 @@ impl MountFs for DevFs {
                 size: 0,
                 mode: 0o040_755,
                 mtime: 0,
+                inode: 0,
             });
         }
         DEVICES.contains(&name).then_some(Attrs {
@@ -62,6 +63,7 @@ impl MountFs for DevFs {
             size: 0,
             mode: 0o020_666,
             mtime: 0,
+            inode: 0,
         })
     }
 

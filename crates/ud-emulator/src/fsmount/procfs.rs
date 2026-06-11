@@ -92,18 +92,21 @@ impl MountFs for ProcFs {
                 size: b.len() as u64,
                 mode: 0o100_444,
                 mtime: 0,
+                inode: 0,
             }),
             Some(Node::Symlink(t)) => Some(Attrs {
                 kind: NodeKind::Symlink,
                 size: t.len() as u64,
                 mode: 0o120_777,
                 mtime: 0,
+                inode: 0,
             }),
             None if self.dir_of(&key) => Some(Attrs {
                 kind: NodeKind::Dir,
                 size: 0,
                 mode: 0o040_555,
                 mtime: 0,
+                inode: 0,
             }),
             None => None,
         }
