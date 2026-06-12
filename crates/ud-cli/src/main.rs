@@ -163,6 +163,13 @@ enum Command {
         #[arg(long)]
         kvm: bool,
 
+        /// Allow the guest to open real **host network** sockets
+        /// (TCP/UDP/DNS), e.g. so `apk add` can download packages.
+        /// Off by default; enabling it lets the sandboxed program
+        /// reach the host's network.
+        #[arg(long)]
+        net: bool,
+
         /// Back the root filesystem with a real on-disk format
         /// (ext4 / ntfs / fat / exfat) via fstool instead of the
         /// flat in-memory store. `auto` picks the per-OS default
@@ -872,6 +879,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             args,
             dump_vfs,
             kvm,
+            net,
             fs_type,
             mount,
             no_default_mounts,
@@ -890,6 +898,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     dump_vfs.as_deref(),
                     preserve_deletes,
                     kvm,
+                    net,
                     &FsOpts {
                         fs_type,
                         mounts: mount,
@@ -3006,6 +3015,26 @@ fn rootfs_image_path(source: &std::path::Path) -> anyhow::Result<std::path::Path
     Ok(ud_cache_dir().join(format!("{stem}-{:016x}.ext4", h.finish())))
 }
 
+/// Alpine release branch (`v<MAJ.MIN>`) for an `alpine[:VERSION]` spec, or
+/// `None` for a local path / non-alpine source (we don't know its branch).
+#[cfg(feature = "fstool")]
+fn alpine_branch_for(spec: &str) -> Option<String> {
+    if spec != "alpine" && !spec.starts_with("alpine:") && !spec.starts_with("alpine/") {
+        return None;
+    }
+    let rest = &spec["alpine".len()..];
+    let ver_part = rest.split_once('/').map_or(rest, |(v, _)| v);
+    let version = ver_part
+        .strip_prefix(':')
+        .filter(|v| !v.is_empty())
+        .unwrap_or(DEFAULT_ALPINE_VERSION);
+    let mut it = version.split('.');
+    match (it.next(), it.next()) {
+        (Some(maj), Some(min)) => Some(format!("v{maj}.{min}")),
+        _ => None,
+    }
+}
+
 /// Build (if needed) and mount the `--rootfs` source as a writable ext4 root.
 #[cfg(feature = "fstool")]
 fn install_rootfs(table: &mut ud_emulator::fsmount::MountTable, spec: &str) -> anyhow::Result<()> {
@@ -3028,6 +3057,34 @@ fn install_rootfs(table: &mut ud_emulator::fsmount::MountTable, spec: &str) -> a
     let fm = FsToolMount::open_image(&image, "ext4", true)
         .with_context(|| format!("mount rootfs image {}", image.display()))?;
     table.mount("/", Box::new(fm));
+
+    // Seed a resolver so guest DNS (musl reads /etc/resolv.conf) works; without
+    // one musl defaults to 127.0.0.1, which usually goes nowhere and hangs.
+    use ud_emulator::context::FileAccess;
+    let resolv = b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
+    if let Some(h) = table.open("/etc/resolv.conf", FileAccess::ReadWrite) {
+        table.write_handle(h, resolv);
+        table.close(h);
+    }
+
+    // Point apk at `http://` mirrors. The minirootfs ships `https://` repos, but
+    // it carries no CA bundle, so TLS cert verification fails ("certificate
+    // verify failed"). apk authenticates packages with the RSA keys in
+    // `/etc/apk/keys/` (shipped in the rootfs), so plain HTTP is still secure —
+    // the index and every .apk are signature-checked regardless of transport.
+    if let Some(branch) = alpine_branch_for(spec) {
+        let repos = format!(
+            "http://dl-cdn.alpinelinux.org/alpine/{branch}/main\n\
+             http://dl-cdn.alpinelinux.org/alpine/{branch}/community\n"
+        );
+        // Truncate first: the shipped `https://` file is longer than our
+        // `http://` replacement, so a plain overwrite would leave stale bytes.
+        let _ = table.truncate_path("/etc/apk/repositories", 0);
+        if let Some(h) = table.open("/etc/apk/repositories", FileAccess::ReadWrite) {
+            table.write_handle(h, repos.as_bytes());
+            table.close(h);
+        }
+    }
     Ok(())
 }
 
@@ -3126,6 +3183,7 @@ fn default_linux_env() -> Vec<String> {
     .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn monitor_install_elf(
     input: &Path,
     bytes: &[u8],
@@ -3134,6 +3192,7 @@ fn monitor_install_elf(
     extra_args: Option<&str>,
     dump_vfs: Option<&Path>,
     use_kvm: bool,
+    use_net: bool,
     fs: &FsOpts,
 ) -> anyhow::Result<()> {
     let stem = input
@@ -3168,6 +3227,7 @@ fn monitor_install_elf(
         sb.linux_default_mounts = !fs.no_default_mounts;
         sb.linux_argv.clone_from(&argv);
         sb.linux_env = default_linux_env();
+        sb.linux.net_enabled = use_net;
         let table = sb
             .context_mut()
             .vfs
@@ -3367,6 +3427,7 @@ struct FsOpts {
     rootfs: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn monitor_install(
     input: &Path,
     max_instructions: u64,
@@ -3375,6 +3436,7 @@ fn monitor_install(
     dump_vfs: Option<&Path>,
     preserve_deletes: bool,
     use_kvm: bool,
+    use_net: bool,
     fs: &FsOpts,
 ) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
@@ -3407,6 +3469,7 @@ fn monitor_install(
             extra_args,
             dump_vfs,
             use_kvm,
+            use_net,
             fs,
         );
     }

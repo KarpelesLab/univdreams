@@ -68,6 +68,22 @@ enum Fd {
     /// one process this is an in-memory byte buffer.
     PipeRead(usize),
     PipeWrite(usize),
+    /// A host-proxied network socket (index into `LinuxKernel::sockets`).
+    Socket(usize),
+}
+
+/// State of a host-proxied guest socket. The guest runs its own protocol (HTTP,
+/// TLS, DNS); we just shuttle bytes to a real host socket.
+#[derive(Debug, Default)]
+enum SocketState {
+    /// `socket()` created but not yet connected/bound.
+    Pending {
+        ty: i32,
+    },
+    Tcp(std::net::TcpStream),
+    Udp(std::net::UdpSocket),
+    #[default]
+    Closed,
 }
 
 /// The arch-agnostic Linux kernel engine: process memory bookkeeping, the
@@ -108,6 +124,16 @@ pub struct LinuxKernel {
     umask: u32,
     /// In-memory pipe buffers, referenced by [`Fd::PipeRead`] / [`Fd::PipeWrite`].
     pipes: Vec<std::collections::VecDeque<u8>>,
+    /// Host-proxied sockets, referenced by [`Fd::Socket`]. Only usable when
+    /// `net_enabled` (the CLI's opt-in `--net`).
+    sockets: Vec<SocketState>,
+    /// Per-socket `O_NONBLOCK` flag (parallel to `sockets`). musl/libfetch set
+    /// it via `SOCK_NONBLOCK` and toggle it with `fcntl(F_SETFL)`; we report it
+    /// back through `F_GETFL` and use it to give `connect` non-blocking
+    /// (`EINPROGRESS`) semantics, which the apk fetch state machine depends on.
+    sock_nonblock: Vec<bool>,
+    /// Allow the guest to open real host network sockets. Off by default.
+    pub net_enabled: bool,
 }
 
 /// A file-backed `mmap` region we may need to flush back to the file.
@@ -141,6 +167,7 @@ impl LinuxKernel {
         self.cwd = "/".to_string();
         self.umask = 0o022;
         self.pipes.clear();
+        self.sockets.clear();
     }
 
     /// Read a NUL-terminated array of string pointers (`argv` / `envp`) from
@@ -273,7 +300,22 @@ impl LinuxKernel {
             Sysno::Getrandom => self.sys_getrandom(a0, a1, mmu),
             Sysno::SchedYield => 0,
             Sysno::Nanosleep => 0, // time is frozen; sleeping is instantaneous
-            Sysno::Poll | Sysno::Ppoll => self.sys_poll(a0, a1, mmu),
+            Sysno::Poll => self.sys_poll(a0, a1, i64::from(a2 as i32), mmu),
+            Sysno::Ppoll => {
+                let tmo = self.poll_timeout_from_timespec(a2, mmu);
+                self.sys_poll(a0, a1, tmo, mmu)
+            }
+            // select(nfds, r, w, e, timeval) — libfetch waits for socket
+            // write-readiness here before sending its HTTP request.
+            Sysno::Select => {
+                let tmo = self.poll_timeout_from_timeval(a[4] as u32, mmu);
+                self.sys_select(a0, a1, a2, a[3] as u32, tmo, mmu)
+            }
+            // pselect6(nfds, r, w, e, timespec, sigmask)
+            Sysno::Pselect6 => {
+                let tmo = self.poll_timeout_from_timespec(a[4] as u32, mmu);
+                self.sys_select(a0, a1, a2, a[3] as u32, tmo, mmu)
+            }
             // clone/futex are serviced by the amd64 thread scheduler; on the
             // single-threaded paths they degrade to "no threads".
             Sysno::Clone => ENOSYS,
@@ -281,6 +323,14 @@ impl LinuxKernel {
             // don't enforce permissions, so "exists" == "accessible".
             Sysno::Access => self.sys_faccessat(AT_FDCWD, a0, mmu, vfs),
             Sysno::Faccessat => self.sys_faccessat(a0 as i32, a1, mmu, vfs),
+            // rename(old, new) / renameat[2](olddirfd, old, newdirfd, new): apk
+            // downloads each index to a temp file then renames it into place.
+            // We don't model ownership, so chown/fchown/lchown/fchownat succeed.
+            Sysno::Chown => 0,
+            Sysno::Rename => self.sys_renameat(AT_FDCWD, a0, AT_FDCWD, a1, mmu, vfs),
+            Sysno::Renameat | Sysno::Renameat2 => {
+                self.sys_renameat(a0 as i32, a1, a2 as i32, a[3] as u32, mmu, vfs)
+            }
             Sysno::Fcntl => self.sys_fcntl(a0 as i32, a1, a2),
             Sysno::Dup => self.sys_dup(a0 as i32),
             Sysno::Dup2 => self.sys_dup2(a0 as i32, a1 as i32, vfs),
@@ -299,6 +349,22 @@ impl LinuxKernel {
             Sysno::Pwrite64 => self.sys_pwrite64(a0 as i32, a1, a2, a[3], vfs, mmu),
             Sysno::Readv => self.sys_readv(a0 as i32, a1, a2, mmu, vfs),
             Sysno::Pipe | Sysno::Pipe2 => self.sys_pipe(a0, mmu),
+            Sysno::Flock => 0, // single process: locks always succeed
+            Sysno::Statfs | Sysno::Fstatfs => self.sys_statfs(a1, mmu),
+            // ---- host-proxied network sockets (opt-in `--net`) ----
+            Sysno::Socket => self.sys_socket(a0 as i32, a1 as i32),
+            Sysno::Connect => self.sys_connect(a0 as i32, a1, a2, mmu),
+            Sysno::Sendto => self.sys_sendto(a0 as i32, a1, a2, a[4] as u32, a[5] as u32, mmu),
+            Sysno::Recvfrom => self.sys_recvfrom(a0 as i32, a1, a2, a[4] as u32, a[5] as u32, mmu),
+            Sysno::Sendmsg => self.sys_sendmsg(a0 as i32, a1, mmu),
+            Sysno::Recvmsg => self.sys_recvmsg(a0 as i32, a1, mmu),
+            Sysno::Setsockopt => 0, // accept all socket options
+            Sysno::Getsockopt => self.sys_getsockopt(a[3] as u32, a[4] as u32, mmu),
+            Sysno::Getsockname | Sysno::Getpeername => self.sys_getsockname(a1, a2, mmu),
+            Sysno::Shutdown => self.sys_shutdown(a0 as i32),
+            Sysno::Bind => 0,        // accept (we don't model listening servers)
+            Sysno::Listen => ENOSYS, // no inbound connections
+            Sysno::Accept => ENOSYS,
             Sysno::Getcwd => self.sys_getcwd(a0, a1, mmu),
             Sysno::Ioctl => ENOTTY, // "not a terminal" → libc picks full buffering
             Sysno::ArchPrctl => 0,
@@ -341,6 +407,7 @@ impl LinuxKernel {
                 self.pipes[i].extend(data.iter().copied());
                 data.len() as i64
             }
+            Some(&Fd::Socket(i)) => self.socket_send(i, &data),
             Some(Fd::Stdin | Fd::Dir { .. } | Fd::PipeRead(_)) | None => EBADF,
         }
     }
@@ -359,6 +426,26 @@ impl LinuxKernel {
             let ptr = mmu.load32(base).ok()?;
             let len = mmu.load32(base.wrapping_add(4)).ok()?;
             Some((ptr, len))
+        }
+    }
+
+    /// Parse a `struct msghdr` at `msg`, returning `(msg_name, msg_namelen,
+    /// addr-of-msg_namelen, msg_iov, msg_iovlen)` at the guest's pointer width.
+    fn read_msghdr(&self, mmu: &dyn GuestMem, msg: u32) -> Option<(u32, u32, u32, u32, u32)> {
+        if self.ptr64 {
+            let name = mmu.load64(msg).ok()? as u32;
+            let namelen_addr = msg.wrapping_add(8);
+            let namelen = mmu.load32(namelen_addr).ok()?;
+            let iov = mmu.load64(msg.wrapping_add(16)).ok()? as u32;
+            let iovlen = mmu.load64(msg.wrapping_add(24)).ok()? as u32;
+            Some((name, namelen, namelen_addr, iov, iovlen))
+        } else {
+            let name = mmu.load32(msg).ok()?;
+            let namelen_addr = msg.wrapping_add(4);
+            let namelen = mmu.load32(namelen_addr).ok()?;
+            let iov = mmu.load32(msg.wrapping_add(8)).ok()?;
+            let iovlen = mmu.load32(msg.wrapping_add(12)).ok()?;
+            Some((name, namelen, namelen_addr, iov, iovlen))
         }
     }
 
@@ -410,6 +497,17 @@ impl LinuxKernel {
                 }
                 n as i64 // 0 when empty (treated as EOF in this single-process model)
             }
+            Some(&Fd::Socket(i)) => {
+                let mut tmp = vec![0u8; len as usize];
+                let n = self.socket_recv(i, &mut tmp);
+                if n < 0 {
+                    return n;
+                }
+                if write_mem(mmu, buf, &tmp[..n as usize]).is_none() {
+                    return EFAULT;
+                }
+                n
+            }
             // read() on a directory fd is EISDIR; the std streams are EBADF.
             Some(Fd::Dir { .. }) => EISDIR,
             Some(Fd::Stdout | Fd::Stderr | Fd::PipeWrite(_)) | None => EBADF,
@@ -433,6 +531,40 @@ impl LinuxKernel {
             }
         };
         Some(canonicalize(&base, &p))
+    }
+
+    /// `renameat`: the mount layer has no native rename, so move the file by
+    /// copy + unlink. Same-mount only (the common case: temp → final in the
+    /// ext4 root); good enough for apk's atomic-index install.
+    fn sys_renameat(
+        &mut self,
+        olddirfd: i32,
+        oldp: u32,
+        newdirfd: i32,
+        newp: u32,
+        mmu: &dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let (Some(old), Some(new)) = (
+            self.resolve_at(olddirfd, oldp, mmu),
+            self.resolve_at(newdirfd, newp, mmu),
+        ) else {
+            return EBADF;
+        };
+        if old == new {
+            return 0;
+        }
+        let Some(data) = vfs.read_file(&old) else {
+            return -2; // ENOENT
+        };
+        let _ = vfs.truncate_path(&new, 0); // drop stale bytes if the target exists
+        let Some(h) = vfs.open(&new, FileAccess::Write) else {
+            return -13; // EACCES (read-only mount / bad path)
+        };
+        vfs.write_handle(h, &data);
+        vfs.close(h);
+        let _ = vfs.unlink_path(&old);
+        0
     }
 
     fn sys_openat(
@@ -490,6 +622,11 @@ impl LinuxKernel {
         match self.fds.remove(&fd) {
             Some(Fd::Vfs { h, .. }) => {
                 vfs.close(h);
+                0
+            }
+            Some(Fd::Socket(i)) => {
+                // Drop the host socket (close the connection).
+                self.sockets[i] = SocketState::Closed;
                 0
             }
             Some(_) => 0, // closing a std stream or dir fd: accept
@@ -768,7 +905,12 @@ impl LinuxKernel {
                     // A char-device stat for the std streams + pipes keeps
                     // isatty()/libc buffering happy.
                     Some(
-                        Fd::Stdin | Fd::Stdout | Fd::Stderr | Fd::PipeRead(_) | Fd::PipeWrite(_),
+                        Fd::Stdin
+                        | Fd::Stdout
+                        | Fd::Stderr
+                        | Fd::PipeRead(_)
+                        | Fd::PipeWrite(_)
+                        | Fd::Socket(_),
                     ) => (NodeKind::CharDevice, 0, 0o666, u64::from(fd as u32), buf),
                     Some(Fd::Vfs { path, .. } | Fd::Dir { path, .. }) => {
                         let path = path.clone();
@@ -1084,15 +1226,40 @@ impl LinuxKernel {
     /// `fcntl(fd, cmd, arg)`: enough for musl/busybox startup. We don't model
     /// O_CLOEXEC / file-status flags (no exec yet), so the descriptor-flag
     /// commands are accepted and queried as 0; `F_DUPFD` duplicates the fd.
-    fn sys_fcntl(&mut self, fd: i32, cmd: u32, _arg: u32) -> i64 {
-        if !self.fds.contains_key(&fd) {
-            return EBADF;
-        }
+    fn sys_fcntl(&mut self, fd: i32, cmd: u32, arg: u32) -> i64 {
+        // O_NONBLOCK is 0o4000 = 0x800 on every Linux/x86 ABI we run.
+        const O_NONBLOCK: u32 = 0x800;
+        let sock_idx = match self.fds.get(&fd) {
+            Some(&Fd::Socket(i)) => Some(i),
+            Some(_) => None,
+            None => return EBADF,
+        };
         match cmd {
             0 | 1030 => self.sys_dup(fd), // F_DUPFD / F_DUPFD_CLOEXEC
-            1 | 3 => 0,                   // F_GETFD / F_GETFL → no flags
-            2 | 4 => 0,                   // F_SETFD / F_SETFL → accept
-            _ => 0,                       // other commands: accept
+            1 => 0,                       // F_GETFD → no descriptor flags
+            3 => {
+                // F_GETFL: report O_RDWR plus real O_NONBLOCK for sockets so the
+                // caller's "is this non-blocking?" bookkeeping stays consistent.
+                match sock_idx {
+                    Some(i) if self.sock_nonblock[i] => 2 | i64::from(O_NONBLOCK),
+                    Some(_) => 2, // O_RDWR
+                    None => 0,
+                }
+            }
+            2 => 0, // F_SETFD → accept
+            4 => {
+                // F_SETFL: honor O_NONBLOCK toggles on sockets (libfetch clears
+                // it before the blocking request/response transfer).
+                if let Some(i) = sock_idx {
+                    let nb = arg & O_NONBLOCK != 0;
+                    self.sock_nonblock[i] = nb;
+                    if let SocketState::Tcp(s) = &self.sockets[i] {
+                        let _ = s.set_nonblocking(nb);
+                    }
+                }
+                0
+            }
+            _ => 0, // other commands: accept
         }
     }
 
@@ -1114,6 +1281,323 @@ impl LinuxKernel {
         if write_mem(mmu, fds_ptr, &(rfd as u32).to_le_bytes()).is_none()
             || write_mem(mmu, fds_ptr.wrapping_add(4), &(wfd as u32).to_le_bytes()).is_none()
         {
+            return EFAULT;
+        }
+        0
+    }
+
+    // ---- host-proxied sockets -------------------------------------------
+
+    fn sys_socket(&mut self, domain: i32, ty: i32) -> i64 {
+        if !self.net_enabled {
+            return -13; // EACCES — networking is opt-in (`--net`)
+        }
+        // AF_INET=2, AF_INET6=10. SOCK_STREAM=1, SOCK_DGRAM=2 (low bits; the
+        // upper bits carry SOCK_NONBLOCK=0x800 / SOCK_CLOEXEC=0x80000).
+        if domain != 2 && domain != 10 {
+            return -97; // EAFNOSUPPORT
+        }
+        let idx = self.sockets.len();
+        self.sockets.push(SocketState::Pending { ty: ty & 0xff });
+        self.sock_nonblock.push(ty & 0x800 != 0);
+        i64::from(self.install_fd(Fd::Socket(idx)))
+    }
+
+    fn sys_connect(&mut self, fd: i32, addr: u32, len: u32, mmu: &dyn GuestMem) -> i64 {
+        let idx = match self.fds.get(&fd) {
+            Some(&Fd::Socket(i)) => i,
+            _ => return EBADF,
+        };
+        let Some(sa) = read_sockaddr(mmu, addr, len) else {
+            return EINVAL;
+        };
+        let ty = match &self.sockets[idx] {
+            SocketState::Pending { ty, .. } => *ty,
+            _ => return -56, // EISCONN
+        };
+        if ty == 2 {
+            // UDP: bind an ephemeral local socket and remember the peer.
+            match std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect(sa).map(|()| s)) {
+                Ok(s) => {
+                    self.sockets[idx] = SocketState::Udp(s);
+                    0
+                }
+                Err(_) => -111, // ECONNREFUSED
+            }
+        } else {
+            // TCP: we connect synchronously (blocking) under the hood, but a
+            // guest that opened the socket `SOCK_NONBLOCK` expects `connect` to
+            // return EINPROGRESS and then drive POLLOUT → getsockopt(SO_ERROR)
+            // → write. Honor that: complete the connect, mark the host stream
+            // non-blocking, and report EINPROGRESS so the fetch state machine
+            // proceeds to send its request.
+            match std::net::TcpStream::connect(sa) {
+                Ok(s) => {
+                    let nb = self.sock_nonblock[idx];
+                    let _ = s.set_nonblocking(nb);
+                    self.sockets[idx] = SocketState::Tcp(s);
+                    if nb {
+                        -115 // EINPROGRESS
+                    } else {
+                        0
+                    }
+                }
+                Err(_) => -111,
+            }
+        }
+    }
+
+    /// Send `data` over a connected socket. Returns bytes sent or `-errno`
+    /// (EAGAIN when the socket is non-blocking and the send buffer is full).
+    fn socket_send(&mut self, idx: usize, data: &[u8]) -> i64 {
+        use std::io::Write;
+        match &mut self.sockets[idx] {
+            SocketState::Tcp(s) => s.write(data).map_or_else(io_errno, |n| n as i64),
+            SocketState::Udp(s) => s.send(data).map_or_else(io_errno, |n| n as i64),
+            _ => -107, // ENOTCONN
+        }
+    }
+
+    /// Receive into `buf` from a connected socket. Returns bytes (0 at EOF) or
+    /// `-errno` (EAGAIN when non-blocking and no data is queued).
+    fn socket_recv(&mut self, idx: usize, buf: &mut [u8]) -> i64 {
+        use std::io::Read;
+        match &mut self.sockets[idx] {
+            SocketState::Tcp(s) => s.read(buf).map_or_else(io_errno, |n| n as i64),
+            SocketState::Udp(s) => s.recv(buf).map_or_else(io_errno, |n| n as i64),
+            _ => -107,
+        }
+    }
+
+    /// Real `POLLIN` readiness of a socket via a non-blocking `MSG_PEEK`.
+    /// Returns `(readable, hung_up)` and always restores blocking mode so the
+    /// subsequent `read` blocks normally. `readable` is true when data is
+    /// queued or the peer has closed (so the caller's `read` returns 0/EOF).
+    fn socket_pollin(&self, idx: usize) -> (bool, bool) {
+        use std::io::ErrorKind::WouldBlock;
+        let restore = self.sock_nonblock[idx]; // leave the socket as the guest set it
+        let mut probe = [0u8; 1];
+        match &self.sockets[idx] {
+            SocketState::Tcp(s) => {
+                let _ = s.set_nonblocking(true);
+                let r = s.peek(&mut probe);
+                let _ = s.set_nonblocking(restore);
+                match r {
+                    Ok(0) => (true, true),  // peer closed: readable + HUP
+                    Ok(_) => (true, false), // data queued
+                    Err(e) if e.kind() == WouldBlock => (false, false),
+                    Err(_) => (true, true), // error: let read surface it
+                }
+            }
+            SocketState::Udp(s) => {
+                let _ = s.set_nonblocking(true);
+                let r = s.peek_from(&mut probe);
+                let _ = s.set_nonblocking(restore);
+                match r {
+                    Ok(_) => (true, false),
+                    Err(e) if e.kind() == WouldBlock => (false, false),
+                    Err(_) => (true, true),
+                }
+            }
+            _ => (false, false),
+        }
+    }
+
+    fn sys_sendto(
+        &mut self,
+        fd: i32,
+        buf: u32,
+        len: u32,
+        dest: u32,
+        destlen: u32,
+        mmu: &dyn GuestMem,
+    ) -> i64 {
+        let idx = match self.fds.get(&fd) {
+            Some(&Fd::Socket(i)) => i,
+            _ => return EBADF,
+        };
+        let Some(data) = read_mem(mmu, buf, len as usize) else {
+            return EFAULT;
+        };
+        // sendto with an explicit destination: bind a UDP socket lazily (apk's
+        // DNS sends without a prior connect) and send the datagram.
+        if dest != 0 && destlen != 0 {
+            let Some(sa) = read_sockaddr(mmu, dest, destlen) else {
+                return EINVAL;
+            };
+            if matches!(self.sockets[idx], SocketState::Pending { ty: 2, .. }) {
+                match std::net::UdpSocket::bind("0.0.0.0:0") {
+                    Ok(s) => self.sockets[idx] = SocketState::Udp(s),
+                    Err(_) => return -111,
+                }
+            }
+            if let SocketState::Udp(s) = &self.sockets[idx] {
+                return s.send_to(&data, sa).map_or(-111, |n| n as i64);
+            }
+        }
+        self.socket_send(idx, &data)
+    }
+
+    /// `sendmsg`/`recvmsg`: handle the common single-buffer datagram shape by
+    /// extracting `msg_name` (peer) + the first iovec and routing to
+    /// `sendto`/`recvfrom`. (musl's DNS resolver uses these.)
+    fn sys_sendmsg(&mut self, fd: i32, msg: u32, mmu: &mut dyn GuestMem) -> i64 {
+        let Some((name, namelen, _, iov, iovlen)) = self.read_msghdr(mmu, msg) else {
+            return EFAULT;
+        };
+        // Sum the iovecs into one datagram.
+        let mut data = Vec::new();
+        for i in 0..iovlen {
+            if let Some((p, l)) = self.read_iovec(iov, i, mmu) {
+                if let Some(chunk) = read_mem(mmu, p, l as usize) {
+                    data.extend_from_slice(&chunk);
+                }
+            }
+        }
+        // Stage the datagram in guest-independent form, then reuse sys_sendto by
+        // writing nothing — instead send directly.
+        let idx = match self.fds.get(&fd) {
+            Some(&Fd::Socket(i)) => i,
+            _ => return EBADF,
+        };
+        if name != 0 && namelen != 0 {
+            if let Some(sa) = read_sockaddr(mmu, name, namelen) {
+                if matches!(self.sockets[idx], SocketState::Pending { ty: 2, .. }) {
+                    if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                        self.sockets[idx] = SocketState::Udp(s);
+                    }
+                }
+                if let SocketState::Udp(s) = &self.sockets[idx] {
+                    return s.send_to(&data, sa).map_or(-111, |n| n as i64);
+                }
+            }
+        }
+        self.socket_send(idx, &data)
+    }
+
+    fn sys_recvmsg(&mut self, fd: i32, msg: u32, mmu: &mut dyn GuestMem) -> i64 {
+        let Some((name, _, namelen_ptr, iov, _iovlen)) = self.read_msghdr(mmu, msg) else {
+            return EFAULT;
+        };
+        let idx = match self.fds.get(&fd) {
+            Some(&Fd::Socket(i)) => i,
+            _ => return EBADF,
+        };
+        // Receive into the first iovec (datagrams fit one buffer in practice).
+        let Some((ptr, cap)) = self.read_iovec(iov, 0, mmu) else {
+            return EFAULT;
+        };
+        let mut tmp = vec![0u8; cap as usize];
+        let n = if let SocketState::Udp(s) = &self.sockets[idx] {
+            match s.recv_from(&mut tmp) {
+                Ok((n, peer)) => {
+                    if name != 0 {
+                        write_sockaddr(mmu, name, namelen_ptr, peer);
+                    }
+                    n as i64
+                }
+                Err(_) => -111,
+            }
+        } else {
+            self.socket_recv(idx, &mut tmp)
+        };
+        if n < 0 {
+            return n;
+        }
+        if write_mem(mmu, ptr, &tmp[..n as usize]).is_none() {
+            return EFAULT;
+        }
+        n
+    }
+
+    fn sys_recvfrom(
+        &mut self,
+        fd: i32,
+        buf: u32,
+        len: u32,
+        src: u32,
+        srclen: u32,
+        mmu: &mut dyn GuestMem,
+    ) -> i64 {
+        let idx = match self.fds.get(&fd) {
+            Some(&Fd::Socket(i)) => i,
+            _ => return EBADF,
+        };
+        let mut tmp = vec![0u8; len as usize];
+        // recvfrom on an unconnected UDP socket returns the peer in `src`.
+        let n = if let SocketState::Udp(s) = &self.sockets[idx] {
+            match s.recv_from(&mut tmp) {
+                Ok((n, peer)) => {
+                    if src != 0 && srclen != 0 {
+                        write_sockaddr(mmu, src, srclen, peer);
+                    }
+                    n as i64
+                }
+                Err(_) => -111,
+            }
+        } else {
+            self.socket_recv(idx, &mut tmp)
+        };
+        if n < 0 {
+            return n;
+        }
+        if write_mem(mmu, buf, &tmp[..n as usize]).is_none() {
+            return EFAULT;
+        }
+        n
+    }
+
+    fn sys_getsockopt(&self, optval: u32, optlen: u32, mmu: &mut dyn GuestMem) -> i64 {
+        // Report success/no-error for the common SO_ERROR probe after connect.
+        if optval != 0 && optlen != 0 {
+            let _ = write_mem(mmu, optval, &0u32.to_le_bytes());
+        }
+        0
+    }
+
+    fn sys_getsockname(&self, addr: u32, addrlen: u32, mmu: &mut dyn GuestMem) -> i64 {
+        // A minimal AF_INET sockaddr (0.0.0.0:0) — enough for callers that just
+        // read the family.
+        if addr != 0 && addrlen != 0 {
+            let mut sa = [0u8; 16];
+            sa[0] = 2; // AF_INET (little-endian sa_family low byte)
+            let _ = write_mem(mmu, addr, &sa);
+            let _ = write_mem(mmu, addrlen, &16u32.to_le_bytes());
+        }
+        0
+    }
+
+    fn sys_shutdown(&mut self, fd: i32) -> i64 {
+        match self.fds.get(&fd) {
+            Some(&Fd::Socket(i)) => {
+                if let SocketState::Tcp(s) = &self.sockets[i] {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+                0
+            }
+            _ => EBADF,
+        }
+    }
+
+    /// `statfs`/`fstatfs`: report a large, mostly-free filesystem so callers
+    /// (e.g. apk's free-space check) proceed.
+    fn sys_statfs(&self, buf: u32, mmu: &mut dyn GuestMem) -> i64 {
+        // struct statfs is arch-specific but the leading fields line up enough:
+        // f_type(8) f_bsize(8) f_blocks(8) f_bfree(8) f_bavail(8) f_files(8)
+        // f_ffree(8) f_fsid(8) f_namelen(8) f_frsize(8) ...
+        let mut b = [0u8; 120];
+        let put =
+            |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put(&mut b, 0, 0xEF53); // f_type = EXT4_SUPER_MAGIC
+        put(&mut b, 8, 4096); // f_bsize
+        put(&mut b, 16, 1 << 20); // f_blocks (4 GiB)
+        put(&mut b, 24, 1 << 19); // f_bfree
+        put(&mut b, 32, 1 << 19); // f_bavail
+        put(&mut b, 40, 1 << 18); // f_files
+        put(&mut b, 48, 1 << 17); // f_ffree
+        put(&mut b, 64, 255); // f_namelen
+        put(&mut b, 72, 4096); // f_frsize
+        if write_mem(mmu, buf, &b).is_none() {
             return EFAULT;
         }
         0
@@ -1147,22 +1631,181 @@ impl LinuxKernel {
     /// `poll`/`ppoll`: we don't block, and regular files / the std streams are
     /// always ready. Set each `revents` to its requested `events` and report
     /// the count of ready fds.
-    fn sys_poll(&self, fds: u32, nfds: u32, mmu: &mut dyn GuestMem) -> i64 {
-        // struct pollfd { int fd; short events; short revents; } — 8 bytes.
-        let mut ready = 0i64;
-        for i in 0..nfds {
-            let base = fds.wrapping_add(i.wrapping_mul(8));
-            let Ok(events) = mmu.load16(base.wrapping_add(4)) else {
-                return EFAULT;
-            };
-            if write_mem(mmu, base.wrapping_add(6), &events.to_le_bytes()).is_none() {
-                return EFAULT;
-            }
-            if events != 0 {
-                ready += 1;
-            }
+    /// `ppoll` carries its timeout as a `struct timespec *`; a null pointer
+    /// means "wait forever" (we return -1). Reads the two longs at pointer
+    /// width and collapses them to whole milliseconds for [`sys_poll`].
+    fn poll_timeout_from_timespec(&self, ts: u32, mmu: &dyn GuestMem) -> i64 {
+        if ts == 0 {
+            return -1;
         }
-        ready
+        let (sec, nsec) = if self.ptr64 {
+            (
+                mmu.load64(ts).unwrap_or(0),
+                mmu.load64(ts.wrapping_add(8)).unwrap_or(0),
+            )
+        } else {
+            (
+                u64::from(mmu.load32(ts).unwrap_or(0)),
+                u64::from(mmu.load32(ts.wrapping_add(4)).unwrap_or(0)),
+            )
+        };
+        (sec.saturating_mul(1000) + nsec / 1_000_000) as i64
+    }
+
+    /// `select` carries its timeout as a `struct timeval *` (seconds +
+    /// microseconds); a null pointer means "wait forever" (-1).
+    fn poll_timeout_from_timeval(&self, tv: u32, mmu: &dyn GuestMem) -> i64 {
+        if tv == 0 {
+            return -1;
+        }
+        let (sec, usec) = if self.ptr64 {
+            (
+                mmu.load64(tv).unwrap_or(0),
+                mmu.load64(tv.wrapping_add(8)).unwrap_or(0),
+            )
+        } else {
+            (
+                u64::from(mmu.load32(tv).unwrap_or(0)),
+                u64::from(mmu.load32(tv.wrapping_add(4)).unwrap_or(0)),
+            )
+        };
+        (sec.saturating_mul(1000) + usec / 1000) as i64
+    }
+
+    /// Per-fd readiness for `select`: sockets report real readability (peek)
+    /// and connected-writability; everything else is always ready.
+    fn select_ready(&self, fd: i32, want_r: bool, want_w: bool) -> (bool, bool) {
+        match self.fds.get(&fd) {
+            Some(&Fd::Socket(idx)) => {
+                let w = want_w
+                    && matches!(self.sockets[idx], SocketState::Tcp(_) | SocketState::Udp(_));
+                let r = want_r && self.socket_pollin(idx).0;
+                (r, w)
+            }
+            Some(_) => (want_r, want_w), // files/pipes/std streams: always ready
+            None => (false, false),
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn sys_select(
+        &self,
+        nfds: u32,
+        readfds: u32,
+        writefds: u32,
+        exceptfds: u32,
+        timeout_ms: i64,
+        mmu: &mut dyn GuestMem,
+    ) -> i64 {
+        let nfds = nfds.min(1024);
+        let word_bytes: u32 = if self.ptr64 { 8 } else { 4 };
+        let start = std::time::Instant::now();
+        let deadline_ms: u128 = if timeout_ms < 0 {
+            120_000
+        } else {
+            timeout_ms as u128
+        };
+        loop {
+            let mut ready_r: Vec<u32> = Vec::new();
+            let mut ready_w: Vec<u32> = Vec::new();
+            let mut count = 0i64;
+            for fd in 0..nfds {
+                let want_r = readfds != 0 && fdset_test(mmu, readfds, fd, word_bytes);
+                let want_w = writefds != 0 && fdset_test(mmu, writefds, fd, word_bytes);
+                if !want_r && !want_w {
+                    continue;
+                }
+                let (rok, wok) = self.select_ready(fd as i32, want_r, want_w);
+                if rok {
+                    ready_r.push(fd);
+                    count += 1;
+                }
+                if wok {
+                    ready_w.push(fd);
+                    count += 1;
+                }
+            }
+            if count > 0 || timeout_ms == 0 || start.elapsed().as_millis() >= deadline_ms {
+                if readfds != 0 {
+                    fdset_write(mmu, readfds, nfds, &ready_r, word_bytes);
+                }
+                if writefds != 0 {
+                    fdset_write(mmu, writefds, nfds, &ready_w, word_bytes);
+                }
+                if exceptfds != 0 {
+                    fdset_write(mmu, exceptfds, nfds, &[], word_bytes); // no exceptions
+                }
+                return count;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn sys_poll(&self, fds: u32, nfds: u32, timeout_ms: i64, mmu: &mut dyn GuestMem) -> i64 {
+        // struct pollfd { int fd; short events; short revents; } — 8 bytes.
+        const POLLIN: u16 = 0x001;
+        const POLLOUT: u16 = 0x004;
+        const POLLHUP: u16 = 0x010;
+        const POLLNVAL: u16 = 0x020;
+        // Files/pipes/std streams are always ready; sockets report *real*
+        // readiness (peek for POLLIN, connected ⇒ writable) so a client that
+        // polls before writing isn't told to read an empty socket. Block until
+        // an fd is ready or the timeout elapses; a negative timeout means wait
+        // forever, which we cap so a wedged guest can't hang the host.
+        let start = std::time::Instant::now();
+        let deadline_ms: u128 = if timeout_ms < 0 {
+            120_000
+        } else {
+            timeout_ms as u128
+        };
+        loop {
+            let mut ready = 0i64;
+            for i in 0..nfds {
+                let base = fds.wrapping_add(i.wrapping_mul(8));
+                let (Ok(fd_raw), Ok(events)) = (mmu.load32(base), mmu.load16(base.wrapping_add(4)))
+                else {
+                    return EFAULT;
+                };
+                let fd = fd_raw as i32;
+                let mut revents = 0u16;
+                match self.fds.get(&fd) {
+                    Some(&Fd::Socket(idx)) => {
+                        if events & POLLOUT != 0
+                            && matches!(
+                                self.sockets[idx],
+                                SocketState::Tcp(_) | SocketState::Udp(_)
+                            )
+                        {
+                            revents |= POLLOUT;
+                        }
+                        if events & POLLIN != 0 {
+                            let (readable, hup) = self.socket_pollin(idx);
+                            if readable {
+                                revents |= POLLIN;
+                            }
+                            if hup {
+                                revents |= POLLHUP;
+                            }
+                        }
+                    }
+                    Some(_) => revents = events, // files/pipes/std: always ready
+                    None => revents = POLLNVAL,
+                }
+                if write_mem(mmu, base.wrapping_add(6), &revents.to_le_bytes()).is_none() {
+                    return EFAULT;
+                }
+                if revents != 0 {
+                    ready += 1;
+                }
+            }
+            if ready > 0 || timeout_ms == 0 {
+                return ready;
+            }
+            if start.elapsed().as_millis() >= deadline_ms {
+                return 0;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     fn sys_pread64(
@@ -1239,6 +1882,87 @@ impl LinuxKernel {
         }
         total
     }
+}
+
+/// Test bit `fd` in a guest `fd_set` (an array of `long`s at `set`).
+fn fdset_test(mmu: &dyn GuestMem, set: u32, fd: u32, word_bytes: u32) -> bool {
+    let bits = word_bytes * 8;
+    let waddr = set.wrapping_add((fd / bits) * word_bytes);
+    let word = if word_bytes == 8 {
+        mmu.load64(waddr).unwrap_or(0)
+    } else {
+        u64::from(mmu.load32(waddr).unwrap_or(0))
+    };
+    word & (1u64 << (fd % bits)) != 0
+}
+
+/// Overwrite a guest `fd_set` so exactly the fds in `ready` are set, covering
+/// `nfds` descriptors (the kernel rewrites the caller's sets in place).
+fn fdset_write(mmu: &mut dyn GuestMem, set: u32, nfds: u32, ready: &[u32], word_bytes: u32) {
+    let bits = word_bytes * 8;
+    let nwords = nfds.div_ceil(bits);
+    let mut words = vec![0u64; nwords as usize];
+    for &fd in ready {
+        words[(fd / bits) as usize] |= 1u64 << (fd % bits);
+    }
+    for (i, w) in words.iter().enumerate() {
+        let waddr = set.wrapping_add(i as u32 * word_bytes);
+        let _ = write_mem(mmu, waddr, &w.to_le_bytes()[..word_bytes as usize]);
+    }
+}
+
+/// Map a host socket I/O error to a guest `-errno`. `WouldBlock` becomes
+/// EAGAIN so a non-blocking guest retries rather than treating it as fatal.
+fn io_errno(e: std::io::Error) -> i64 {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset, WouldBlock};
+    match e.kind() {
+        WouldBlock => -11,       // EAGAIN
+        BrokenPipe => -32,       // EPIPE
+        ConnectionReset => -104, // ECONNRESET
+        _ => -111,               // ECONNREFUSED / generic
+    }
+}
+
+/// Parse a guest `sockaddr` (`AF_INET` / `AF_INET6`) into a host
+/// [`std::net::SocketAddr`]. Port and address are network byte order.
+fn read_sockaddr(mmu: &dyn GuestMem, addr: u32, len: u32) -> Option<std::net::SocketAddr> {
+    let buf = read_mem(mmu, addr, (len as usize).clamp(8, 28))?;
+    let family = u16::from_le_bytes([buf[0], buf[1]]);
+    let port = u16::from_be_bytes([buf[2], buf[3]]);
+    match family {
+        2 => {
+            let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+            Some(std::net::SocketAddr::new(ip.into(), port))
+        }
+        10 if buf.len() >= 24 => {
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&buf[8..24]);
+            Some(std::net::SocketAddr::new(
+                std::net::Ipv6Addr::from(o).into(),
+                port,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Write a host [`std::net::SocketAddr`] back into a guest `sockaddr` plus its
+/// length (for `recvfrom`'s source-address out-param).
+fn write_sockaddr(mmu: &mut dyn GuestMem, addr: u32, addrlen_ptr: u32, peer: std::net::SocketAddr) {
+    let mut buf = vec![0u8; if peer.is_ipv6() { 28 } else { 16 }];
+    buf[2..4].copy_from_slice(&peer.port().to_be_bytes());
+    match peer {
+        std::net::SocketAddr::V4(a) => {
+            buf[0] = 2;
+            buf[4..8].copy_from_slice(&a.ip().octets());
+        }
+        std::net::SocketAddr::V6(a) => {
+            buf[0] = 10;
+            buf[8..24].copy_from_slice(&a.ip().octets());
+        }
+    }
+    let _ = write_mem(mmu, addr, &buf);
+    let _ = write_mem(mmu, addrlen_ptr, &(buf.len() as u32).to_le_bytes());
 }
 
 /// A stable, non-zero inode number for a path. The dynamic linker dedups
