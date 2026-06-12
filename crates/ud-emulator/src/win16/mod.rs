@@ -1986,4 +1986,201 @@ mod tests {
         assert!(service_interrupt(0x21, &mut cpu, &mut mmu, &mut state));
         assert!(!service_interrupt(0x80, &mut cpu, &mut mmu, &mut state));
     }
+
+    /// Set DS:DX to point at the host-side `path` bytes, NUL-terminated,
+    /// inside a freshly-mapped buffer at `linear_base`. The DS selector
+    /// is `1` and the offset is `0`, so a real `INT 21h AH=0x3D` reads
+    /// the path through the standard far-pointer arg path.
+    fn set_dos_ds_dx_to_path(cpu: &mut Cpu, mmu: &mut Mmu, linear_base: u32, path: &str) {
+        use crate::emulator::mmu::Perm;
+        mmu.map(linear_base, 0x1000, Perm::R | Perm::W);
+        for (i, b) in path.bytes().enumerate() {
+            mmu.store8(linear_base + i as u32, b).unwrap();
+        }
+        mmu.store8(linear_base + path.len() as u32, 0).unwrap();
+        cpu.define_selector(1, linear_base);
+        cpu.load_segment(crate::emulator::isa_int::Seg::Ds, 1);
+        cpu.regs.set16(Reg16::Dx, 0);
+    }
+
+    #[test]
+    fn dos_open_create_rejects_empty_path() {
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        // DS:DX = 0:0 with no selector defined → linear 0; path will be
+        // empty since the address isn't mapped.
+        cpu.regs.set8(Reg8::Ah, 0x3D);
+        cpu.regs.set8(Reg8::Al, 0);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(cpu.regs.flags.cf, "carry set on failed open");
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 0x02, "file-not-found");
+    }
+
+    #[test]
+    fn dos_open_returns_handle_for_known_file() {
+        use crate::context::{FileAccess, VirtualFs};
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        let mut vfs = VirtualFs::new();
+        vfs.insert("c:\\hello.txt", b"hi".to_vec());
+        state.context.vfs = Some(vfs);
+        set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\HELLO.TXT");
+        cpu.regs.set8(Reg8::Ah, 0x3D);
+        cpu.regs.set8(Reg8::Al, 0); // read-only
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(!cpu.regs.flags.cf, "carry clear on successful open");
+        let dh = cpu.regs.get16(Reg16::Bx); // re-read after copying handle in
+        let dh_ax = cpu.regs.get16(Reg16::Ax);
+        assert!(dh_ax >= 5, "DOS handle starts at 5; got {dh_ax:#x}");
+        assert!(
+            state.dos_handles.contains_key(&dh_ax),
+            "handle table tracks it"
+        );
+        let _ = (FileAccess::Read, dh); // silence unused-import warning in some builds
+    }
+
+    #[test]
+    fn dos_read_returns_bytes_advances_position() {
+        use crate::context::VirtualFs;
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        let mut vfs = VirtualFs::new();
+        vfs.insert("c:\\data.bin", b"ABCDEFGH".to_vec());
+        state.context.vfs = Some(vfs);
+        // Open
+        set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\DATA.BIN");
+        cpu.regs.set8(Reg8::Ah, 0x3D);
+        cpu.regs.set8(Reg8::Al, 0);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        let dh = cpu.regs.get16(Reg16::Ax);
+        // Read 4 bytes into DS:DX (reuse the path buffer).
+        cpu.regs.set8(Reg8::Ah, 0x3F);
+        cpu.regs.set16(Reg16::Bx, dh);
+        cpu.regs.set16(Reg16::Cx, 4);
+        cpu.regs.set16(Reg16::Dx, 0x100); // an offset into the mapped page
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(!cpu.regs.flags.cf, "carry clear on successful read");
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 4, "read 4 bytes");
+        let mut got = [0u8; 4];
+        for i in 0..4 {
+            got[i] = mmu.load8(0x10_0000 + 0x100 + i as u32).unwrap();
+        }
+        assert_eq!(&got, b"ABCD");
+        // Second read should pick up where we left off.
+        cpu.regs.set8(Reg8::Ah, 0x3F);
+        cpu.regs.set16(Reg16::Bx, dh);
+        cpu.regs.set16(Reg16::Cx, 4);
+        cpu.regs.set16(Reg16::Dx, 0x100);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 4, "read 4 more bytes");
+        for i in 0..4 {
+            got[i] = mmu.load8(0x10_0000 + 0x100 + i as u32).unwrap();
+        }
+        assert_eq!(&got, b"EFGH");
+        // Third read should return 0 (EOF).
+        cpu.regs.set8(Reg8::Ah, 0x3F);
+        cpu.regs.set16(Reg16::Bx, dh);
+        cpu.regs.set16(Reg16::Cx, 4);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 0, "EOF read returns 0");
+    }
+
+    #[test]
+    fn dos_write_then_read_round_trips_through_vfs() {
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        // Create a file
+        set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\OUT.BIN");
+        cpu.regs.set8(Reg8::Ah, 0x3C); // create
+        cpu.regs.set16(Reg16::Cx, 0); // attrs
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(!cpu.regs.flags.cf, "create succeeds");
+        let dh = cpu.regs.get16(Reg16::Ax);
+        // Write 4 bytes at DS:DX+0x200
+        for (i, b) in b"WXYZ".iter().enumerate() {
+            mmu.store8(0x10_0000 + 0x200 + i as u32, *b).unwrap();
+        }
+        cpu.regs.set8(Reg8::Ah, 0x40);
+        cpu.regs.set16(Reg16::Bx, dh);
+        cpu.regs.set16(Reg16::Cx, 4);
+        cpu.regs.set16(Reg16::Dx, 0x200);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(!cpu.regs.flags.cf, "write succeeds");
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 4, "wrote 4 bytes");
+        // Seek to start
+        cpu.regs.set8(Reg8::Ah, 0x42);
+        cpu.regs.set8(Reg8::Al, 0); // SET
+        cpu.regs.set16(Reg16::Bx, dh);
+        cpu.regs.set16(Reg16::Cx, 0);
+        cpu.regs.set16(Reg16::Dx, 0);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 0, "position low word = 0");
+        // Read back
+        cpu.regs.set8(Reg8::Ah, 0x3F);
+        cpu.regs.set16(Reg16::Bx, dh);
+        cpu.regs.set16(Reg16::Cx, 4);
+        cpu.regs.set16(Reg16::Dx, 0x300);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 4, "read 4 bytes");
+        for (i, want) in b"WXYZ".iter().enumerate() {
+            assert_eq!(mmu.load8(0x10_0000 + 0x300 + i as u32).unwrap(), *want);
+        }
+    }
+
+    #[test]
+    fn dos_seek_end_returns_file_size() {
+        use crate::context::VirtualFs;
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        let mut vfs = VirtualFs::new();
+        vfs.insert("c:\\sized.bin", vec![0u8; 0x1234]); // 4660 bytes
+        state.context.vfs = Some(vfs);
+        set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\SIZED.BIN");
+        cpu.regs.set8(Reg8::Ah, 0x3D);
+        cpu.regs.set8(Reg8::Al, 0);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        let dh = cpu.regs.get16(Reg16::Ax);
+        // SEEK_END, offset 0 → returns file size in DX:AX.
+        cpu.regs.set8(Reg8::Ah, 0x42);
+        cpu.regs.set8(Reg8::Al, 2);
+        cpu.regs.set16(Reg16::Bx, dh);
+        cpu.regs.set16(Reg16::Cx, 0);
+        cpu.regs.set16(Reg16::Dx, 0);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 0x1234);
+        assert_eq!(cpu.regs.get16(Reg16::Dx), 0);
+    }
+
+    #[test]
+    fn dos_close_removes_handle() {
+        use crate::context::VirtualFs;
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        let mut vfs = VirtualFs::new();
+        vfs.insert("c:\\x.bin", vec![0u8]);
+        state.context.vfs = Some(vfs);
+        set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\X.BIN");
+        cpu.regs.set8(Reg8::Ah, 0x3D);
+        cpu.regs.set8(Reg8::Al, 0);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        let dh = cpu.regs.get16(Reg16::Ax);
+        assert!(state.dos_handles.contains_key(&dh));
+        cpu.regs.set8(Reg8::Ah, 0x3E);
+        cpu.regs.set16(Reg16::Bx, dh);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(!cpu.regs.flags.cf, "close succeeds");
+        assert!(!state.dos_handles.contains_key(&dh), "handle removed");
+        // Second close fails with invalid-handle.
+        cpu.regs.set8(Reg8::Ah, 0x3E);
+        cpu.regs.set16(Reg16::Bx, dh);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(cpu.regs.flags.cf, "double-close errors");
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 0x06, "invalid-handle code");
+    }
 }
