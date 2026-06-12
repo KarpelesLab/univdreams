@@ -2157,6 +2157,63 @@ mod tests {
     }
 
     #[test]
+    fn dos_file_attribs_reports_archive_for_known_file() {
+        use crate::context::VirtualFs;
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        let mut vfs = VirtualFs::new();
+        vfs.insert("c:\\flag.txt", vec![0u8; 1]);
+        state.context.vfs = Some(vfs);
+        set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\FLAG.TXT");
+        cpu.regs.set8(Reg8::Ah, 0x43);
+        cpu.regs.set8(Reg8::Al, 0); // get
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(!cpu.regs.flags.cf, "get-attrs succeeds for known file");
+        assert_eq!(cpu.regs.get16(Reg16::Cx), 0x20, "FILE_ATTRIBUTE_ARCHIVE");
+    }
+
+    #[test]
+    fn dos_file_attribs_fails_for_missing_file() {
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\NOPE.TXT");
+        cpu.regs.set8(Reg8::Ah, 0x43);
+        cpu.regs.set8(Reg8::Al, 0);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(cpu.regs.flags.cf, "get-attrs fails for unknown file");
+        assert_eq!(cpu.regs.get16(Reg16::Ax), 0x02, "file-not-found");
+    }
+
+    #[test]
+    fn dos_ioctl_get_info_reports_regular_file() {
+        use crate::context::VirtualFs;
+        let mut cpu = Cpu::new();
+        let mut mmu = Mmu::new();
+        let mut state = HostState::default();
+        let mut vfs = VirtualFs::new();
+        vfs.insert("c:\\f.bin", vec![0u8; 1]);
+        state.context.vfs = Some(vfs);
+        set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\F.BIN");
+        cpu.regs.set8(Reg8::Ah, 0x3D);
+        cpu.regs.set8(Reg8::Al, 0);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        let dh = cpu.regs.get16(Reg16::Ax);
+        cpu.regs.set8(Reg8::Ah, 0x44);
+        cpu.regs.set8(Reg8::Al, 0); // get device info
+        cpu.regs.set16(Reg16::Bx, dh);
+        dos_int21(&mut cpu, &mut mmu, &mut state);
+        assert!(!cpu.regs.flags.cf, "ioctl succeeds for known handle");
+        // Bit 15 clear = regular file (not character device).
+        assert_eq!(
+            cpu.regs.get16(Reg16::Dx) & 0x8000,
+            0,
+            "DX bit 15 clear (file, not device)"
+        );
+    }
+
+    #[test]
     fn dos_close_removes_handle() {
         use crate::context::VirtualFs;
         let mut cpu = Cpu::new();
