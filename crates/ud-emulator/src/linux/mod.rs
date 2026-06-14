@@ -145,6 +145,8 @@ pub struct ProcSnapshot {
     next_fd: i32,
     brk: u32,
     brk_mapped: u32,
+    mmap_top: u32,
+    file_maps: Vec<FileMapping>,
     cwd: String,
     umask: u32,
 }
@@ -194,6 +196,8 @@ impl LinuxKernel {
             next_fd: self.next_fd,
             brk: self.brk,
             brk_mapped: self.brk_mapped,
+            mmap_top: self.mmap_top,
+            file_maps: self.file_maps.clone(),
             cwd: self.cwd.clone(),
             umask: self.umask,
         }
@@ -205,6 +209,8 @@ impl LinuxKernel {
         self.next_fd = s.next_fd;
         self.brk = s.brk;
         self.brk_mapped = s.brk_mapped;
+        self.mmap_top = s.mmap_top;
+        self.file_maps = s.file_maps;
         self.cwd = s.cwd;
         self.umask = s.umask;
     }
@@ -304,6 +310,7 @@ impl LinuxKernel {
                 self.sys_mmap(a0, a1, a2, a[3] as u32, a[4] as i32, off, mmu, vfs)
             }
             Sysno::Munmap => self.sys_munmap(a0, a1, mmu, vfs),
+            Sysno::Mremap => self.sys_mremap(a0, a1, a2, a[3] as u32, mmu),
             Sysno::Mprotect => self.sys_mprotect(a0, a1, a2, mmu),
             Sysno::Exit | Sysno::ExitGroup => {
                 self.exit_code = Some(a0 as i32);
@@ -386,6 +393,18 @@ impl LinuxKernel {
             Sysno::Fchmod | Sysno::Fchmodat | Sysno::Utimensat => 0,
             Sysno::Pread64 => self.sys_pread64(a0 as i32, a1, a2, a[3], vfs, mmu),
             Sysno::Pwrite64 => self.sys_pwrite64(a0 as i32, a1, a2, a[3], vfs, mmu),
+            // fallocate(fd, mode, offset, len): preallocate ⇒ ensure the file is
+            // at least offset+len long (apk reserves space before extracting).
+            Sysno::Fallocate => self.sys_fallocate(a0 as i32, a[2], a[3], vfs),
+            Sysno::CopyFileRange => self.sys_copy_file_range(
+                a0 as i32,
+                a1,
+                a2 as i32,
+                a[3] as u32,
+                a[4] as u32,
+                mmu,
+                vfs,
+            ),
             Sysno::Readv => self.sys_readv(a0 as i32, a1, a2, mmu, vfs),
             Sysno::Pipe | Sysno::Pipe2 => self.sys_pipe(a0, mmu),
             Sysno::Flock => 0, // single process: locks always succeed
@@ -593,6 +612,13 @@ impl LinuxKernel {
         if old == new {
             return 0;
         }
+        // Prefer the backend's native rename: atomic and symlink-preserving.
+        if vfs.rename_path(&old, &new).is_ok() {
+            return 0;
+        }
+        // Fallback (cross-mount / no native rename): copy the bytes then unlink.
+        // This can't preserve a symlink, but the native path covers same-mount
+        // renames, which is where symlinks are involved.
         let Some(data) = vfs.read_file(&old) else {
             return -2; // ENOENT
         };
@@ -765,6 +791,53 @@ impl LinuxKernel {
             file_len,
             writeback,
         });
+        i64::from(base)
+    }
+
+    /// `mremap(old, old_size, new_size, flags, new_addr)`. In the flat-memory
+    /// model a shrink keeps the base (surplus pages stay mapped, harmless); a
+    /// grow extends in place when the region is the top of the arena, otherwise
+    /// (with `MREMAP_MAYMOVE`) allocates a fresh region and copies the contents.
+    fn sys_mremap(
+        &mut self,
+        old_addr: u32,
+        old_size: u32,
+        new_size: u32,
+        flags: u32,
+        mmu: &mut dyn GuestMem,
+    ) -> i64 {
+        const MREMAP_MAYMOVE: u32 = 1;
+        let rwx = Perm::R | Perm::W | Perm::X;
+        let old_sz = page_up(old_size.max(1));
+        let new_sz = page_up(new_size.max(1));
+        if new_sz <= old_sz {
+            return i64::from(old_addr);
+        }
+        let extra = new_sz - old_sz;
+        // Grow in place if this mapping ends exactly at the arena top.
+        if old_addr.wrapping_add(old_sz) == self.mmap_top
+            && self
+                .mmap_top
+                .checked_add(extra)
+                .is_some_and(|e| e <= MMAP_LIMIT)
+        {
+            mmu.map_zeroed(self.mmap_top, extra, rwx);
+            self.mmap_top = self.mmap_top.wrapping_add(extra);
+            return i64::from(old_addr);
+        }
+        if flags & MREMAP_MAYMOVE == 0 {
+            return -12; // ENOMEM — can't grow in place, caller forbade moving
+        }
+        let base = self.mmap_top;
+        if base.checked_add(new_sz).is_none_or(|e| e > MMAP_LIMIT) {
+            return -12;
+        }
+        self.mmap_top = base.wrapping_add(new_sz);
+        mmu.map_zeroed(base, new_sz, rwx);
+        // Copy the live bytes; the tail past `old_size` stays zero.
+        if let Some(data) = read_mem(mmu, old_addr, old_size as usize) {
+            let _ = write_mem(mmu, base, &data);
+        }
         i64::from(base)
     }
 
@@ -1893,6 +1966,78 @@ impl LinuxKernel {
         } else {
             EBADF
         }
+    }
+
+    /// `fallocate(fd, mode, offset, len)`: in the grow-on-write model there's
+    /// no real preallocation, so just ensure the file is at least `offset+len`
+    /// long and report success. apk reserves space before extracting a file.
+    fn sys_fallocate(&mut self, fd: i32, offset: u64, len: u64, vfs: &mut MountTable) -> i64 {
+        let path = match self.fds.get(&fd) {
+            Some(Fd::Vfs { path, .. }) => path.clone(),
+            Some(Fd::Dir { .. }) => return EISDIR,
+            _ => return EBADF,
+        };
+        let want = offset.saturating_add(len);
+        let cur = vfs.stat_path(&path).map_or(0, |a| a.size);
+        if want > cur {
+            let _ = vfs.truncate_path(&path, want);
+        }
+        0
+    }
+
+    /// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`: copy bytes
+    /// between two open files. NULL offset pointers use (and advance) each fd's
+    /// own position; non-NULL ones are read/written in guest memory (`loff_t`).
+    fn sys_copy_file_range(
+        &mut self,
+        fd_in: i32,
+        off_in: u32,
+        fd_out: i32,
+        off_out: u32,
+        len: u32,
+        mmu: &mut dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let (in_h, in_path) = match self.fds.get(&fd_in) {
+            Some(Fd::Vfs { h, path }) => (*h, path.clone()),
+            _ => return EBADF,
+        };
+        let (out_h, out_path) = match self.fds.get(&fd_out) {
+            Some(Fd::Vfs { h, path }) => (*h, path.clone()),
+            _ => return EBADF,
+        };
+        let len = (len as usize).min(64 << 20); // cap a single call at 64 MiB
+
+        // Read the source bytes (explicit offset or the fd's position).
+        let data = if off_in == 0 {
+            let mut buf = vec![0u8; len];
+            let n = vfs.read_handle(in_h, &mut buf).unwrap_or(0);
+            buf.truncate(n);
+            buf
+        } else {
+            let off = mmu.load64(off_in).unwrap_or(0);
+            let d = read_file_region(vfs, &in_path, off, len);
+            let _ = mmu.store64(off_in, off + d.len() as u64);
+            d
+        };
+        if data.is_empty() {
+            return 0;
+        }
+
+        // Write to the destination (explicit offset or the fd's position).
+        let n = if off_out == 0 {
+            vfs.write_handle(out_h, &data).unwrap_or(0)
+        } else if let Some(h) = vfs.open(&out_path, FileAccess::ReadWrite) {
+            let off = mmu.load64(off_out).unwrap_or(0);
+            vfs.seek(h, off);
+            let w = vfs.write_handle(h, &data).unwrap_or(0);
+            vfs.close(h);
+            let _ = mmu.store64(off_out, off + w as u64);
+            w
+        } else {
+            return EBADF;
+        };
+        n as i64
     }
 
     /// `readv(fd, iov, cnt)`: scatter read into the iovec array (mirror of

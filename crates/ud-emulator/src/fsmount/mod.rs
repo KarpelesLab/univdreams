@@ -103,6 +103,12 @@ pub trait MountFs: std::fmt::Debug {
     fn symlink(&mut self, _target: &str, _rel: &str) -> std::io::Result<()> {
         Err(read_only_err())
     }
+    /// Rename `old_rel` to `new_rel` within this filesystem (atomic, preserves
+    /// symlinks). Default is unsupported so the caller can fall back to copy +
+    /// unlink.
+    fn rename(&mut self, _old_rel: &str, _new_rel: &str) -> std::io::Result<()> {
+        Err(read_only_err())
+    }
     fn readlink(&mut self, _rel: &str) -> std::io::Result<String> {
         Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
     }
@@ -499,6 +505,20 @@ impl MountTable {
             return self.overlays[i].fs.readlink(&rel);
         }
         Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)) // EINVAL: not a link
+    }
+
+    /// Rename within a single mount using the backend's native rename (atomic,
+    /// symlink-preserving). Errors if the two paths land on different mounts or
+    /// the backend lacks rename — the caller then falls back to copy + unlink.
+    pub fn rename_path(&mut self, old_abs: &str, new_abs: &str) -> std::io::Result<()> {
+        let old = self.resolve(old_abs);
+        let new = self.resolve(new_abs);
+        if let (Some((i, old_rel)), Some((j, new_rel))) = (old, new) {
+            if i == j {
+                return self.overlays[i].fs.rename(&old_rel, &new_rel);
+            }
+        }
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 
     pub fn truncate_path(&mut self, abs: &str, len: u64) -> std::io::Result<()> {

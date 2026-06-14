@@ -326,6 +326,35 @@ impl MountFs for FsToolMount {
         Ok(target.to_string_lossy().into_owned())
     }
 
+    fn symlink(&mut self, target: &str, rel: &str) -> io::Result<()> {
+        self.fs
+            .create_symlink(
+                &mut *self.dev,
+                Path::new(rel),
+                Path::new(target),
+                FileMeta::with_mode(0o777),
+            )
+            .map_err(to_io)
+    }
+
+    fn unlink(&mut self, rel: &str) -> io::Result<()> {
+        self.fs
+            .remove(&mut *self.dev, Path::new(rel))
+            .map_err(to_io)
+    }
+
+    fn rmdir(&mut self, rel: &str) -> io::Result<()> {
+        self.fs
+            .remove(&mut *self.dev, Path::new(rel))
+            .map_err(to_io)
+    }
+
+    fn rename(&mut self, old_rel: &str, new_rel: &str) -> io::Result<()> {
+        self.fs
+            .rename(&mut *self.dev, Path::new(old_rel), Path::new(new_rel))
+            .map_err(to_io)
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         if self.read_only {
             return Ok(());
