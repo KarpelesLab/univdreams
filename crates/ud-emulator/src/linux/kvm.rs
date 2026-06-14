@@ -32,17 +32,24 @@
 // `/dev/kvm` ioctl wrappers. Every block carries a `// SAFETY:` note.
 #![allow(unsafe_code)]
 
-use kvm_bindings::{kvm_msr_entry, kvm_segment, kvm_userspace_memory_region, Msrs};
+use kvm_bindings::{
+    kvm_msr_entry, kvm_segment, kvm_userspace_memory_region, Msrs, KVM_MEM_LOG_DIRTY_PAGES,
+};
 use kvm_ioctls::{Kvm, VcpuExit};
 
 use crate::emulator::Trap;
 use crate::fsmount::MountTable;
 
-use super::abi::Amd64Abi;
+use super::abi::{Amd64Abi, LinuxAbi, Sysno};
 use super::guest::GuestCpu;
 use super::loader;
 use super::mem::GuestMem;
 use super::LinuxKernel;
+
+/// Instruction budget handed to a nested interpreter run of an `execve`'d
+/// program (the child of a `fork`). Generous — the typical case is a small
+/// post-install trigger (`busybox`), not a long-running service.
+const NESTED_BUDGET: u64 = 200_000_000_000;
 
 // ---- guest-physical layout (all below the 0x400000 image base) -------------
 const PML4: u64 = 0x1000;
@@ -67,6 +74,12 @@ const MSR_SFMASK: u32 = 0xC000_0084;
 struct KvmMem {
     base: *mut u8,
     size: usize,
+    /// While a `fork` child is running, the parent's original content of every
+    /// 4 KiB page the kernel writes on the child's behalf (syscall result
+    /// buffers). Lets [`run_kvm_child`] roll those writes back so the suspended
+    /// parent's memory is undisturbed. Empty / inert outside a child.
+    recording: bool,
+    child_saved: std::collections::HashMap<u32, Box<[u8; 4096]>>,
 }
 
 impl KvmMem {
@@ -91,7 +104,57 @@ impl KvmMem {
         Ok(Self {
             base: base.cast::<u8>(),
             size,
+            recording: false,
+            child_saved: std::collections::HashMap::new(),
         })
+    }
+
+    /// Copy one 4 KiB guest page out to a host buffer.
+    fn read_page(&self, page: u32) -> Box<[u8; 4096]> {
+        let mut buf = Box::new([0u8; 4096]);
+        let gpa = u64::from(page) * 4096;
+        // SAFETY: `page` indexes within the 4 GiB region (callers pass page
+        // numbers derived from in-range addresses).
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.host_ptr(gpa), buf.as_mut_ptr(), 4096);
+        }
+        buf
+    }
+
+    /// Overwrite one 4 KiB guest page from a host buffer.
+    fn write_page(&mut self, page: u32, data: &[u8; 4096]) {
+        let gpa = u64::from(page) * 4096;
+        // SAFETY: as `read_page`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.host_ptr(gpa), 4096);
+        }
+    }
+
+    /// Zero one 4 KiB guest page (used to restore a page the child first
+    /// populated — it was zero in the parent).
+    fn zero_page(&mut self, page: u32) {
+        let gpa = u64::from(page) * 4096;
+        // SAFETY: as `read_page`.
+        unsafe {
+            std::ptr::write_bytes(self.host_ptr(gpa), 0, 4096);
+        }
+    }
+
+    /// Copy-on-write hook for kernel-side writes during a fork child: save each
+    /// touched page's pre-write (parent) content the first time it's written.
+    #[inline]
+    fn mark(&mut self, addr: u32, len: usize) {
+        if !self.recording || len == 0 {
+            return;
+        }
+        let first = addr >> 12;
+        let last = addr.wrapping_add(len as u32 - 1) >> 12;
+        for page in first..=last {
+            if !self.child_saved.contains_key(&page) {
+                let snap = self.read_page(page);
+                self.child_saved.insert(page, snap);
+            }
+        }
     }
 
     #[inline]
@@ -145,6 +208,7 @@ macro_rules! store_impl {
     ($name:ident, $ty:ty) => {
         fn $name(&mut self, addr: u32, value: $ty) -> Result<(), Trap> {
             let a = self.check(addr, std::mem::size_of::<$ty>())?;
+            self.mark(addr, std::mem::size_of::<$ty>());
             // SAFETY: bounds checked; x86 host permits unaligned writes.
             unsafe { self.base.add(a).cast::<$ty>().write_unaligned(value) };
             Ok(())
@@ -170,6 +234,7 @@ impl GuestMem for KvmMem {
         // Anonymous mapping: zero the range even if it held file data (e.g. the
         // dynamic linker overlaying a `.bss` tail).
         if let Ok(a) = self.check(addr, size as usize) {
+            self.mark(addr, size as usize);
             // SAFETY: bounds checked above.
             unsafe { std::ptr::write_bytes(self.base.add(a), 0, size as usize) };
         }
@@ -177,6 +242,7 @@ impl GuestMem for KvmMem {
 
     fn write_initializer(&mut self, addr: u32, data: &[u8]) -> Result<(), Trap> {
         let a = self.check(addr, data.len())?;
+        self.mark(addr, data.len());
         // SAFETY: bounds checked above.
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(a), data.len()) };
         Ok(())
@@ -318,7 +384,10 @@ pub fn run(
         guest_phys_addr: 0,
         memory_size: MEM_SIZE,
         userspace_addr: mem.base as u64,
-        flags: 0,
+        // Log dirty pages so a synchronous `fork` child's native writes can be
+        // rolled back from a parent snapshot (kernel-side writes use the CoW
+        // path in `KvmMem`).
+        flags: KVM_MEM_LOG_DIRTY_PAGES,
     };
     // SAFETY: `mem` outlives the VM; the region is a valid mmap of `memory_size`.
     unsafe {
@@ -409,6 +478,13 @@ pub fn run(
 
     let abi = Amd64Abi;
     let mut fs_base: u64 = 0;
+    // Synchronous-fork bookkeeping: child PIDs, reaped-but-unwaited statuses,
+    // and a persistent snapshot of the parent's content for every guest-dirtied
+    // page (so a fork child's native writes can be rolled back).
+    let mut next_pid: i32 = 2;
+    let mut zombies: Vec<(i32, i32)> = Vec::new();
+    let mut psnap: std::collections::HashMap<u32, Box<[u8; 4096]>> =
+        std::collections::HashMap::new();
 
     // --- run loop: native execution until a syscall (hlt trampoline), the
     // program exits, or the guest faults. ---
@@ -424,17 +500,61 @@ pub fn run(
                     fs_base,
                     fs_dirty: false,
                 };
-                kernel.dispatch(&abi, &mut kcpu, &mut mem, vfs);
-                if let Some(code) = kernel.exit_code {
-                    return Ok(code);
-                }
-                vcpu.set_regs(&kcpu.regs)
-                    .map_err(|e| format!("set_regs: {e}"))?;
-                if kcpu.fs_dirty {
-                    fs_base = kcpu.fs_base;
-                    let mut s = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
-                    s.fs.base = fs_base;
-                    vcpu.set_sregs(&s).map_err(|e| format!("set_sregs: {e}"))?;
+                match abi.map_syscall(abi.syscall_nr(&kcpu)) {
+                    // fork/vfork: run the child to completion synchronously in
+                    // this same vCPU (it execs almost immediately), record it as
+                    // a zombie, then return its PID to the parent.
+                    Some(Sysno::Fork | Sysno::Vfork) => {
+                        let pid = next_pid;
+                        next_pid += 1;
+                        let status = run_kvm_child(
+                            &vm,
+                            &mut vcpu,
+                            &mut mem,
+                            kernel,
+                            vfs,
+                            &abi,
+                            &mut fs_base,
+                            &mut psnap,
+                        )?;
+                        zombies.push((pid, wait_status(status)));
+                        let mut pr = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
+                        pr.rax = pid as u64;
+                        vcpu.set_regs(&pr).map_err(|e| format!("set_regs: {e}"))?;
+                    }
+                    // wait4: the child already ran, so a zombie is waiting.
+                    Some(Sysno::Wait4) => {
+                        let a = abi.syscall_args(&kcpu);
+                        let ret = if let Some((cpid, st)) = zombies.pop() {
+                            if a[1] != 0 {
+                                let _ = mem.store32(a[1] as u32, st as u32);
+                            }
+                            i64::from(cpid)
+                        } else {
+                            -10 // ECHILD
+                        };
+                        kcpu.regs.rax = ret as u64;
+                        vcpu.set_regs(&kcpu.regs)
+                            .map_err(|e| format!("set_regs: {e}"))?;
+                    }
+                    // The main process execs itself: become the new program.
+                    Some(Sysno::Execve) => {
+                        return Ok(exec_run(&mem, kernel, vfs, &kcpu, &abi));
+                    }
+                    _ => {
+                        kernel.dispatch(&abi, &mut kcpu, &mut mem, vfs);
+                        if let Some(code) = kernel.exit_code {
+                            return Ok(code);
+                        }
+                        vcpu.set_regs(&kcpu.regs)
+                            .map_err(|e| format!("set_regs: {e}"))?;
+                        if kcpu.fs_dirty {
+                            fs_base = kcpu.fs_base;
+                            let mut s = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
+                            s.fs.base = fs_base;
+                            vcpu.set_sregs(&s).map_err(|e| format!("set_sregs: {e}"))?;
+                        }
+                    }
                 }
             }
             VcpuExit::Shutdown => {
@@ -454,4 +574,179 @@ pub fn run(
             other => return Err(format!("unexpected KVM exit: {other:?}")),
         }
     }
+}
+
+/// Build a `wait4` status word from an exit code (`WIFEXITED` form).
+fn wait_status(code: i32) -> i32 {
+    (code & 0xff) << 8
+}
+
+/// Page indices the guest has dirtied since the last call (reading clears the
+/// log). Empty on error — the snapshot just covers fewer pages.
+fn dirty_pages(vm: &kvm_ioctls::VmFd) -> Vec<u32> {
+    let Ok(bitmap) = vm.get_dirty_log(0, MEM_SIZE as usize) else {
+        return Vec::new();
+    };
+    let mut pages = Vec::new();
+    for (w, &word) in bitmap.iter().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        for bit in 0..64u32 {
+            if word & (1u64 << bit) != 0 {
+                pages.push(w as u32 * 64 + bit);
+            }
+        }
+    }
+    pages
+}
+
+/// Read a NUL-terminated C string from guest memory (capped).
+fn read_cstr_kvm(mem: &KvmMem, addr: u32) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut a = addr;
+    for _ in 0..4096 {
+        let b = mem.load8(a).ok()?;
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+        a = a.wrapping_add(1);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Service an `execve`: load `path argv…` from the guest and run it to
+/// completion in a fresh interpreter [`Sandbox`](crate::Sandbox) sharing the
+/// same root filesystem. Returns the program's exit code (127 if it can't be
+/// loaded). The KVM engine has no in-place loader, so the exec'd image runs on
+/// the software interpreter — fine for the small post-install triggers apk runs.
+fn exec_run(
+    mem: &KvmMem,
+    kernel: &mut LinuxKernel,
+    vfs: &mut MountTable,
+    kcpu: &KvmCpu,
+    abi: &Amd64Abi,
+) -> i32 {
+    let a = abi.syscall_args(kcpu);
+    let Some(path) = read_cstr_kvm(mem, a[0] as u32) else {
+        return 127;
+    };
+    let argv = kernel.read_str_array(mem, a[1] as u32);
+    let envp = kernel.read_str_array(mem, a[2] as u32);
+    match crate::runtime::exec_nested(vfs, &path, &argv, &envp, NESTED_BUDGET) {
+        Some((code, out, err)) => {
+            kernel.stdout.extend_from_slice(&out);
+            kernel.stderr.extend_from_slice(&err);
+            code
+        }
+        None => 127,
+    }
+}
+
+/// Run a `fork`/`vfork` child to completion in the **same** vCPU, then restore
+/// the parent. The child sees `rax = 0` and runs until it `execve`s (the common
+/// case — handed to [`exec_run`]) or exits. Per-process kernel state (fd table,
+/// brk, cwd) is snapshotted and rolled back so the parent is unaffected; the
+/// child does only a few fd ops before exec, so guest memory needs no copy.
+/// Returns the child's exit code.
+#[allow(clippy::too_many_arguments)]
+fn run_kvm_child(
+    vm: &kvm_ioctls::VmFd,
+    vcpu: &mut kvm_ioctls::VcpuFd,
+    mem: &mut KvmMem,
+    kernel: &mut LinuxKernel,
+    vfs: &mut MountTable,
+    abi: &Amd64Abi,
+    fs_base: &mut u64,
+    psnap: &mut std::collections::HashMap<u32, Box<[u8; 4096]>>,
+) -> Result<i32, String> {
+    let snap = kernel.proc_snapshot();
+    let parent_regs = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
+    let parent_fs = *fs_base;
+
+    // Capture the parent's content of every page the guest has dirtied since the
+    // last fork (all pages, on the first). `get_dirty_log` also clears the log,
+    // so the post-child read below reports only the child's native writes.
+    for page in dirty_pages(vm) {
+        psnap.insert(page, mem.read_page(page));
+    }
+
+    // Record (copy-on-write) every page the kernel writes for the child, so we
+    // can roll those writes back and leave the parent's memory untouched.
+    mem.child_saved.clear();
+    mem.recording = true;
+
+    // The child returns 0 from fork; everything else carries over.
+    let mut cregs = parent_regs;
+    cregs.rax = 0;
+    vcpu.set_regs(&cregs)
+        .map_err(|e| format!("set_regs: {e}"))?;
+
+    let status = loop {
+        match vcpu.run().map_err(|e| format!("KVM_RUN(child): {e}"))? {
+            VcpuExit::Hlt => {
+                let r = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
+                let mut kcpu = KvmCpu {
+                    regs: r,
+                    fs_base: *fs_base,
+                    fs_dirty: false,
+                };
+                match abi.map_syscall(abi.syscall_nr(&kcpu)) {
+                    Some(Sysno::Execve) => break exec_run(mem, kernel, vfs, &kcpu, abi),
+                    Some(Sysno::Exit | Sysno::ExitGroup) => {
+                        break abi.syscall_args(&kcpu)[0] as i32;
+                    }
+                    // A child that forks again isn't supported; fail it.
+                    Some(Sysno::Fork | Sysno::Vfork) => {
+                        kcpu.regs.rax = (-38i64) as u64; // ENOSYS
+                        vcpu.set_regs(&kcpu.regs)
+                            .map_err(|e| format!("set_regs: {e}"))?;
+                    }
+                    _ => {
+                        kernel.dispatch(abi, &mut kcpu, mem, vfs);
+                        if let Some(code) = kernel.exit_code.take() {
+                            break code;
+                        }
+                        vcpu.set_regs(&kcpu.regs)
+                            .map_err(|e| format!("set_regs: {e}"))?;
+                        if kcpu.fs_dirty {
+                            *fs_base = kcpu.fs_base;
+                            let mut s = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
+                            s.fs.base = *fs_base;
+                            vcpu.set_sregs(&s).map_err(|e| format!("set_sregs: {e}"))?;
+                        }
+                    }
+                }
+            }
+            VcpuExit::Shutdown => break 139, // treat a child fault as a crash
+            other => return Err(format!("unexpected KVM exit in child: {other:?}")),
+        }
+    };
+
+    // Roll the parent back. First the child's *native* writes (from the dirty
+    // log) using the parent snapshot — a page the child first populated wasn't
+    // in the parent, so it's zeroed. Then the child's *kernel-side* writes from
+    // the exact copy-on-write record (authoritative, so applied last).
+    mem.recording = false;
+    let saved = std::mem::take(&mut mem.child_saved);
+    for page in dirty_pages(vm) {
+        match psnap.get(&page) {
+            Some(orig) => mem.write_page(page, orig),
+            None => mem.zero_page(page),
+        }
+    }
+    for (page, orig) in &saved {
+        mem.write_page(*page, orig);
+    }
+    kernel.proc_restore(snap);
+    vcpu.set_regs(&parent_regs)
+        .map_err(|e| format!("set_regs: {e}"))?;
+    if *fs_base != parent_fs {
+        *fs_base = parent_fs;
+        let mut s = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
+        s.fs.base = parent_fs;
+        vcpu.set_sregs(&s).map_err(|e| format!("set_sregs: {e}"))?;
+    }
+    Ok(status)
 }

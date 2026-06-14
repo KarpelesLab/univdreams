@@ -201,7 +201,7 @@ fn read_cstr_guest(mmu: &crate::emulator::Mmu, addr: u32) -> Option<String> {
 /// Handles one level of `#!` shebang. Returns `(exit_code, stdout, stderr)`, or
 /// `None` if the program can't be read / loaded (the caller's `execve` then
 /// fails with `ENOENT`).
-fn exec_nested(
+pub(crate) fn exec_nested(
     vfs: &mut crate::fsmount::MountTable,
     path: &str,
     argv: &[String],

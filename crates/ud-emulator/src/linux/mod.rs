@@ -136,6 +136,19 @@ pub struct LinuxKernel {
     pub net_enabled: bool,
 }
 
+/// Opaque snapshot of the per-process kernel state a synchronous `fork` child
+/// may mutate. Produced by [`LinuxKernel::proc_snapshot`] and consumed by
+/// [`LinuxKernel::proc_restore`]; the KVM fork path holds one across a child's
+/// run without inspecting it.
+pub struct ProcSnapshot {
+    fds: BTreeMap<i32, Fd>,
+    next_fd: i32,
+    brk: u32,
+    brk_mapped: u32,
+    cwd: String,
+    umask: u32,
+}
+
 /// A file-backed `mmap` region we may need to flush back to the file.
 #[derive(Debug, Clone)]
 struct FileMapping {
@@ -168,6 +181,32 @@ impl LinuxKernel {
         self.umask = 0o022;
         self.pipes.clear();
         self.sockets.clear();
+    }
+
+    /// Snapshot the per-process kernel state a synchronous `fork` child may
+    /// mutate before it execs (its fd table, brk, cwd, umask). Sockets, pipes
+    /// and file mappings are left shared — a fork-then-exec child doesn't
+    /// disturb them. Pair with [`Self::proc_restore`] to roll the parent back
+    /// after the child has run to completion.
+    pub fn proc_snapshot(&self) -> ProcSnapshot {
+        ProcSnapshot {
+            fds: self.fds.clone(),
+            next_fd: self.next_fd,
+            brk: self.brk,
+            brk_mapped: self.brk_mapped,
+            cwd: self.cwd.clone(),
+            umask: self.umask,
+        }
+    }
+
+    /// Restore the per-process state captured by [`Self::proc_snapshot`].
+    pub fn proc_restore(&mut self, s: ProcSnapshot) {
+        self.fds = s.fds;
+        self.next_fd = s.next_fd;
+        self.brk = s.brk;
+        self.brk_mapped = s.brk_mapped;
+        self.cwd = s.cwd;
+        self.umask = s.umask;
     }
 
     /// Read a NUL-terminated array of string pointers (`argv` / `envp`) from
