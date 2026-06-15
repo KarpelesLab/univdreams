@@ -330,6 +330,10 @@ impl LinuxKernel {
             Sysno::Unlinkat => self.sys_unlinkat(a0 as i32, a1, a2 & 0x200 != 0, mmu, vfs),
             Sysno::Symlink => self.sys_symlinkat(a0, AT_FDCWD, a1, mmu, vfs),
             Sysno::Symlinkat => self.sys_symlinkat(a0, a1 as i32, a2, mmu, vfs),
+            // link(old, new) / linkat(olddir, old, newdir, new, flags): a hard
+            // link. apk uses it for package files that are hardlink aliases.
+            Sysno::Link => self.sys_linkat(AT_FDCWD, a0, AT_FDCWD, a1, mmu, vfs),
+            Sysno::Linkat => self.sys_linkat(a0 as i32, a1, a2 as i32, a[3] as u32, mmu, vfs),
             Sysno::Truncate => self.sys_truncate(a0, a[1], mmu, vfs),
             Sysno::Ftruncate => self.sys_ftruncate(a0 as i32, a[1], vfs),
             Sysno::Readlink => self.sys_readlinkat(AT_FDCWD, a0, a1, a2, mmu, vfs),
@@ -629,6 +633,40 @@ impl LinuxKernel {
         vfs.write_handle(h, &data);
         vfs.close(h);
         let _ = vfs.unlink_path(&old);
+        0
+    }
+
+    /// `linkat`: create a hard link via the backend's native hardlink (shares
+    /// the inode). Falls back to copying the file when that's unavailable
+    /// (cross-mount / non-ext backend) — apk only needs both paths to exist
+    /// with the same content.
+    fn sys_linkat(
+        &mut self,
+        olddirfd: i32,
+        oldp: u32,
+        newdirfd: i32,
+        newp: u32,
+        mmu: &dyn GuestMem,
+        vfs: &mut MountTable,
+    ) -> i64 {
+        let (Some(old), Some(new)) = (
+            self.resolve_at(olddirfd, oldp, mmu),
+            self.resolve_at(newdirfd, newp, mmu),
+        ) else {
+            return EBADF;
+        };
+        if vfs.hardlink_path(&old, &new).is_ok() {
+            return 0;
+        }
+        let Some(data) = vfs.read_file(&old) else {
+            return -2; // ENOENT
+        };
+        let _ = vfs.truncate_path(&new, 0);
+        let Some(h) = vfs.open(&new, FileAccess::Write) else {
+            return -13; // EACCES
+        };
+        vfs.write_handle(h, &data);
+        vfs.close(h);
         0
     }
 

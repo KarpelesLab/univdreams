@@ -355,6 +355,12 @@ impl MountFs for FsToolMount {
             .map_err(to_io)
     }
 
+    fn hardlink(&mut self, target_rel: &str, new_rel: &str) -> io::Result<()> {
+        self.fs
+            .hardlink(&mut *self.dev, Path::new(target_rel), Path::new(new_rel))
+            .map_err(to_io)
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         if self.read_only {
             return Ok(());

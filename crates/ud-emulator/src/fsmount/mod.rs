@@ -109,6 +109,11 @@ pub trait MountFs: std::fmt::Debug {
     fn rename(&mut self, _old_rel: &str, _new_rel: &str) -> std::io::Result<()> {
         Err(read_only_err())
     }
+    /// Create a hard link at `new_rel` to the existing inode `target_rel`.
+    /// Default is unsupported so the caller can fall back to copying.
+    fn hardlink(&mut self, _target_rel: &str, _new_rel: &str) -> std::io::Result<()> {
+        Err(read_only_err())
+    }
     fn readlink(&mut self, _rel: &str) -> std::io::Result<String> {
         Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
     }
@@ -516,6 +521,20 @@ impl MountTable {
         if let (Some((i, old_rel)), Some((j, new_rel))) = (old, new) {
             if i == j {
                 return self.overlays[i].fs.rename(&old_rel, &new_rel);
+            }
+        }
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    /// Hard-link `new_abs` to the existing inode at `target_abs`, within a
+    /// single mount. Errors across mounts / unsupported backends so the caller
+    /// can fall back to copying the file.
+    pub fn hardlink_path(&mut self, target_abs: &str, new_abs: &str) -> std::io::Result<()> {
+        let target = self.resolve(target_abs);
+        let new = self.resolve(new_abs);
+        if let (Some((i, target_rel)), Some((j, new_rel))) = (target, new) {
+            if i == j {
+                return self.overlays[i].fs.hardlink(&target_rel, &new_rel);
             }
         }
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
