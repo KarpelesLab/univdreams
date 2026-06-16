@@ -78,8 +78,9 @@ kvm-bindings = { version = "0.13", optional = true, features = ["fam-wrappers"] 
 # Real on-disk filesystems (ext/NTFS/FAT/…) for the `fstool` mount backend.
 # `gzip` is enabled so we can repack `.tar.gz` sources (Alpine minirootfs, `.apk`
 # packages) into an ext4 root; the rest of fstool's archive/compression codecs
-# stay off.
-fstool = { version = "0.4", optional = true, default-features = false, features = [
+# stay off. 0.4.18 fixes ext rename in directories larger than one block
+# (KarpelesLab/fstool#29), needed for `apk add git` and other big-dir packages.
+fstool = { version = "0.4.18", optional = true, default-features = false, features = [
     "gzip",
 ] }
 

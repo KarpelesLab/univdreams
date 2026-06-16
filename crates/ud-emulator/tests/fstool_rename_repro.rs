@@ -3,17 +3,11 @@
 //! with "ext: entry not found in directory". It mirrors apk's exact pattern —
 //! create an empty `.apk.<n>` file, write it, then rename it to the final name.
 //!
-//! Finding: the first ~100 files rename fine; once the directory's entries
-//! outgrow a single 4 KiB directory block, `rename`'s directory lookup can no
-//! longer find newly-created entries (it appears to only scan the first block),
-//! even though `create_file`/`open_file_rw` placed and wrote them. The threshold
-//! tracks the block size: ~100 short names per 4 KiB block.
-//!
-//! `#[ignore]`d because it documents a *known fstool-crate bug*, not an emulator
-//! regression. Drop the `ignore` once fstool's multi-block directory lookup is
-//! fixed; the assertion then guards against regressing it. Run explicitly with:
-//!   cargo test -p ud-emulator --features fstool --test fstool_rename_repro \
-//!     -- --ignored --nocapture
+//! History: with fstool <= 0.4.15, the first ~100 files renamed fine but once a
+//! directory's entries outgrew a single 4 KiB block, `rename`'s lookup could no
+//! longer find newly-created entries (it scanned only the first block) — see
+//! <https://github.com/KarpelesLab/fstool/issues/29>. Fixed in fstool 0.4.18;
+//! this now passes and guards against a regression.
 #![cfg(feature = "fstool")]
 #![allow(clippy::cast_possible_truncation)]
 
@@ -25,8 +19,6 @@ use fstool::fs::ext::{Ext, FormatOpts, FsKind};
 use fstool::fs::{FileMeta, FileSource, Filesystem, FilesystemFactory, OpenFlags};
 
 #[test]
-#[ignore = "reproduces a known fstool ext bug (rename can't find entries past \
-            the first directory block); un-ignore when fstool is fixed"]
 fn create_then_rename_in_large_dir() {
     let size = 256u64 << 20;
     let mut dev = MemoryBackend::new(size);
