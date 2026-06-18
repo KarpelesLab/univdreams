@@ -159,17 +159,18 @@ pub struct LinuxKernel {
     pub pending_signal: Option<i32>,
     /// Shared channel to a background host-stdin reader (interactive KVM only).
     /// When present, `read_host_stdin` drains it instead of reading stdin
-    /// directly, and an **async** Ctrl-C (the guest isn't in a `read`) arrives
-    /// via `input.pending_sigint`. Absent ⇒ the synchronous fallback path.
+    /// directly, and an **async** terminal signal (the guest isn't in a `read`)
+    /// arrives via `input.pending`. Absent ⇒ the synchronous fallback path.
     pub input: Option<std::sync::Arc<InteractiveInput>>,
 }
 
 /// Shared host-stdin channel for interactive mode. A background reader thread
 /// (spawned by the KVM run loop) reads the raw host terminal and pushes bytes
-/// here; the kernel line discipline drains them. The reader also watches for
-/// the guest's VINTR (Ctrl-C): when `isig` is set it raises an **async** SIGINT
-/// (and the run loop kicks the vCPU out of `KVM_RUN`), so a CPU-bound guest that
-/// isn't in a `read` can still be interrupted.
+/// here; the kernel line discipline drains them. The reader also turns terminal
+/// signals into **async** ones (and the run loop kicks the vCPU out of
+/// `KVM_RUN`), so a CPU-bound guest not in a `read` can still be interrupted:
+/// VINTR (Ctrl-C) → SIGINT, VQUIT (Ctrl-\) → SIGQUIT, and a host window resize →
+/// SIGWINCH (with the new size published in `win_rows`/`win_cols`).
 #[derive(Debug, Default)]
 pub struct InteractiveInput {
     state: std::sync::Mutex<InputState>,
@@ -178,8 +179,15 @@ pub struct InteractiveInput {
     pub isig: std::sync::atomic::AtomicBool,
     /// Guest VINTR byte (default Ctrl-C = 3), updated on `TCSETS`.
     pub vintr: std::sync::atomic::AtomicU8,
-    /// An async Ctrl-C the reader observed; consumed by the run loop.
-    pub pending_sigint: std::sync::atomic::AtomicBool,
+    /// Guest VQUIT byte (default Ctrl-\ = 0x1c), updated on `TCSETS`.
+    pub vquit: std::sync::atomic::AtomicU8,
+    /// Pending async signals as a bitmask: bit `(sig-1)` set ⇒ `sig` pending.
+    /// Consumed lowest-first by the run loop.
+    pub pending: std::sync::atomic::AtomicU64,
+    /// Live terminal size (rows, cols) tracked across SIGWINCH; `TIOCGWINSZ`
+    /// reads it. Zero ⇒ fall back to the kernel's `term_size`.
+    pub win_rows: std::sync::atomic::AtomicU16,
+    pub win_cols: std::sync::atomic::AtomicU16,
     /// Set to ask the reader thread to exit at its next poll tick.
     pub stop: std::sync::atomic::AtomicBool,
 }
@@ -208,23 +216,41 @@ impl InteractiveInput {
         self.state.lock().unwrap().closed = true;
         self.cv.notify_all();
     }
-    /// Raise an async Ctrl-C; wake any waiting reader. Taken under the state
+    /// Raise async signal `sig`; wake any waiting reader. Set under the state
     /// lock so a reader parked in `next_byte` can't miss the wakeup.
-    pub fn raise_sigint(&self) {
+    pub fn raise(&self, sig: i32) {
         let _g = self.state.lock().unwrap();
-        self.pending_sigint
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.pending.fetch_or(
+            1u64 << ((sig - 1) as u64),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         self.cv.notify_all();
     }
-    /// Block until a byte is available, the channel closes, or an async Ctrl-C
-    /// is raised.
+    /// Pop the lowest-numbered pending async signal, if any.
+    pub fn take(&self) -> Option<i32> {
+        use std::sync::atomic::Ordering::SeqCst;
+        loop {
+            let cur = self.pending.load(SeqCst);
+            if cur == 0 {
+                return None;
+            }
+            let sig = cur.trailing_zeros() as i32 + 1;
+            let next = cur & !(1u64 << (sig - 1) as u64);
+            if self
+                .pending
+                .compare_exchange(cur, next, SeqCst, SeqCst)
+                .is_ok()
+            {
+                return Some(sig);
+            }
+        }
+    }
+    /// Block until a byte is available, the channel closes, or a signal is
+    /// raised.
     fn next_byte(&self) -> InByte {
         let mut st = self.state.lock().unwrap();
         loop {
-            if self
-                .pending_sigint
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.pending.load(std::sync::atomic::Ordering::SeqCst) != 0 {
                 return InByte::Interrupted;
             }
             if let Some(b) = st.buf.pop_front() {
@@ -261,6 +287,7 @@ impl Default for Termios {
         // (ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN).
         let mut cc = [0u8; 19];
         cc[0] = 0x03; // VINTR  = Ctrl-C
+        cc[1] = 0x1c; // VQUIT  = Ctrl-\
         cc[2] = 0x7f; // VERASE = DEL
         cc[4] = 0x04; // VEOF   = Ctrl-D
         cc[6] = 0x01; // VMIN   = 1
@@ -380,29 +407,30 @@ impl LinuxKernel {
         use std::sync::atomic::Ordering::SeqCst;
         input.isig.store(self.termios.lflag & 0x1 != 0, SeqCst);
         input.vintr.store(self.termios.cc[0], SeqCst);
+        input.vquit.store(self.termios.cc[1], SeqCst);
+        input.win_rows.store(self.term_size.0, SeqCst);
+        input.win_cols.store(self.term_size.1, SeqCst);
         self.input = Some(input);
     }
 
-    /// Mirror the guest tty's ISIG/VINTR into the background reader after a
-    /// `TCSETS`, so it tracks whether Ctrl-C raises a signal or is a raw byte.
+    /// Mirror the guest tty's ISIG/VINTR/VQUIT into the background reader after a
+    /// `TCSETS`, so it tracks whether Ctrl-C / Ctrl-\ raise a signal or are bytes.
     fn sync_input_termios(&self) {
         use std::sync::atomic::Ordering::SeqCst;
         if let Some(input) = &self.input {
             input.isig.store(self.termios.lflag & 0x1 != 0, SeqCst);
             input.vintr.store(self.termios.cc[0], SeqCst);
+            input.vquit.store(self.termios.cc[1], SeqCst);
         }
     }
 
-    /// Consume a pending SIGINT from either the synchronous line discipline
+    /// Consume a pending signal from either the synchronous line discipline
     /// (`pending_signal`, set while the guest was in a `read`) or the async
-    /// background reader (`input.pending_sigint`, raised between instructions).
+    /// background reader (`input.pending`, raised between instructions).
     pub fn take_pending_signal(&mut self) -> Option<i32> {
         if let Some(input) = &self.input {
-            if input
-                .pending_sigint
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Some(2); // SIGINT
+            if let Some(sig) = input.take() {
+                return Some(sig);
             }
         }
         self.pending_signal.take()
@@ -781,7 +809,11 @@ impl LinuxKernel {
             }
             0x5413 => {
                 // TIOCGWINSZ → struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel }
-                let (mut rows, mut cols) = self.term_size;
+                // Prefer the live size the reader tracks across SIGWINCH.
+                let (mut rows, mut cols) = self.input.as_ref().map_or(self.term_size, |i| {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    (i.win_rows.load(SeqCst), i.win_cols.load(SeqCst))
+                });
                 if rows == 0 {
                     rows = 24;
                 }

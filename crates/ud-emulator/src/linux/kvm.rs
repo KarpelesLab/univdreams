@@ -338,25 +338,39 @@ fn user_segment(selector: u16, code: bool) -> kvm_segment {
 }
 
 /// The signal we use to kick the vCPU thread out of `KVM_RUN` so an async
-/// Ctrl-C can be delivered between guest instructions.
+/// terminal signal can be delivered between guest instructions.
 const KICK_SIG: libc::c_int = libc::SIGUSR1;
 
-extern "C" fn kick_handler(_sig: libc::c_int) {}
+/// Set by the host `SIGWINCH` handler; the reader polls it to re-read the
+/// terminal size and forward a `SIGWINCH` to the guest.
+static WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Install a no-op `SIGUSR1` handler exactly once. No `SA_RESTART`, so a kick
-/// makes the in-flight `KVM_RUN` return `EINTR` instead of auto-restarting.
-fn install_kick_handler() {
+extern "C" fn kick_handler(_sig: libc::c_int) {}
+extern "C" fn winch_handler(_sig: libc::c_int) {
+    WINCH.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install our host signal handlers exactly once: the no-op `SIGUSR1` kick (no
+/// `SA_RESTART`, so a kick makes the in-flight `KVM_RUN` return `EINTR`) and the
+/// `SIGWINCH` flag-setter that drives terminal-resize forwarding.
+fn install_host_handlers() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        // SAFETY: a process-wide handler for our own kick signal; the handler is
-        // async-signal-safe (it does nothing).
+        // SAFETY: process-wide handlers for our own signals; both are
+        // async-signal-safe (a no-op and a single atomic store).
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = kick_handler as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
             sa.sa_flags = 0; // no SA_RESTART → interrupt KVM_RUN
             libc::sigaction(KICK_SIG, &sa, std::ptr::null_mut());
+
+            let mut sw: libc::sigaction = std::mem::zeroed();
+            sw.sa_sigaction = winch_handler as *const () as usize;
+            libc::sigemptyset(&mut sw.sa_mask);
+            sw.sa_flags = libc::SA_RESTART;
+            libc::sigaction(libc::SIGWINCH, &sw, std::ptr::null_mut());
         }
     });
 }
@@ -370,11 +384,23 @@ impl Drop for ReaderGuard {
     }
 }
 
+/// Forward an async signal to the guest: flag it on `input` and kick the vCPU
+/// thread out of `KVM_RUN` so it's delivered between guest instructions.
+fn raise_and_kick(input: &InteractiveInput, main_tid: u64, sig: i32) {
+    input.raise(sig);
+    // SAFETY: directed kick to the vCPU thread; KICK_SIG has a no-op handler
+    // installed process-wide.
+    unsafe {
+        libc::pthread_kill(main_tid as libc::pthread_t, KICK_SIG);
+    }
+}
+
 /// Spawn the background host-stdin reader for interactive mode. It reads the raw
-/// host terminal, pushes bytes into `input`, and — while the guest has `ISIG`
-/// set — turns VINTR (Ctrl-C) into an async SIGINT: it flags `input` and kicks
-/// the vCPU thread (`main_tid`) out of `KVM_RUN`, so even a CPU-bound guest that
-/// isn't in a `read` is interrupted. Exits on host EOF or `input.stop`.
+/// host terminal and pushes bytes into `input`; while the guest has `ISIG` set it
+/// turns VINTR (Ctrl-C) → SIGINT and VQUIT (Ctrl-\) → SIGQUIT, and it forwards a
+/// host window resize → SIGWINCH. Each is flagged on `input` and the vCPU thread
+/// (`main_tid`) is kicked out of `KVM_RUN`, so even a CPU-bound guest not in a
+/// `read` is interrupted. Exits on host EOF or `input.stop`.
 fn spawn_stdin_reader(input: std::sync::Arc<InteractiveInput>, main_tid: u64) {
     std::thread::spawn(move || {
         use std::sync::atomic::Ordering::SeqCst;
@@ -388,11 +414,23 @@ fn spawn_stdin_reader(input: std::sync::Arc<InteractiveInput>, main_tid: u64) {
             if input.stop.load(SeqCst) {
                 return;
             }
-            // Poll with a timeout so `stop` is still observed when no key is
-            // pressed. SAFETY: one valid pollfd, count 1.
+            // A pending terminal resize (host SIGWINCH): re-read the size and
+            // forward SIGWINCH to the guest so TUIs redraw.
+            if WINCH.swap(false, SeqCst) {
+                // SAFETY: TIOCGWINSZ into a local winsize.
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                let r = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
+                if r == 0 {
+                    input.win_rows.store(ws.ws_row, SeqCst);
+                    input.win_cols.store(ws.ws_col, SeqCst);
+                }
+                raise_and_kick(&input, main_tid, 28); // SIGWINCH
+            }
+            // Poll with a timeout so `stop`/resize are still observed when no key
+            // is pressed. SAFETY: one valid pollfd, count 1.
             let pr = unsafe { libc::poll(&mut pfd, 1, 100) };
             if pr <= 0 {
-                continue; // timeout (0) or EINTR (-1): re-check `stop`
+                continue; // timeout (0) or EINTR (-1): re-check flags
             }
             // SAFETY: read into a local buffer of known length.
             let n = unsafe {
@@ -407,18 +445,16 @@ fn spawn_stdin_reader(input: std::sync::Arc<InteractiveInput>, main_tid: u64) {
                 return;
             }
             for &b in &buf[..n as usize] {
-                if input.isig.load(SeqCst) && b == input.vintr.load(SeqCst) {
-                    // Echo `^C` like a real tty's line discipline (the host is in
-                    // raw mode, so we do it). SAFETY: write to stdout fd.
-                    unsafe {
-                        libc::write(libc::STDOUT_FILENO, b"^C\r\n".as_ptr().cast(), 4);
-                    }
-                    input.raise_sigint();
-                    // SAFETY: directed kick to the vCPU thread; KICK_SIG has a
-                    // no-op handler installed process-wide.
-                    unsafe {
-                        libc::pthread_kill(main_tid as libc::pthread_t, KICK_SIG);
-                    }
+                let isig = input.isig.load(SeqCst);
+                if isig && b == input.vintr.load(SeqCst) {
+                    // Echo `^C` like a real tty (host is raw, so we do it).
+                    // SAFETY: write to stdout fd.
+                    unsafe { libc::write(libc::STDOUT_FILENO, b"^C\r\n".as_ptr().cast(), 4) };
+                    raise_and_kick(&input, main_tid, 2); // SIGINT
+                } else if isig && b == input.vquit.load(SeqCst) {
+                    // SAFETY: write to stdout fd.
+                    unsafe { libc::write(libc::STDOUT_FILENO, b"^\\\r\n".as_ptr().cast(), 4) };
+                    raise_and_kick(&input, main_tid, 3); // SIGQUIT
                 } else {
                     input.push(b);
                 }
@@ -565,7 +601,7 @@ pub fn run(
     // kick so an async Ctrl-C can interrupt a CPU-bound foreground command. The
     // guard stops the thread when `run` returns.
     let _reader = if kernel.interactive {
-        install_kick_handler();
+        install_host_handlers();
         // SAFETY: pthread_self has no preconditions; the id identifies this vCPU
         // thread for the reader's directed kick.
         let main_tid = unsafe { libc::pthread_self() } as u64;
@@ -728,11 +764,20 @@ fn wait_status(code: i32) -> i32 {
 /// pre-signal blocked mask.
 const SIG_CTX_WORDS: u32 = 19;
 
-/// Deliver `sig` to the guest. SIG_IGN → drop (`Ok(None)`); SIG_DFL → the
-/// process should terminate (`Ok(Some(status))`); a handler → build an amd64
-/// signal frame on the guest stack and point the vCPU at it. The interrupted
-/// syscall's result (rax, already `-EINTR`) is saved in the frame, so a handler
-/// that returns resumes right after it via `rt_sigreturn`.
+/// Whether a signal's **default** (SIG_DFL) action terminates the process. The
+/// defaults that don't — child/continue/stop/resize/urgent — are treated as
+/// *ignore* here (no job control on the synchronous-fork model, so the stop
+/// signals are dropped rather than suspending): SIGCHLD(17) SIGCONT(18)
+/// SIGSTOP(19) SIGTSTP(20) SIGTTIN(21) SIGTTOU(22) SIGURG(23) SIGWINCH(28).
+fn default_terminates(sig: i32) -> bool {
+    !matches!(sig, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28)
+}
+
+/// Deliver `sig` to the guest. SIG_IGN → drop (`Ok(None)`); SIG_DFL → terminate
+/// (`Ok(Some(status))`) or drop, per the signal's default action; a handler →
+/// build an amd64 signal frame on the guest stack and point the vCPU at it. The
+/// interrupted syscall's result (rax, already `-EINTR`) is saved in the frame,
+/// so a handler that returns resumes right after it via `rt_sigreturn`.
 fn deliver_signal(
     vcpu: &mut kvm_ioctls::VcpuFd,
     mem: &mut KvmMem,
@@ -740,8 +785,11 @@ fn deliver_signal(
     sig: i32,
 ) -> Result<Option<i32>, String> {
     let (handler, _flags, restorer, mask) = match kernel.signal_disposition(sig) {
-        None | Some((0, ..)) => return Ok(Some(128 + sig)), // SIG_DFL → terminate
-        Some((1, ..)) => return Ok(None),                   // SIG_IGN → drop
+        None | Some((0, ..)) => {
+            // SIG_DFL: terminate or (resize/child/stop) ignore.
+            return Ok(default_terminates(sig).then_some(128 + sig));
+        }
+        Some((1, ..)) => return Ok(None), // SIG_IGN → drop
         Some(d) => d,
     };
     let r = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
