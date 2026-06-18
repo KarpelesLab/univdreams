@@ -134,6 +134,71 @@ pub struct LinuxKernel {
     sock_nonblock: Vec<bool>,
     /// Allow the guest to open real host network sockets. Off by default.
     pub net_enabled: bool,
+    /// Interactive mode (the CLI's `--interactive`): fd 0 reads the host
+    /// terminal through the line discipline, fd 1/2 write straight to the host,
+    /// and the tty `ioctl`s report a real terminal. Off by default (batch runs
+    /// keep stdin=EOF and buffered stdout).
+    pub interactive: bool,
+    /// Guest tty settings (the Linux `struct termios`), driving the line
+    /// discipline. `ICANON`/`ECHO`/`ISIG` in `c_lflag` select cooked vs raw.
+    termios: Termios,
+    /// Cooked input not yet consumed by the guest — the line discipline yields a
+    /// whole line, which byte-at-a-time guest reads drain across calls.
+    stdin_buf: std::collections::VecDeque<u8>,
+    /// Host terminal size for `TIOCGWINSZ` (rows, cols); the CLI fills it in.
+    /// `(0, 0)` falls back to 24×80.
+    pub term_size: (u16, u16),
+    /// Installed signal dispositions, by signal number (`rt_sigaction`).
+    /// Absent = SIG_DFL. Used to deliver SIGINT from Ctrl-C.
+    sigactions: BTreeMap<i32, SigAction>,
+    /// Currently blocked signal mask (`rt_sigprocmask`); saved/restored across
+    /// a signal frame.
+    sig_mask: u64,
+    /// A signal raised by the line discipline (Ctrl-C) that the run loop must
+    /// deliver to the guest after the current syscall returns.
+    pub pending_signal: Option<i32>,
+}
+
+/// The Linux kernel `struct termios` (the 36-byte `TCGETS` layout: four 32-bit
+/// flag words, a line discipline byte, then 19 control characters).
+#[derive(Debug, Clone, Copy)]
+struct Termios {
+    iflag: u32,
+    oflag: u32,
+    cflag: u32,
+    lflag: u32,
+    line: u8,
+    cc: [u8; 19],
+}
+
+impl Default for Termios {
+    fn default() -> Self {
+        // Standard Linux cooked-tty defaults: CR→NL + flow control on input,
+        // post-process + NL→CRNL on output, CS8, and the canonical local flags
+        // (ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN).
+        let mut cc = [0u8; 19];
+        cc[0] = 0x03; // VINTR  = Ctrl-C
+        cc[2] = 0x7f; // VERASE = DEL
+        cc[4] = 0x04; // VEOF   = Ctrl-D
+        cc[6] = 0x01; // VMIN   = 1
+        Self {
+            iflag: 0x100 | 0x400 | 0x4000, // ICRNL | IXON | IUTF8
+            oflag: 0x1 | 0x4,              // OPOST | ONLCR
+            cflag: 0xbf,                   // B38400 | CS8 | CREAD | HUPCL-ish
+            lflag: 0x8a3b,
+            line: 0,
+            cc,
+        }
+    }
+}
+
+/// A stored `rt_sigaction` disposition.
+#[derive(Debug, Clone, Copy)]
+struct SigAction {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
 }
 
 /// Opaque snapshot of the per-process kernel state a synchronous `fork` child
@@ -213,6 +278,17 @@ impl LinuxKernel {
         self.file_maps = s.file_maps;
         self.cwd = s.cwd;
         self.umask = s.umask;
+    }
+
+    /// Reset the memory layout for an `execve` that reuses this kernel: the new
+    /// program gets a fresh brk and mmap arena and no inherited file mappings,
+    /// but **keeps** the fd table and cwd (execve inherits them — shells set up
+    /// redirections between fork and exec).
+    pub fn exec_reset(&mut self, brk: u32) {
+        self.brk = brk;
+        self.brk_mapped = brk;
+        self.mmap_top = MMAP_BASE;
+        self.file_maps.clear();
     }
 
     /// Read a NUL-terminated array of string pointers (`argv` / `envp`) from
@@ -428,10 +504,15 @@ impl LinuxKernel {
             Sysno::Listen => ENOSYS, // no inbound connections
             Sysno::Accept => ENOSYS,
             Sysno::Getcwd => self.sys_getcwd(a0, a1, mmu),
-            Sysno::Ioctl => ENOTTY, // "not a terminal" → libc picks full buffering
+            Sysno::Ioctl => self.sys_ioctl(a0 as i32, a1, a2, mmu),
             Sysno::ArchPrctl => 0,
             Sysno::SetTidAddress => 1,
-            Sysno::SetRobustList | Sysno::RtSigaction | Sysno::RtSigprocmask | Sysno::Ignored => 0,
+            Sysno::RtSigaction => self.sys_rt_sigaction(a0 as i32, a1, a2, mmu),
+            Sysno::RtSigprocmask => self.sys_rt_sigprocmask(a0 as i32, a1, a2, mmu),
+            // rt_sigreturn is completed by the KVM run loop (it needs the vCPU to
+            // restore the saved context); here it's an unreachable no-op.
+            Sysno::RtSigreturn => 0,
+            Sysno::SetRobustList | Sysno::Ignored => 0,
             // Defensive: any variant we forgot routes to ENOSYS with a log.
             #[allow(unreachable_patterns)]
             _ => {
@@ -457,11 +538,19 @@ impl LinuxKernel {
         };
         match self.fds.get(&fd) {
             Some(Fd::Stdout) => {
-                self.stdout.extend_from_slice(&data);
+                if self.interactive {
+                    self.write_host(false, &data);
+                } else {
+                    self.stdout.extend_from_slice(&data);
+                }
                 data.len() as i64
             }
             Some(Fd::Stderr) => {
-                self.stderr.extend_from_slice(&data);
+                if self.interactive {
+                    self.write_host(true, &data);
+                } else {
+                    self.stderr.extend_from_slice(&data);
+                }
                 data.len() as i64
             }
             Some(Fd::Vfs { h, .. }) => vfs.write_handle(*h, &data).map_or(EBADF, |n| n as i64),
@@ -533,6 +622,262 @@ impl LinuxKernel {
         total
     }
 
+    /// Terminal `ioctl`s. In interactive mode, fd 0/1/2 are a real tty: report
+    /// and accept termios, window size, and the common no-op requests so
+    /// `isatty()` is true and shells configure the line discipline. Everything
+    /// else (and any ioctl on a non-tty fd) stays `ENOTTY`.
+    fn sys_ioctl(&mut self, fd: i32, req: u32, arg: u32, mmu: &mut dyn GuestMem) -> i64 {
+        let is_std = matches!(self.fds.get(&fd), Some(Fd::Stdin | Fd::Stdout | Fd::Stderr));
+        if !self.interactive || !is_std {
+            return ENOTTY;
+        }
+        match req {
+            0x5401 => {
+                // TCGETS
+                let t = self.termios;
+                let mut b = [0u8; 36];
+                b[0..4].copy_from_slice(&t.iflag.to_le_bytes());
+                b[4..8].copy_from_slice(&t.oflag.to_le_bytes());
+                b[8..12].copy_from_slice(&t.cflag.to_le_bytes());
+                b[12..16].copy_from_slice(&t.lflag.to_le_bytes());
+                b[16] = t.line;
+                b[17..36].copy_from_slice(&t.cc);
+                if write_mem(mmu, arg, &b).is_none() {
+                    return EFAULT;
+                }
+                0
+            }
+            0x5402 | 0x5403 | 0x5404 => {
+                // TCSETS / TCSETSW / TCSETSF
+                let Some(b) = read_mem(mmu, arg, 36) else {
+                    return EFAULT;
+                };
+                let rd = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                self.termios.iflag = rd(0);
+                self.termios.oflag = rd(4);
+                self.termios.cflag = rd(8);
+                self.termios.lflag = rd(12);
+                self.termios.line = b[16];
+                self.termios.cc.copy_from_slice(&b[17..36]);
+                0
+            }
+            0x5413 => {
+                // TIOCGWINSZ → struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel }
+                let (mut rows, mut cols) = self.term_size;
+                if rows == 0 {
+                    rows = 24;
+                }
+                if cols == 0 {
+                    cols = 80;
+                }
+                let mut b = [0u8; 8];
+                b[0..2].copy_from_slice(&rows.to_le_bytes());
+                b[2..4].copy_from_slice(&cols.to_le_bytes());
+                if write_mem(mmu, arg, &b).is_none() {
+                    return EFAULT;
+                }
+                0
+            }
+            0x540f => {
+                // TIOCGPGRP → report a stub foreground process group
+                let _ = write_mem(mmu, arg, &1i32.to_le_bytes());
+                0
+            }
+            0x541b => {
+                // FIONREAD → bytes currently buffered for the guest
+                let n = self.stdin_buf.len() as i32;
+                let _ = write_mem(mmu, arg, &n.to_le_bytes());
+                0
+            }
+            // TIOCSWINSZ, TIOCSPGRP, TCSBRK, TIOCSCTTY, TCFLSH, … → accept.
+            0x5410 | 0x5414 | 0x5409 | 0x540b | 0x540e => 0,
+            _ => 0, // other tty ioctls on a tty fd: accept rather than error
+        }
+    }
+
+    /// `rt_sigaction`: store the disposition so the KVM signal path can deliver
+    /// it (amd64 `struct kernel_sigaction`: handler, flags, restorer, mask — four
+    /// 8-byte words). i386 isn't a signal-delivery target, so it stays a no-op.
+    fn sys_rt_sigaction(&mut self, sig: i32, act: u32, oldact: u32, mmu: &mut dyn GuestMem) -> i64 {
+        if !self.ptr64 {
+            return 0;
+        }
+        if oldact != 0 {
+            let prev = self.sigactions.get(&sig).copied().unwrap_or(SigAction {
+                handler: 0,
+                flags: 0,
+                restorer: 0,
+                mask: 0,
+            });
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&prev.handler.to_le_bytes());
+            b[8..16].copy_from_slice(&prev.flags.to_le_bytes());
+            b[16..24].copy_from_slice(&prev.restorer.to_le_bytes());
+            b[24..32].copy_from_slice(&prev.mask.to_le_bytes());
+            let _ = write_mem(mmu, oldact, &b);
+        }
+        if act != 0 {
+            let Some(b) = read_mem(mmu, act, 32) else {
+                return EFAULT;
+            };
+            let rd = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+            self.sigactions.insert(
+                sig,
+                SigAction {
+                    handler: rd(0),
+                    flags: rd(8),
+                    restorer: rd(16),
+                    mask: rd(24),
+                },
+            );
+        }
+        0
+    }
+
+    /// `rt_sigprocmask`: track the blocked-signal mask (a single 64-bit word for
+    /// signals 1..64) so a signal frame can save/restore it.
+    fn sys_rt_sigprocmask(
+        &mut self,
+        how: i32,
+        set: u32,
+        oldset: u32,
+        mmu: &mut dyn GuestMem,
+    ) -> i64 {
+        if oldset != 0 {
+            let _ = write_mem(mmu, oldset, &self.sig_mask.to_le_bytes());
+        }
+        if set != 0 {
+            if let Some(b) = read_mem(mmu, set, 8) {
+                let m = u64::from_le_bytes(b.try_into().unwrap());
+                match how {
+                    0 => self.sig_mask |= m,  // SIG_BLOCK
+                    1 => self.sig_mask &= !m, // SIG_UNBLOCK
+                    2 => self.sig_mask = m,   // SIG_SETMASK
+                    _ => {}
+                }
+            }
+        }
+        0
+    }
+
+    /// The stored disposition for `sig` (`handler, flags, restorer, mask`), or
+    /// `None` for the default (SIG_DFL). For the KVM signal path.
+    pub fn signal_disposition(&self, sig: i32) -> Option<(u64, u64, u64, u64)> {
+        self.sigactions
+            .get(&sig)
+            .map(|s| (s.handler, s.flags, s.restorer, s.mask))
+    }
+
+    /// Current blocked-signal mask; the KVM signal path saves it into a frame
+    /// and restores it on `rt_sigreturn`.
+    pub fn sig_mask(&self) -> u64 {
+        self.sig_mask
+    }
+
+    /// Replace the blocked-signal mask (used by `rt_sigreturn`).
+    pub fn set_sig_mask(&mut self, mask: u64) {
+        self.sig_mask = mask;
+    }
+
+    /// Write guest output straight to the host terminal in interactive mode.
+    /// Since the host tty is in raw mode, we perform the guest's `OPOST|ONLCR`
+    /// translation (`\n` → `\r\n`) ourselves so lines don't stair-step.
+    fn write_host(&self, is_err: bool, data: &[u8]) {
+        use std::io::Write;
+        let onlcr = self.termios.oflag & 0x1 != 0 && self.termios.oflag & 0x4 != 0;
+        let buf: std::borrow::Cow<[u8]> = if onlcr && data.contains(&b'\n') {
+            let mut v = Vec::with_capacity(data.len() + 8);
+            for &b in data {
+                if b == b'\n' {
+                    v.push(b'\r');
+                }
+                v.push(b);
+            }
+            std::borrow::Cow::Owned(v)
+        } else {
+            std::borrow::Cow::Borrowed(data)
+        };
+        if is_err {
+            let mut e = std::io::stderr().lock();
+            let _ = e.write_all(&buf);
+            let _ = e.flush();
+        } else {
+            let mut o = std::io::stdout().lock();
+            let _ = o.write_all(&buf);
+            let _ = o.flush();
+        }
+    }
+
+    /// Interactive line discipline: read host stdin and turn it into bytes for
+    /// the guest, honoring the guest `termios`. The host terminal is in raw mode
+    /// (the CLI set it), so we do cooked-mode echo/editing here.
+    ///
+    /// Returns the bytes to deliver (empty = EOF), or `None` when Ctrl-C raised a
+    /// pending SIGINT and the read should fail with `EINTR`.
+    fn read_host_stdin(&mut self, max: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Write};
+        let cooked = self.termios.lflag & 0x2 != 0; // ICANON
+        let echo = self.termios.lflag & 0x8 != 0; // ECHO
+        let isig = self.termios.lflag & 0x1 != 0; // ISIG
+        let mut stdin = std::io::stdin().lock();
+        let mut out = std::io::stdout().lock();
+        if !cooked {
+            // Raw: hand over whatever bytes are available (blocking for ≥1).
+            let mut tmp = vec![0u8; max.max(1)];
+            let n = stdin.read(&mut tmp).unwrap_or(0);
+            if isig && tmp[..n].contains(&0x03) {
+                self.pending_signal = Some(2); // SIGINT
+                return None;
+            }
+            return Some(tmp[..n].to_vec());
+        }
+        // Cooked: assemble one line with local echo + minimal editing.
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            let mut b = [0u8; 1];
+            match stdin.read(&mut b) {
+                Ok(0) | Err(_) => return Some(line), // host EOF
+                Ok(_) => {}
+            }
+            match b[0] {
+                0x03 if isig => {
+                    let _ = out.write_all(b"^C\r\n");
+                    let _ = out.flush();
+                    self.pending_signal = Some(2); // SIGINT
+                    return None;
+                }
+                0x04 => {
+                    // Ctrl-D: EOF on an empty line, else deliver what's typed.
+                    return Some(line);
+                }
+                b'\r' | b'\n' => {
+                    line.push(b'\n');
+                    if echo {
+                        let _ = out.write_all(b"\r\n");
+                        let _ = out.flush();
+                    }
+                    return Some(line);
+                }
+                0x7f | 0x08 => {
+                    if line.pop().is_some() && echo {
+                        let _ = out.write_all(b"\x08 \x08");
+                        let _ = out.flush();
+                    }
+                }
+                c => {
+                    line.push(c);
+                    if echo {
+                        let _ = out.write_all(&[c]);
+                        let _ = out.flush();
+                    }
+                    if line.len() >= max {
+                        return Some(line);
+                    }
+                }
+            }
+        }
+    }
+
     fn sys_read(
         &mut self,
         fd: i32,
@@ -542,7 +887,24 @@ impl LinuxKernel {
         vfs: &mut MountTable,
     ) -> i64 {
         match self.fds.get(&fd) {
-            Some(Fd::Stdin) => 0, // EOF — no stdin
+            Some(Fd::Stdin) => {
+                if !self.interactive {
+                    return 0; // EOF — no stdin in batch mode
+                }
+                if self.stdin_buf.is_empty() {
+                    match self.read_host_stdin(len as usize) {
+                        None => return -4,                   // EINTR (a pending signal will follow)
+                        Some(d) if d.is_empty() => return 0, // EOF
+                        Some(d) => self.stdin_buf.extend(d),
+                    }
+                }
+                let n = (len as usize).min(self.stdin_buf.len());
+                let bytes: Vec<u8> = self.stdin_buf.drain(..n).collect();
+                if write_mem(mmu, buf, &bytes).is_none() {
+                    return EFAULT;
+                }
+                n as i64
+            }
             Some(Fd::Vfs { h, .. }) => {
                 let mut tmp = vec![0u8; len as usize];
                 let n = vfs.read_handle(*h, &mut tmp).unwrap_or(0);
@@ -755,7 +1117,10 @@ impl LinuxKernel {
         }
         let want = page_up(new);
         if want > self.brk_mapped {
-            mmu.map(
+            // Newly-grown heap must read as zero (Linux guarantees it). On a
+            // fresh address space the pages already are, but after an `execve`
+            // over dirty memory they hold stale bytes, so zero them explicitly.
+            mmu.map_zeroed(
                 self.brk_mapped,
                 want.wrapping_sub(self.brk_mapped),
                 Perm::R | Perm::W,
@@ -810,8 +1175,12 @@ impl LinuxKernel {
             Some(Fd::Vfs { path, .. }) => path.clone(),
             _ => return EBADF,
         };
-        // Map writable to populate, then read [offset, offset+len) from the file.
-        mmu.map(base, size, Perm::R | Perm::W);
+        // Zero the region first, then overlay the file bytes: a segment with
+        // memsz > filesz (a shared library's `.bss` tail) must read as zero. On
+        // a fresh address space the pages are already zero, but after an
+        // `execve` reuses dirty memory they hold stale bytes — which corrupts
+        // zero-initialized globals (e.g. libpython) and crashes the program.
+        mmu.map_zeroed(base, size, Perm::R | Perm::W);
         let data = read_file_region(vfs, &path, offset, len as usize);
         let file_len = data.len() as u32;
         if write_mem(mmu, base, &data).is_none() {

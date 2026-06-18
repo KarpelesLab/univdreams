@@ -170,6 +170,13 @@ enum Command {
         #[arg(long)]
         net: bool,
 
+        /// Run interactively: wire the guest's stdin/stdout/stderr to
+        /// this terminal (raw mode), report a real tty to the guest,
+        /// and deliver Ctrl-C as SIGINT — so you can drive a shell.
+        /// Off by default (batch: stdin is EOF, output is captured).
+        #[arg(short = 'i', long)]
+        interactive: bool,
+
         /// Back the root filesystem with a real on-disk format
         /// (ext4 / ntfs / fat / exfat) via fstool instead of the
         /// flat in-memory store. `auto` picks the per-OS default
@@ -880,6 +887,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             dump_vfs,
             kvm,
             net,
+            interactive,
             fs_type,
             mount,
             no_default_mounts,
@@ -899,6 +907,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     preserve_deletes,
                     kvm,
                     net,
+                    interactive,
                     &FsOpts {
                         fs_type,
                         mounts: mount,
@@ -3184,6 +3193,59 @@ fn default_linux_env() -> Vec<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Puts the host terminal (fd 0) into raw mode for the guard's lifetime and
+/// restores the saved settings on drop (including on panic). No-op if stdin is
+/// not a tty. With the host raw, every keystroke — including Ctrl-C — reaches
+/// the guest, whose line discipline does the echo/editing/signals instead.
+struct RawTerminal {
+    saved: Option<libc::termios>,
+}
+
+impl RawTerminal {
+    #[allow(unsafe_code)]
+    fn enable() -> Self {
+        let fd = libc::STDIN_FILENO;
+        // SAFETY: `termios` is plain-old-data; the ioctls act on our own stdin.
+        unsafe {
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::isatty(fd) != 1 || libc::tcgetattr(fd, &mut saved) != 0 {
+                return Self { saved: None };
+            }
+            let mut raw = saved;
+            libc::cfmakeraw(&mut raw);
+            libc::tcsetattr(fd, libc::TCSANOW, &raw);
+            Self { saved: Some(saved) }
+        }
+    }
+}
+
+impl Drop for RawTerminal {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved {
+            // SAFETY: restoring the settings we captured in `enable`.
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved);
+            }
+        }
+    }
+}
+
+/// Host terminal size `(rows, cols)` via `TIOCGWINSZ`, or `(0, 0)` if it's not a
+/// terminal (the guest's `TIOCGWINSZ` then falls back to 24×80).
+#[allow(unsafe_code)]
+fn host_term_size() -> (u16, u16) {
+    // SAFETY: `winsize` is plain-old-data; the ioctl reads our own stdin.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+            (ws.ws_row, ws.ws_col)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
 fn monitor_install_elf(
     input: &Path,
     bytes: &[u8],
@@ -3193,6 +3255,7 @@ fn monitor_install_elf(
     dump_vfs: Option<&Path>,
     use_kvm: bool,
     use_net: bool,
+    use_interactive: bool,
     fs: &FsOpts,
 ) -> anyhow::Result<()> {
     let stem = input
@@ -3200,6 +3263,19 @@ fn monitor_install_elf(
         .and_then(|s| s.to_str())
         .unwrap_or("a.out");
     let argv = shell_split(extra_args.unwrap_or(""));
+    // Interactive: put the host terminal in raw mode (restored on drop) and
+    // wire the guest's std streams to it; otherwise stdin is EOF + output is
+    // captured for the report.
+    let term_size = if use_interactive {
+        host_term_size()
+    } else {
+        (0, 0)
+    };
+    let _raw_guard = if use_interactive {
+        Some(RawTerminal::enable())
+    } else {
+        None
+    };
 
     // i386, x86-64 and aarch64 static ELFs have executors.
     if !ud_emulator::linux::loader::is_runnable(bytes) {
@@ -3228,6 +3304,8 @@ fn monitor_install_elf(
         sb.linux_argv.clone_from(&argv);
         sb.linux_env = default_linux_env();
         sb.linux.net_enabled = use_net;
+        sb.linux.interactive = use_interactive;
+        sb.linux.term_size = term_size;
         let table = sb
             .context_mut()
             .vfs
@@ -3331,7 +3409,9 @@ fn monitor_install_elf(
     let unsupported: Vec<(String, u64)> =
         k.unsupported.iter().map(|(s, n)| (s.clone(), *n)).collect();
 
-    if as_json {
+    if use_interactive {
+        // Output streamed straight to the terminal; no batch report to print.
+    } else if as_json {
         let v = serde_json::json!({
             "input": input.display().to_string(),
             "personality": "linux-i386",
@@ -3437,6 +3517,7 @@ fn monitor_install(
     preserve_deletes: bool,
     use_kvm: bool,
     use_net: bool,
+    use_interactive: bool,
     fs: &FsOpts,
 ) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
@@ -3470,6 +3551,7 @@ fn monitor_install(
             dump_vfs,
             use_kvm,
             use_net,
+            use_interactive,
             fs,
         );
     }

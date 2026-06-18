@@ -50,3 +50,5 @@ serde_json = "1"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 bs58 = "0.5"
 base64 = "0.22"
+# Host terminal raw mode + window size for `--interactive`.
+libc = "0.2"

@@ -258,6 +258,14 @@ fn map_segments(
                 offset: ph.p_offset,
                 len: ph.p_filesz,
             })?;
+        // Zero the `.bss` tail (`[filesz, memsz)`). On a fresh address space the
+        // pages are already zero, but an `execve` that reloads over dirty memory
+        // leaves stale bytes there — corrupting zero-initialized globals
+        // (function pointers, flags) and crashing the program.
+        if memsz > filesz {
+            let zeros = vec![0u8; (memsz - filesz) as usize];
+            let _ = mmu.write_initializer(vaddr.wrapping_add(filesz), &zeros);
+        }
         mmu.map(start, end.wrapping_sub(start), perm);
 
         high = high.max(end);

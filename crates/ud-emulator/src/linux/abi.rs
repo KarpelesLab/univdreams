@@ -78,6 +78,7 @@ pub enum Sysno {
     SetRobustList,
     RtSigaction,
     RtSigprocmask,
+    RtSigreturn,
     Time,
     ClockGettime,
     Gettimeofday,
@@ -274,6 +275,7 @@ impl LinuxAbi for I386Abi {
             146 => Sysno::Writev,
             174 => Sysno::RtSigaction,
             175 => Sysno::RtSigprocmask,
+            173 => Sysno::RtSigreturn,
             183 => Sysno::Getcwd,
             192 => Sysno::Mmap,  // mmap2 (page-offset variant) — treated as mmap
             195 => Sysno::Stat,  // stat64
@@ -367,6 +369,7 @@ impl Amd64Abi {
             12 => Sysno::Brk,
             13 => Sysno::RtSigaction,
             14 => Sysno::RtSigprocmask,
+            15 => Sysno::RtSigreturn,
             16 => Sysno::Ioctl,
             19 => Sysno::Readv,
             20 => Sysno::Writev,
@@ -614,6 +617,7 @@ impl Aarch64Abi {
             99 => Sysno::SetRobustList,
             134 => Sysno::RtSigaction,
             135 => Sysno::RtSigprocmask,
+            139 => Sysno::RtSigreturn,
             160 => Sysno::Uname,
             172 => Sysno::Getpid,
             173 => Sysno::Getppid,
