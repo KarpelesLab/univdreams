@@ -157,6 +157,89 @@ pub struct LinuxKernel {
     /// A signal raised by the line discipline (Ctrl-C) that the run loop must
     /// deliver to the guest after the current syscall returns.
     pub pending_signal: Option<i32>,
+    /// Shared channel to a background host-stdin reader (interactive KVM only).
+    /// When present, `read_host_stdin` drains it instead of reading stdin
+    /// directly, and an **async** Ctrl-C (the guest isn't in a `read`) arrives
+    /// via `input.pending_sigint`. Absent ⇒ the synchronous fallback path.
+    pub input: Option<std::sync::Arc<InteractiveInput>>,
+}
+
+/// Shared host-stdin channel for interactive mode. A background reader thread
+/// (spawned by the KVM run loop) reads the raw host terminal and pushes bytes
+/// here; the kernel line discipline drains them. The reader also watches for
+/// the guest's VINTR (Ctrl-C): when `isig` is set it raises an **async** SIGINT
+/// (and the run loop kicks the vCPU out of `KVM_RUN`), so a CPU-bound guest that
+/// isn't in a `read` can still be interrupted.
+#[derive(Debug, Default)]
+pub struct InteractiveInput {
+    state: std::sync::Mutex<InputState>,
+    cv: std::sync::Condvar,
+    /// Guest `ISIG` enabled — mirrors `c_lflag & ISIG`, updated on `TCSETS`.
+    pub isig: std::sync::atomic::AtomicBool,
+    /// Guest VINTR byte (default Ctrl-C = 3), updated on `TCSETS`.
+    pub vintr: std::sync::atomic::AtomicU8,
+    /// An async Ctrl-C the reader observed; consumed by the run loop.
+    pub pending_sigint: std::sync::atomic::AtomicBool,
+    /// Set to ask the reader thread to exit at its next poll tick.
+    pub stop: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct InputState {
+    buf: std::collections::VecDeque<u8>,
+    closed: bool,
+}
+
+/// Outcome of pulling one byte from the interactive input channel.
+enum InByte {
+    Byte(u8),
+    Closed,
+    Interrupted,
+}
+
+impl InteractiveInput {
+    /// Push a byte read from the host terminal; wake any waiting reader.
+    pub fn push(&self, b: u8) {
+        self.state.lock().unwrap().buf.push_back(b);
+        self.cv.notify_all();
+    }
+    /// Mark host stdin closed (EOF); wake any waiting reader.
+    pub fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.cv.notify_all();
+    }
+    /// Raise an async Ctrl-C; wake any waiting reader. Taken under the state
+    /// lock so a reader parked in `next_byte` can't miss the wakeup.
+    pub fn raise_sigint(&self) {
+        let _g = self.state.lock().unwrap();
+        self.pending_sigint
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cv.notify_all();
+    }
+    /// Block until a byte is available, the channel closes, or an async Ctrl-C
+    /// is raised.
+    fn next_byte(&self) -> InByte {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if self
+                .pending_sigint
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return InByte::Interrupted;
+            }
+            if let Some(b) = st.buf.pop_front() {
+                return InByte::Byte(b);
+            }
+            if st.closed {
+                return InByte::Closed;
+            }
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+    /// Non-blocking pop of one buffered byte (raw-mode drain).
+    fn try_byte(&self) -> Option<u8> {
+        self.state.lock().unwrap().buf.pop_front()
+    }
 }
 
 /// The Linux kernel `struct termios` (the 36-byte `TCGETS` layout: four 32-bit
@@ -289,6 +372,40 @@ impl LinuxKernel {
         self.brk_mapped = brk;
         self.mmap_top = MMAP_BASE;
         self.file_maps.clear();
+    }
+
+    /// Attach the background host-stdin reader (interactive KVM only) and seed
+    /// it with the current tty ISIG/VINTR so it knows when Ctrl-C is a signal.
+    pub fn attach_input(&mut self, input: std::sync::Arc<InteractiveInput>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        input.isig.store(self.termios.lflag & 0x1 != 0, SeqCst);
+        input.vintr.store(self.termios.cc[0], SeqCst);
+        self.input = Some(input);
+    }
+
+    /// Mirror the guest tty's ISIG/VINTR into the background reader after a
+    /// `TCSETS`, so it tracks whether Ctrl-C raises a signal or is a raw byte.
+    fn sync_input_termios(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if let Some(input) = &self.input {
+            input.isig.store(self.termios.lflag & 0x1 != 0, SeqCst);
+            input.vintr.store(self.termios.cc[0], SeqCst);
+        }
+    }
+
+    /// Consume a pending SIGINT from either the synchronous line discipline
+    /// (`pending_signal`, set while the guest was in a `read`) or the async
+    /// background reader (`input.pending_sigint`, raised between instructions).
+    pub fn take_pending_signal(&mut self) -> Option<i32> {
+        if let Some(input) = &self.input {
+            if input
+                .pending_sigint
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Some(2); // SIGINT
+            }
+        }
+        self.pending_signal.take()
     }
 
     /// Read a NUL-terminated array of string pointers (`argv` / `envp`) from
@@ -659,6 +776,7 @@ impl LinuxKernel {
                 self.termios.lflag = rd(12);
                 self.termios.line = b[16];
                 self.termios.cc.copy_from_slice(&b[17..36]);
+                self.sync_input_termios();
                 0
             }
             0x5413 => {
@@ -819,6 +937,67 @@ impl LinuxKernel {
         let cooked = self.termios.lflag & 0x2 != 0; // ICANON
         let echo = self.termios.lflag & 0x8 != 0; // ECHO
         let isig = self.termios.lflag & 0x1 != 0; // ISIG
+
+        // Background-reader path: bytes arrive from the host-stdin thread, which
+        // also intercepts VINTR (when ISIG) into an async SIGINT. The line
+        // discipline (echo/editing) still runs here on the guest's behalf.
+        if let Some(input) = self.input.clone() {
+            let mut out = std::io::stdout().lock();
+            if !cooked {
+                // Raw: block for ≥1 byte, then drain whatever else is buffered.
+                let first = match input.next_byte() {
+                    InByte::Byte(b) => b,
+                    InByte::Closed => return Some(Vec::new()),
+                    InByte::Interrupted => return None,
+                };
+                let mut v = vec![first];
+                while v.len() < max.max(1) {
+                    match input.try_byte() {
+                        Some(b) => v.push(b),
+                        None => break,
+                    }
+                }
+                return Some(v);
+            }
+            // Cooked: assemble one line with local echo + minimal editing.
+            let mut line: Vec<u8> = Vec::new();
+            loop {
+                let b = match input.next_byte() {
+                    InByte::Byte(b) => b,
+                    InByte::Closed => return Some(line),
+                    InByte::Interrupted => return None,
+                };
+                match b {
+                    0x04 => return Some(line), // VEOF (Ctrl-D)
+                    b'\r' | b'\n' => {
+                        line.push(b'\n');
+                        if echo {
+                            let _ = out.write_all(b"\r\n");
+                            let _ = out.flush();
+                        }
+                        return Some(line);
+                    }
+                    0x7f | 0x08 => {
+                        if line.pop().is_some() && echo {
+                            let _ = out.write_all(b"\x08 \x08");
+                            let _ = out.flush();
+                        }
+                    }
+                    c => {
+                        line.push(c);
+                        if echo {
+                            let _ = out.write_all(&[c]);
+                            let _ = out.flush();
+                        }
+                        if line.len() >= max {
+                            return Some(line);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: read host stdin directly (no background reader attached).
         let mut stdin = std::io::stdin().lock();
         let mut out = std::io::stdout().lock();
         if !cooked {

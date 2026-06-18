@@ -44,7 +44,7 @@ use super::abi::{Amd64Abi, LinuxAbi, Sysno};
 use super::guest::GuestCpu;
 use super::loader;
 use super::mem::GuestMem;
-use super::LinuxKernel;
+use super::{InteractiveInput, LinuxKernel};
 
 // ---- guest-physical layout (all below the 0x400000 image base) -------------
 const PML4: u64 = 0x1000;
@@ -337,6 +337,96 @@ fn user_segment(selector: u16, code: bool) -> kvm_segment {
     }
 }
 
+/// The signal we use to kick the vCPU thread out of `KVM_RUN` so an async
+/// Ctrl-C can be delivered between guest instructions.
+const KICK_SIG: libc::c_int = libc::SIGUSR1;
+
+extern "C" fn kick_handler(_sig: libc::c_int) {}
+
+/// Install a no-op `SIGUSR1` handler exactly once. No `SA_RESTART`, so a kick
+/// makes the in-flight `KVM_RUN` return `EINTR` instead of auto-restarting.
+fn install_kick_handler() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: a process-wide handler for our own kick signal; the handler is
+        // async-signal-safe (it does nothing).
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = kick_handler as *const () as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = 0; // no SA_RESTART → interrupt KVM_RUN
+            libc::sigaction(KICK_SIG, &sa, std::ptr::null_mut());
+        }
+    });
+}
+
+/// Background reader guard: stops the host-stdin reader thread when the run
+/// loop returns (the thread wakes within one poll tick and exits).
+struct ReaderGuard(std::sync::Arc<InteractiveInput>);
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.0.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Spawn the background host-stdin reader for interactive mode. It reads the raw
+/// host terminal, pushes bytes into `input`, and — while the guest has `ISIG`
+/// set — turns VINTR (Ctrl-C) into an async SIGINT: it flags `input` and kicks
+/// the vCPU thread (`main_tid`) out of `KVM_RUN`, so even a CPU-bound guest that
+/// isn't in a `read` is interrupted. Exits on host EOF or `input.stop`.
+fn spawn_stdin_reader(input: std::sync::Arc<InteractiveInput>, main_tid: u64) {
+    std::thread::spawn(move || {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut pfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut buf = [0u8; 256];
+        loop {
+            if input.stop.load(SeqCst) {
+                return;
+            }
+            // Poll with a timeout so `stop` is still observed when no key is
+            // pressed. SAFETY: one valid pollfd, count 1.
+            let pr = unsafe { libc::poll(&mut pfd, 1, 100) };
+            if pr <= 0 {
+                continue; // timeout (0) or EINTR (-1): re-check `stop`
+            }
+            // SAFETY: read into a local buffer of known length.
+            let n = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                input.close(); // host EOF or error
+                return;
+            }
+            for &b in &buf[..n as usize] {
+                if input.isig.load(SeqCst) && b == input.vintr.load(SeqCst) {
+                    // Echo `^C` like a real tty's line discipline (the host is in
+                    // raw mode, so we do it). SAFETY: write to stdout fd.
+                    unsafe {
+                        libc::write(libc::STDOUT_FILENO, b"^C\r\n".as_ptr().cast(), 4);
+                    }
+                    input.raise_sigint();
+                    // SAFETY: directed kick to the vCPU thread; KICK_SIG has a
+                    // no-op handler installed process-wide.
+                    unsafe {
+                        libc::pthread_kill(main_tid as libc::pthread_t, KICK_SIG);
+                    }
+                } else {
+                    input.push(b);
+                }
+            }
+        }
+    });
+}
+
 /// Run an amd64 static ELF under KVM, servicing its syscalls through `kernel`.
 /// Returns the process exit code.
 ///
@@ -471,10 +561,47 @@ pub fn run(
     let mut zombies: Vec<(i32, i32)> = Vec::new();
     let mut native_pages: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
+    // Interactive mode: spawn the background host-stdin reader and arm the vCPU
+    // kick so an async Ctrl-C can interrupt a CPU-bound foreground command. The
+    // guard stops the thread when `run` returns.
+    let _reader = if kernel.interactive {
+        install_kick_handler();
+        // SAFETY: pthread_self has no preconditions; the id identifies this vCPU
+        // thread for the reader's directed kick.
+        let main_tid = unsafe { libc::pthread_self() } as u64;
+        let input = std::sync::Arc::new(InteractiveInput::default());
+        kernel.attach_input(input.clone());
+        spawn_stdin_reader(input.clone(), main_tid);
+        Some(ReaderGuard(input))
+    } else {
+        None
+    };
+
     // --- run loop: native execution until a syscall (hlt trampoline), the
     // program exits, or the guest faults. ---
     loop {
-        match vcpu.run().map_err(|e| format!("KVM_RUN: {e}"))? {
+        let exit = match vcpu.run() {
+            Ok(e) => e,
+            // Kicked out of KVM_RUN by the async Ctrl-C path (or any stray
+            // signal): deliver a pending signal between instructions, resume.
+            Err(e) if e.errno() == libc::EINTR => {
+                // Deliver only between *userspace* instructions. At the CPL0
+                // trampoline the pending `sysretq` must complete first, else we
+                // resume it at the wrong privilege level; leave the flag set and
+                // the post-syscall check picks it up.
+                let in_user = vcpu.get_sregs().map(|s| s.cs.dpl == 3).unwrap_or(true);
+                if in_user {
+                    if let Some(sig) = kernel.take_pending_signal() {
+                        if let Some(status) = deliver_signal(&mut vcpu, &mut mem, kernel, sig)? {
+                            return Ok(status);
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(e) => return Err(format!("KVM_RUN: {e}")),
+        };
+        match exit {
             VcpuExit::Hlt => {
                 // A `syscall` reached the trampoline; service it through the
                 // shared kernel, then `sysretq` (already at rip) resumes guest
@@ -564,10 +691,10 @@ pub fn run(
                         }
                     }
                 }
-                // A Ctrl-C raised by the line discipline during the syscall above
-                // (a blocking read): deliver it. A default disposition ends the
+                // A Ctrl-C raised during the syscall above (a blocking read, or
+                // the async reader): deliver it. A default disposition ends the
                 // main process.
-                if let Some(sig) = kernel.pending_signal.take() {
+                if let Some(sig) = kernel.take_pending_signal() {
                     if let Some(status) = deliver_signal(&mut vcpu, &mut mem, kernel, sig)? {
                         return Ok(status);
                     }
@@ -823,6 +950,12 @@ fn run_kvm_child(
 ) -> Result<i32, String> {
     let proc = kernel.proc_snapshot();
     let parent_regs = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
+    // Snapshot the parent's segment state too: the parent always forks from a
+    // syscall (the trampoline, CPL0), but a child terminated *asynchronously*
+    // (an async Ctrl-C in userspace) leaves CS at CPL3. Restoring only the GP
+    // regs would resume the parent's `sysretq` at the wrong privilege level and
+    // triple-fault — so roll the full sregs (CS/SS/fs.base) back as well.
+    let parent_sregs = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
     let parent_fs = *fs_base;
 
     // Snapshot the parent's current content for every populated page (guest
@@ -851,7 +984,26 @@ fn run_kvm_child(
     // apk's trigger script). Reaped by this level's own `wait4`.
     let mut zombies: Vec<(i32, i32)> = Vec::new();
     let status = loop {
-        match vcpu.run().map_err(|e| format!("KVM_RUN(child): {e}"))? {
+        let exit = match vcpu.run() {
+            Ok(e) => e,
+            // Async Ctrl-C kicked this child out of KVM_RUN: deliver it (a
+            // default disposition terminates the child) and resume otherwise.
+            Err(e) if e.errno() == libc::EINTR => {
+                // Userspace-only delivery (see the main loop): defer at the CPL0
+                // trampoline so the pending `sysretq` finishes first.
+                let in_user = vcpu.get_sregs().map(|s| s.cs.dpl == 3).unwrap_or(true);
+                if in_user {
+                    if let Some(sig) = kernel.take_pending_signal() {
+                        if let Some(st) = deliver_signal(vcpu, mem, kernel, sig)? {
+                            break st;
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(e) => return Err(format!("KVM_RUN(child): {e}")),
+        };
+        match exit {
             VcpuExit::Hlt => {
                 let r = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
                 let mut kcpu = KvmCpu {
@@ -926,9 +1078,10 @@ fn run_kvm_child(
                         }
                     }
                 }
-                // A Ctrl-C raised while this child was in a blocking read:
-                // deliver it. A default disposition terminates the child.
-                if let Some(sig) = kernel.pending_signal.take() {
+                // A Ctrl-C raised while this child was in a blocking read (or
+                // via the async reader): deliver it. A default disposition
+                // terminates the child.
+                if let Some(sig) = kernel.take_pending_signal() {
                     if let Some(st) = deliver_signal(vcpu, mem, kernel, sig)? {
                         break st;
                     }
@@ -952,11 +1105,11 @@ fn run_kvm_child(
     kernel.proc_restore(proc);
     vcpu.set_regs(&parent_regs)
         .map_err(|e| format!("set_regs: {e}"))?;
-    if *fs_base != parent_fs {
-        *fs_base = parent_fs;
-        let mut s = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
-        s.fs.base = parent_fs;
-        vcpu.set_sregs(&s).map_err(|e| format!("set_sregs: {e}"))?;
-    }
+    // Restore the parent's segment/CPL state (and with it fs.base). Always done,
+    // not just on fs-base change, so an async-terminated child can't leave the
+    // parent at the wrong CPL.
+    vcpu.set_sregs(&parent_sregs)
+        .map_err(|e| format!("set_sregs: {e}"))?;
+    *fs_base = parent_fs;
     Ok(status)
 }
