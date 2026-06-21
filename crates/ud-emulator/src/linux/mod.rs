@@ -311,11 +311,17 @@ struct SigAction {
     mask: u64,
 }
 
-/// Opaque snapshot of the per-process kernel state a synchronous `fork` child
-/// may mutate. Produced by [`LinuxKernel::proc_snapshot`] and consumed by
-/// [`LinuxKernel::proc_restore`]; the KVM fork path holds one across a child's
-/// run without inspecting it.
-pub struct ProcSnapshot {
+/// The complete per-process kernel state — everything that a `fork` child gets
+/// its own copy of and that a context switch must save/restore. The shared
+/// resources a process *references* (pipe/socket buffers, the captured stdout,
+/// the tty) live in [`LinuxKernel`] directly and are NOT duplicated here; only
+/// the per-process *view* (the fd table, memory layout, cwd, signal state) is.
+///
+/// Produced by [`LinuxKernel::proc_snapshot`] (a clone of the live state) and
+/// installed by [`LinuxKernel::proc_restore`] (a move). The synchronous `fork`
+/// path holds one across a child's run; the scheduler stores one per process.
+#[derive(Clone)]
+pub struct ProcState {
     fds: BTreeMap<i32, Fd>,
     next_fd: i32,
     brk: u32,
@@ -324,6 +330,12 @@ pub struct ProcSnapshot {
     file_maps: Vec<FileMapping>,
     cwd: String,
     umask: u32,
+    /// Installed signal dispositions — per-process (each `execve` and `fork`
+    /// gets its own; a child's `rt_sigaction` must not leak into the parent).
+    sigactions: BTreeMap<i32, SigAction>,
+    sig_mask: u64,
+    pending_signal: Option<i32>,
+    current_tid: i32,
 }
 
 /// A file-backed `mmap` region we may need to flush back to the file.
@@ -360,13 +372,13 @@ impl LinuxKernel {
         self.sockets.clear();
     }
 
-    /// Snapshot the per-process kernel state a synchronous `fork` child may
-    /// mutate before it execs (its fd table, brk, cwd, umask). Sockets, pipes
-    /// and file mappings are left shared — a fork-then-exec child doesn't
-    /// disturb them. Pair with [`Self::proc_restore`] to roll the parent back
-    /// after the child has run to completion.
-    pub fn proc_snapshot(&self) -> ProcSnapshot {
-        ProcSnapshot {
+    /// Clone the live per-process kernel state (fd table, memory layout, cwd,
+    /// umask, signal dispositions/mask). Pipes, sockets and the captured output
+    /// streams are shared, not copied. Pair with [`Self::proc_restore`] to roll
+    /// the parent back after a synchronous child runs, or to seed a `fork`
+    /// child's [`ProcState`].
+    pub fn proc_snapshot(&self) -> ProcState {
+        ProcState {
             fds: self.fds.clone(),
             next_fd: self.next_fd,
             brk: self.brk,
@@ -375,11 +387,17 @@ impl LinuxKernel {
             file_maps: self.file_maps.clone(),
             cwd: self.cwd.clone(),
             umask: self.umask,
+            sigactions: self.sigactions.clone(),
+            sig_mask: self.sig_mask,
+            pending_signal: self.pending_signal,
+            current_tid: self.current_tid,
         }
     }
 
-    /// Restore the per-process state captured by [`Self::proc_snapshot`].
-    pub fn proc_restore(&mut self, s: ProcSnapshot) {
+    /// Install a [`ProcState`] as the live per-process state (a move). Used to
+    /// restore a parent after its child runs, and by the scheduler to switch in
+    /// a process.
+    pub fn proc_restore(&mut self, s: ProcState) {
         self.fds = s.fds;
         self.next_fd = s.next_fd;
         self.brk = s.brk;
@@ -388,6 +406,10 @@ impl LinuxKernel {
         self.file_maps = s.file_maps;
         self.cwd = s.cwd;
         self.umask = s.umask;
+        self.sigactions = s.sigactions;
+        self.sig_mask = s.sig_mask;
+        self.pending_signal = s.pending_signal;
+        self.current_tid = s.current_tid;
     }
 
     /// Reset the memory layout for an `execve` that reuses this kernel: the new

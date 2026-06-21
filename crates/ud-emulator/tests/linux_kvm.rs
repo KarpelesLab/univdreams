@@ -116,6 +116,40 @@ fn kvm_runs_freestanding_raw_syscalls() {
     assert_eq!(exit, 5);
 }
 
+/// A `fork` child and its parent share the same pipe buffer: the child writes,
+/// the parent reads it back. Guards the shared-pipe arena (pipe buffers live in
+/// `LinuxKernel`, not per-process `ProcState`) across the fork boundary. Uses
+/// the raw `fork` syscall (glibc `fork()` routes through `clone`).
+#[test]
+fn kvm_fork_pipe_shares_buffer() {
+    if !kvm_available() {
+        eprintln!("SKIP: /dev/kvm not accessible");
+        return;
+    }
+    let Some(elf) = compile_static(
+        r#"#include <unistd.h>
+           #include <sys/syscall.h>
+           int main(void){
+               int fd[2];
+               if (pipe(fd)) return 11;
+               long pid = syscall(SYS_fork);
+               if (pid == 0){ write(fd[1], "ping", 4); _exit(0); }
+               char buf[8];
+               long n = read(fd[0], buf, sizeof buf);
+               if (n != 4) return 12;
+               write(1, buf, 4);
+               return 0;
+           }"#,
+        "forkpipe",
+    ) else {
+        return;
+    };
+    let mut sb = Sandbox::new_linux();
+    let exit = sb.run_linux_kvm("forkpipe", &elf).expect("kvm run");
+    assert_eq!(String::from_utf8_lossy(&sb.linux.stdout), "ping");
+    assert_eq!(exit, 0, "parent read the child's pipe write");
+}
+
 #[test]
 fn kvm_returns_exit_code() {
     if !kvm_available() {
