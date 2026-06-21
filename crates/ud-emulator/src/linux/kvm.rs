@@ -126,6 +126,26 @@ impl KvmMem {
         }
     }
 
+    /// Drop the backing pages so the region reads zero again, for recycling a
+    /// reaped process's window before a new process reuses it. `MADV_DONTNEED`
+    /// on an anonymous mapping zero-fills on the next fault. Also clears the
+    /// host-write tracking. (Used by the scheduler's window recycler — landing
+    /// next in P1 — and the isolation test.)
+    #[allow(dead_code)]
+    fn madv_dontneed(&mut self) {
+        // SAFETY: `base`/`size` are our own mmap; MADV_DONTNEED is non-destructive
+        // to the mapping (only its resident pages).
+        unsafe {
+            libc::madvise(
+                self.base.cast::<libc::c_void>(),
+                self.size,
+                libc::MADV_DONTNEED,
+            );
+        }
+        self.host_pages.clear();
+        self.last_host_page = u32::MAX;
+    }
+
     /// Record host-written pages in `host_pages` (cheap `last_host_page` dedup
     /// for sequential writes), so a fork snapshot can include them.
     #[inline]
@@ -300,19 +320,26 @@ impl GuestCpu for KvmCpu {
     }
 }
 
-/// Build the 2 MiB identity page tables covering `[0, 4 GiB)`, user-accessible.
-fn build_page_tables(mem: &mut KvmMem) {
-    mem.poke64(PML4, PDPT | PTE_P | PTE_RW | PTE_US);
+/// Build the page tables for a per-process window whose guest-physical backing
+/// starts at `base`. The structures sit at the window's low offsets
+/// (`base+PML4`, `base+PDPT`, `base+PD_BASE`) and map guest-virtual `[0, 4 GiB)`
+/// to guest-physical `[base, base+4 GiB)` with user-accessible 2 MiB pages — so
+/// every process sees the same flat GVA layout while living in its own GPA
+/// window. `CR3` for the window is `base + PML4`. `poke64` addresses are host
+/// offsets *within* the window (unchanged); only the stored physical addresses
+/// carry `base`.
+fn build_page_tables(mem: &mut KvmMem, base: u64) {
+    mem.poke64(PML4, (base + PDPT) | PTE_P | PTE_RW | PTE_US);
     for i in 0..4u64 {
         mem.poke64(
             PDPT + i * 8,
-            (PD_BASE + i * 0x1000) | PTE_P | PTE_RW | PTE_US,
+            (base + PD_BASE + i * 0x1000) | PTE_P | PTE_RW | PTE_US,
         );
     }
     for k in 0..4u64 {
         let pd = PD_BASE + k * 0x1000;
         for j in 0..512u64 {
-            let phys = (k * 0x4000_0000) + j * 0x20_0000;
+            let phys = base + (k * 0x4000_0000) + j * 0x20_0000;
             mem.poke64(pd + j * 8, phys | PTE_P | PTE_RW | PTE_US | PTE_PS);
         }
     }
@@ -485,7 +512,7 @@ pub fn run(
         .map_err(|e| format!("ELF load: {e}"))?;
     kernel.init(image.brk);
 
-    build_page_tables(&mut mem);
+    build_page_tables(&mut mem, 0);
     mem.poke_bytes(TRAMP, &[0xF4, 0x48, 0x0F, 0x07]); // hlt ; sysretq
 
     // --- KVM: VM, memory slot, vCPU ---
@@ -1160,4 +1187,140 @@ fn run_kvm_child(
         .map_err(|e| format!("set_sregs: {e}"))?;
     *fs_base = parent_fs;
     Ok(status)
+}
+
+#[cfg(test)]
+mod window_tests {
+    //! Validate the per-process address-space model the scheduler relies on:
+    //! distinct guest-physical windows + per-window page tables + a `CR3` swap
+    //! give isolated address spaces on one vCPU, and a recycled window reads
+    //! zero. This is the make-or-break memory mechanic for the scheduler.
+    use super::*;
+    use crate::linux::mem::GuestMem;
+    use kvm_bindings::kvm_userspace_memory_region;
+
+    fn kvm_ok() -> bool {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok()
+    }
+
+    #[test]
+    fn per_process_windows_isolate_and_recycle() {
+        if !kvm_ok() {
+            eprintln!("SKIP: /dev/kvm not accessible");
+            return;
+        }
+        let gva_code: u32 = 0x40_0000;
+        let gva_data: u32 = 0x50_0000;
+        // `mov byte [0x500000], 0xAA ; syscall` — write a marker, then trap.
+        let prog = [
+            0xC6u8, 0x04, 0x25, 0x00, 0x00, 0x50, 0x00, 0xAA, // mov byte [0x500000],0xAA
+            0x0F, 0x05, // syscall
+        ];
+        let tramp = [0xF4u8, 0x48, 0x0F, 0x07]; // hlt ; sysretq
+
+        let kvm = Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+
+        // Two windows at distinct guest-physical bases: 0 and 4 GiB.
+        let bases = [0u64, MEM_SIZE];
+        let mut wins: Vec<KvmMem> = Vec::new();
+        for (slot, &base) in bases.iter().enumerate() {
+            let mut mem = KvmMem::new(MEM_SIZE as usize).unwrap();
+            build_page_tables(&mut mem, base);
+            mem.poke_bytes(TRAMP, &tramp);
+            mem.poke_bytes(u64::from(gva_code), &prog);
+            let region = kvm_userspace_memory_region {
+                slot: slot as u32,
+                guest_phys_addr: base,
+                memory_size: MEM_SIZE,
+                userspace_addr: mem.base as u64,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            // SAFETY: `mem` outlives the VM in this test; region matches the mmap.
+            unsafe { vm.set_user_memory_region(region).unwrap() };
+            wins.push(mem);
+        }
+
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let mut sregs = vcpu.get_sregs().unwrap();
+        sregs.cr4 = 0x20; // PAE
+        sregs.cr0 = 0x8000_0033; // PG|NE|ET|MP|PE
+        sregs.efer = 0x100 | 0x400 | 0x1; // LME|LMA|SCE
+        sregs.cs = user_segment(0x33, true);
+        let data = user_segment(0x2b, false);
+        sregs.ds = data;
+        sregs.es = data;
+        sregs.fs = data;
+        sregs.gs = data;
+        sregs.ss = data;
+        let msrs = Msrs::from_entries(&[
+            kvm_msr_entry {
+                index: MSR_LSTAR,
+                data: TRAMP,
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: MSR_STAR,
+                data: (0x20u64 << 48) | (0x10u64 << 32),
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: MSR_SFMASK,
+                data: 0x700,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        vcpu.set_msrs(&msrs).unwrap();
+
+        let mut run_in = |vcpu: &mut kvm_ioctls::VcpuFd, base: u64| {
+            sregs.cr3 = base + PML4;
+            vcpu.set_sregs(&sregs).unwrap();
+            let regs = kvm_bindings::kvm_regs {
+                rip: u64::from(gva_code),
+                rsp: 0x60_0000,
+                rflags: 0x2,
+                ..Default::default()
+            };
+            vcpu.set_regs(&regs).unwrap();
+            match vcpu.run().unwrap() {
+                VcpuExit::Hlt => {}
+                other => panic!("unexpected exit running window @ {base:#x}: {other:?}"),
+            }
+        };
+
+        // Run in window 0 → marker lands in window 0 only.
+        run_in(&mut vcpu, bases[0]);
+        assert_eq!(
+            wins[0].load8(gva_data).unwrap(),
+            0xAA,
+            "window 0 got the write"
+        );
+        assert_eq!(wins[1].load8(gva_data).unwrap(), 0x00, "window 1 isolated");
+
+        // Run in window 1 → marker lands in window 1; window 0 unchanged.
+        run_in(&mut vcpu, bases[1]);
+        assert_eq!(
+            wins[1].load8(gva_data).unwrap(),
+            0xAA,
+            "window 1 got the write"
+        );
+        assert_eq!(
+            wins[0].load8(gva_data).unwrap(),
+            0xAA,
+            "window 0 kept its own"
+        );
+
+        // Recycle window 0: MADV_DONTNEED must zero the backing for reuse.
+        wins[0].madv_dontneed();
+        assert_eq!(
+            wins[0].load8(gva_data).unwrap(),
+            0x00,
+            "recycled window reads zero"
+        );
+    }
 }
