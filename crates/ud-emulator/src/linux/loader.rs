@@ -128,7 +128,7 @@ pub fn load_static(
 /// Map `bytes` into `mmu` and set up the initial process stack. Handles both
 /// **static** executables and **dynamically linked** ones (`PT_INTERP`): the
 /// interpreter (`ld-musl`, …) is read from `mounts` (the guest rootfs), mapped
-/// at [`INTERP_BASE`], and execution starts in it with a full auxv so it can
+/// at `INTERP_BASE`, and execution starts in it with a full auxv so it can
 /// relocate the main object and run it.
 ///
 /// `mounts` is required for dynamic binaries; a dynamic ELF with `mounts =

@@ -1,6 +1,6 @@
 //! A **mount table** layered over the per-instance virtual filesystem.
 //!
-//! Historically the guest saw a single flat [`VirtualFs`](crate::context::VirtualFs)
+//! Historically the guest saw a single flat [`VirtualFs`]
 //! (a path→bytes map). This module lets multiple filesystems live at multiple
 //! paths: a **root** backend plus prefix-keyed **overlays** (e.g. Linux
 //! `/proc`, `/dev`, or a real ext4 image mounted at `/data`). Path lookups

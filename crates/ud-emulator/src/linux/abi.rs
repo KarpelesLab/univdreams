@@ -2,7 +2,7 @@
 //!
 //! The [`LinuxKernel`](super::LinuxKernel) is arch-agnostic: it works in
 //! terms of a canonical [`Sysno`] and six `u64` arguments. A [`LinuxAbi`]
-//! adapter bridges a concrete [`Cpu`] to it — it knows which registers
+//! adapter bridges a concrete `Cpu` to it — it knows which registers
 //! carry the syscall number / arguments / return value for its ABI, and
 //! maps the architecture's syscall *numbers* (which differ wildly between
 //! i386, x86-64 and aarch64) onto the canonical set.

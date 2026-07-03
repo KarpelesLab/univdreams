@@ -4,6 +4,15 @@
 //!
 //! No external toolchain — the ELF is built byte-for-byte here.
 
+// The ELF is assembled by hand from `u32`/`usize` offsets written
+// into a byte buffer, so the file is full of intentional
+// address/size casts down to the widths the on-disk format uses.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+
 use ud_emulator::Sandbox;
 
 const LOAD: u32 = 0x0804_8000;

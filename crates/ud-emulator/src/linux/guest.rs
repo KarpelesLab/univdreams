@@ -4,7 +4,7 @@
 //! Registers are addressed by the **architecture's native index** (the
 //! adapter and the CPU's impl agree on the numbering): x86 uses the
 //! `rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8..r15` order; aarch64 uses
-//! `x0..x30`. Memory is *not* here — it stays on the shared [`Mmu`].
+//! `x0..x30`. Memory is *not* here — it stays on the shared [`Mmu`](crate::emulator::Mmu).
 
 use crate::emulator::aarch64::Aarch64Cpu;
 use crate::emulator::Cpu;

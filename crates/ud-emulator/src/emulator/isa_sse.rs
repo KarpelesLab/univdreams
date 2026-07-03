@@ -1,6 +1,6 @@
 //! SSE / SSE2 instruction executor.
 //!
-//! Routed from [`super::isa_int::Cpu::dispatch_0f`] for the
+//! Routed from `super::isa_int::Cpu::dispatch_0f` for the
 //! second-byte ranges that overlap the SSE encoding space:
 //!
 //! ```text
@@ -15,8 +15,8 @@
 //!
 //! The 0x66 / 0xF2 / 0xF3 mandatory prefixes select between
 //! lane widths (PS / PD / SS / SD); we track those in
-//! [`super::isa_int::Cpu`]'s prefix state ([`Cpu::op_size_16`]
-//! for `0x66`, [`Cpu::rep_prefix`] for `0xF2` / `0xF3`).
+//! [`super::isa_int::Cpu`]'s prefix state (`Cpu::op_size_16`
+//! for `0x66`, `Cpu::rep_prefix` for `0xF2` / `0xF3`).
 //!
 //! New opcodes are added trace-driven: when a real codec
 //! traps with `UndefinedOpcode { opcode: 0xF?? }`, look up the

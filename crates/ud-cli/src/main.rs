@@ -3,6 +3,10 @@
 // Allow the cast at module level rather than peppering 14 inline
 // attrs across the VfW handlers.
 #![allow(clippy::cast_possible_wrap)]
+// Guest memory is a 32-bit address space, so `usize`/`u64` offsets
+// and lengths are cast down to `u32` throughout by design; the
+// truncation is intentional, not a latent bug.
+#![allow(clippy::cast_possible_truncation)]
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1141,8 +1145,8 @@ const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
 
 /// Scratch address inside the heap arena, chosen so it's above
 /// any reasonable codec allocation made during DllMain. The
-/// heap allocator grows up from `HEAP_ARENA_START` (0x60000000);
-/// the slot sits just below `HEAP_ARENA_END` (0x66000000) giving
+/// heap allocator grows up from `HEAP_ARENA_START` (0x6000_0000);
+/// the slot sits just below `HEAP_ARENA_END` (0x6600_0000) giving
 /// the codec ~95 MiB before the scratch range collides.
 const QTCODEC_SCRATCH: u32 = 0x65FE_0000;
 
@@ -1287,7 +1291,7 @@ fn fourcc_be(s: &str) -> u32 {
     for (i, c) in s.bytes().take(4).enumerate() {
         b[i] = c;
     }
-    // OSType is Big-Endian — 'imdc' → 0x696d6463
+    // OSType is Big-Endian — 'imdc' → 0x696d_6463
     u32::from_be_bytes(b)
 }
 
@@ -1671,31 +1675,31 @@ fn qtcodec_list(
     // Diagnostic: read qts internal CM state to see what the dispatch
     // table + global state look like at runtime.
     let probe_addrs = &[
-        (0x67356240u32, "dispatch_table[cat 0..3] (32 bytes)"),
-        (0x67386860u32, "CM global state struct (32 bytes)"),
-        (0x6734a4ecu32, "[CM global ptr]"),
-        (0x6734a4e0u32, "[QT dispatcher ptr]"),
-        (0x668845b0u32, "theQuickTimeDispatcher prologue (32 bytes)"),
-        (0x67356248u32, "cat[1] entry (8 bytes raw)"),
-        (0x1004dcd0u32, "qtmlclient init flag (4 bytes)"),
+        (0x6735_6240u32, "dispatch_table[cat 0..3] (32 bytes)"),
+        (0x6738_6860u32, "CM global state struct (32 bytes)"),
+        (0x6734_a4ecu32, "[CM global ptr]"),
+        (0x6734_a4e0u32, "[QT dispatcher ptr]"),
+        (0x6688_45b0u32, "theQuickTimeDispatcher prologue (32 bytes)"),
+        (0x6735_6248u32, "cat[1] entry (8 bytes raw)"),
+        (0x1004_dcd0u32, "qtmlclient init flag (4 bytes)"),
         (
-            0x1004dcdcu32,
+            0x1004_dcdcu32,
             "qtmlclient->theQuickTimeDispatcher (4 bytes)",
         ),
-        (0x10024220u32, "qtmlclient!RegisterComponent (16 bytes)"),
-        (0x66884890u32, "cat[1].subtable stub (16 bytes)"),
-        (0x67347000u32, "qts CRT-init flag (4 bytes)"),
-        (0x67347004u32, "qts TLS slot index (4 bytes)"),
-        (0x673851e8u32, "qts thread-data lock (4 bytes)"),
-        (0x673851ecu32, "qts thread-data list head (4 bytes)"),
+        (0x1002_4220u32, "qtmlclient!RegisterComponent (16 bytes)"),
+        (0x6688_4890u32, "cat[1].subtable stub (16 bytes)"),
+        (0x6734_7000u32, "qts CRT-init flag (4 bytes)"),
+        (0x6734_7004u32, "qts TLS slot index (4 bytes)"),
+        (0x6738_51e8u32, "qts thread-data lock (4 bytes)"),
+        (0x6738_51ecu32, "qts thread-data list head (4 bytes)"),
         (0x7FFD_DFF0u32, "page below TEB (32 bytes)"),
         (0x7FFD_E000u32, "TEB start (32 bytes)"),
         (
-            0x400380a0u32,
+            0x4003_80a0u32,
             "libdispatch IAT slot range (32 bytes incl _initterm)",
         ),
         (
-            0x400380e0u32,
+            0x4003_80e0u32,
             "libdispatch IAT slot range (32 bytes incl pthread_setspecific @ +0x10)",
         ),
     ];
@@ -1703,13 +1707,12 @@ fn qtcodec_list(
     for (a, label) in probe_addrs {
         let mut bytes = [0u8; 32];
         let mut ok = true;
-        for i in 0..32 {
-            match sandbox.mmu.load8(a.wrapping_add(i as u32)) {
-                Ok(b) => bytes[i] = b,
-                Err(_) => {
-                    ok = false;
-                    break;
-                }
+        for (i, slot) in bytes.iter_mut().enumerate() {
+            if let Ok(b) = sandbox.mmu.load8(a.wrapping_add(i as u32)) {
+                *slot = b;
+            } else {
+                ok = false;
+                break;
             }
         }
         if ok {
@@ -2336,7 +2339,7 @@ fn solana_cmd(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn analyze(
     input: &Path,
     max_instructions: u64,
@@ -3341,6 +3344,11 @@ fn host_term_size() -> (u16, u16) {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)]
 fn monitor_install_elf(
     input: &Path,
     bytes: &[u8],
@@ -3374,9 +3382,7 @@ fn monitor_install_elf(
 
     // i386, x86-64 and aarch64 static ELFs have executors.
     if !ud_emulator::linux::loader::is_runnable(bytes) {
-        let machine = ud_format::elf::Elf64File::parse(bytes)
-            .map(|e| e.ehdr.e_machine)
-            .unwrap_or(0);
+        let machine = ud_format::elf::Elf64File::parse(bytes).map_or(0, |e| e.ehdr.e_machine);
         anyhow::bail!(
             "ELF executor for e_machine={machine} is not implemented yet \
              (i386 / x86-64 / aarch64 run); {} cannot be executed",
@@ -3384,9 +3390,7 @@ fn monitor_install_elf(
         );
     }
 
-    let entry = ud_format::elf::Elf64File::parse(bytes)
-        .map(|e| e.ehdr.e_entry as u32)
-        .unwrap_or(0);
+    let entry = ud_format::elf::Elf64File::parse(bytes).map_or(0, |e| e.ehdr.e_entry as u32);
     #[cfg(feature = "kvm")]
     let machine = ud_format::elf::Elf64File::parse(bytes)
         .map(|e| e.ehdr.e_machine)
@@ -3570,7 +3574,7 @@ fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
                 hwnd, class, title, ..
             } => println!("    CreateWindow hwnd={hwnd:#06x} [{class}] {title:?}"),
             GuiEvent::ShowWindow { hwnd, cmd } => {
-                println!("    ShowWindow hwnd={hwnd:#06x} cmd={cmd}")
+                println!("    ShowWindow hwnd={hwnd:#06x} cmd={cmd}");
             }
             GuiEvent::MessageBox {
                 caption,
@@ -3586,7 +3590,7 @@ fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
             }
             GuiEvent::DialogEnd { result } => println!("    DialogEnd -> {result}"),
             GuiEvent::SetWindowText { hwnd, text } => {
-                println!("    SetWindowText hwnd={hwnd:#06x} {text:?}")
+                println!("    SetWindowText hwnd={hwnd:#06x} {text:?}");
             }
         }
     }
@@ -3602,7 +3606,11 @@ struct FsOpts {
     rootfs: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)]
 fn monitor_install(
     input: &Path,
     max_instructions: u64,
@@ -4149,9 +4157,7 @@ struct MapBlobSpec {
 
 /// Parse `VA=PATH` into a [`MapBlobSpec`].
 fn parse_map_blob_spec(s: &str) -> anyhow::Result<MapBlobSpec> {
-    let (va, path) = s
-        .split_once('=')
-        .with_context(|| "expected VA=PATH")?;
+    let (va, path) = s.split_once('=').with_context(|| "expected VA=PATH")?;
     Ok(MapBlobSpec {
         va: parse_u32_arg(va)?,
         file: PathBuf::from(path),
@@ -4195,9 +4201,7 @@ fn apply_map_blob(sandbox: &mut ud_emulator::Sandbox, spec: &MapBlobSpec) -> any
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.split_once('*') {
         Some((pre, post)) => {
-            name.len() >= pre.len() + post.len()
-                && name.starts_with(pre)
-                && name.ends_with(post)
+            name.len() >= pre.len() + post.len() && name.starts_with(pre) && name.ends_with(post)
         }
         None => pattern == name,
     }
@@ -4226,7 +4230,10 @@ fn drive_exports(
             }
         }
         if !matched {
-            eprintln!("warning: --call-export {pat:?} matched no export in {}", image.name);
+            eprintln!(
+                "warning: --call-export {pat:?} matched no export in {}",
+                image.name
+            );
         }
     }
     names
@@ -4258,30 +4265,31 @@ fn capture_dump(sandbox: &ud_emulator::Sandbox, spec: &DumpSpec) -> anyhow::Resu
         .collect();
     let mapped_bytes = bytes.iter().filter(|b| b.is_some()).count();
 
-    let (file, hex) = match &spec.file {
-        Some(path) => {
-            let raw: Vec<u8> = bytes.iter().map(|b| b.unwrap_or(0)).collect();
-            std::fs::write(path, &raw)
-                .with_context(|| format!("write memory dump to {}", path.display()))?;
-            eprintln!(
-                "dumped {} bytes ({} mapped) of guest memory at {:#010x} to {}",
-                spec.len,
-                mapped_bytes,
-                spec.addr,
-                path.display()
-            );
-            (Some(path.display().to_string()), None)
-        }
-        None => {
-            let mut h = String::with_capacity(spec.len * 2);
-            for b in &bytes {
-                match b {
-                    Some(v) => h.push_str(&format!("{v:02x}")),
-                    None => h.push_str(".."),
+    let (file, hex) = if let Some(path) = &spec.file {
+        let raw: Vec<u8> = bytes.iter().map(|b| b.unwrap_or(0)).collect();
+        std::fs::write(path, &raw)
+            .with_context(|| format!("write memory dump to {}", path.display()))?;
+        eprintln!(
+            "dumped {} bytes ({} mapped) of guest memory at {:#010x} to {}",
+            spec.len,
+            mapped_bytes,
+            spec.addr,
+            path.display()
+        );
+        (Some(path.display().to_string()), None)
+    } else {
+        let mut h = String::with_capacity(spec.len * 2);
+        for b in &bytes {
+            match b {
+                Some(v) => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    h.push(HEX[(v >> 4) as usize] as char);
+                    h.push(HEX[(v & 0xf) as usize] as char);
                 }
+                None => h.push_str(".."),
             }
-            (None, Some(h))
         }
+        (None, Some(h))
     };
 
     Ok(MemoryDump {
@@ -4403,6 +4411,7 @@ fn scan_ascii_strings(buf: &[u8], out: &mut Vec<String>) {
 }
 
 impl AnalyzeReport {
+    #[allow(clippy::too_many_lines)]
     fn write_text(&self, input: &Path) {
         println!(
             "loaded: {} (image_base 0x{:x}, entry 0x{:x})",
@@ -4539,7 +4548,11 @@ impl AnalyzeReport {
 /// and the report's compact hex string (two chars per byte, `..`
 /// marking an unmapped byte).
 fn print_hexdump(base: u32, hex: &str) {
-    let cells: Vec<&str> = hex.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap_or("..")).collect();
+    let cells: Vec<&str> = hex
+        .as_bytes()
+        .chunks(2)
+        .map(|c| std::str::from_utf8(c).unwrap_or(".."))
+        .collect();
     for (row, chunk) in cells.chunks(16).enumerate() {
         let addr = base.wrapping_add((row * 16) as u32);
         let mut hexpart = String::new();

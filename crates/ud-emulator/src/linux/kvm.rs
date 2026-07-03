@@ -1111,8 +1111,18 @@ fn schedule(
                         fs_dirty: false,
                     };
                     let yielded = service_syscall(
-                        vm, vcpu, kernel, vfs, abi, &mut procs, &mut order, &mut next_pid,
-                        &mut next_slot, &mut free_slots, cur, &mut kcpu,
+                        vm,
+                        vcpu,
+                        kernel,
+                        vfs,
+                        abi,
+                        &mut procs,
+                        &mut order,
+                        &mut next_pid,
+                        &mut next_slot,
+                        &mut free_slots,
+                        cur,
+                        &mut kcpu,
                     )?;
                     match yielded {
                         Yield::Continue => {
@@ -1121,9 +1131,7 @@ fn schedule(
                             if let Some(sig) = kernel.take_pending_signal() {
                                 let win = &mut procs.get_mut(&cur).unwrap().win;
                                 if let Some(status) = deliver_signal(vcpu, win, kernel, sig)? {
-                                    exit_proc(
-                                        &mut procs, vm, &mut free_slots, cur, status,
-                                    );
+                                    exit_proc(&mut procs, vm, &mut free_slots, cur, status);
                                     loaded = None;
                                     break 'run;
                                 }
@@ -1264,14 +1272,18 @@ fn service_syscall(
     let r = kcpu.regs;
     match abi.map_syscall(abi.syscall_nr(kcpu)) {
         Some(Sysno::Fork | Sysno::Vfork) => {
-            do_fork(vm, vcpu, kernel, procs, order, next_pid, next_slot, free_slots, cur, &r)?;
+            do_fork(
+                vm, vcpu, kernel, procs, order, next_pid, next_slot, free_slots, cur, &r,
+            )?;
             Ok(Yield::Continue)
         }
         // `clone` without CLONE_VM is a `fork`; with it (a thread) stays ENOSYS.
         Some(Sysno::Clone) => {
             let flags = abi.syscall_args(kcpu)[0];
             if flags & 0x100 == 0 {
-                do_fork(vm, vcpu, kernel, procs, order, next_pid, next_slot, free_slots, cur, &r)?;
+                do_fork(
+                    vm, vcpu, kernel, procs, order, next_pid, next_slot, free_slots, cur, &r,
+                )?;
             } else {
                 kcpu.regs.rax = (-38i64) as u64; // ENOSYS
                 vcpu.set_regs(&kcpu.regs)
@@ -1290,7 +1302,16 @@ fn service_syscall(
                 (path, argv, envp)
             };
             let p = procs.get_mut(&cur).unwrap();
-            if exec_in_place(vcpu, &mut p.win, kernel, vfs, &mut p.fs_base, &path, &argv, &envp) {
+            if exec_in_place(
+                vcpu,
+                &mut p.win,
+                kernel,
+                vfs,
+                &mut p.fs_base,
+                &path,
+                &argv,
+                &envp,
+            ) {
                 p.resident.clear();
             } else {
                 kcpu.regs.rax = (-2i64) as u64; // ENOENT

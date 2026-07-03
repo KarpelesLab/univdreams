@@ -433,7 +433,7 @@ pub struct ThreadState {
     /// Active wait, if `status == Waiting`. Cleared on wake.
     pub wait: Option<crate::sched::WaitCondition>,
     /// Per-thread TIB (Thread Information Block) base — guest
-    /// VA the thread's CPU references via FS:[0]. `0` for the
+    /// VA the thread's CPU references via `FS:[0]`. `0` for the
     /// bootstrap thread (which uses the runtime's shared
     /// `TEB_BASE`); `CreateThread` carves a fresh page out of
     /// the per-process TIB pool for each new thread.
@@ -509,7 +509,7 @@ pub struct HostState {
     pub next_pid: u32,
     /// Image base for the next child PE loaded via
     /// `CreateProcessA`. `0` until a child-image arena is
-    /// configured (via [`Self::with_child_image_arena`]); the
+    /// configured (via `Self::with_child_image_arena`); the
     /// runtime walks the cursor forward by [`CHILD_IMAGE_STRIDE`]
     /// per spawn.
     pub next_child_image_base: u32,
@@ -535,7 +535,7 @@ pub struct HostState {
     pub next_tid: u32,
     /// Last error code (`SetLastError` / `GetLastError`). Phase
     /// 6 will mirror this through the per-thread TIB at
-    /// FS:[0x34] so guest code reading it directly sees the
+    /// `FS:[0x34]` so guest code reading it directly sees the
     /// per-thread value. For now (single thread) the field on
     /// HostState is the source of truth.
     pub last_error: u32,

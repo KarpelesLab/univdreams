@@ -175,7 +175,7 @@
 //! `Sandbox::set_exec_trace(true)` — every executed
 //! instruction (`kind=exec`). Output is JSONL on a sink
 //! configured via `OXIDEAV_VFW_TRACE_FILE=<path|2>` or
-//! [`Sandbox::set_trace_sink`]. With the feature off, every
+//! `Sandbox::set_trace_sink`. With the feature off, every
 //! probe compiles away; release builds are bit-identical to
 //! the round-17 baseline. Companion CLI is
 //! `oxideav-tracevfw`.

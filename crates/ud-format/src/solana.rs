@@ -32,9 +32,9 @@
 //! This module is the single source of truth for those
 //! byte-level decisions. Two callers consume it:
 //!
-//! * [`ud_cli::solana`] — adds the network layer (JSON-RPC
+//! * `ud_cli::solana` — adds the network layer (JSON-RPC
 //!   over `ureq` + base64 + on-disk cache) on top.
-//! * [`ud_wasm`] — exposes the strippers as wasm-bindgen
+//! * `ud_wasm` — exposes the strippers as wasm-bindgen
 //!   functions so the browser playground can do the network
 //!   piece in JS and call into here for byte parsing.
 

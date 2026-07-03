@@ -265,7 +265,7 @@ fn assemble_call_local(operands: &[&str]) -> Result<Vec<u8>, AssembleError> {
     Ok(encode_slot(0x8d, 0, 0, 0, imm))
 }
 
-/// Like [`parse_int`] but accepts a leading `-` so callers
+/// Like `parse_int` but accepts a leading `-` so callers
 /// can pass signed slot counts (used by the desymbolised
 /// `call_internal` form, whose imm may be negative when
 /// calling a function earlier in the section).

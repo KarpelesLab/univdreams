@@ -5,8 +5,8 @@
 //! pair of dst/src nibbles, a signed `le16` offset, and a
 //! signed `le32` immediate. One special instruction — `lddw`
 //! (load 64-bit immediate, opcode 0x18) — takes two
-//! consecutive slots: the first carries bits [31:0] in `imm`,
-//! the second has opcode 0 and bits [63:32] in its `imm`.
+//! consecutive slots: the first carries bits `[31:0]` in `imm`,
+//! the second has opcode 0 and bits `[63:32]` in its `imm`.
 //!
 //! Solana SBF (classic / sBPFv1) and Agave sBPFv2 reuse the
 //! same encoding with a handful of extra opcodes:

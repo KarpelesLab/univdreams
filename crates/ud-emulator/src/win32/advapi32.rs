@@ -1,6 +1,6 @@
 //! `advapi32.dll` registry stubs.
 //!
-//! Now backed by the attached [`VirtualRegistry`]: open / query
+//! Now backed by the attached `VirtualRegistry`: open / query
 //! / set route through it so MSI-walker writes and other
 //! pre-staged keys are visible to guest lookups. Without the
 //! registry attached (or for unknown keys), keep the

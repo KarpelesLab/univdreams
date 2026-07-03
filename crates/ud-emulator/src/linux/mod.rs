@@ -5,7 +5,7 @@
 //!
 //! Split into an arch-agnostic **engine** ([`LinuxKernel`], here) and thin
 //! per-architecture **adapters** ([`abi`]). The engine speaks a canonical
-//! [`Sysno`](abi::Sysno) and six `u64` args; the adapter knows the arch's
+//! [`Sysno`] and six `u64` args; the adapter knows the arch's
 //! register layout and number table. Only the i386 adapter is wired to a
 //! working CPU today (the interpreter is 32-bit); x86-64 / aarch64 land as
 //! additional adapters once their CPU back-ends exist.

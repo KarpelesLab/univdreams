@@ -48,3 +48,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    # Mirror what docs.rs builds: public API only (no private items),
+    # with broken intra-doc links promoted to hard errors so the
+    # published docs never ship a dangling `[link]`.
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps

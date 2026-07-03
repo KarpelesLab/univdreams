@@ -1,6 +1,6 @@
 //! AVX (VEX-encoded) instruction executor.
 //!
-//! Routed from [`super::isa_int::Cpu::dispatch`] when a `0xC4`
+//! Routed from `super::isa_int::Cpu::dispatch` when a `0xC4`
 //! or `0xC5` byte appears with the high bit of the following
 //! byte set (the VEX-vs-LES/LDS discriminator in 32-bit code).
 //!
