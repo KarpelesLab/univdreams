@@ -122,8 +122,10 @@ pub struct LinuxKernel {
     /// Process file-mode creation mask (`umask`). Cosmetic — we don't enforce
     /// permissions — but tracked so `umask` returns the previous value.
     umask: u32,
-    /// In-memory pipe buffers, referenced by [`Fd::PipeRead`] / [`Fd::PipeWrite`].
-    pipes: Vec<std::collections::VecDeque<u8>>,
+    /// In-memory pipes, referenced by [`Fd::PipeRead`] / [`Fd::PipeWrite`]. Each
+    /// tracks open read/write ends (across all processes) so a read on an empty
+    /// pipe can block (writers still open) vs. return EOF (all writers closed).
+    pipes: Vec<Pipe>,
     /// Host-proxied sockets, referenced by [`Fd::Socket`]. Only usable when
     /// `net_enabled` (the CLI's opt-in `--net`).
     sockets: Vec<SocketState>,
@@ -162,6 +164,45 @@ pub struct LinuxKernel {
     /// directly, and an **async** terminal signal (the guest isn't in a `read`)
     /// arrives via `input.pending`. Absent ⇒ the synchronous fallback path.
     pub input: Option<std::sync::Arc<InteractiveInput>>,
+    /// Set true while running under the KVM **scheduler** (multiple concurrent
+    /// processes). Gates cooperative yielding: a blocking syscall parks the
+    /// process instead of host-blocking the single vCPU thread.
+    pub scheduler: bool,
+    /// The current process's pid / parent pid, set by the scheduler on each
+    /// context switch so `getpid`/`getppid`/`gettid` report real values.
+    /// Default `(1, 0)` for the single-process / non-scheduler paths.
+    pub pid: i32,
+    pub ppid: i32,
+    /// A blocking syscall's request to the scheduler to park the current
+    /// process. The scheduler consumes it after `dispatch`, rewinds the syscall,
+    /// and reschedules; the syscall re-runs (and succeeds) when the process is
+    /// woken. Only meaningful when `scheduler` is set.
+    pub block_request: Option<BlockReason>,
+    /// In-progress cooked-mode input line, kept across a stdin park so a
+    /// re-run `read` resumes assembly instead of re-echoing/re-consuming.
+    line_accum: Vec<u8>,
+}
+
+/// Why the current process must park (set by a blocking syscall, consumed by the
+/// scheduler). Carries enough to know when to wake it.
+#[derive(Debug, Clone)]
+pub enum BlockReason {
+    /// Interactive stdin `read` with no complete input available yet.
+    Stdin,
+    /// `nanosleep`/`clock_nanosleep` until this deadline.
+    Timer(std::time::Instant),
+    /// `read` on an empty pipe whose write end is still open (woken when a
+    /// writer writes, or the last writer closes → EOF). Carries the pipe index.
+    Pipe(usize),
+}
+
+/// One in-memory pipe: a byte buffer plus counts of open read/write ends across
+/// all processes (so an empty read blocks while writers remain, else EOFs).
+#[derive(Debug, Default)]
+struct Pipe {
+    buf: std::collections::VecDeque<u8>,
+    readers: i32,
+    writers: i32,
 }
 
 /// Shared host-stdin channel for interactive mode. A background reader thread
@@ -266,6 +307,39 @@ impl InteractiveInput {
     fn try_byte(&self) -> Option<u8> {
         self.state.lock().unwrap().buf.pop_front()
     }
+    /// Host stdin reached EOF with nothing left buffered.
+    fn at_eof(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.buf.is_empty() && st.closed
+    }
+    /// The scheduler can make progress on a stdin-parked process: a byte is
+    /// buffered, EOF was signalled, or a terminal signal is pending.
+    pub fn has_input(&self) -> bool {
+        if self.pending.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return true;
+        }
+        let st = self.state.lock().unwrap();
+        !st.buf.is_empty() || st.closed
+    }
+    /// Park the scheduler's idle wait until input is ready or `timeout` elapses
+    /// (`None` = until ready). Re-checks under the lock to avoid lost wakeups.
+    pub fn wait_for_input(&self, timeout: Option<std::time::Duration>) {
+        let st = self.state.lock().unwrap();
+        if self.pending.load(std::sync::atomic::Ordering::SeqCst) != 0
+            || !st.buf.is_empty()
+            || st.closed
+        {
+            return;
+        }
+        match timeout {
+            Some(d) => {
+                let (_g, _) = self.cv.wait_timeout(st, d).unwrap();
+            }
+            None => {
+                let _g = self.cv.wait(st).unwrap();
+            }
+        }
+    }
 }
 
 /// The Linux kernel `struct termios` (the 36-byte `TCGETS` layout: four 32-bit
@@ -366,6 +440,8 @@ impl LinuxKernel {
         self.fds.insert(2, Fd::Stderr);
         self.next_fd = 3;
         self.current_tid = 1;
+        self.pid = 1;
+        self.ppid = 0;
         self.cwd = "/".to_string();
         self.umask = 0o022;
         self.pipes.clear();
@@ -421,6 +497,60 @@ impl LinuxKernel {
         self.brk_mapped = brk;
         self.mmap_top = MMAP_BASE;
         self.file_maps.clear();
+    }
+
+    /// Set the running process's identity (scheduler context switch), so
+    /// `getpid`/`getppid`/`gettid` report it.
+    pub fn set_ids(&mut self, pid: i32, ppid: i32) {
+        self.pid = pid;
+        self.ppid = ppid;
+        self.current_tid = pid;
+    }
+
+    /// A `fork` child inherits a copy of every fd, so each pipe end the parent
+    /// holds gains another open reference. Call after cloning the fd table.
+    pub fn fork_dup_pipes(&mut self) {
+        let (mut rs, mut ws) = (Vec::new(), Vec::new());
+        for fd in self.fds.values() {
+            match fd {
+                Fd::PipeRead(i) => rs.push(*i),
+                Fd::PipeWrite(i) => ws.push(*i),
+                _ => {}
+            }
+        }
+        for i in rs {
+            self.pipes[i].readers += 1;
+        }
+        for i in ws {
+            self.pipes[i].writers += 1;
+        }
+    }
+
+    /// A process exit closes all its fds: drop each pipe end's open reference so
+    /// a blocked reader sees EOF once the last writer is gone.
+    pub fn exit_close_pipes(&mut self) {
+        let (mut rs, mut ws) = (Vec::new(), Vec::new());
+        for fd in self.fds.values() {
+            match fd {
+                Fd::PipeRead(i) => rs.push(*i),
+                Fd::PipeWrite(i) => ws.push(*i),
+                _ => {}
+            }
+        }
+        for i in rs {
+            self.pipes[i].readers -= 1;
+        }
+        for i in ws {
+            self.pipes[i].writers -= 1;
+        }
+    }
+
+    /// A pipe read can make progress: data is buffered, or all writers have
+    /// closed (EOF). Used by the scheduler to wake a pipe-blocked reader.
+    pub fn pipe_readable(&self, i: usize) -> bool {
+        self.pipes
+            .get(i)
+            .is_some_and(|p| !p.buf.is_empty() || p.writers <= 0)
     }
 
     /// Attach the background host-stdin reader (interactive KVM only) and seed
@@ -582,9 +712,9 @@ impl LinuxKernel {
             Sysno::Readlink => self.sys_readlinkat(AT_FDCWD, a0, a1, a2, mmu, vfs),
             Sysno::Readlinkat => self.sys_readlinkat(a0 as i32, a1, a2, a[3] as u32, mmu, vfs),
             Sysno::Uname => self.sys_uname(a0, mmu),
-            Sysno::Getpid => 1,
-            Sysno::Gettid => i64::from(self.current_tid),
-            Sysno::Getppid => 0,
+            Sysno::Getpid => i64::from(self.pid),
+            Sysno::Gettid => i64::from(self.pid),
+            Sysno::Getppid => i64::from(self.ppid),
             Sysno::Getuid | Sysno::Geteuid | Sysno::Getgid | Sysno::Getegid => 0,
             Sysno::Time => 0,
             Sysno::ClockGettime => self.sys_clock_gettime(a1, mmu),
@@ -592,7 +722,7 @@ impl LinuxKernel {
             Sysno::Futex => 0, // uncontended: report success
             Sysno::Getrandom => self.sys_getrandom(a0, a1, mmu),
             Sysno::SchedYield => 0,
-            Sysno::Nanosleep => 0, // time is frozen; sleeping is instantaneous
+            Sysno::Nanosleep => self.sys_nanosleep(a0, a2, mmu),
             Sysno::Poll => self.sys_poll(a0, a1, i64::from(a2 as i32), mmu),
             Sysno::Ppoll => {
                 let tmo = self.poll_timeout_from_timespec(a2, mmu);
@@ -722,7 +852,7 @@ impl LinuxKernel {
             }
             Some(Fd::Vfs { h, .. }) => vfs.write_handle(*h, &data).map_or(EBADF, |n| n as i64),
             Some(&Fd::PipeWrite(i)) => {
-                self.pipes[i].extend(data.iter().copied());
+                self.pipes[i].buf.extend(data.iter().copied());
                 data.len() as i64
             }
             Some(&Fd::Socket(i)) => self.socket_send(i, &data),
@@ -980,12 +1110,37 @@ impl LinuxKernel {
         }
     }
 
+    /// `nanosleep` / `clock_nanosleep`. Under the scheduler, park the process
+    /// until the deadline (so a backgrounded `sleep` waits while the shell
+    /// runs); in batch mode time is frozen and a sleep is instantaneous.
+    ///
+    /// `nanosleep(req, rem)` puts the timespec at `a0`; `clock_nanosleep(clockid,
+    /// flags, req, rem)` puts it at `a2`. Both map to this `Sysno`, so pick by
+    /// whether `a0` is a plausible userspace pointer (clockids are small ints).
+    fn sys_nanosleep(&mut self, a0: u32, a2: u32, mmu: &dyn GuestMem) -> i64 {
+        if !self.scheduler {
+            return 0;
+        }
+        let req = if a0 >= 0x1000 { a0 } else { a2 };
+        let secs = mmu.load64(req).unwrap_or(0).min(1 << 32);
+        let nanos = u32::try_from(mmu.load64(req.wrapping_add(8)).unwrap_or(0))
+            .unwrap_or(0)
+            .min(999_999_999);
+        let dur = std::time::Duration::new(secs, nanos);
+        if dur.is_zero() {
+            return 0;
+        }
+        self.block_request = Some(BlockReason::Timer(std::time::Instant::now() + dur));
+        0
+    }
+
     /// Interactive line discipline: read host stdin and turn it into bytes for
     /// the guest, honoring the guest `termios`. The host terminal is in raw mode
     /// (the CLI set it), so we do cooked-mode echo/editing here.
     ///
-    /// Returns the bytes to deliver (empty = EOF), or `None` when Ctrl-C raised a
-    /// pending SIGINT and the read should fail with `EINTR`.
+    /// Returns the bytes to deliver (empty = EOF), or `None` when the read should
+    /// not complete now: a pending SIGINT (→ `EINTR`) or, under the scheduler, a
+    /// `block_request` (→ the scheduler parks and re-runs the read).
     fn read_host_stdin(&mut self, max: usize) -> Option<Vec<u8>> {
         use std::io::{Read, Write};
         let cooked = self.termios.lflag & 0x2 != 0; // ICANON
@@ -994,11 +1149,31 @@ impl LinuxKernel {
 
         // Background-reader path: bytes arrive from the host-stdin thread, which
         // also intercepts VINTR (when ISIG) into an async SIGINT. The line
-        // discipline (echo/editing) still runs here on the guest's behalf.
+        // discipline (echo/editing) runs here on the guest's behalf. Under the
+        // scheduler we pull non-blocking and *park* the process (keeping the
+        // partial cooked line in `line_accum`) instead of blocking the vCPU.
         if let Some(input) = self.input.clone() {
             let mut out = std::io::stdout().lock();
             if !cooked {
-                // Raw: block for ≥1 byte, then drain whatever else is buffered.
+                if self.scheduler {
+                    // Raw: hand over what's buffered; park if dry, EOF if closed.
+                    let mut v = Vec::new();
+                    while v.len() < max.max(1) {
+                        match input.try_byte() {
+                            Some(b) => v.push(b),
+                            None => break,
+                        }
+                    }
+                    if !v.is_empty() {
+                        return Some(v);
+                    }
+                    if input.at_eof() {
+                        return Some(Vec::new());
+                    }
+                    self.block_request = Some(BlockReason::Stdin);
+                    return None;
+                }
+                // Non-scheduler: block for ≥1 byte, then drain the rest.
                 let first = match input.next_byte() {
                     InByte::Byte(b) => b,
                     InByte::Closed => return Some(Vec::new()),
@@ -1013,38 +1188,55 @@ impl LinuxKernel {
                 }
                 return Some(v);
             }
-            // Cooked: assemble one line with local echo + minimal editing.
-            let mut line: Vec<u8> = Vec::new();
+            // Cooked: assemble one line with local echo + minimal editing into
+            // the persistent `line_accum`, so a scheduler park/re-run resumes it.
             loop {
-                let b = match input.next_byte() {
-                    InByte::Byte(b) => b,
-                    InByte::Closed => return Some(line),
-                    InByte::Interrupted => return None,
+                let b = if self.scheduler {
+                    match input.try_byte() {
+                        Some(b) => b,
+                        None => {
+                            if input.at_eof() {
+                                // EOF (or a final partial line) → deliver it.
+                                return Some(std::mem::take(&mut self.line_accum));
+                            }
+                            self.block_request = Some(BlockReason::Stdin);
+                            return None; // park; `line_accum` is kept
+                        }
+                    }
+                } else {
+                    match input.next_byte() {
+                        InByte::Byte(b) => b,
+                        InByte::Closed => return Some(std::mem::take(&mut self.line_accum)),
+                        InByte::Interrupted => {
+                            self.line_accum.clear();
+                            return None;
+                        }
+                    }
                 };
                 match b {
-                    0x04 => return Some(line), // VEOF (Ctrl-D)
+                    0x04 => return Some(std::mem::take(&mut self.line_accum)), // VEOF
                     b'\r' | b'\n' => {
-                        line.push(b'\n');
+                        self.line_accum.push(b'\n');
                         if echo {
                             let _ = out.write_all(b"\r\n");
                             let _ = out.flush();
                         }
-                        return Some(line);
+                        return Some(std::mem::take(&mut self.line_accum));
                     }
                     0x7f | 0x08 => {
-                        if line.pop().is_some() && echo {
+                        if self.line_accum.pop().is_some() && echo {
                             let _ = out.write_all(b"\x08 \x08");
                             let _ = out.flush();
                         }
                     }
                     c => {
-                        line.push(c);
+                        self.line_accum.push(c);
                         if echo {
                             let _ = out.write_all(&[c]);
                             let _ = out.flush();
                         }
-                        if line.len() >= max {
-                            return Some(line);
+                        if self.line_accum.len() >= max {
+                            return Some(std::mem::take(&mut self.line_accum));
                         }
                     }
                 }
@@ -1126,7 +1318,10 @@ impl LinuxKernel {
                 }
                 if self.stdin_buf.is_empty() {
                     match self.read_host_stdin(len as usize) {
-                        None => return -4,                   // EINTR (a pending signal will follow)
+                        // Parked for the scheduler (it rewinds + re-runs this
+                        // read) → return a placeholder it discards; otherwise a
+                        // pending signal → EINTR.
+                        None => return if self.block_request.is_some() { 0 } else { -4 },
                         Some(d) if d.is_empty() => return 0, // EOF
                         Some(d) => self.stdin_buf.extend(d),
                     }
@@ -1147,12 +1342,21 @@ impl LinuxKernel {
                 n as i64
             }
             Some(&Fd::PipeRead(i)) => {
-                let n = (len as usize).min(self.pipes[i].len());
-                let bytes: Vec<u8> = self.pipes[i].drain(..n).collect();
+                if self.pipes[i].buf.is_empty() {
+                    // Empty pipe: EOF if all writers closed; otherwise block (the
+                    // scheduler re-runs this read when a writer writes / closes).
+                    if self.scheduler && self.pipes[i].writers > 0 {
+                        self.block_request = Some(BlockReason::Pipe(i));
+                        return 0; // placeholder; discarded by the scheduler rewind
+                    }
+                    return 0; // EOF (no writers, or non-scheduler single-process)
+                }
+                let n = (len as usize).min(self.pipes[i].buf.len());
+                let bytes: Vec<u8> = self.pipes[i].buf.drain(..n).collect();
                 if write_mem(mmu, buf, &bytes).is_none() {
                     return EFAULT;
                 }
-                n as i64 // 0 when empty (treated as EOF in this single-process model)
+                n as i64
             }
             Some(&Fd::Socket(i)) => {
                 let mut tmp = vec![0u8; len as usize];
@@ -1325,6 +1529,14 @@ impl LinuxKernel {
             Some(Fd::Socket(i)) => {
                 // Drop the host socket (close the connection).
                 self.sockets[i] = SocketState::Closed;
+                0
+            }
+            Some(Fd::PipeRead(i)) => {
+                self.pipes[i].readers -= 1;
+                0
+            }
+            Some(Fd::PipeWrite(i)) => {
+                self.pipes[i].writers -= 1;
                 0
             }
             Some(_) => 0, // closing a std stream or dir fd: accept
@@ -2027,7 +2239,11 @@ impl LinuxKernel {
     /// fd pair to `fds[0]`/`fds[1]`.
     fn sys_pipe(&mut self, fds_ptr: u32, mmu: &mut dyn GuestMem) -> i64 {
         let idx = self.pipes.len();
-        self.pipes.push(std::collections::VecDeque::new());
+        self.pipes.push(Pipe {
+            buf: std::collections::VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        });
         let rfd = self.install_fd(Fd::PipeRead(idx));
         let wfd = self.install_fd(Fd::PipeWrite(idx));
         if write_mem(mmu, fds_ptr, &(rfd as u32).to_le_bytes()).is_none()
@@ -2355,9 +2571,23 @@ impl LinuxKernel {
         0
     }
 
+    /// Adjust a pipe end's open-count when an fd referencing it is duplicated
+    /// (`+1`) or closed (`-1`). No-op for non-pipe fds.
+    fn pipe_ref(&mut self, fd: &Fd, delta: i32) {
+        match *fd {
+            Fd::PipeRead(i) => self.pipes[i].readers += delta,
+            Fd::PipeWrite(i) => self.pipes[i].writers += delta,
+            _ => {}
+        }
+    }
+
     fn sys_dup(&mut self, oldfd: i32) -> i64 {
         match self.fds.get(&oldfd).cloned() {
-            Some(v) => i64::from(self.install_fd(v)),
+            Some(v) => {
+                let fd = self.install_fd(v.clone());
+                self.pipe_ref(&v, 1);
+                i64::from(fd)
+            }
             None => EBADF,
         }
     }
@@ -2370,10 +2600,16 @@ impl LinuxKernel {
             return i64::from(newfd);
         }
         // Close whatever currently occupies newfd.
-        if let Some(Fd::Vfs { h, .. }) = self.fds.remove(&newfd) {
-            vfs.close(h);
+        match self.fds.remove(&newfd) {
+            Some(Fd::Vfs { h, .. }) => {
+                vfs.close(h);
+            }
+            Some(Fd::PipeRead(i)) => self.pipes[i].readers -= 1,
+            Some(Fd::PipeWrite(i)) => self.pipes[i].writers -= 1,
+            _ => {}
         }
-        self.fds.insert(newfd, v);
+        self.fds.insert(newfd, v.clone());
+        self.pipe_ref(&v, 1);
         if newfd >= self.next_fd {
             self.next_fd = newfd + 1;
         }

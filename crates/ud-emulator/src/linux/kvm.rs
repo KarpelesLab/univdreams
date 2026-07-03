@@ -44,7 +44,7 @@ use super::abi::{Amd64Abi, LinuxAbi, Sysno};
 use super::guest::GuestCpu;
 use super::loader;
 use super::mem::GuestMem;
-use super::{InteractiveInput, LinuxKernel};
+use super::{BlockReason, InteractiveInput, LinuxKernel};
 
 // ---- guest-physical layout (all below the 0x400000 image base) -------------
 const PML4: u64 = 0x1000;
@@ -603,183 +603,37 @@ pub fn run(
     .map_err(|e| format!("build MSRs: {e:?}"))?;
     vcpu.set_msrs(&msrs).map_err(|e| format!("set_msrs: {e}"))?;
 
-    // --- entry registers ---
-    // The SysV entry state zeroes the GP registers (notably RDX = 0, the
-    // `rtld_fini` slot glibc reads — x86 reset would otherwise leave the CPU
-    // signature in RDX, which glibc would register as a bogus atexit handler).
-    let regs = kvm_bindings::kvm_regs {
-        rip: u64::from(image.entry),
-        rsp: u64::from(image.stack_ptr),
-        rflags: 0x2,
-        ..Default::default()
-    };
-    vcpu.set_regs(&regs).map_err(|e| format!("set_regs: {e}"))?;
-
     let abi = Amd64Abi;
-    let mut fs_base: u64 = 0;
-    // Synchronous-fork bookkeeping: child PIDs, reaped-but-unwaited statuses,
-    // and a persistent snapshot of the parent's content for every guest-dirtied
-    // page (so a fork child's native writes can be rolled back).
-    let mut next_pid: i32 = 2;
-    let mut zombies: Vec<(i32, i32)> = Vec::new();
-    let mut native_pages: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     // Interactive mode: spawn the background host-stdin reader and arm the vCPU
-    // kick so an async Ctrl-C can interrupt a CPU-bound foreground command. The
+    // kick so an async terminal signal can interrupt a CPU-bound process. The
     // guard stops the thread when `run` returns.
-    let _reader = if kernel.interactive {
+    let reader = if kernel.interactive {
         install_host_handlers();
-        // SAFETY: pthread_self has no preconditions; the id identifies this vCPU
+        // SAFETY: pthread_self has no preconditions; it identifies this vCPU
         // thread for the reader's directed kick.
         let main_tid = unsafe { libc::pthread_self() } as u64;
         let input = std::sync::Arc::new(InteractiveInput::default());
         kernel.attach_input(input.clone());
         spawn_stdin_reader(input.clone(), main_tid);
-        Some(ReaderGuard(input))
+        Some(input)
     } else {
         None
     };
+    let _reader_guard = reader.clone().map(ReaderGuard);
 
-    // --- run loop: native execution until a syscall (hlt trampoline), the
-    // program exits, or the guest faults. ---
-    loop {
-        let exit = match vcpu.run() {
-            Ok(e) => e,
-            // Kicked out of KVM_RUN by the async Ctrl-C path (or any stray
-            // signal): deliver a pending signal between instructions, resume.
-            Err(e) if e.errno() == libc::EINTR => {
-                // Deliver only between *userspace* instructions. At the CPL0
-                // trampoline the pending `sysretq` must complete first, else we
-                // resume it at the wrong privilege level; leave the flag set and
-                // the post-syscall check picks it up.
-                let in_user = vcpu.get_sregs().map(|s| s.cs.dpl == 3).unwrap_or(true);
-                if in_user {
-                    if let Some(sig) = kernel.take_pending_signal() {
-                        if let Some(status) = deliver_signal(&mut vcpu, &mut mem, kernel, sig)? {
-                            return Ok(status);
-                        }
-                    }
-                }
-                continue;
-            }
-            Err(e) => return Err(format!("KVM_RUN: {e}")),
-        };
-        match exit {
-            VcpuExit::Hlt => {
-                // A `syscall` reached the trampoline; service it through the
-                // shared kernel, then `sysretq` (already at rip) resumes guest
-                // userspace right after the original `syscall`.
-                let r = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
-                let mut kcpu = KvmCpu {
-                    regs: r,
-                    fs_base,
-                    fs_dirty: false,
-                };
-                match abi.map_syscall(abi.syscall_nr(&kcpu)) {
-                    // fork/vfork: run the child to completion synchronously in
-                    // this same vCPU (it execs almost immediately), record it as
-                    // a zombie, then return its PID to the parent.
-                    Some(Sysno::Fork | Sysno::Vfork) => {
-                        let pid = next_pid;
-                        next_pid += 1;
-                        let status = run_kvm_child(
-                            &vm,
-                            &mut vcpu,
-                            &mut mem,
-                            kernel,
-                            vfs,
-                            &abi,
-                            &mut fs_base,
-                            &mut native_pages,
-                            &mut next_pid,
-                        )?;
-                        zombies.push((pid, wait_status(status)));
-                        let mut pr = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
-                        pr.rax = pid as u64;
-                        vcpu.set_regs(&pr).map_err(|e| format!("set_regs: {e}"))?;
-                    }
-                    // wait4: the child already ran, so a zombie is waiting.
-                    Some(Sysno::Wait4) => {
-                        let a = abi.syscall_args(&kcpu);
-                        let ret = if let Some((cpid, st)) = zombies.pop() {
-                            if a[1] != 0 {
-                                let _ = mem.store32(a[1] as u32, st as u32);
-                            }
-                            i64::from(cpid)
-                        } else {
-                            -10 // ECHILD
-                        };
-                        kcpu.regs.rax = ret as u64;
-                        vcpu.set_regs(&kcpu.regs)
-                            .map_err(|e| format!("set_regs: {e}"))?;
-                    }
-                    // The main process execs itself: load the new program in
-                    // place and keep running it natively on this vCPU.
-                    Some(Sysno::Execve) => {
-                        let a = abi.syscall_args(&kcpu);
-                        let path = read_cstr_kvm(&mem, a[0] as u32).unwrap_or_default();
-                        let argv = kernel.read_str_array(&mem, a[1] as u32);
-                        let envp = kernel.read_str_array(&mem, a[2] as u32);
-                        if !exec_in_place(
-                            &mut vcpu,
-                            &mut mem,
-                            kernel,
-                            vfs,
-                            &mut fs_base,
-                            &path,
-                            &argv,
-                            &envp,
-                        ) {
-                            kcpu.regs.rax = (-2i64) as u64; // ENOENT
-                            vcpu.set_regs(&kcpu.regs)
-                                .map_err(|e| format!("set_regs: {e}"))?;
-                        }
-                    }
-                    // Return from a signal handler: restore the saved context.
-                    Some(Sysno::RtSigreturn) => {
-                        handle_sigreturn(&mut vcpu, &mem, kernel)?;
-                    }
-                    _ => {
-                        kernel.dispatch(&abi, &mut kcpu, &mut mem, vfs);
-                        if let Some(code) = kernel.exit_code {
-                            return Ok(code);
-                        }
-                        vcpu.set_regs(&kcpu.regs)
-                            .map_err(|e| format!("set_regs: {e}"))?;
-                        if kcpu.fs_dirty {
-                            fs_base = kcpu.fs_base;
-                            let mut s = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
-                            s.fs.base = fs_base;
-                            vcpu.set_sregs(&s).map_err(|e| format!("set_sregs: {e}"))?;
-                        }
-                    }
-                }
-                // A Ctrl-C raised during the syscall above (a blocking read, or
-                // the async reader): deliver it. A default disposition ends the
-                // main process.
-                if let Some(sig) = kernel.take_pending_signal() {
-                    if let Some(status) = deliver_signal(&mut vcpu, &mut mem, kernel, sig)? {
-                        return Ok(status);
-                    }
-                }
-            }
-            VcpuExit::Shutdown => {
-                let at = vcpu
-                    .get_regs()
-                    .ok()
-                    .map_or(String::new(), |r| format!(" at rip={:#x}", r.rip));
-                if trace {
-                    eprintln!("kvm: guest triple-faulted{at}");
-                }
-                return Err(format!("guest triple-faulted (KVM_EXIT_SHUTDOWN){at}"));
-            }
-            VcpuExit::FailEntry(reason, cpu) => {
-                return Err(format!("KVM_EXIT_FAIL_ENTRY reason={reason:#x} cpu={cpu}"));
-            }
-            VcpuExit::InternalError => return Err("KVM_EXIT_INTERNAL_ERROR".into()),
-            other => return Err(format!("unexpected KVM exit: {other:?}")),
-        }
-    }
+    // Process 1 is the initial program: it owns the loaded window (slot 0, GPA
+    // 0). The scheduler multiplexes it and its `fork` descendants on this one
+    // vCPU, each in its own address-space window (distinct GPA + CR3).
+    kernel.scheduler = true;
+    let mut p0 = Proc::new(1, 0, 0, mem, kernel.proc_snapshot());
+    p0.regs.rip = u64::from(image.entry);
+    p0.regs.rsp = u64::from(image.stack_ptr);
+    p0.regs.rflags = 0x2;
+
+    // `sregs` already holds the CPL3 long-mode template; the scheduler only
+    // varies cr3 + fs.base per context switch.
+    schedule(&vm, &mut vcpu, kernel, vfs, &abi, sregs, p0, reader, trace)
 }
 
 /// Build a `wait4` status word from an exit code (`WIFEXITED` form).
@@ -896,10 +750,10 @@ fn handle_sigreturn(
     Ok(())
 }
 
-/// Page indices the guest has dirtied since the last call (reading clears the
-/// log). Empty on error — the snapshot just covers fewer pages.
-fn dirty_pages(vm: &kvm_ioctls::VmFd) -> Vec<u32> {
-    let Ok(bitmap) = vm.get_dirty_log(0, MEM_SIZE as usize) else {
+/// Page indices the guest has dirtied in `slot` since the last call (reading
+/// clears the log). Empty on error — the resident set just covers fewer pages.
+fn dirty_pages(vm: &kvm_ioctls::VmFd, slot: u32) -> Vec<u32> {
+    let Ok(bitmap) = vm.get_dirty_log(slot, MEM_SIZE as usize) else {
         return Vec::new();
     };
     let mut pages = Vec::new();
@@ -1001,192 +855,644 @@ fn exec_in_place(
     true
 }
 
-/// Run a `fork`/`vfork` child to completion on the **same** vCPU, then restore
-/// the parent. The child sees `rax = 0` and runs — exec'ing in place, forking
-/// its own children (recursing here) and reaping them via `wait4` — until it
-/// exits. The parent's full populated memory plus per-process kernel state are
-/// snapshotted and rolled back, so it resumes untouched. Returns the child's
-/// exit code.
-///
-/// `native_pages` accumulates every guest-dirtied page across the whole run (the
-/// KVM dirty log is cleared on read); together with `KvmMem::host_pages` it is
-/// the set of pages a snapshot must cover. `next_pid` hands out child PIDs.
+/// Maximum concurrent live processes (each owns a 4 GiB guest-physical window;
+/// `MAX_SLOTS * 4 GiB` of guest-physical address space). Slots of reaped
+/// processes are recycled, so this bounds *concurrency*, not total forks.
+const MAX_SLOTS: u32 = 16;
+
+/// Why a process is parked, and how the scheduler wakes it.
+enum Block {
+    /// Interactive stdin `read` with no complete input yet (woken by the reader).
+    Stdin,
+    /// `nanosleep` until the deadline.
+    Timer(std::time::Instant),
+    /// `wait4` with a live child that hasn't exited (woken when one does).
+    Wait4,
+    /// `read` on an empty pipe with the write end still open (woken on write /
+    /// last-writer-close). Carries the pipe index.
+    Pipe(usize),
+}
+
+enum PState {
+    Runnable,
+    Blocked(Block),
+    /// Exited; the `wait4`-encoded status awaits the parent's reap.
+    Zombie(i32),
+}
+
+/// One live guest process multiplexed onto the single vCPU. While a process is
+/// *running* its register/kernel state lives in the vCPU/`LinuxKernel`; while it
+/// is parked, the saved copy lives here.
+struct Proc {
+    pid: i32,
+    ppid: i32,
+    state: PState,
+    /// This process's address-space window (own mmap + KVM slot at `gpa`).
+    win: KvmMem,
+    slot: u32,
+    gpa: u64,
+    /// Pages this process has populated (guest-dirty accumulator ∪ host writes),
+    /// copied to a `fork` child. Reset on `execve`.
+    resident: std::collections::HashSet<u32>,
+    /// Saved vCPU GP registers (canonical CPL3 userspace state while parked).
+    regs: kvm_bindings::kvm_regs,
+    fs_base: u64,
+    /// Saved per-process kernel state (fds, brk, cwd, signal dispositions…).
+    kstate: super::ProcState,
+    /// Live child pids (for `wait4` / `ECHILD`).
+    children: Vec<i32>,
+}
+
+impl Proc {
+    fn new(pid: i32, ppid: i32, slot: u32, win: KvmMem, kstate: super::ProcState) -> Self {
+        Proc {
+            pid,
+            ppid,
+            state: PState::Runnable,
+            win,
+            slot,
+            gpa: u64::from(slot) * MEM_SIZE,
+            resident: std::collections::HashSet::new(),
+            regs: kvm_bindings::kvm_regs::default(),
+            fs_base: 0,
+            kstate,
+            children: Vec::new(),
+        }
+    }
+}
+
+/// Allocate and register a fresh window for `slot` (guest-physical base
+/// `slot*4 GiB`): a zeroed mmap with its own page tables + trampoline.
+fn new_window(vm: &kvm_ioctls::VmFd, slot: u32) -> Result<KvmMem, String> {
+    let gpa = u64::from(slot) * MEM_SIZE;
+    let mut win = KvmMem::new(MEM_SIZE as usize)?;
+    build_page_tables(&mut win, gpa);
+    win.poke_bytes(TRAMP, &[0xF4, 0x48, 0x0F, 0x07]); // hlt ; sysretq
+    let region = kvm_userspace_memory_region {
+        slot,
+        guest_phys_addr: gpa,
+        memory_size: MEM_SIZE,
+        userspace_addr: win.base as u64,
+        flags: KVM_MEM_LOG_DIRTY_PAGES,
+    };
+    // SAFETY: `win` outlives the slot (removed on reap before drop); region
+    // matches the mmap.
+    unsafe {
+        vm.set_user_memory_region(region)
+            .map_err(|e| format!("KVM_SET_USER_MEMORY_REGION(slot {slot}): {e}"))?;
+    }
+    Ok(win)
+}
+
+/// Remove a reaped process's KVM slot so its window can be dropped (munmap'd)
+/// without leaving a dangling mapping. The slot number is then free to reuse.
+fn drop_slot(vm: &kvm_ioctls::VmFd, slot: u32, gpa: u64) {
+    let region = kvm_userspace_memory_region {
+        slot,
+        guest_phys_addr: gpa,
+        memory_size: 0, // size 0 removes the slot
+        userspace_addr: 0,
+        flags: 0,
+    };
+    // SAFETY: removing our own slot; no vCPU references this GPA (CR3 isolation).
+    unsafe {
+        let _ = vm.set_user_memory_region(region);
+    }
+}
+
+/// Switch the vCPU to `p`: its CR3, fs.base and GP registers. The `sregs`
+/// template already carries the CPL3 long-mode segments, so a parked process
+/// (saved at a canonical userspace point) resumes in userspace.
+fn switch_in(
+    vcpu: &mut kvm_ioctls::VcpuFd,
+    sregs: &mut kvm_bindings::kvm_sregs,
+    p: &Proc,
+) -> Result<(), String> {
+    sregs.cr3 = p.gpa + PML4;
+    sregs.fs.base = p.fs_base;
+    vcpu.set_sregs(sregs)
+        .map_err(|e| format!("switch set_sregs: {e}"))?;
+    vcpu.set_regs(&p.regs)
+        .map_err(|e| format!("switch set_regs: {e}"))?;
+    Ok(())
+}
+
+/// Trampoline-time registers (at the `hlt`, RCX = return address, R11 = saved
+/// RFLAGS) → a canonical CPL3 userspace state that *resumes after* the syscall.
+/// Used for a `fork` child (rax already set to 0 by the caller) and for
+/// complete-then-park syscalls (`nanosleep`).
+fn resume_after(r: kvm_bindings::kvm_regs) -> kvm_bindings::kvm_regs {
+    let mut n = r;
+    n.rip = r.rcx;
+    n.rflags = r.r11;
+    n
+}
+
+/// As `resume_after`, but resumes *at* the `syscall` instruction so it re-runs
+/// (RCX points just past it; `syscall` is 2 bytes). Used for rewind-blocking
+/// syscalls (`read`, `wait4`) whose result depends on data available on re-run.
+fn resume_retry(r: kvm_bindings::kvm_regs) -> kvm_bindings::kvm_regs {
+    let mut n = r;
+    n.rip = r.rcx.wrapping_sub(2);
+    n.rflags = r.r11;
+    n
+}
+
+/// The cooperative scheduler: multiplex `procs` onto the one vCPU, switching at
+/// syscall blocking points and preemption kicks, until process 1 exits.
 #[allow(clippy::too_many_arguments)]
-fn run_kvm_child(
+fn schedule(
     vm: &kvm_ioctls::VmFd,
     vcpu: &mut kvm_ioctls::VcpuFd,
-    mem: &mut KvmMem,
     kernel: &mut LinuxKernel,
     vfs: &mut MountTable,
     abi: &Amd64Abi,
-    fs_base: &mut u64,
-    native_pages: &mut std::collections::HashSet<u32>,
-    next_pid: &mut i32,
+    mut sregs: kvm_bindings::kvm_sregs,
+    p0: Proc,
+    reader: Option<std::sync::Arc<InteractiveInput>>,
+    trace: bool,
 ) -> Result<i32, String> {
-    let proc = kernel.proc_snapshot();
-    let parent_regs = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
-    // Snapshot the parent's segment state too: the parent always forks from a
-    // syscall (the trampoline, CPL0), but a child terminated *asynchronously*
-    // (an async Ctrl-C in userspace) leaves CS at CPL3. Restoring only the GP
-    // regs would resume the parent's `sysretq` at the wrong privilege level and
-    // triple-fault — so roll the full sregs (CS/SS/fs.base) back as well.
-    let parent_sregs = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
-    let parent_fs = *fs_base;
+    use std::collections::HashMap;
+    let mut procs: HashMap<i32, Proc> = HashMap::new();
+    procs.insert(p0.pid, p0);
+    let mut next_pid = 2i32;
+    let mut next_slot = 1u32;
+    let mut free_slots: Vec<u32> = Vec::new();
+    let mut order: Vec<i32> = vec![1]; // round-robin order (stable pids)
+    let mut loaded: Option<i32> = None;
+    let mut cur = 1i32;
 
-    // Snapshot the parent's current content for every populated page (guest
-    // writes accumulated from the dirty log + host-side loader/buffer writes),
-    // so any change at any nesting depth rolls back to it. Reading the dirty log
-    // clears it, so accumulate into `native_pages` first to lose nothing.
-    for p in dirty_pages(vm) {
-        native_pages.insert(p);
-    }
-    let mut snap: std::collections::HashMap<u32, Box<[u8; 4096]>> =
-        std::collections::HashMap::with_capacity(native_pages.len());
-    for &p in native_pages.iter() {
-        snap.insert(p, mem.read_page(p));
-    }
-    let host_now: Vec<u32> = mem.host_pages.iter().copied().collect();
-    for p in host_now {
-        snap.entry(p).or_insert_with(|| mem.read_page(p));
-    }
-
-    let mut cregs = parent_regs;
-    cregs.rax = 0;
-    vcpu.set_regs(&cregs)
-        .map_err(|e| format!("set_regs: {e}"))?;
-
-    // Reaped-but-unwaited children forked *by this child* (a shell pipeline,
-    // apk's trigger script). Reaped by this level's own `wait4`.
-    let mut zombies: Vec<(i32, i32)> = Vec::new();
-    let status = loop {
-        let exit = match vcpu.run() {
-            Ok(e) => e,
-            // Async Ctrl-C kicked this child out of KVM_RUN: deliver it (a
-            // default disposition terminates the child) and resume otherwise.
-            Err(e) if e.errno() == libc::EINTR => {
-                // Userspace-only delivery (see the main loop): defer at the CPL0
-                // trampoline so the pending `sysretq` finishes first.
-                let in_user = vcpu.get_sregs().map(|s| s.cs.dpl == 3).unwrap_or(true);
-                if in_user {
-                    if let Some(sig) = kernel.take_pending_signal() {
-                        if let Some(st) = deliver_signal(vcpu, mem, kernel, sig)? {
-                            break st;
-                        }
-                    }
+    loop {
+        // --- wake blocked processes whose condition is satisfiable ---
+        let now = std::time::Instant::now();
+        let input_ready = reader.as_ref().is_some_and(|i| i.has_input());
+        for p in procs.values_mut() {
+            if let PState::Blocked(b) = &p.state {
+                let wake = match b {
+                    Block::Timer(t) => *t <= now,
+                    Block::Stdin => input_ready,
+                    Block::Wait4 => false, // woken inline when a child exits
+                    Block::Pipe(i) => kernel.pipe_readable(*i),
+                };
+                if wake {
+                    p.state = PState::Runnable;
                 }
+            }
+        }
+
+        // --- pick the next runnable process (round-robin from `cur`) ---
+        let pick = pick_runnable(&order, &procs, cur);
+        let idx = match pick {
+            Some(p) => p,
+            None => {
+                if procs.values().all(|p| matches!(p.state, PState::Zombie(_))) {
+                    return Ok(procs.get(&1).map_or(0, |p| match p.state {
+                        PState::Zombie(st) => (st >> 8) & 0xff,
+                        _ => 0,
+                    }));
+                }
+                idle_wait(&procs, reader.as_deref());
                 continue;
             }
-            Err(e) => return Err(format!("KVM_RUN(child): {e}")),
         };
-        match exit {
-            VcpuExit::Hlt => {
-                let r = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
-                let mut kcpu = KvmCpu {
-                    regs: r,
-                    fs_base: *fs_base,
-                    fs_dirty: false,
-                };
-                match abi.map_syscall(abi.syscall_nr(&kcpu)) {
-                    // Nested fork: run a grandchild recursively, then resume.
-                    Some(Sysno::Fork | Sysno::Vfork) => {
-                        let pid = *next_pid;
-                        *next_pid += 1;
-                        let st = run_kvm_child(
-                            vm,
-                            vcpu,
-                            mem,
-                            kernel,
-                            vfs,
-                            abi,
-                            fs_base,
-                            native_pages,
-                            next_pid,
-                        )?;
-                        zombies.push((pid, wait_status(st)));
-                        let mut pr = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
-                        pr.rax = pid as u64;
-                        vcpu.set_regs(&pr).map_err(|e| format!("set_regs: {e}"))?;
-                    }
-                    Some(Sysno::Wait4) => {
-                        let a = abi.syscall_args(&kcpu);
-                        let ret = if let Some((cpid, st)) = zombies.pop() {
-                            if a[1] != 0 {
-                                let _ = mem.store32(a[1] as u32, st as u32);
-                            }
-                            i64::from(cpid)
-                        } else {
-                            -10 // ECHILD
-                        };
-                        kcpu.regs.rax = ret as u64;
-                        vcpu.set_regs(&kcpu.regs)
-                            .map_err(|e| format!("set_regs: {e}"))?;
-                    }
-                    Some(Sysno::Execve) => {
-                        let a = abi.syscall_args(&kcpu);
-                        let path = read_cstr_kvm(mem, a[0] as u32).unwrap_or_default();
-                        let argv = kernel.read_str_array(mem, a[1] as u32);
-                        let envp = kernel.read_str_array(mem, a[2] as u32);
-                        // Load the new program in place and keep running it in
-                        // this child loop; a failed exec exits 127 like a shell.
-                        if !exec_in_place(vcpu, mem, kernel, vfs, fs_base, &path, &argv, &envp) {
-                            break 127;
-                        }
-                    }
-                    Some(Sysno::Exit | Sysno::ExitGroup) => {
-                        break abi.syscall_args(&kcpu)[0] as i32;
-                    }
-                    Some(Sysno::RtSigreturn) => {
-                        handle_sigreturn(vcpu, mem, kernel)?;
-                    }
-                    _ => {
-                        kernel.dispatch(abi, &mut kcpu, mem, vfs);
-                        if let Some(code) = kernel.exit_code.take() {
-                            break code;
-                        }
-                        vcpu.set_regs(&kcpu.regs)
-                            .map_err(|e| format!("set_regs: {e}"))?;
-                        if kcpu.fs_dirty {
-                            *fs_base = kcpu.fs_base;
-                            let mut s = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
-                            s.fs.base = *fs_base;
-                            vcpu.set_sregs(&s).map_err(|e| format!("set_sregs: {e}"))?;
-                        }
-                    }
-                }
-                // A Ctrl-C raised while this child was in a blocking read (or
-                // via the async reader): deliver it. A default disposition
-                // terminates the child.
-                if let Some(sig) = kernel.take_pending_signal() {
-                    if let Some(st) = deliver_signal(vcpu, mem, kernel, sig)? {
-                        break st;
-                    }
+
+        // --- context switch if needed ---
+        if loaded != Some(idx) {
+            if let Some(l) = loaded {
+                if let Some(p) = procs.get_mut(&l) {
+                    p.kstate = kernel.proc_snapshot();
                 }
             }
-            VcpuExit::Shutdown => break 139, // treat a child fault as a crash
-            other => return Err(format!("unexpected KVM exit in child: {other:?}")),
+            let ks = procs[&idx].kstate.clone();
+            kernel.proc_restore(ks);
+            kernel.set_ids(procs[&idx].pid, procs[&idx].ppid);
+            switch_in(vcpu, &mut sregs, &procs[&idx])?;
+            loaded = Some(idx);
+        }
+        cur = idx;
+
+        // --- run `cur` until it yields (blocks / exits / is preempted) ---
+        'run: loop {
+            let exit = match vcpu.run() {
+                Ok(e) => e,
+                Err(e) if e.errno() == libc::EINTR => {
+                    // Preemption / async-signal kick. Only act at CPL3 (the
+                    // trampoline must finish its sysret first).
+                    let in_user = vcpu.get_sregs().map(|s| s.cs.dpl == 3).unwrap_or(true);
+                    if !in_user {
+                        continue 'run;
+                    }
+                    // Deliver a pending (async) signal to `cur`.
+                    if let Some(sig) = kernel.take_pending_signal() {
+                        let win = &mut procs.get_mut(&cur).unwrap().win;
+                        if let Some(status) = deliver_signal(vcpu, win, kernel, sig)? {
+                            exit_proc(&mut procs, vm, &mut free_slots, cur, status);
+                            loaded = None;
+                            break 'run;
+                        }
+                    }
+                    // Yield the CPU (preemption): save `cur`'s registers and
+                    // reschedule. `loaded` stays `Some(cur)`, so if the
+                    // round-robin re-picks `cur` (nothing else runnable) the
+                    // switch is skipped; the switch path saves its kstate if a
+                    // different process is chosen.
+                    procs.get_mut(&cur).unwrap().regs =
+                        vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
+                    break 'run;
+                }
+                Err(e) => return Err(format!("KVM_RUN: {e}")),
+            };
+            match exit {
+                VcpuExit::Hlt => {
+                    let r = vcpu.get_regs().map_err(|e| format!("get_regs: {e}"))?;
+                    let mut kcpu = KvmCpu {
+                        regs: r,
+                        fs_base: procs[&cur].fs_base,
+                        fs_dirty: false,
+                    };
+                    let yielded = service_syscall(
+                        vm, vcpu, kernel, vfs, abi, &mut procs, &mut order, &mut next_pid,
+                        &mut next_slot, &mut free_slots, cur, &mut kcpu,
+                    )?;
+                    match yielded {
+                        Yield::Continue => {
+                            // Deliver a signal raised during the syscall (sync
+                            // Ctrl-C while in a blocking read, etc.).
+                            if let Some(sig) = kernel.take_pending_signal() {
+                                let win = &mut procs.get_mut(&cur).unwrap().win;
+                                if let Some(status) = deliver_signal(vcpu, win, kernel, sig)? {
+                                    exit_proc(
+                                        &mut procs, vm, &mut free_slots, cur, status,
+                                    );
+                                    loaded = None;
+                                    break 'run;
+                                }
+                            }
+                        }
+                        Yield::Park => {
+                            loaded = None;
+                            break 'run;
+                        }
+                        Yield::Exited => {
+                            loaded = None;
+                            break 'run;
+                        }
+                    }
+                }
+                VcpuExit::Shutdown => {
+                    let at = vcpu
+                        .get_regs()
+                        .ok()
+                        .map_or(String::new(), |r| format!(" at rip={:#x}", r.rip));
+                    if trace {
+                        eprintln!("kvm: guest (pid {cur}) triple-faulted{at}");
+                    }
+                    return Err(format!("guest triple-faulted (KVM_EXIT_SHUTDOWN){at}"));
+                }
+                VcpuExit::FailEntry(reason, c) => {
+                    return Err(format!("KVM_EXIT_FAIL_ENTRY reason={reason:#x} cpu={c}"));
+                }
+                VcpuExit::InternalError => return Err("KVM_EXIT_INTERNAL_ERROR".into()),
+                other => return Err(format!("unexpected KVM exit: {other:?}")),
+            }
+        }
+    }
+}
+
+/// Round-robin pick: the first `Runnable` process at or after `cur` in `order`.
+fn pick_runnable(
+    order: &[i32],
+    procs: &std::collections::HashMap<i32, Proc>,
+    cur: i32,
+) -> Option<i32> {
+    let n = order.len();
+    let start = order.iter().position(|&p| p == cur).map_or(0, |i| i + 1);
+    for k in 0..n {
+        let pid = order[(start + k) % n];
+        if let Some(p) = procs.get(&pid) {
+            if matches!(p.state, PState::Runnable) {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+/// Block the scheduler when nothing is runnable: wait for the earliest timer
+/// deadline, or for interactive input, whichever comes first.
+fn idle_wait(procs: &std::collections::HashMap<i32, Proc>, reader: Option<&InteractiveInput>) {
+    let now = std::time::Instant::now();
+    let earliest = procs
+        .values()
+        .filter_map(|p| match &p.state {
+            PState::Blocked(Block::Timer(t)) => Some(*t),
+            _ => None,
+        })
+        .min();
+    let timeout = earliest.map(|t| t.saturating_duration_since(now));
+    match reader {
+        Some(input) => input.wait_for_input(timeout),
+        None => {
+            if let Some(d) = timeout {
+                if !d.is_zero() {
+                    std::thread::sleep(d.min(std::time::Duration::from_millis(50)));
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Mark `pid` a zombie with exit `code`, free its window/slot, and wake its
+/// parent if it was waiting. Keeps the (windowless) zombie in the table until
+/// the parent reaps it via `wait4`.
+fn exit_proc(
+    procs: &mut std::collections::HashMap<i32, Proc>,
+    vm: &kvm_ioctls::VmFd,
+    free_slots: &mut Vec<u32>,
+    pid: i32,
+    code: i32,
+) {
+    let (ppid, slot, gpa) = {
+        let p = procs.get(&pid).unwrap();
+        (p.ppid, p.slot, p.gpa)
+    };
+    // Free the window now (a zombie never runs again); keep slot 0 (process 1).
+    if slot != 0 {
+        drop_slot(vm, slot, gpa);
+        free_slots.push(slot);
+    }
+    if let Some(p) = procs.get_mut(&pid) {
+        p.state = PState::Zombie(wait_status(code));
+    }
+    // Wake a parent parked in wait4.
+    if let Some(parent) = procs.get_mut(&ppid) {
+        if matches!(parent.state, PState::Blocked(Block::Wait4)) {
+            parent.state = PState::Runnable;
+        }
+    }
+}
+
+/// What `service_syscall` did with the current process.
+enum Yield {
+    /// Stay on `cur` and keep running it.
+    Continue,
+    /// `cur` parked (its saved regs/kstate are set); reschedule.
+    Park,
+    /// `cur` exited; reschedule.
+    Exited,
+}
+
+/// Service one syscall for `cur` (at the `hlt` trampoline). Returns whether the
+/// process keeps running, parked, or exited.
+#[allow(clippy::too_many_arguments)]
+fn service_syscall(
+    vm: &kvm_ioctls::VmFd,
+    vcpu: &mut kvm_ioctls::VcpuFd,
+    kernel: &mut LinuxKernel,
+    vfs: &mut MountTable,
+    abi: &Amd64Abi,
+    procs: &mut std::collections::HashMap<i32, Proc>,
+    order: &mut Vec<i32>,
+    next_pid: &mut i32,
+    next_slot: &mut u32,
+    free_slots: &mut Vec<u32>,
+    cur: i32,
+    kcpu: &mut KvmCpu,
+) -> Result<Yield, String> {
+    let r = kcpu.regs;
+    match abi.map_syscall(abi.syscall_nr(kcpu)) {
+        Some(Sysno::Fork | Sysno::Vfork) => {
+            do_fork(vm, vcpu, kernel, procs, order, next_pid, next_slot, free_slots, cur, &r)?;
+            Ok(Yield::Continue)
+        }
+        // `clone` without CLONE_VM is a `fork`; with it (a thread) stays ENOSYS.
+        Some(Sysno::Clone) => {
+            let flags = abi.syscall_args(kcpu)[0];
+            if flags & 0x100 == 0 {
+                do_fork(vm, vcpu, kernel, procs, order, next_pid, next_slot, free_slots, cur, &r)?;
+            } else {
+                kcpu.regs.rax = (-38i64) as u64; // ENOSYS
+                vcpu.set_regs(&kcpu.regs)
+                    .map_err(|e| format!("set_regs: {e}"))?;
+            }
+            Ok(Yield::Continue)
+        }
+        Some(Sysno::Wait4) => do_wait4(vcpu, kernel, abi, procs, order, cur, kcpu, &r),
+        Some(Sysno::Execve) => {
+            let a = abi.syscall_args(kcpu);
+            let (path, argv, envp) = {
+                let win = &procs[&cur].win;
+                let path = read_cstr_kvm(win, a[0] as u32).unwrap_or_default();
+                let argv = kernel.read_str_array(win, a[1] as u32);
+                let envp = kernel.read_str_array(win, a[2] as u32);
+                (path, argv, envp)
+            };
+            let p = procs.get_mut(&cur).unwrap();
+            if exec_in_place(vcpu, &mut p.win, kernel, vfs, &mut p.fs_base, &path, &argv, &envp) {
+                p.resident.clear();
+            } else {
+                kcpu.regs.rax = (-2i64) as u64; // ENOENT
+                vcpu.set_regs(&kcpu.regs)
+                    .map_err(|e| format!("set_regs: {e}"))?;
+            }
+            Ok(Yield::Continue)
+        }
+        Some(Sysno::Exit | Sysno::ExitGroup) => {
+            let code = abi.syscall_args(kcpu)[0] as i32;
+            exit_proc(procs, vm, free_slots, cur, code);
+            Ok(Yield::Exited)
+        }
+        Some(Sysno::RtSigreturn) => {
+            let win = &procs[&cur].win;
+            handle_sigreturn(vcpu, win, kernel)?;
+            Ok(Yield::Continue)
+        }
+        _ => {
+            {
+                let win = &mut procs.get_mut(&cur).unwrap().win;
+                kernel.dispatch(abi, kcpu, win, vfs);
+            }
+            // A blocking syscall asked to park (stdin read / nanosleep).
+            if let Some(reason) = kernel.block_request.take() {
+                let p = procs.get_mut(&cur).unwrap();
+                p.regs = match &reason {
+                    // Re-run the read on wake.
+                    BlockReason::Stdin | BlockReason::Pipe(_) => resume_retry(r),
+                    BlockReason::Timer(_) => {
+                        let mut nr = resume_after(r); // nanosleep completes (rax=0)
+                        nr.rax = 0;
+                        nr
+                    }
+                };
+                p.state = match reason {
+                    BlockReason::Stdin => PState::Blocked(Block::Stdin),
+                    BlockReason::Timer(t) => PState::Blocked(Block::Timer(t)),
+                    BlockReason::Pipe(i) => PState::Blocked(Block::Pipe(i)),
+                };
+                p.kstate = kernel.proc_snapshot();
+                return Ok(Yield::Park);
+            }
+            if let Some(code) = kernel.exit_code.take() {
+                exit_proc(procs, vm, free_slots, cur, code);
+                return Ok(Yield::Exited);
+            }
+            vcpu.set_regs(&kcpu.regs)
+                .map_err(|e| format!("set_regs: {e}"))?;
+            if kcpu.fs_dirty {
+                procs.get_mut(&cur).unwrap().fs_base = kcpu.fs_base;
+                // Update only fs.base on the *current* sregs — the vCPU is at the
+                // CPL0 trampoline here, so we must not clobber its CS with the
+                // CPL3 template (that would fault the pending `sysretq`).
+                let mut s = vcpu.get_sregs().map_err(|e| format!("get_sregs: {e}"))?;
+                s.fs.base = kcpu.fs_base;
+                vcpu.set_sregs(&s).map_err(|e| format!("set_sregs: {e}"))?;
+            }
+            Ok(Yield::Continue)
+        }
+    }
+}
+
+/// `fork`/`vfork`: allocate the child's window, rebuild its page tables, copy the
+/// parent's resident data pages, clone the kernel state, and add it to the table
+/// as Runnable. The parent gets the child pid; the child resumes after `fork`
+/// returning 0.
+#[allow(clippy::too_many_arguments)]
+fn do_fork(
+    vm: &kvm_ioctls::VmFd,
+    vcpu: &mut kvm_ioctls::VcpuFd,
+    kernel: &mut LinuxKernel,
+    procs: &mut std::collections::HashMap<i32, Proc>,
+    order: &mut Vec<i32>,
+    next_pid: &mut i32,
+    next_slot: &mut u32,
+    free_slots: &mut Vec<u32>,
+    cur: i32,
+    r: &kvm_bindings::kvm_regs,
+) -> Result<(), String> {
+    let slot = match free_slots.pop() {
+        Some(s) => s,
+        None if *next_slot < MAX_SLOTS => {
+            let s = *next_slot;
+            *next_slot += 1;
+            s
+        }
+        None => {
+            // Too many live processes — fail the fork with EAGAIN.
+            let mut pr = *r;
+            pr.rax = (-11i64) as u64;
+            vcpu.set_regs(&pr).map_err(|e| format!("set_regs: {e}"))?;
+            return Ok(());
         }
     };
+    let mut child_win = new_window(vm, slot)?;
+    let child_pid = *next_pid;
+    *next_pid += 1;
 
-    // Roll the parent back: rewrite every snapshotted page to its parent
-    // content. Pages the child newly populated aren't in the snapshot and are
-    // left as-is — the parent never references them, and a later map re-zeros
-    // them. Accumulate the child's writes so an ancestor's snapshot covers them.
-    for (page, orig) in &snap {
-        mem.write_page(*page, orig);
+    // Copy the parent's populated data pages (skip page tables 1..8 / null page).
+    let (child_resident, parent_fs) = {
+        let parent = procs.get_mut(&cur).unwrap();
+        for pg in dirty_pages(vm, parent.slot) {
+            parent.resident.insert(pg);
+        }
+        let mut pages: std::collections::HashSet<u32> = parent.resident.clone();
+        pages.extend(parent.win.host_pages.iter().copied());
+        pages.retain(|&p| p >= 9);
+        for &pg in &pages {
+            let data = parent.win.read_page(pg);
+            child_win.write_page(pg, &data);
+        }
+        parent.children.push(child_pid);
+        (pages, parent.fs_base)
+    };
+
+    let mut child = Proc::new(child_pid, cur, slot, child_win, kernel.proc_snapshot());
+    kernel.fork_dup_pipes(); // child inherits a copy of every pipe end
+    child.resident = child_resident;
+    child.fs_base = parent_fs;
+    let mut cr = resume_after(*r);
+    cr.rax = 0;
+    child.regs = cr;
+    procs.insert(child_pid, child);
+    order.push(child_pid);
+
+    // Parent keeps running; `fork` returns the child pid.
+    let mut pr = *r;
+    pr.rax = child_pid as u64;
+    vcpu.set_regs(&pr).map_err(|e| format!("set_regs: {e}"))?;
+    Ok(())
+}
+
+/// `wait4(pid, wstatus, options)`: reap a matching zombie child (writing its
+/// status), return `ECHILD` if there are no matching children, or park
+/// (`Block::Wait4`) until one exits (unless `WNOHANG`).
+#[allow(clippy::too_many_arguments)]
+fn do_wait4(
+    vcpu: &mut kvm_ioctls::VcpuFd,
+    kernel: &mut LinuxKernel,
+    abi: &Amd64Abi,
+    procs: &mut std::collections::HashMap<i32, Proc>,
+    order: &mut Vec<i32>,
+    cur: i32,
+    kcpu: &mut KvmCpu,
+    r: &kvm_bindings::kvm_regs,
+) -> Result<Yield, String> {
+    let a = abi.syscall_args(kcpu);
+    let target = a[0] as i64; // <=0 → any child; >0 → that pid
+    let wstatus = a[1] as u32;
+    let options = a[2] as i32;
+
+    let children = procs[&cur].children.clone();
+    let mut zombie: Option<(i32, i32)> = None;
+    let mut any_live = false;
+    for &cpid in &children {
+        if target > 0 && target as i32 != cpid {
+            continue;
+        }
+        match procs.get(&cpid).map(|p| &p.state) {
+            Some(PState::Zombie(st)) => {
+                zombie = Some((cpid, *st));
+                break;
+            }
+            Some(_) => any_live = true,
+            None => {}
+        }
     }
-    for p in dirty_pages(vm) {
-        native_pages.insert(p);
+
+    if let Some((cpid, st)) = zombie {
+        if wstatus != 0 {
+            let win = &mut procs.get_mut(&cur).unwrap().win;
+            let _ = win.store32(wstatus, st as u32);
+        }
+        procs.remove(&cpid);
+        order.retain(|&p| p != cpid);
+        let p = procs.get_mut(&cur).unwrap();
+        p.children.retain(|&c| c != cpid);
+        kcpu.regs.rax = cpid as u64;
+        vcpu.set_regs(&kcpu.regs)
+            .map_err(|e| format!("set_regs: {e}"))?;
+        return Ok(Yield::Continue);
     }
-    kernel.proc_restore(proc);
-    vcpu.set_regs(&parent_regs)
+    if any_live {
+        if options & 1 != 0 {
+            // WNOHANG: nothing to report yet.
+            kcpu.regs.rax = 0;
+            vcpu.set_regs(&kcpu.regs)
+                .map_err(|e| format!("set_regs: {e}"))?;
+            return Ok(Yield::Continue);
+        }
+        let p = procs.get_mut(&cur).unwrap();
+        p.regs = resume_retry(*r);
+        p.state = PState::Blocked(Block::Wait4);
+        p.kstate = kernel.proc_snapshot();
+        return Ok(Yield::Park);
+    }
+    // No children at all.
+    kcpu.regs.rax = (-10i64) as u64; // ECHILD
+    vcpu.set_regs(&kcpu.regs)
         .map_err(|e| format!("set_regs: {e}"))?;
-    // Restore the parent's segment/CPL state (and with it fs.base). Always done,
-    // not just on fs-base change, so an async-terminated child can't leave the
-    // parent at the wrong CPL.
-    vcpu.set_sregs(&parent_sregs)
-        .map_err(|e| format!("set_sregs: {e}"))?;
-    *fs_base = parent_fs;
-    Ok(status)
+    Ok(Yield::Continue)
 }
 
 #[cfg(test)]
