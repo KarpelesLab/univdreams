@@ -281,6 +281,17 @@ enum Command {
         /// in the hex dump and are zero-filled in file output.
         #[arg(long, value_name = "SPEC")]
         dump_mem: Vec<String>,
+
+        /// Before any `--call-export`, stage a host file's bytes
+        /// into guest memory at a chosen VA. SPEC is `VA=PATH`
+        /// (VA decimal or `0x` hex). Gap pages are mapped R+W;
+        /// the write bypasses page W-protection, so a blob can
+        /// land in read-only data too. Repeatable. Use it to
+        /// inject a valid init cookie / descriptor an export
+        /// expects, then point `--export-arg` at the VA and
+        /// `--dump-mem` at the tables it builds.
+        #[arg(long, value_name = "SPEC")]
+        map_blob: Vec<String>,
     },
 
     /// Video for Windows codec tools — drive a codec DLL
@@ -928,6 +939,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             call_export,
             export_arg,
             dump_mem,
+            map_blob,
         } => {
             if monitor {
                 monitor_install(
@@ -958,6 +970,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     &call_export,
                     &export_arg,
                     &dump_mem,
+                    &map_blob,
                 )
             }
         }
@@ -2334,10 +2347,11 @@ fn analyze(
     call_export: &[String],
     export_arg: &[String],
     dump_mem: &[String],
+    map_blob: &[String],
 ) -> anyhow::Result<()> {
-    // Parse the `--export-arg` / `--dump-mem` specs up front so a
-    // typo fails before we spin up the sandbox rather than after a
-    // multi-second run.
+    // Parse the `--export-arg` / `--dump-mem` / `--map-blob` specs
+    // up front so a typo fails before we spin up the sandbox rather
+    // than after a multi-second run.
     let export_args: Vec<u32> = export_arg
         .iter()
         .map(|s| parse_u32_arg(s).with_context(|| format!("--export-arg {s:?}")))
@@ -2345,6 +2359,10 @@ fn analyze(
     let dump_specs: Vec<DumpSpec> = dump_mem
         .iter()
         .map(|s| parse_dump_spec(s).with_context(|| format!("--dump-mem {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let blob_specs: Vec<MapBlobSpec> = map_blob
+        .iter()
+        .map(|s| parse_map_blob_spec(s).with_context(|| format!("--map-blob {s:?}")))
         .collect::<anyhow::Result<_>>()?;
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     if !ud_format::pe::is_pe(&bytes) {
@@ -2411,6 +2429,14 @@ fn analyze(
             anyhow::bail!("load {}: {}", input.display(), e);
         }
     };
+
+    // Stage any injected blobs (init cookies / descriptors) into
+    // guest memory now — after load so the image is mapped, before
+    // DllMain/exports so a descriptor an export dereferences is
+    // already present.
+    for spec in &blob_specs {
+        apply_map_blob(&mut sandbox, spec)?;
+    }
 
     let dll_main_result = sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH);
 
@@ -4112,6 +4138,55 @@ fn parse_dump_spec(s: &str) -> anyhow::Result<DumpSpec> {
         len: parse_u32_arg(len)? as usize,
         file,
     })
+}
+
+/// Parsed `--map-blob` spec: a guest VA and the host file whose
+/// bytes get staged there.
+struct MapBlobSpec {
+    va: u32,
+    file: PathBuf,
+}
+
+/// Parse `VA=PATH` into a [`MapBlobSpec`].
+fn parse_map_blob_spec(s: &str) -> anyhow::Result<MapBlobSpec> {
+    let (va, path) = s
+        .split_once('=')
+        .with_context(|| "expected VA=PATH")?;
+    Ok(MapBlobSpec {
+        va: parse_u32_arg(va)?,
+        file: PathBuf::from(path),
+    })
+}
+
+/// Stage a host file's bytes into guest memory at `spec.va`. Any
+/// page in the target span that isn't mapped yet is mapped fresh
+/// R+W; the write itself goes through `write_initializer`, which
+/// bypasses per-page W-protection so a blob can also overwrite a
+/// read-only data page without disturbing its permissions.
+fn apply_map_blob(sandbox: &mut ud_emulator::Sandbox, spec: &MapBlobSpec) -> anyhow::Result<()> {
+    let bytes =
+        std::fs::read(&spec.file).with_context(|| format!("read {}", spec.file.display()))?;
+    for i in 0..bytes.len() {
+        let addr = spec.va.wrapping_add(i as u32);
+        if !sandbox.mmu.is_mapped(addr) {
+            sandbox.mmu.map(
+                addr,
+                1,
+                ud_emulator::emulator::Perm::R | ud_emulator::emulator::Perm::W,
+            );
+        }
+    }
+    sandbox
+        .mmu
+        .write_initializer(spec.va, &bytes)
+        .map_err(|t| anyhow::anyhow!("stage blob at {:#010x}: {t:?}", spec.va))?;
+    eprintln!(
+        "staged {} bytes at guest {:#010x} from {}",
+        bytes.len(),
+        spec.va,
+        spec.file.display()
+    );
+    Ok(())
 }
 
 /// Match `name` against a pattern that may contain a single `*`
