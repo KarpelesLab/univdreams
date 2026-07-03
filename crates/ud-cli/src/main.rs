@@ -296,6 +296,15 @@ enum Command {
         /// `--dump-mem` at the tables it builds.
         #[arg(long, value_name = "SPEC")]
         map_blob: Vec<String>,
+
+        /// Size of the guest malloc / `HeapAlloc` arena in MiB.
+        /// Raise it when a decoder-init exhausts the default
+        /// (96 MiB) arena. Clamped to `[96, 256]`; the ceiling is
+        /// the const-arena region above the heap. Only raise it
+        /// for single-DLL codecs — the extra band is where
+        /// fixed-base QuickTime helper DLLs would load.
+        #[arg(long, value_name = "MiB", default_value_t = ud_emulator::Sandbox::DEFAULT_HEAP_MB)]
+        heap_mb: u32,
     },
 
     /// Video for Windows codec tools — drive a codec DLL
@@ -599,6 +608,23 @@ enum VfwCommand {
         /// Cap the run at this many guest instructions.
         #[arg(long, default_value_t = 100_000_000)]
         max_instructions: u64,
+
+        /// After `ICDecompress` returns (decoder tables built,
+        /// before teardown), dump a region of guest memory. SPEC
+        /// is `ADDR:LEN` to hex-dump to **stderr** (so it never
+        /// corrupts the decoded frame on stdout), or `ADDR:LEN=PATH`
+        /// to write the raw bytes to a host file. ADDR/LEN take
+        /// decimal or `0x` hex. Repeatable — capture the codec's
+        /// window / codebook / coupling tables after a real frame
+        /// decode. Unmapped bytes render as `··` / zero-fill.
+        #[arg(long, value_name = "SPEC")]
+        dump_mem: Vec<String>,
+
+        /// Size of the guest malloc / `HeapAlloc` arena in MiB.
+        /// Raise it when a decoder exhausts the default (96 MiB)
+        /// arena mid-decode. Clamped to `[96, 256]`.
+        #[arg(long, value_name = "MiB", default_value_t = ud_emulator::Sandbox::DEFAULT_HEAP_MB)]
+        heap_mb: u32,
     },
 
     /// Drive `ICCompress` on uncompressed pixel input: load
@@ -944,6 +970,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             export_arg,
             dump_mem,
             map_blob,
+            heap_mb,
         } => {
             if monitor {
                 monitor_install(
@@ -975,6 +1002,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     &export_arg,
                     &dump_mem,
                     &map_blob,
+                    heap_mb,
                 )
             }
         }
@@ -1016,6 +1044,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 pix_format,
                 output,
                 max_instructions,
+                dump_mem,
+                heap_mb,
             } => decode_cmd(
                 &dll,
                 &input,
@@ -1025,6 +1055,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 pix_format,
                 output.as_deref(),
                 max_instructions,
+                &dump_mem,
+                heap_mb,
             ),
             VfwCommand::Encode {
                 dll,
@@ -2082,7 +2114,16 @@ fn decode_cmd(
     pix_format: PixFormat,
     output: Option<&Path>,
     max_instructions: u64,
+    dump_mem: &[String],
+    heap_mb: u32,
 ) -> anyhow::Result<()> {
+    // Parse the `--dump-mem` specs up front so a typo fails before
+    // the multi-second decode run rather than after it.
+    let dump_specs: Vec<DumpSpec> = dump_mem
+        .iter()
+        .map(|s| parse_dump_spec(s).with_context(|| format!("--dump-mem {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+
     let dll_bytes =
         std::fs::read(dll_path).with_context(|| format!("reading {}", dll_path.display()))?;
     let dll_name = dll_path
@@ -2091,7 +2132,7 @@ fn decode_cmd(
     let frame =
         std::fs::read(input).with_context(|| format!("reading frame {}", input.display()))?;
 
-    let mut sandbox = ud_emulator::Sandbox::new();
+    let mut sandbox = ud_emulator::Sandbox::new_with_heap_mb(heap_mb);
     sandbox.host.instruction_budget = Some(max_instructions);
 
     let img = sandbox
@@ -2156,6 +2197,26 @@ fn decode_cmd(
         rc as i32,
         decoded.len()
     );
+
+    // Snapshot requested guest-memory regions while the decoder's
+    // tables are still live (before ICDecompressEnd/Close tear them
+    // down). Hex dumps go to stderr so they never mix into the
+    // decoded frame on stdout.
+    for spec in &dump_specs {
+        let dump = capture_dump(&sandbox, spec)?;
+        if dump.file.is_none() {
+            if let Some(hex) = &dump.hex {
+                eprintln!(
+                    "[decode] memory dump [0x{:x}..0x{:x}] ({} of {} bytes mapped):",
+                    dump.addr,
+                    dump.addr.wrapping_add(dump.len as u32),
+                    dump.mapped_bytes,
+                    dump.len
+                );
+                eprint!("{}", render_hexdump(dump.addr, hex));
+            }
+        }
+    }
 
     if let Some(path) = output {
         std::fs::write(path, &decoded)
@@ -2351,6 +2412,7 @@ fn analyze(
     export_arg: &[String],
     dump_mem: &[String],
     map_blob: &[String],
+    heap_mb: u32,
 ) -> anyhow::Result<()> {
     // Parse the `--export-arg` / `--dump-mem` / `--map-blob` specs
     // up front so a typo fails before we spin up the sandbox rather
@@ -2379,7 +2441,7 @@ fn analyze(
         .and_then(|s| s.to_str())
         .unwrap_or("input");
 
-    let mut sandbox = ud_emulator::Sandbox::new();
+    let mut sandbox = ud_emulator::Sandbox::new_with_heap_mb(heap_mb);
     sandbox.host.trace_stubs = true;
     sandbox.host.instruction_budget = Some(max_instructions);
     sandbox
@@ -4546,13 +4608,17 @@ impl AnalyzeReport {
 
 /// Render a canonical 16-byte-per-row hex dump from an address
 /// and the report's compact hex string (two chars per byte, `..`
-/// marking an unmapped byte).
-fn print_hexdump(base: u32, hex: &str) {
+/// marking an unmapped byte). Returns the multi-line text (each
+/// row newline-terminated) so the caller can route it to stdout
+/// or stderr as appropriate.
+fn render_hexdump(base: u32, hex: &str) -> String {
+    use std::fmt::Write as _;
     let cells: Vec<&str> = hex
         .as_bytes()
         .chunks(2)
         .map(|c| std::str::from_utf8(c).unwrap_or(".."))
         .collect();
+    let mut out = String::new();
     for (row, chunk) in cells.chunks(16).enumerate() {
         let addr = base.wrapping_add((row * 16) as u32);
         let mut hexpart = String::new();
@@ -4575,8 +4641,14 @@ fn print_hexdump(base: u32, hex: &str) {
         for _ in hexpart.len()..width {
             hexpart.push(' ');
         }
-        println!("  {addr:08x}  {hexpart} |{asciipart}|");
+        let _ = writeln!(out, "  {addr:08x}  {hexpart} |{asciipart}|");
     }
+    out
+}
+
+/// Print a hex dump to stdout (used by the `analyze` text report).
+fn print_hexdump(base: u32, hex: &str) {
+    print!("{}", render_hexdump(base, hex));
 }
 
 #[derive(serde::Serialize)]

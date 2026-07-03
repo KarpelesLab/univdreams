@@ -411,6 +411,39 @@ impl Sandbox {
     /// pre-mapped, the kernel32 stub set registered, and the
     /// CPU's `esp` pointing at a freshly-allocated stack.
     pub fn new() -> Self {
+        Self::new_with_heap_end(HEAP_ARENA_END)
+    }
+
+    /// Like [`Self::new`] but with a caller-chosen top for the
+    /// malloc / `HeapAlloc` bump arena, giving decoders more
+    /// allocation headroom. The arena spans
+    /// `[HEAP_ARENA_START, heap_end)`; `heap_end` is clamped to
+    /// `[HEAP_ARENA_END, CONST_ARENA_START)`, so it can only grow
+    /// past the 96 MiB default (never shrink) and never overruns
+    /// the const-arena / stack regions above it — the hard ceiling
+    /// is `CONST_ARENA_START` (a 256 MiB arena).
+    ///
+    /// Caveat: the band above the default end is also where the
+    /// fixed-base QuickTime helper DLLs (`.qts` / `.qtx`) load, so
+    /// only raise it for single-DLL codecs that don't pull those in.
+    /// Default heap-arena size in MiB (the [`Self::new`] value).
+    pub const DEFAULT_HEAP_MB: u32 = (HEAP_ARENA_END - HEAP_ARENA_START) >> 20;
+    /// Largest heap-arena size in MiB before the const-arena
+    /// ceiling; `new_with_heap_mb` clamps to this.
+    pub const MAX_HEAP_MB: u32 = (CONST_ARENA_START - HEAP_ARENA_START) >> 20;
+
+    /// [`Self::new_with_heap_end`] addressed in MiB: the arena is
+    /// sized to `heap_mb` mebibytes, clamped to
+    /// `[DEFAULT_HEAP_MB, MAX_HEAP_MB]`.
+    #[must_use]
+    pub fn new_with_heap_mb(heap_mb: u32) -> Self {
+        let end = HEAP_ARENA_START.saturating_add(heap_mb.saturating_mul(1 << 20));
+        Self::new_with_heap_end(end)
+    }
+
+    #[must_use]
+    pub fn new_with_heap_end(heap_end: u32) -> Self {
+        let heap_end = heap_end.clamp(HEAP_ARENA_END, CONST_ARENA_START);
         let mut mmu = Mmu::new();
         // Heap arena (R+W+X). Old codecs (e.g. Cinepak) ship
         // architecture-specific inner-loop assembly that they
@@ -422,7 +455,7 @@ impl Sandbox {
         // perm rules; only the X bit is broader.
         mmu.map(
             HEAP_ARENA_START,
-            HEAP_ARENA_END - HEAP_ARENA_START,
+            heap_end - HEAP_ARENA_START,
             Perm::R | Perm::W | Perm::X,
         );
         // Const-arena for canned strings (R+W mapped; the caller
@@ -507,7 +540,7 @@ impl Sandbox {
                 .expect("seed data import");
         }
 
-        let mut host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
+        let mut host = HostState::new(HEAP_ARENA_START, heap_end)
             .with_const_arena(CONST_ARENA_START, CONST_ARENA_END)
             .with_thread_stack_pool(THREAD_STACK_POOL_BOTTOM, THREAD_STACK_POOL_TOP)
             .with_tib_pool(TIB_POOL_BOTTOM, TIB_POOL_TOP)
