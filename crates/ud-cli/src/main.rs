@@ -252,6 +252,35 @@ enum Command {
         /// loads. Implies `--fail-soft`.
         #[arg(long)]
         vfs_deps: bool,
+
+        /// After `DllMain` returns, call every exported symbol
+        /// whose name matches this pattern (repeatable). A single
+        /// `*` acts as a wildcard, so `--call-export '*InitDecoder'`
+        /// drives the codec's decoder-init entry point that CRT
+        /// init alone never reaches. Each match is invoked stdcall
+        /// with the `--export-arg` values (none by default); its
+        /// return value and any trap are added to the report, and
+        /// the Win32-call / coverage totals include the calls it
+        /// makes. Non-matching patterns emit a warning.
+        #[arg(long, value_name = "PATTERN")]
+        call_export: Vec<String>,
+
+        /// 32-bit argument pushed (in order, left to right) to
+        /// each `--call-export` target. Repeatable; accepts
+        /// decimal or `0x`-prefixed hex. Applied uniformly to
+        /// every called export.
+        #[arg(long, value_name = "N")]
+        export_arg: Vec<String>,
+
+        /// After the run (including any `--call-export`), dump a
+        /// region of guest memory. SPEC is `ADDR:LEN` to hex-dump
+        /// to stdout, or `ADDR:LEN=PATH` to write the raw bytes to
+        /// a host file. ADDR/LEN take decimal or `0x` hex.
+        /// Repeatable — use it to capture the tables / buffers a
+        /// decoder-init populated. Unmapped bytes render as `··`
+        /// in the hex dump and are zero-filled in file output.
+        #[arg(long, value_name = "SPEC")]
+        dump_mem: Vec<String>,
     },
 
     /// Video for Windows codec tools — drive a codec DLL
@@ -896,6 +925,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             fail_soft,
             stage_vfs,
             vfs_deps,
+            call_export,
+            export_arg,
+            dump_mem,
         } => {
             if monitor {
                 monitor_install(
@@ -923,6 +955,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     fail_soft || vfs_deps,
                     &stage_vfs,
                     vfs_deps,
+                    &call_export,
+                    &export_arg,
+                    &dump_mem,
                 )
             }
         }
@@ -2296,7 +2331,21 @@ fn analyze(
     fail_soft: bool,
     stage_vfs: &[PathBuf],
     vfs_deps: bool,
+    call_export: &[String],
+    export_arg: &[String],
+    dump_mem: &[String],
 ) -> anyhow::Result<()> {
+    // Parse the `--export-arg` / `--dump-mem` specs up front so a
+    // typo fails before we spin up the sandbox rather than after a
+    // multi-second run.
+    let export_args: Vec<u32> = export_arg
+        .iter()
+        .map(|s| parse_u32_arg(s).with_context(|| format!("--export-arg {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let dump_specs: Vec<DumpSpec> = dump_mem
+        .iter()
+        .map(|s| parse_dump_spec(s).with_context(|| format!("--dump-mem {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     if !ud_format::pe::is_pe(&bytes) {
         anyhow::bail!(
@@ -2345,12 +2394,14 @@ fn analyze(
                     dll_main: DllMainOutcome::LoadFailed {
                         message: e.to_string(),
                     },
+                    export_calls: Vec::new(),
                     win32_calls: Vec::new(),
                     win32_calls_by_function: Vec::new(),
                     coverage: CoverageSummary::default(),
                     indicators,
                     instructions_executed: 0,
                     instruction_budget: max_instructions,
+                    memory_dumps: Vec::new(),
                     debug_log: std::mem::take(&mut sandbox.host.debug_log),
                 };
                 let s = serde_json::to_string_pretty(&report)?;
@@ -2362,6 +2413,22 @@ fn analyze(
     };
 
     let dll_main_result = sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH);
+
+    // With CRT init done, drive the requested codec exports
+    // (e.g. `*InitDecoder`). These run in the same guest state
+    // DllMain left behind, so the Win32-call and coverage totals
+    // taken below fold in whatever the exports touched — which is
+    // the whole point: DllMain alone never reaches the decoder.
+    let export_calls = drive_exports(&mut sandbox, &image, call_export, &export_args);
+
+    // Snapshot the requested memory regions before we tear the
+    // sandbox down. Files are written here (side effect); the
+    // returned records carry the hex preview for the report.
+    let memory_dumps = dump_specs
+        .iter()
+        .map(|spec| capture_dump(&sandbox, spec))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
     let stub_calls = std::mem::take(&mut sandbox.host.stub_calls);
     let _: Vec<String> = std::mem::take(&mut sandbox.host.stub_trace);
     let instructions_executed = sandbox.host.instructions_executed;
@@ -2419,12 +2486,14 @@ fn analyze(
         image_base: image.image_base,
         entry_point: image.entry_point,
         dll_main,
+        export_calls,
         win32_calls,
         win32_calls_by_function,
         coverage,
         indicators,
         instructions_executed,
         instruction_budget: max_instructions,
+        memory_dumps,
         debug_log: std::mem::take(&mut sandbox.host.debug_log),
     };
 
@@ -3953,14 +4022,200 @@ struct AnalyzeReport {
     image_base: u32,
     entry_point: u32,
     dll_main: DllMainOutcome,
+    /// Exports driven after `DllMain` via `--call-export` (empty
+    /// when the flag isn't used).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    export_calls: Vec<ExportCall>,
     win32_calls: Vec<Win32Call>,
     win32_calls_by_function: Vec<Win32CallCount>,
     coverage: CoverageSummary,
     indicators: Indicators,
     instructions_executed: u64,
     instruction_budget: u64,
+    /// Guest-memory regions captured via `--dump-mem` (empty when
+    /// the flag isn't used).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memory_dumps: Vec<MemoryDump>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     debug_log: Vec<String>,
+}
+
+/// One `--call-export` invocation: the resolved export, the args
+/// it was handed, and how the guest call ended.
+#[derive(serde::Serialize)]
+struct ExportCall {
+    name: String,
+    /// Resolved guest VA of the export entry point.
+    va: u32,
+    args: Vec<u32>,
+    #[serde(flatten)]
+    outcome: ExportOutcome,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ExportOutcome {
+    /// The export returned; `value` is `EAX` (stdcall return).
+    Returned { value: u32 },
+    /// The export trapped (unresolved import, fault, budget).
+    Trapped { message: String },
+}
+
+/// A captured guest-memory region.
+#[derive(serde::Serialize)]
+struct MemoryDump {
+    addr: u32,
+    len: usize,
+    /// How many of the `len` bytes were actually mapped/readable.
+    mapped_bytes: usize,
+    /// Host file the raw bytes were written to, if `=PATH` was
+    /// given (unmapped bytes are zero-filled on disk).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    /// Hex string of the region (mapped bytes only, unmapped shown
+    /// as `..`). Present only when no `=PATH` was given, so JSON
+    /// consumers still get the content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hex: Option<String>,
+}
+
+/// Parsed `--dump-mem` spec: region plus optional output file.
+struct DumpSpec {
+    addr: u32,
+    len: usize,
+    file: Option<PathBuf>,
+}
+
+/// Parse a `0x`-hex or decimal 32-bit literal (for `--export-arg`
+/// and the ADDR/LEN fields of `--dump-mem`).
+fn parse_u32_arg(s: &str) -> anyhow::Result<u32> {
+    let s = s.trim();
+    let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16)
+    } else {
+        s.parse::<u32>()
+    };
+    v.with_context(|| format!("not a 32-bit integer: {s:?}"))
+}
+
+/// Parse `ADDR:LEN` or `ADDR:LEN=PATH` into a [`DumpSpec`].
+fn parse_dump_spec(s: &str) -> anyhow::Result<DumpSpec> {
+    let (region, file) = match s.split_once('=') {
+        Some((r, p)) => (r, Some(PathBuf::from(p))),
+        None => (s, None),
+    };
+    let (addr, len) = region
+        .split_once(':')
+        .with_context(|| "expected ADDR:LEN[=PATH]")?;
+    Ok(DumpSpec {
+        addr: parse_u32_arg(addr)?,
+        len: parse_u32_arg(len)? as usize,
+        file,
+    })
+}
+
+/// Match `name` against a pattern that may contain a single `*`
+/// wildcard (`*Init`, `Init*`, `Foo*Bar`, or a bare name for an
+/// exact match). Case-sensitive, matching PE export semantics.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((pre, post)) => {
+            name.len() >= pre.len() + post.len()
+                && name.starts_with(pre)
+                && name.ends_with(post)
+        }
+        None => pattern == name,
+    }
+}
+
+/// Resolve every `--call-export` pattern against the image's
+/// export table and drive each match once (stdcall, shared
+/// `args`). Deduplicates so overlapping patterns don't call the
+/// same export twice; warns on patterns that match nothing.
+fn drive_exports(
+    sandbox: &mut ud_emulator::Sandbox,
+    image: &ud_emulator::pe::Image,
+    patterns: &[String],
+    args: &[u32],
+) -> Vec<ExportCall> {
+    let mut names: Vec<String> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for pat in patterns {
+        let mut matched = false;
+        for name in image.exports.keys() {
+            if glob_match(pat, name) {
+                matched = true;
+                if seen.insert(name.clone()) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        if !matched {
+            eprintln!("warning: --call-export {pat:?} matched no export in {}", image.name);
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let va = image.export(&name).unwrap_or(0);
+            let outcome = match sandbox.call_export(image, &name, args) {
+                Ok(value) => ExportOutcome::Returned { value },
+                Err(e) => ExportOutcome::Trapped {
+                    message: e.to_string(),
+                },
+            };
+            ExportCall {
+                name,
+                va,
+                args: args.to_vec(),
+                outcome,
+            }
+        })
+        .collect()
+}
+
+/// Read a `--dump-mem` region out of guest memory. Unmapped bytes
+/// come back as `None`; on file output they're zero-filled, in the
+/// report `hex` they render as `..`.
+fn capture_dump(sandbox: &ud_emulator::Sandbox, spec: &DumpSpec) -> anyhow::Result<MemoryDump> {
+    let bytes: Vec<Option<u8>> = (0..spec.len)
+        .map(|i| sandbox.mmu.load8(spec.addr.wrapping_add(i as u32)).ok())
+        .collect();
+    let mapped_bytes = bytes.iter().filter(|b| b.is_some()).count();
+
+    let (file, hex) = match &spec.file {
+        Some(path) => {
+            let raw: Vec<u8> = bytes.iter().map(|b| b.unwrap_or(0)).collect();
+            std::fs::write(path, &raw)
+                .with_context(|| format!("write memory dump to {}", path.display()))?;
+            eprintln!(
+                "dumped {} bytes ({} mapped) of guest memory at {:#010x} to {}",
+                spec.len,
+                mapped_bytes,
+                spec.addr,
+                path.display()
+            );
+            (Some(path.display().to_string()), None)
+        }
+        None => {
+            let mut h = String::with_capacity(spec.len * 2);
+            for b in &bytes {
+                match b {
+                    Some(v) => h.push_str(&format!("{v:02x}")),
+                    None => h.push_str(".."),
+                }
+            }
+            (None, Some(h))
+        }
+    };
+
+    Ok(MemoryDump {
+        addr: spec.addr,
+        len: spec.len,
+        mapped_bytes,
+        file,
+        hex,
+    })
 }
 
 #[derive(serde::Serialize, Default)]
@@ -4153,6 +4408,86 @@ impl AnalyzeReport {
                 println!("load failed: {message}");
             }
         }
+
+        if !self.export_calls.is_empty() {
+            println!();
+            println!("Export calls ({}):", self.export_calls.len());
+            for c in &self.export_calls {
+                let args: Vec<String> = c.args.iter().map(|a| format!("0x{a:x}")).collect();
+                match &c.outcome {
+                    ExportOutcome::Returned { value } => {
+                        println!(
+                            "  {}(0x{:x})({}) → 0x{value:x}",
+                            c.name,
+                            c.va,
+                            args.join(", ")
+                        );
+                    }
+                    ExportOutcome::Trapped { message } => {
+                        println!(
+                            "  {}(0x{:x})({}) trapped: {message}",
+                            c.name,
+                            c.va,
+                            args.join(", ")
+                        );
+                    }
+                }
+            }
+        }
+
+        for d in &self.memory_dumps {
+            println!();
+            if let Some(file) = &d.file {
+                println!(
+                    "Memory dump [0x{:x}..0x{:x}] ({} mapped) → {file}",
+                    d.addr,
+                    d.addr.wrapping_add(d.len as u32),
+                    d.mapped_bytes
+                );
+            } else {
+                println!(
+                    "Memory dump [0x{:x}..0x{:x}] ({} of {} bytes mapped):",
+                    d.addr,
+                    d.addr.wrapping_add(d.len as u32),
+                    d.mapped_bytes,
+                    d.len
+                );
+                if let Some(hex) = &d.hex {
+                    print_hexdump(d.addr, hex);
+                }
+            }
+        }
+    }
+}
+
+/// Render a canonical 16-byte-per-row hex dump from an address
+/// and the report's compact hex string (two chars per byte, `..`
+/// marking an unmapped byte).
+fn print_hexdump(base: u32, hex: &str) {
+    let cells: Vec<&str> = hex.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap_or("..")).collect();
+    for (row, chunk) in cells.chunks(16).enumerate() {
+        let addr = base.wrapping_add((row * 16) as u32);
+        let mut hexpart = String::new();
+        let mut asciipart = String::new();
+        for (i, cell) in chunk.iter().enumerate() {
+            if i == 8 {
+                hexpart.push(' ');
+            }
+            hexpart.push_str(cell);
+            hexpart.push(' ');
+            match u8::from_str_radix(cell, 16) {
+                Ok(b) if (0x20..=0x7e).contains(&b) => asciipart.push(b as char),
+                Ok(_) => asciipart.push('.'),
+                Err(_) => asciipart.push(' '),
+            }
+        }
+        // Pad the hex column so the ASCII gutter lines up on short
+        // final rows.
+        let width = 16 * 3 + 1;
+        for _ in hexpart.len()..width {
+            hexpart.push(' ');
+        }
+        println!("  {addr:08x}  {hexpart} |{asciipart}|");
     }
 }
 
