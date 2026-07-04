@@ -276,6 +276,24 @@ enum Command {
         #[arg(long, value_name = "N")]
         export_arg: Vec<String>,
 
+        /// Call one export with its own argument list, as an
+        /// ordered step in a persistent decode sequence. SPEC is
+        /// `NAME[:arg,arg,…]` (args decimal or `0x` hex).
+        /// Repeatable; the calls run in command-line order in the
+        /// same guest context — so a codec whose decode-time
+        /// tables are built only across a call *sequence* can be
+        /// driven end to end in one process, e.g.
+        /// `--call RAOpenCodec:0x20000000
+        ///  --call RAInitDecoder:0x20000000
+        ///  --call RADecode:0x30000000,0,0x40000000`.
+        /// Stage the descriptor / frame buffers with `--map-blob`
+        /// and capture what a call built with `--dump-mem`. Runs
+        /// after any `--call-export` matches. Unlike `--call-export`
+        /// the name is matched exactly and a repeat re-invokes it
+        /// (e.g. decode several frames).
+        #[arg(long = "call", value_name = "NAME[:args]")]
+        call: Vec<String>,
+
         /// After the run (including any `--call-export`), dump a
         /// region of guest memory. SPEC is `ADDR:LEN` to hex-dump
         /// to stdout, or `ADDR:LEN=PATH` to write the raw bytes to
@@ -579,10 +597,17 @@ enum VfwCommand {
         /// Codec DLL.
         dll: PathBuf,
 
-        /// Raw codec frame (no container — extract from any
-        /// AVI / MOV wrapper beforehand).
-        #[arg(long, value_name = "FILE")]
-        input: PathBuf,
+        /// Raw codec frame(s), bitstream only (no container —
+        /// extract from any AVI / MOV wrapper beforehand).
+        /// Repeatable: multiple `--input` frames are fed through
+        /// `ICDecompress` in order within ONE Open→Begin…End→Close
+        /// lifetime, so inter-frame decoder state (indeo5's
+        /// inheritance-MV tables, a dispatch table a P-frame
+        /// populates) persists across the sequence. An inter frame
+        /// that can't decode standalone (`ICDecompress=1` on its
+        /// own) decodes once its reference frame has run.
+        #[arg(long, value_name = "FILE", required = true)]
+        input: Vec<PathBuf>,
 
         /// Output frame width (pixels).
         #[arg(long)]
@@ -619,6 +644,14 @@ enum VfwCommand {
         /// decode. Unmapped bytes render as `··` / zero-fill.
         #[arg(long, value_name = "SPEC")]
         dump_mem: Vec<String>,
+
+        /// With multiple `--input` frames, take the `--dump-mem`
+        /// snapshots after this 1-based frame index instead of
+        /// after the last — to capture decoder state at a chosen
+        /// point in the sequence (e.g. right after the first inter
+        /// frame populates a table). Default: after the final frame.
+        #[arg(long, value_name = "N")]
+        dump_after_frame: Option<usize>,
 
         /// Size of the guest malloc / `HeapAlloc` arena in MiB.
         /// Raise it when a decoder exhausts the default (96 MiB)
@@ -968,6 +1001,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             vfs_deps,
             call_export,
             export_arg,
+            call,
             dump_mem,
             map_blob,
             heap_mb,
@@ -1000,6 +1034,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     vfs_deps,
                     &call_export,
                     &export_arg,
+                    &call,
                     &dump_mem,
                     &map_blob,
                     heap_mb,
@@ -1045,6 +1080,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 output,
                 max_instructions,
                 dump_mem,
+                dump_after_frame,
                 heap_mb,
             } => decode_cmd(
                 &dll,
@@ -1056,6 +1092,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 output.as_deref(),
                 max_instructions,
                 &dump_mem,
+                dump_after_frame,
                 heap_mb,
             ),
             VfwCommand::Encode {
@@ -2107,7 +2144,7 @@ fn vfw_probe(
 #[allow(clippy::too_many_lines)]
 fn decode_cmd(
     dll_path: &Path,
-    input: &Path,
+    inputs: &[PathBuf],
     width: u32,
     height: u32,
     fcc_handler: Option<&str>,
@@ -2115,6 +2152,7 @@ fn decode_cmd(
     output: Option<&Path>,
     max_instructions: u64,
     dump_mem: &[String],
+    dump_after_frame: Option<usize>,
     heap_mb: u32,
 ) -> anyhow::Result<()> {
     // Parse the `--dump-mem` specs up front so a typo fails before
@@ -2129,8 +2167,12 @@ fn decode_cmd(
     let dll_name = dll_path
         .file_name()
         .map_or_else(|| "codec.dll".into(), |n| n.to_string_lossy().into_owned());
-    let frame =
-        std::fs::read(input).with_context(|| format!("reading frame {}", input.display()))?;
+    // Read every frame up front (clap guarantees ≥1). They are fed
+    // through the codec in order within one open instance.
+    let frames: Vec<Vec<u8>> = inputs
+        .iter()
+        .map(|p| std::fs::read(p).with_context(|| format!("reading frame {}", p.display())))
+        .collect::<anyhow::Result<_>>()?;
 
     let mut sandbox = ud_emulator::Sandbox::new_with_heap_mb(heap_mb);
     sandbox.host.instruction_budget = Some(max_instructions);
@@ -2149,6 +2191,8 @@ fn decode_cmd(
     let fcc_type = u32::from_le_bytes(*b"VIDC");
     let fcc_handler_u32 = fourcc_to_u32(&fcc);
 
+    // `in_bih` for the format-query uses the first frame's size; each
+    // decode below rebuilds it with that frame's byte length.
     let in_bih = ud_emulator::Bih {
         bi_size: 40,
         width: width as i32,
@@ -2156,7 +2200,7 @@ fn decode_cmd(
         planes: 1,
         bit_count: 24,
         compression: fcc_handler_u32.to_le_bytes(),
-        size_image: u32::try_from(frame.len()).unwrap_or(u32::MAX),
+        size_image: u32::try_from(frames[0].len()).unwrap_or(u32::MAX),
         ..ud_emulator::Bih::default()
     };
     let out_bih = ud_emulator::Bih {
@@ -2189,46 +2233,87 @@ fn decode_cmd(
 
     let _ = sandbox.ic_decompress_begin(hic, &in_bih, &out_bih);
     let out_capacity = width * height * pix_format.bytes_per_pixel();
-    let (rc, decoded) = sandbox
-        .ic_decompress(hic, 0, &in_bih, &frame, &out_bih, out_capacity)
-        .context("ICDecompress")?;
-    eprintln!(
-        "[decode] ICDecompress = {} (output {} bytes)",
-        rc as i32,
-        decoded.len()
-    );
 
-    // Snapshot requested guest-memory regions while the decoder's
-    // tables are still live (before ICDecompressEnd/Close tear them
-    // down). Hex dumps go to stderr so they never mix into the
-    // decoded frame on stdout.
-    for spec in &dump_specs {
-        let dump = capture_dump(&sandbox, spec)?;
-        if dump.file.is_none() {
-            if let Some(hex) = &dump.hex {
-                eprintln!(
-                    "[decode] memory dump [0x{:x}..0x{:x}] ({} of {} bytes mapped):",
-                    dump.addr,
-                    dump.addr.wrapping_add(dump.len as u32),
-                    dump.mapped_bytes,
-                    dump.len
-                );
-                eprint!("{}", render_hexdump(dump.addr, hex));
+    // Which frame's decode to snapshot after (0-based). Default is
+    // the last frame; `--dump-after-frame N` (1-based) targets an
+    // earlier point in the sequence.
+    let dump_idx = match dump_after_frame {
+        Some(n) if (1..=frames.len()).contains(&n) => n - 1,
+        Some(n) => {
+            eprintln!(
+                "warning: --dump-after-frame {n} out of range 1..={}; dumping after the last frame",
+                frames.len()
+            );
+            frames.len() - 1
+        }
+        None => frames.len() - 1,
+    };
+
+    // Feed every frame through ICDecompress in order, in this one
+    // open instance — so inter-frame decoder state persists across
+    // the sequence. An inter frame that returns ICERR_UNSUPPORTED
+    // (1) standalone decodes once its reference frame has run.
+    let mut last_decoded: Vec<u8> = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let frame_bih = ud_emulator::Bih {
+            bi_size: 40,
+            width: width as i32,
+            height: height as i32,
+            planes: 1,
+            bit_count: 24,
+            compression: fcc_handler_u32.to_le_bytes(),
+            size_image: u32::try_from(frame.len()).unwrap_or(u32::MAX),
+            ..ud_emulator::Bih::default()
+        };
+        let (rc, decoded) = sandbox
+            .ic_decompress(hic, 0, &frame_bih, frame, &out_bih, out_capacity)
+            .with_context(|| format!("ICDecompress (frame {}/{})", i + 1, frames.len()))?;
+        eprintln!(
+            "[decode] frame {}/{}: ICDecompress = {} (output {} bytes)",
+            i + 1,
+            frames.len(),
+            rc as i32,
+            decoded.len()
+        );
+
+        // Snapshot requested guest-memory regions while the decoder's
+        // tables are still live (before ICDecompressEnd/Close tear
+        // them down). Hex dumps go to stderr so they never mix into
+        // the decoded frame on stdout.
+        if i == dump_idx {
+            for spec in &dump_specs {
+                let dump = capture_dump(&sandbox, spec)?;
+                if dump.file.is_none() {
+                    if let Some(hex) = &dump.hex {
+                        eprintln!(
+                            "[decode] memory dump after frame {} [0x{:x}..0x{:x}] ({} of {} bytes mapped):",
+                            i + 1,
+                            dump.addr,
+                            dump.addr.wrapping_add(dump.len as u32),
+                            dump.mapped_bytes,
+                            dump.len
+                        );
+                        eprint!("{}", render_hexdump(dump.addr, hex));
+                    }
+                }
             }
         }
+        last_decoded = decoded;
     }
 
+    // Emit the final frame's pixels (with several frames the point is
+    // the persistent-state dump, not every frame's output).
     if let Some(path) = output {
-        std::fs::write(path, &decoded)
+        std::fs::write(path, &last_decoded)
             .with_context(|| format!("writing output {}", path.display()))?;
         eprintln!(
             "[decode] wrote {} bytes to {}",
-            decoded.len(),
+            last_decoded.len(),
             path.display()
         );
     } else {
         use std::io::Write as _;
-        std::io::stdout().write_all(&decoded)?;
+        std::io::stdout().write_all(&last_decoded)?;
     }
 
     let _ = sandbox.ic_decompress_end(hic);
@@ -2410,16 +2495,21 @@ fn analyze(
     vfs_deps: bool,
     call_export: &[String],
     export_arg: &[String],
+    call: &[String],
     dump_mem: &[String],
     map_blob: &[String],
     heap_mb: u32,
 ) -> anyhow::Result<()> {
-    // Parse the `--export-arg` / `--dump-mem` / `--map-blob` specs
-    // up front so a typo fails before we spin up the sandbox rather
-    // than after a multi-second run.
+    // Parse the `--export-arg` / `--call` / `--dump-mem` / `--map-blob`
+    // specs up front so a typo fails before we spin up the sandbox
+    // rather than after a multi-second run.
     let export_args: Vec<u32> = export_arg
         .iter()
         .map(|s| parse_u32_arg(s).with_context(|| format!("--export-arg {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let call_specs: Vec<CallSpec> = call
+        .iter()
+        .map(|s| parse_call_spec(s).with_context(|| format!("--call {s:?}")))
         .collect::<anyhow::Result<_>>()?;
     let dump_specs: Vec<DumpSpec> = dump_mem
         .iter()
@@ -2510,7 +2600,15 @@ fn analyze(
     // DllMain left behind, so the Win32-call and coverage totals
     // taken below fold in whatever the exports touched — which is
     // the whole point: DllMain alone never reaches the decoder.
-    let export_calls = drive_exports(&mut sandbox, &image, call_export, &export_args);
+    let mut export_calls = drive_exports(&mut sandbox, &image, call_export, &export_args);
+
+    // Then drive the ordered `--call` sequence in command-line
+    // order, each with its own argument list. This is the
+    // persistent-instance path: Open→Init→Decode against one live
+    // guest context, so decode-time tables built only across a call
+    // sequence (cook's MDCT window / coupling coefficients, built in
+    // RADecode not RAInitDecoder) come into being before the dumps.
+    export_calls.extend(drive_call_sequence(&mut sandbox, &image, &call_specs));
 
     // Snapshot the requested memory regions before we tear the
     // sandbox down. Files are written here (side effect); the
@@ -4267,6 +4365,75 @@ fn glob_match(pattern: &str, name: &str) -> bool {
         }
         None => pattern == name,
     }
+}
+
+/// Parsed `--call` spec: an exact export name plus its own
+/// (ordered) argument list.
+struct CallSpec {
+    name: String,
+    args: Vec<u32>,
+}
+
+/// Parse `NAME[:arg,arg,…]` into a [`CallSpec`]. Args are
+/// comma-separated decimal / `0x` hex 32-bit values; a bare
+/// `NAME` (no `:`) is a zero-argument call.
+fn parse_call_spec(s: &str) -> anyhow::Result<CallSpec> {
+    let (name, arglist) = match s.split_once(':') {
+        Some((n, a)) => (n, a),
+        None => (s, ""),
+    };
+    if name.is_empty() {
+        anyhow::bail!("empty export name");
+    }
+    let args = if arglist.is_empty() {
+        Vec::new()
+    } else {
+        arglist
+            .split(',')
+            .map(parse_u32_arg)
+            .collect::<anyhow::Result<_>>()?
+    };
+    Ok(CallSpec {
+        name: name.to_owned(),
+        args,
+    })
+}
+
+/// Drive the ordered `--call` sequence: each spec resolves an
+/// export by exact name and invokes it stdcall with its own
+/// argument list, in order, against the same live guest context.
+/// A name that isn't exported records a `Trapped` outcome (rather
+/// than aborting the sequence) so the report shows how far the
+/// chain got.
+fn drive_call_sequence(
+    sandbox: &mut ud_emulator::Sandbox,
+    image: &ud_emulator::pe::Image,
+    specs: &[CallSpec],
+) -> Vec<ExportCall> {
+    specs
+        .iter()
+        .map(|spec| {
+            let va = image.export(&spec.name).unwrap_or(0);
+            let outcome = if va == 0 && !image.exports.contains_key(&spec.name) {
+                ExportOutcome::Trapped {
+                    message: format!("export {:?} not found in {}", spec.name, image.name),
+                }
+            } else {
+                match sandbox.call_export(image, &spec.name, &spec.args) {
+                    Ok(value) => ExportOutcome::Returned { value },
+                    Err(e) => ExportOutcome::Trapped {
+                        message: e.to_string(),
+                    },
+                }
+            };
+            ExportCall {
+                name: spec.name.clone(),
+                va,
+                args: spec.args.clone(),
+                outcome,
+            }
+        })
+        .collect()
 }
 
 /// Resolve every `--call-export` pattern against the image's
