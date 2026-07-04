@@ -22,6 +22,11 @@ kvm = ["ud-emulator/kvm"]
 # Opt-in real-filesystem mounts (ext4/NTFS/FAT images, mkfs) for `--fs-type` /
 # `--mount` (forwards to `ud-emulator/fstool`).
 fstool = ["ud-emulator/fstool"]
+# Opt-in JavaScript scripting of the sandbox (`ud script foo.js`) via the
+# pure-Rust `kataan` engine: load DLLs, stage memory, drive exports/decodes,
+# and dump memory from JS with real control flow. Pulls in `kataan`
+# (edition 2024, needs Rust >= 1.88).
+script = ["dep:kataan"]
 
 [[bin]]
 name = "ud"
@@ -52,3 +57,10 @@ bs58 = "0.5"
 base64 = "0.22"
 # Host terminal raw mode + window size for `--interactive`.
 libc = "0.2"
+# Optional: pure-Rust JavaScript engine backing `ud script` (feature `script`).
+# `std` + `host` only — skips the intl / crypto / fetch / cli deps.
+kataan = { version = "0.0.7", optional = true, default-features = false, features = [
+    "std",
+    "host",
+    "module",
+] }

@@ -14,6 +14,9 @@ use std::process::ExitCode;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "script")]
+mod script;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "ud",
@@ -376,6 +379,27 @@ enum Command {
         /// Where to write the `.ud` source. Defaults to stdout.
         #[arg(short, long)]
         out: Option<PathBuf>,
+    },
+
+    /// Drive the sandbox from a JavaScript program (feature `script`).
+    /// The script gets host globals — `load`, `dllMain`, `mapBlob`,
+    /// `callExport`, `dumpMem`, `readFile`/`writeFile`, `checkpoint`/
+    /// `restore`, `print` — over one persistent guest instance, so a
+    /// codec Open→Init→Decode sequence (or multi-frame decode) can be
+    /// orchestrated with real control flow. See `ud script --help`.
+    #[cfg(feature = "script")]
+    Script {
+        /// JavaScript program to run.
+        file: PathBuf,
+
+        /// Guest malloc / `HeapAlloc` arena size in MiB (default 96,
+        /// clamped to `[96, 256]`).
+        #[arg(long, value_name = "MiB", default_value_t = ud_emulator::Sandbox::DEFAULT_HEAP_MB)]
+        heap_mb: u32,
+
+        /// Cap each guest call at this many instructions.
+        #[arg(long, default_value_t = 100_000_000)]
+        max_instructions: u64,
     },
 }
 
@@ -1177,6 +1201,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 max_instructions,
             ),
         },
+
+        #[cfg(feature = "script")]
+        Command::Script {
+            file,
+            heap_mb,
+            max_instructions,
+        } => script::run_script(&file, heap_mb, max_instructions),
     }
 }
 
