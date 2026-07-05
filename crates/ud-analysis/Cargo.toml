@@ -15,9 +15,9 @@ description = "Analysis passes over loaded binaries: function discovery, type re
 workspace = true
 
 [dependencies]
-ud-core = { version = "0.2.0", path = "../ud-core" }
-ud-arch-bpf = { version = "0.2.0", path = "../ud-arch-bpf" }
-ud-format = { version = "0.2.0", path = "../ud-format" }
-ud-signatures = { version = "0.2.0", path = "../ud-signatures" }
+ud-core = { version = "0.3.0", path = "../ud-core" }
+ud-arch-bpf = { version = "0.3.0", path = "../ud-arch-bpf" }
+ud-format = { version = "0.3.0", path = "../ud-format" }
+ud-signatures = { version = "0.3.0", path = "../ud-signatures" }
 gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
 thiserror = "2"

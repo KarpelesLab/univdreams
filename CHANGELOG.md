@@ -8,6 +8,72 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/KarpelesLab/univdreams/compare/v0.2.0...v0.3.0) - 2026-07-05
+
+### Format
+
+- NE (16-bit Windows New Executable) byte-identical round-trip
+
+### Win16
+
+- resource APIs + 14 more KERNEL/USER/GDI/COMMDLG stubs + XLAT (SITEX10 3165→6181)
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
+
 ## [0.2.0](https://github.com/KarpelesLab/univdreams/compare/v0.1.5...v0.2.0) - 2026-05-25
 
 ### Added
