@@ -19,6 +19,10 @@
 //!   keep it live; `ud.decodeFrame(ch, bytes) -> Uint8Array` decodes one frame
 //!   in that persistent instance (call it in a loop for inter-frame state);
 //!   `ud.codecClose(ch)` tears it down.
+//! * `ud.watch(addr, len)` arms a watchpoint; `ud.watchLog() ->
+//!   [{seq, addr, offset, width, value, eip}]` returns the ordered
+//!   write-trace of every store into a watched region — a byte-exact
+//!   behavioral trace of how the real codec fills a buffer.
 //! * `ud.readFile(path) -> Uint8Array` / `ud.writeFile(path, bytes)`.
 //! * `ud.checkpoint() -> snap` / `ud.restore(snap)` — snapshot / restore guest
 //!   memory **and** the heap allocator (arena cursors + block map + module and
@@ -63,6 +67,8 @@ const ud = {
   codecOpen: __ud_codecOpen,
   decodeFrame: function (c, b) { return new Uint8Array(__ud_decodeFrame(c, b)); },
   codecClose: __ud_codecClose,
+  watch: __ud_watch,
+  watchLog: __ud_watchLog,
   checkpoint: __ud_checkpoint,
   restore: __ud_restore,
   print: __ud_print,
@@ -96,6 +102,8 @@ struct State {
     images: Vec<ud_emulator::pe::Image>,
     snapshots: Vec<Snapshot>,
     codecs: Vec<CodecCtx>,
+    /// Base address of each armed watchpoint, for reporting offsets.
+    watch_bases: Vec<u32>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -126,6 +134,7 @@ fn eval_source(src: &str, heap_mb: u32, max_instructions: u64) -> anyhow::Result
         images: Vec::new(),
         snapshots: Vec::new(),
         codecs: Vec::new(),
+        watch_bases: Vec::new(),
     }));
 
     let mut interp = Interp::new();
@@ -339,6 +348,55 @@ fn register_api(interp: &mut Interp<'_>, state: &Shared) {
         Ok(cx.number(bytes.len() as f64))
     });
 
+    // __ud_watch(addr, len) — arm a watchpoint over the region.
+    let st = state.clone();
+    interp.register_global_fn("__ud_watch", 2, move |cx, _this, args| {
+        let addr = arg_u32(cx, args, 0)?;
+        let len = arg_u32(cx, args, 1)?;
+        let s = &mut *st.borrow_mut();
+        s.sandbox.mmu.add_watch(addr, len);
+        if len != 0 {
+            s.watch_bases.push(addr);
+        }
+        Ok(cx.undefined())
+    });
+
+    // __ud_watchLog() -> [{seq, addr, offset, width, value, eip}]
+    let st = state.clone();
+    interp.register_global_fn("__ud_watchLog", 0, move |cx, _this, _args| {
+        let s = st.borrow();
+        let bases = s.watch_bases.clone();
+        let events: Vec<NanBox> = s
+            .sandbox
+            .mmu
+            .watch_log()
+            .iter()
+            .map(|ev| {
+                let base = bases
+                    .iter()
+                    .filter(|&&b| b <= ev.addr)
+                    .max()
+                    .copied()
+                    .unwrap_or(ev.addr);
+                let o = cx.new_object();
+                let v = cx.number(ev.seq as f64);
+                cx.set(o, "seq", v);
+                let v = cx.number(f64::from(ev.addr));
+                cx.set(o, "addr", v);
+                let v = cx.number(f64::from(ev.addr - base));
+                cx.set(o, "offset", v);
+                let v = cx.number(f64::from(ev.width));
+                cx.set(o, "width", v);
+                let v = cx.number(ev.value as f64);
+                cx.set(o, "value", v);
+                let v = cx.number(f64::from(ev.eip));
+                cx.set(o, "eip", v);
+                o
+            })
+            .collect();
+        Ok(cx.new_array(events))
+    });
+
     register_codec_api(interp, state);
     register_snapshot_api(interp, state);
 
@@ -538,6 +596,15 @@ mod tests {
              Array.from(ud.dumpMem(0x40000000,8)).join(',');",
         );
         assert_eq!(out, "0,1,2,3,4,5,6,7");
+    }
+
+    #[test]
+    fn watch_api_is_wired_and_empty_without_guest_writes() {
+        // Only *guest* stores are traced (mapBlob uses the host
+        // initializer path), so with no codec running the log is empty.
+        // Real guest-store traces are exercised by the CLI e2e tests.
+        let out = eval("ud.watch(0x41000000, 16); ud.watchLog().length;");
+        assert_eq!(out, "0");
     }
 
     #[test]

@@ -326,6 +326,17 @@ enum Command {
         /// fixed-base QuickTime helper DLLs would load.
         #[arg(long, value_name = "MiB", default_value_t = ud_emulator::Sandbox::DEFAULT_HEAP_MB)]
         heap_mb: u32,
+
+        /// Watch a guest-memory region and record every store into
+        /// it as an ordered write-trace — `ADDR:LEN` (decimal or
+        /// `0x` hex), repeatable. Armed after `DllMain` + `--map-blob`
+        /// and before the `--call` / `--call-export` sequence, so it
+        /// captures exactly what those calls write. Each hit lands in
+        /// the report (text + JSON) as `#seq +off [addr] = value`
+        /// with the writing EIP — a byte-exact behavioral trace of
+        /// how the real codec fills a table.
+        #[arg(long, value_name = "ADDR:LEN")]
+        watch: Vec<String>,
     },
 
     /// Video for Windows codec tools — drive a codec DLL
@@ -682,6 +693,18 @@ enum VfwCommand {
         /// arena mid-decode. Clamped to `[96, 256]`.
         #[arg(long, value_name = "MiB", default_value_t = ud_emulator::Sandbox::DEFAULT_HEAP_MB)]
         heap_mb: u32,
+
+        /// Watch a guest-memory region and record every store into
+        /// it during the decode as an ordered behavioral trace —
+        /// `ADDR:LEN` (decimal or `0x` hex), repeatable. Each hit is
+        /// printed to **stderr** as `#seq +off [addr] = value (wN)
+        /// eip=…`, so you get a byte-exact, per-write account of how
+        /// the *real* codec fills a table (window / codebook /
+        /// coupling / coefficient buffer) — ud as an instrumented
+        /// reference decoder. Watchpoints arm just before the frame
+        /// loop; use `--dump-mem` for the final contents.
+        #[arg(long, value_name = "ADDR:LEN")]
+        watch: Vec<String>,
     },
 
     /// Drive `ICCompress` on uncompressed pixel input: load
@@ -1029,6 +1052,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             dump_mem,
             map_blob,
             heap_mb,
+            watch,
         } => {
             if monitor {
                 monitor_install(
@@ -1062,6 +1086,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     &dump_mem,
                     &map_blob,
                     heap_mb,
+                    &watch,
                 )
             }
         }
@@ -1106,6 +1131,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 dump_mem,
                 dump_after_frame,
                 heap_mb,
+                watch,
             } => decode_cmd(
                 &dll,
                 &input,
@@ -1118,6 +1144,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 &dump_mem,
                 dump_after_frame,
                 heap_mb,
+                &watch,
             ),
             VfwCommand::Encode {
                 dll,
@@ -2185,12 +2212,17 @@ fn decode_cmd(
     dump_mem: &[String],
     dump_after_frame: Option<usize>,
     heap_mb: u32,
+    watch: &[String],
 ) -> anyhow::Result<()> {
-    // Parse the `--dump-mem` specs up front so a typo fails before
-    // the multi-second decode run rather than after it.
+    // Parse the `--dump-mem` / `--watch` specs up front so a typo
+    // fails before the multi-second decode run rather than after it.
     let dump_specs: Vec<DumpSpec> = dump_mem
         .iter()
         .map(|s| parse_dump_spec(s).with_context(|| format!("--dump-mem {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let watch_specs: Vec<(u32, u32)> = watch
+        .iter()
+        .map(|s| parse_watch_spec(s).with_context(|| format!("--watch {s:?}")))
         .collect::<anyhow::Result<_>>()?;
 
     let dll_bytes =
@@ -2265,6 +2297,12 @@ fn decode_cmd(
     let _ = sandbox.ic_decompress_begin(hic, &in_bih, &out_bih);
     let out_capacity = width * height * pix_format.bytes_per_pixel();
 
+    // Arm watchpoints now — after Open/Begin — so the trace is the
+    // decode's own stores, not codec setup.
+    for &(addr, len) in &watch_specs {
+        sandbox.mmu.add_watch(addr, len);
+    }
+
     // Which frame's decode to snapshot after (0-based). Default is
     // the last frame; `--dump-after-frame N` (1-based) targets an
     // earlier point in the sequence.
@@ -2330,6 +2368,12 @@ fn decode_cmd(
             }
         }
         last_decoded = decoded;
+    }
+
+    // Emit the watchpoint write-trace (to stderr — keeps stdout the
+    // decoded frame) before teardown.
+    if !watch_specs.is_empty() {
+        print_watch_trace(&sandbox, &watch_specs);
     }
 
     // Emit the final frame's pixels (with several frames the point is
@@ -2530,13 +2574,18 @@ fn analyze(
     dump_mem: &[String],
     map_blob: &[String],
     heap_mb: u32,
+    watch: &[String],
 ) -> anyhow::Result<()> {
     // Parse the `--export-arg` / `--call` / `--dump-mem` / `--map-blob`
-    // specs up front so a typo fails before we spin up the sandbox
-    // rather than after a multi-second run.
+    // / `--watch` specs up front so a typo fails before we spin up the
+    // sandbox rather than after a multi-second run.
     let export_args: Vec<u32> = export_arg
         .iter()
         .map(|s| parse_u32_arg(s).with_context(|| format!("--export-arg {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let watch_specs: Vec<(u32, u32)> = watch
+        .iter()
+        .map(|s| parse_watch_spec(s).with_context(|| format!("--watch {s:?}")))
         .collect::<anyhow::Result<_>>()?;
     let call_specs: Vec<CallSpec> = call
         .iter()
@@ -2606,6 +2655,7 @@ fn analyze(
                     instructions_executed: 0,
                     instruction_budget: max_instructions,
                     memory_dumps: Vec::new(),
+                    watch_trace: Vec::new(),
                     debug_log: std::mem::take(&mut sandbox.host.debug_log),
                 };
                 let s = serde_json::to_string_pretty(&report)?;
@@ -2625,6 +2675,12 @@ fn analyze(
     }
 
     let dll_main_result = sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH);
+
+    // Arm watchpoints now — after DllMain + map-blob, before the call
+    // sequence — so the write-trace is the calls' own stores.
+    for &(addr, len) in &watch_specs {
+        sandbox.mmu.add_watch(addr, len);
+    }
 
     // With CRT init done, drive the requested codec exports
     // (e.g. `*InitDecoder`). These run in the same guest state
@@ -2648,6 +2704,8 @@ fn analyze(
         .iter()
         .map(|spec| capture_dump(&sandbox, spec))
         .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let watch_trace = collect_watch_trace(&sandbox, &watch_specs);
 
     let stub_calls = std::mem::take(&mut sandbox.host.stub_calls);
     let _: Vec<String> = std::mem::take(&mut sandbox.host.stub_trace);
@@ -2714,6 +2772,7 @@ fn analyze(
         instructions_executed,
         instruction_budget: max_instructions,
         memory_dumps,
+        watch_trace,
         debug_log: std::mem::take(&mut sandbox.host.debug_log),
     };
 
@@ -4261,8 +4320,53 @@ struct AnalyzeReport {
     /// the flag isn't used).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     memory_dumps: Vec<MemoryDump>,
+    /// Ordered write-trace of stores into any `--watch` region.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    watch_trace: Vec<WatchEventReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     debug_log: Vec<String>,
+}
+
+/// One store that hit a `--watch` region, for the analyze report.
+#[derive(serde::Serialize)]
+struct WatchEventReport {
+    seq: u64,
+    addr: u32,
+    /// Offset from the nearest watch base at or below `addr`.
+    offset: u32,
+    width: u8,
+    value: u64,
+    eip: u32,
+}
+
+/// Collect the MMU's watch log into report records (offset relative to
+/// the nearest watch base).
+fn collect_watch_trace(
+    sandbox: &ud_emulator::Sandbox,
+    watches: &[(u32, u32)],
+) -> Vec<WatchEventReport> {
+    let bases: Vec<u32> = watches.iter().map(|&(a, _)| a).collect();
+    sandbox
+        .mmu
+        .watch_log()
+        .iter()
+        .map(|ev| {
+            let base = bases
+                .iter()
+                .filter(|&&b| b <= ev.addr)
+                .max()
+                .copied()
+                .unwrap_or(ev.addr);
+            WatchEventReport {
+                seq: ev.seq,
+                addr: ev.addr,
+                offset: ev.addr - base,
+                width: ev.width,
+                value: ev.value,
+                eip: ev.eip,
+            }
+        })
+        .collect()
 }
 
 /// One `--call-export` invocation: the resolved export, the args
@@ -4302,6 +4406,47 @@ struct MemoryDump {
     /// consumers still get the content.
     #[serde(skip_serializing_if = "Option::is_none")]
     hex: Option<String>,
+}
+
+/// Parse a `--watch` spec `ADDR:LEN` into a guest range.
+fn parse_watch_spec(s: &str) -> anyhow::Result<(u32, u32)> {
+    let (addr, len) = s.split_once(':').with_context(|| "expected ADDR:LEN")?;
+    Ok((parse_u32_arg(addr)?, parse_u32_arg(len)?))
+}
+
+/// Print a watchpoint write-trace to stderr: one line per store that
+/// hit a watched region, in execution order, with the offset from the
+/// nearest watch base, the value, the store width, and the writing EIP.
+fn print_watch_trace(sandbox: &ud_emulator::Sandbox, watches: &[(u32, u32)]) {
+    let log = sandbox.mmu.watch_log();
+    let bases: Vec<u32> = watches.iter().map(|&(a, _)| a).collect();
+    eprintln!("[watch] {} store(s) hit the watched region(s):", log.len());
+    for ev in log {
+        // Offset from the greatest watch base at or below this address.
+        let base = bases
+            .iter()
+            .filter(|&&b| b <= ev.addr)
+            .max()
+            .copied()
+            .unwrap_or(ev.addr);
+        eprintln!(
+            "[watch] #{:<5} +0x{:<6x} [0x{:08x}] = 0x{:0width$x} (w{}) eip=0x{:08x}",
+            ev.seq,
+            ev.addr - base,
+            ev.addr,
+            ev.value,
+            ev.width,
+            ev.eip,
+            width = (ev.width as usize) * 2,
+        );
+    }
+    let dropped = sandbox.mmu.watch_dropped();
+    if dropped > 0 {
+        eprintln!(
+            "[watch] … {dropped} further store(s) dropped after the {} cap",
+            log.len()
+        );
+    }
 }
 
 /// Parsed `--dump-mem` spec: region plus optional output file.
@@ -4799,6 +4944,26 @@ impl AnalyzeReport {
                 if let Some(hex) = &d.hex {
                     print_hexdump(d.addr, hex);
                 }
+            }
+        }
+
+        if !self.watch_trace.is_empty() {
+            println!();
+            println!(
+                "Watchpoint write-trace ({} stores, in order):",
+                self.watch_trace.len()
+            );
+            for ev in &self.watch_trace {
+                println!(
+                    "  #{:<5} +0x{:<6x} [0x{:08x}] = 0x{:0width$x} (w{}) eip=0x{:08x}",
+                    ev.seq,
+                    ev.offset,
+                    ev.addr,
+                    ev.value,
+                    ev.width,
+                    ev.eip,
+                    width = (ev.width as usize) * 2,
+                );
             }
         }
     }

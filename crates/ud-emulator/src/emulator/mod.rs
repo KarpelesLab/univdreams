@@ -26,7 +26,7 @@ pub mod mmu;
 pub mod regs;
 
 pub use isa_int::Cpu;
-pub use mmu::{Mmu, Perm};
+pub use mmu::{Mmu, Perm, WatchEvent};
 pub use regs::{Flags, Regs};
 
 /// Reasons the interpreter halts other than reaching the

@@ -25,6 +25,10 @@ pub const PAGE_MASK: u32 = (PAGE_SIZE as u32) - 1;
 /// Bit shift for converting an address into a page index.
 pub const PAGE_SHIFT: u32 = 12;
 
+/// Default cap on a watchpoint log — a long decode can issue millions
+/// of stores; past this the trace stops growing and counts drops.
+pub const DEFAULT_WATCH_LIMIT: usize = 1_000_000;
+
 /// Per-page permission bits.
 ///
 /// A page may be flagged readable, writable, executable, or any
@@ -110,6 +114,38 @@ pub struct Mmu {
     /// set by the interpreter so memory watchpoints can report the
     /// faulting instruction. Not load-bearing.
     pub dbg_eip: u32,
+    /// Active memory watchpoints as `[start, end)` guest ranges. Empty
+    /// by default (zero overhead on the store path); when non-empty,
+    /// every guest store overlapping a range appends a [`WatchEvent`]
+    /// to `watch_log`. Set via [`Mmu::add_watch`].
+    watches: Vec<(u32, u32)>,
+    /// Ordered write-trace of stores that hit a watchpoint.
+    watch_log: Vec<WatchEvent>,
+    /// Cap on `watch_log` length; further hits bump `watch_dropped`
+    /// instead of growing unbounded on a long decode.
+    watch_limit: usize,
+    /// Monotonic ordinal assigned to every watched store (1-based),
+    /// independent of the cap, so the trace shows true write order.
+    watch_seq: u64,
+    /// Count of watched stores dropped after `watch_limit` was reached.
+    watch_dropped: u64,
+}
+
+/// One guest store that landed in a watched region — the raw material
+/// for a byte-exact behavioral trace of the real codec: which
+/// instruction wrote which value where, in order.
+#[derive(Clone, Copy, Debug)]
+pub struct WatchEvent {
+    /// 1-based ordinal among all watched stores this run.
+    pub seq: u64,
+    /// Guest address written.
+    pub addr: u32,
+    /// Store width in bytes (1/2/4/8).
+    pub width: u8,
+    /// Value written (little-endian, zero-extended to 64 bits).
+    pub value: u64,
+    /// EIP of the instruction that performed the store.
+    pub eip: u32,
 }
 
 impl Default for Mmu {
@@ -129,6 +165,13 @@ impl Mmu {
             trace: crate::trace::TraceState::new(),
             coverage: crate::coverage::CoverageMap::default(),
             dbg_eip: self.dbg_eip,
+            // Preserve the watchpoint *configuration* into the copy but
+            // start its log clean, mirroring coverage/trace semantics.
+            watches: self.watches.clone(),
+            watch_log: Vec::new(),
+            watch_limit: self.watch_limit,
+            watch_seq: 0,
+            watch_dropped: 0,
         }
     }
 
@@ -144,6 +187,78 @@ impl Mmu {
             trace: crate::trace::TraceState::new(),
             coverage: crate::coverage::CoverageMap::default(),
             dbg_eip: 0,
+            watches: Vec::new(),
+            watch_log: Vec::new(),
+            watch_limit: DEFAULT_WATCH_LIMIT,
+            watch_seq: 0,
+            watch_dropped: 0,
+        }
+    }
+
+    /// Arm a memory watchpoint over `[start, start+len)`. Every guest
+    /// store overlapping it is appended to the watch log (see
+    /// [`Mmu::watch_log`]). Repeatable; a zero-length range is ignored.
+    pub fn add_watch(&mut self, start: u32, len: u32) {
+        if len != 0 {
+            self.watches.push((start, start.wrapping_add(len)));
+        }
+    }
+
+    /// Cap the watch log at `limit` events (further hits are counted,
+    /// not stored).
+    pub fn set_watch_limit(&mut self, limit: usize) {
+        self.watch_limit = limit;
+    }
+
+    /// True if any watchpoint is armed.
+    #[must_use]
+    pub fn has_watches(&self) -> bool {
+        !self.watches.is_empty()
+    }
+
+    /// The ordered write-trace collected so far.
+    #[must_use]
+    pub fn watch_log(&self) -> &[WatchEvent] {
+        &self.watch_log
+    }
+
+    /// Number of watched stores dropped after the cap was hit.
+    #[must_use]
+    pub fn watch_dropped(&self) -> u64 {
+        self.watch_dropped
+    }
+
+    /// Disarm all watchpoints and clear the log.
+    pub fn clear_watches(&mut self) {
+        self.watches.clear();
+        self.watch_log.clear();
+        self.watch_seq = 0;
+        self.watch_dropped = 0;
+    }
+
+    /// Record a store that overlaps a watchpoint. Cheap no-op when no
+    /// watchpoint is armed (the common case): a single `is_empty` test.
+    #[inline]
+    fn note_watch(&mut self, addr: u32, width: u8, value: u64) {
+        if self.watches.is_empty() {
+            return;
+        }
+        let end = addr.wrapping_add(u32::from(width));
+        let hit = self.watches.iter().any(|&(s, e)| addr < e && s < end);
+        if !hit {
+            return;
+        }
+        self.watch_seq += 1;
+        if self.watch_log.len() < self.watch_limit {
+            self.watch_log.push(WatchEvent {
+                seq: self.watch_seq,
+                addr,
+                width,
+                value,
+                eip: self.dbg_eip,
+            });
+        } else {
+            self.watch_dropped += 1;
         }
     }
 
@@ -447,6 +562,7 @@ impl Mmu {
     pub fn store8(&mut self, addr: u32, value: u8) -> Result<(), Trap> {
         self.put_byte(addr, value)?;
         self.coverage.record_write(addr, 1);
+        self.note_watch(addr, 1, u64::from(value));
         #[cfg(feature = "trace")]
         self.maybe_emit_write(addr, 1, u64::from(value));
         Ok(())
@@ -458,6 +574,7 @@ impl Mmu {
         self.put_byte(addr, bytes[0])?;
         self.put_byte(addr.wrapping_add(1), bytes[1])?;
         self.coverage.record_write(addr, 2);
+        self.note_watch(addr, 2, u64::from(value));
         #[cfg(feature = "trace")]
         self.maybe_emit_write(addr, 2, u64::from(value));
         Ok(())
@@ -471,6 +588,7 @@ impl Mmu {
         self.put_byte(addr.wrapping_add(2), bytes[2])?;
         self.put_byte(addr.wrapping_add(3), bytes[3])?;
         self.coverage.record_write(addr, 4);
+        self.note_watch(addr, 4, u64::from(value));
         #[cfg(feature = "trace")]
         self.maybe_emit_write(addr, 4, u64::from(value));
         Ok(())
@@ -482,6 +600,7 @@ impl Mmu {
         self.store32_untraced(addr, value as u32)?;
         self.store32_untraced(addr.wrapping_add(4), (value >> 32) as u32)?;
         self.coverage.record_write(addr, 8);
+        self.note_watch(addr, 8, value);
         #[cfg(feature = "trace")]
         self.maybe_emit_write(addr, 8, value);
         Ok(())
@@ -603,6 +722,44 @@ mod tests {
         assert_eq!(mmu.load8(0x2006).unwrap(), 0xAD);
         assert_eq!(mmu.load8(0x2007).unwrap(), 0xDE);
         assert_eq!(mmu.load32(0x2004).unwrap(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn watchpoint_records_overlapping_stores_only() {
+        let mut mmu = Mmu::new();
+        mmu.map(0x2000, PAGE_SIZE as u32, Perm::R | Perm::W);
+        mmu.dbg_eip = 0xCAFE;
+        mmu.add_watch(0x2010, 0x10); // watch [0x2010, 0x2020)
+
+        mmu.store32(0x2000, 0x1111_1111).unwrap(); // outside: ignored
+        mmu.store32(0x2010, 0xAAAA_AAAA).unwrap(); // hit #1
+        mmu.store16(0x2014, 0xBBBB).unwrap(); // hit #2
+        mmu.store8(0x2020, 0x33).unwrap(); // just past the end: ignored
+
+        let log = mmu.watch_log();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].seq, 1);
+        assert_eq!(log[0].addr, 0x2010);
+        assert_eq!(log[0].width, 4);
+        assert_eq!(log[0].value, 0xAAAA_AAAA);
+        assert_eq!(log[0].eip, 0xCAFE);
+        assert_eq!(log[1].seq, 2);
+        assert_eq!(log[1].addr, 0x2014);
+        assert_eq!(log[1].width, 2);
+        assert_eq!(log[1].value, 0xBBBB);
+    }
+
+    #[test]
+    fn watchpoint_cap_drops_excess_but_counts_them() {
+        let mut mmu = Mmu::new();
+        mmu.map(0x2000, PAGE_SIZE as u32, Perm::R | Perm::W);
+        mmu.add_watch(0x2000, 0x100);
+        mmu.set_watch_limit(3);
+        for i in 0..10u32 {
+            mmu.store8(0x2000 + i, i as u8).unwrap();
+        }
+        assert_eq!(mmu.watch_log().len(), 3);
+        assert_eq!(mmu.watch_dropped(), 7);
     }
 
     #[test]
