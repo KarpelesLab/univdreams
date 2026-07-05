@@ -16,9 +16,9 @@ workspace = true
 
 [dependencies]
 thiserror = "2"
-ud-arch-codec = { version = "0.2.0", path = "../ud-arch-codec" }
-ud-core = { version = "0.2.0", path = "../ud-core" }
-ud-ir = { version = "0.2.0", path = "../ud-ir" }
+ud-arch-codec = { version = "0.3.0", path = "../ud-arch-codec" }
+ud-core = { version = "0.3.0", path = "../ud-core" }
+ud-ir = { version = "0.3.0", path = "../ud-ir" }
 iced-x86 = { version = "1", default-features = false, features = [
     "decoder",
     "encoder",
@@ -29,5 +29,5 @@ iced-x86 = { version = "1", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-ud-format = { version = "0.2.0", path = "../ud-format" }
-ud-analysis = { version = "0.2.0", path = "../ud-analysis" }
+ud-format = { version = "0.3.0", path = "../ud-format" }
+ud-analysis = { version = "0.3.0", path = "../ud-analysis" }
