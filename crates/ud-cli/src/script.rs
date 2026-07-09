@@ -13,6 +13,11 @@
 //! * `ud.installCodec(id)` — register the image's `DriverProc` for VfW.
 //! * `ud.mapBlob(addr, bytes)` — stage bytes into guest memory at `addr`.
 //! * `ud.callExport(id, name, [args]) -> eax` — call an export stdcall.
+//! * `ud.callAddr(addr, [args]) -> eax` — call an arbitrary guest code
+//!   address (an indirect target the export table can't name). Enables
+//!   the full COM walk from JS: `callExport CreateInstance` → read
+//!   `ppv`/`obj`/`vtbl` out of memory with `dumpMem` → `callAddr` the
+//!   resolved vtable method with the object pointer as `this`.
 //! * `ud.dumpMem(addr, len) -> Uint8Array` — read guest memory (unmapped → 0).
 //! * `ud.dumpMemRaw(addr, len) -> [byte|null]` — same, but unmapped → `null`.
 //! * `ud.codecOpen(id, w, h[, fcc]) -> ch` — open a codec (Query+Begin) and
@@ -60,6 +65,7 @@ const ud = {
   installCodec: __ud_installCodec,
   mapBlob: __ud_mapBlob,
   callExport: __ud_callExport,
+  callAddr: __ud_callAddr,
   dumpMem: function (a, l) { return new Uint8Array(__ud_dumpMem(a, l)); },
   dumpMemRaw: __ud_dumpMem,
   readFile: function (p) { return new Uint8Array(__ud_readFile(p)); },
@@ -202,13 +208,18 @@ fn arg_u32_list(cx: &mut Ctx, v: NanBox) -> Result<Vec<u32>, NanBox> {
     Ok(out)
 }
 
-/// Stage `bytes` into guest memory at `addr`, mapping gap pages R+W and
+/// Stage `bytes` into guest memory at `addr`, mapping gap pages R+W+X and
 /// writing through the initializer (bypasses per-page W-protection).
+///
+/// Newly staged pages are executable so a script can stage guest code —
+/// COM callback thunks, fake vtables reached via `callAddr`, patched
+/// jmp stubs — not just data. Already-mapped pages keep their existing
+/// permissions (a loaded image's `R|X` code is never widened to `W`).
 fn stage_bytes(sb: &mut Sandbox, addr: u32, bytes: &[u8]) -> Result<(), String> {
     for i in 0..bytes.len() {
         let a = addr.wrapping_add(i as u32);
         if !sb.mmu.is_mapped(a) {
-            sb.mmu.map(a, 1, Perm::R | Perm::W);
+            sb.mmu.map(a, 1, Perm::R | Perm::W | Perm::X);
         }
     }
     sb.mmu
@@ -314,6 +325,23 @@ fn register_api(interp: &mut Interp<'_>, state: &Shared) {
             .sandbox
             .call_export(img, &name, &call_args)
             .map_err(|e| cx.error(&format!("callExport {name}: {e}")))?;
+        Ok(cx.number(eax as f64))
+    });
+
+    // __ud_callAddr(addr, [args]) -> eax
+    let st = state.clone();
+    interp.register_global_fn("__ud_callAddr", 2, move |cx, _this, args| {
+        let addr = arg_u32(cx, args, 0)?;
+        let call_args = if args.len() > 1 {
+            arg_u32_list(cx, args[1])?
+        } else {
+            Vec::new()
+        };
+        let s = &mut *st.borrow_mut();
+        let eax = s
+            .sandbox
+            .call_addr(addr, &call_args)
+            .map_err(|e| cx.error(&format!("callAddr {addr:#010x}: {e}")))?;
         Ok(cx.number(eax as f64))
     });
 
@@ -611,6 +639,28 @@ mod tests {
     fn host_error_surfaces_as_js_throw() {
         assert_eq!(
             eval("try { ud.callExport(99,'x',[]); 'no throw'; } catch (e) { 'caught'; }"),
+            "caught"
+        );
+    }
+
+    #[test]
+    fn call_addr_runs_staged_guest_code() {
+        // Stage a tiny stdcall routine and call it through its address —
+        // the indirect path callExport (name lookup) can't express.
+        //   8B 44 24 04   mov eax, [esp+4]   ; arg0
+        //   03 44 24 08   add eax, [esp+8]   ; arg1
+        //   C2 08 00      ret 8              ; stdcall cleanup
+        let out = eval(
+            "ud.mapBlob(0x40000000, [0x8B,0x44,0x24,0x04, 0x03,0x44,0x24,0x08, 0xC2,0x08,0x00]); \
+             String(ud.callAddr(0x40000000, [40, 2]));",
+        );
+        assert_eq!(out, "42");
+    }
+
+    #[test]
+    fn call_addr_null_target_throws() {
+        assert_eq!(
+            eval("try { ud.callAddr(0, []); 'no throw'; } catch (e) { 'caught'; }"),
             "caught"
         );
     }

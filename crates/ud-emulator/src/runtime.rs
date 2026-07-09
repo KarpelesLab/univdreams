@@ -1863,6 +1863,42 @@ impl Sandbox {
         )
     }
 
+    /// Call an arbitrary guest code address — an indirect / computed
+    /// call target the export table can't name. Pushes `args`
+    /// right-to-left + the `RET_SENTINEL` and runs until the callee
+    /// returns; returns `eax`.
+    ///
+    /// This is the address-taking analogue of [`Self::call_export`]:
+    /// where `call_export` resolves a name against an image's export
+    /// table, `call_addr` takes the resolved VA directly. That lets a
+    /// script drive dispatch paths a name lookup can't reach — COM
+    /// vtable slots (walk `*ppv` → `*obj` → `*(vtbl + n*4)`), callback
+    /// thunks staged via `mapBlob`, or jump-table entries — by reading
+    /// the target pointer out of guest memory and calling through it.
+    ///
+    /// # Errors
+    /// Returns [`crate::win32::Win32Error::InvalidArgument`] for a null
+    /// target, and propagates any CPU trap raised while running the
+    /// callee (unresolved import, instruction-budget exhaustion, …).
+    pub fn call_addr(&mut self, addr: u32, args: &[u32]) -> Result<u32, crate::Error> {
+        if addr == 0 {
+            return Err(crate::Error::Win32(
+                crate::win32::Win32Error::InvalidArgument {
+                    stub: "call_addr",
+                    reason: "null call target".into(),
+                },
+            ));
+        }
+        call_guest(
+            &mut self.cpu,
+            &mut self.mmu,
+            &mut self.registry,
+            &mut self.host,
+            addr,
+            args,
+        )
+    }
+
     /// Load a 16-bit Windows NE module in fail-soft mode: every
     /// imported ordinal is wired to a trap-on-call thunk, so the run
     /// stops at the first Win16 API the stub surface doesn't cover
