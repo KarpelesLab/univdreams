@@ -43,7 +43,7 @@ use std::ops::Range;
 const E_LFANEW_OFFSET: usize = 0x3c;
 
 /// NE signature: the bytes `N` `E` at `e_lfanew`.
-pub const NE_MAGIC: [u8; 2] = [b'N', b'E'];
+pub const NE_MAGIC: [u8; 2] = *b"NE";
 
 /// Size of the fixed NE header in bytes.
 const NE_HEADER_LEN: usize = 0x40;
@@ -321,7 +321,7 @@ impl NeFile {
             return Err(Error::TooShort { len: bytes.len() });
         }
         let magic = [bytes[0], bytes[1]];
-        if magic != [b'M', b'Z'] {
+        if magic != *b"MZ" {
             return Err(Error::NotMz { magic });
         }
         let e_lfanew = u32::from_le_bytes([

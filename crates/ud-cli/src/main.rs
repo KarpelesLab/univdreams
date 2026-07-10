@@ -2183,7 +2183,7 @@ fn vfw_probe(
     match sandbox.ic_decompress_query(hic, &in_bih, Some(&out_bih)) {
         Ok(q) => println!(
             "[probe] ICDecompressQuery({}x{} {:?} → {:?}) = {} (0 = ICERR_OK)",
-            width, height, &fcc, pix_format, q as i32
+            width, height, fcc, pix_format, q as i32
         ),
         Err(e) => println!("[probe] ICDecompressQuery failed: {e}"),
     }

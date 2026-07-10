@@ -633,11 +633,10 @@ fn rename_esp_slot(text: &str, sp_delta: i64) -> Option<String> {
     } else if let Some(rest) = inner.strip_prefix("esp+") {
         let off = parse_unsigned_disp(rest.trim())?;
         i64::try_from(off).ok()?
-    } else if let Some(rest) = inner.strip_prefix("esp-") {
+    } else {
+        let rest = inner.strip_prefix("esp-")?;
         let off = parse_unsigned_disp(rest.trim())?;
         -(i64::try_from(off).ok()?)
-    } else {
-        return None;
     };
     let stable = sp_delta + disp + 4;
     if stable == 0 || stable == 4 {

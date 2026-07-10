@@ -66,10 +66,8 @@ fn try_match_slot(slice: &str, fp_reg: &str) -> Option<(String, usize)> {
     }
     let (positive, rest) = if let Some(r) = rest.strip_prefix(" + 0x") {
         (true, r)
-    } else if let Some(r) = rest.strip_prefix(" - 0x") {
-        (false, r)
     } else {
-        return None;
+        (false, rest.strip_prefix(" - 0x")?)
     };
     let hex_end = rest.find(']')?;
     let hex_str = &rest[..hex_end];

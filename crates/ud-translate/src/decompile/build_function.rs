@@ -3233,10 +3233,8 @@ fn parse_ecx_field(inner: &str) -> Option<String> {
     let rest = rest.trim();
     let sign = if let Some(r) = rest.strip_prefix('+') {
         ("", r)
-    } else if let Some(r) = rest.strip_prefix('-') {
-        ("minus_", r)
     } else {
-        return None;
+        ("minus_", rest.strip_prefix('-')?)
     };
     let raw = sign.1.trim();
     let parsed = parse_simple_uint(raw)?;

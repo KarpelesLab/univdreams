@@ -299,7 +299,7 @@ fn read_dos_header(build: &[Field]) -> DosHeader {
         };
     };
     let e_magic_bytes = read_byte_list_block(d, "e_magic").unwrap_or_else(|| b"MZ".to_vec());
-    let mut e_magic = [b'M', b'Z'];
+    let mut e_magic = *b"MZ";
     if e_magic_bytes.len() == 2 {
         e_magic.copy_from_slice(&e_magic_bytes);
     }

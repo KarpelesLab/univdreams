@@ -1228,7 +1228,7 @@ fn read_u64(bytes: &[u8], off: usize) -> u64 {
 /// Returns an empty string if the bytes aren't valid UTF-8 or the
 /// long-name offset overflows the string table.
 fn decode_coff_symbol_name(name: &[u8], strtab: &[u8]) -> String {
-    debug_assert!(name.len() == 8);
+    debug_assert_eq!(name.len(), 8);
     if name[0..4] == [0u8; 4] {
         let off = u32::from_le_bytes(name[4..8].try_into().unwrap()) as usize;
         let Some(tail) = strtab.get(off..) else {
