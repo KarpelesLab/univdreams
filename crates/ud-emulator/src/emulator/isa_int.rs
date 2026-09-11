@@ -199,6 +199,24 @@ pub struct Cpu {
     /// captures, additional watchpoint hits are silently
     /// dropped to keep the diagnostic compact.  Default 16.
     pub register_snapshots_cap: usize,
+    /// Round-54 (lagarith Validator): caller-configured memory probes
+    /// captured *at snapshot time* alongside every register snapshot.
+    /// Each entry is `(reg_index, offset, width)` with `reg_index`
+    /// into the `[eax, ecx, edx, ebx, esp, ebp, esi, edi]` order and
+    /// `width` ∈ {1, 4}.  Post-mortem `mmu.load*` on a stack slot is
+    /// stale once the frame has been popped; this captures the value
+    /// the guest actually saw.
+    pub snapshot_probes: Vec<(u8, i32, u8)>,
+    /// Parallel to [`Self::register_snapshots`]: one `Option<u64>` per
+    /// configured probe (`None` when the address was unmapped).
+    pub snapshot_probe_values: Vec<Vec<Option<u64>>>,
+    /// Round-54: optional block dump `(eip, reg_index, byte_len)` — when
+    /// a snapshot fires at `eip`, `byte_len` bytes at `[reg]` are
+    /// copied into [`Self::snapshot_block_dumps`] as `(snapshot_index,
+    /// bytes)`.  Used to capture a per-plane probability model that a
+    /// later plane would overwrite.
+    pub snapshot_block_dump: Option<(u32, u8, u32)>,
+    pub snapshot_block_dumps: Vec<(usize, Vec<u8>)>,
 
     // ── 16-bit segmented (Win16 / NE) execution ────────────────
     /// When `true`, the *default* operand and address size is 16-bit
@@ -290,6 +308,10 @@ impl Cpu {
             register_snapshots: Vec::new(),
             memory_snapshots: Vec::new(),
             register_snapshots_cap: 16,
+            snapshot_probes: Vec::new(),
+            snapshot_probe_values: Vec::new(),
+            snapshot_block_dump: None,
+            snapshot_block_dumps: Vec::new(),
             code16: false,
             cs_sel: 0,
             ds_sel: 0,
@@ -331,6 +353,15 @@ impl Cpu {
     /// overwritten by intervening writes).
     pub fn take_memory_snapshots(&mut self) -> Vec<(u32, [(u32, u32); 4])> {
         std::mem::take(&mut self.memory_snapshots)
+    }
+
+    /// Round-54: drain the snapshot-time probe values (parallel to the
+    /// register snapshots) and block dumps.
+    pub fn take_snapshot_probes(&mut self) -> (Vec<Vec<Option<u64>>>, Vec<(usize, Vec<u8>)>) {
+        (
+            std::mem::take(&mut self.snapshot_probe_values),
+            std::mem::take(&mut self.snapshot_block_dumps),
+        )
     }
 
     /// Round-19: enable per-instruction unique-EIP tracking. Every
@@ -859,6 +890,28 @@ impl Cpu {
                 self.regs.get32(Reg32::Edi),
             ];
             self.register_snapshots.push((entry_eip, snap));
+            if !self.snapshot_probes.is_empty() {
+                let vals = self
+                    .snapshot_probes
+                    .iter()
+                    .map(|(r, off, w)| {
+                        let addr = snap[*r as usize].wrapping_add(*off as u32);
+                        if *w == 1 {
+                            mmu.load8(addr).ok().map(u64::from)
+                        } else {
+                            mmu.load32(addr).ok().map(u64::from)
+                        }
+                    })
+                    .collect();
+                self.snapshot_probe_values.push(vals);
+            }
+            if let Some((eip, r, len)) = self.snapshot_block_dump {
+                if eip == entry_eip {
+                    let base = snap[r as usize];
+                    let bytes: Vec<u8> = (0..len).map(|k| mmu.load8(base.wrapping_add(k)).unwrap_or(0)).collect();
+                    self.snapshot_block_dumps.push((self.register_snapshots.len() - 1, bytes));
+                }
+            }
             let probe_addrs = [
                 esp_now,
                 esp_now.wrapping_add(4),
@@ -2032,7 +2085,17 @@ impl Cpu {
             // Reference: Intel SDM Vol. 2B `RDTSC` instruction
             // reference.
             0x31 => {
-                let tsc = self.instr_count >> 1;
+                // vp6 sandbox round (2026-09-12): On2's VfW codecs
+                // calibrate "CPU MHz" as rdtsc-delta / QPC-delta over
+                // a timeGetTime()+5 busy-wait, then snap the result to
+                // a 50-MHz grid and *divide* every frame's decode
+                // time by it. With one TSC tick per two instructions
+                // the loop (a few dozen guest instructions) measures
+                // < 25 "MHz", snaps to 0 and the per-frame statistic
+                // traps on divide-by-zero. Sixty-four ticks per
+                // instruction keeps the counter monotonic and lands
+                // the calibration in the hundreds-of-MHz range.
+                let tsc = self.instr_count << 6;
                 self.regs.set32(Reg32::Eax, tsc as u32);
                 self.regs.set32(Reg32::Edx, (tsc >> 32) as u32);
                 Ok(StepOk::Continued)

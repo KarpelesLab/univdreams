@@ -26,6 +26,7 @@ use crate::emulator::{Cpu, Mmu};
 
 pub mod advapi32;
 pub mod comctl32;
+pub mod comdlg32;
 pub mod gdi32;
 pub mod kernel32;
 pub mod mfplat;
@@ -1339,6 +1340,7 @@ impl Registry {
         comctl32::register(self);
         shell32::register(self);
         shlwapi::register(self);
+        comdlg32::register(self);
         self.by_name.len() - before
     }
 
