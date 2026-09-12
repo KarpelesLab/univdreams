@@ -1819,6 +1819,17 @@ impl Cpu {
             // 0xF7 — Group 3 (NEG / NOT / MUL / IMUL / DIV / IDIV) r/m32
             0xF7 => self.group3_rm32(mmu, entry_eip),
 
+            // 0xD6 — SALC (undocumented, all Intel/AMD 32-bit parts):
+            // AL = CF ? 0xFF : 0x00. HuffYUV's i386 median post-pass
+            // uses it as a branchless mask select (huffyuv.dll
+            // syswow64 @0x10005b54 and following). Added 2026-09-12
+            // in the oxideav-docs scratch worktree (huffyuv r22/r23).
+            0xD6 => {
+                let v: u8 = if self.regs.flags.cf { 0xFF } else { 0x00 };
+                self.regs.set8(Reg8::Al, v);
+                Ok(StepOk::Continued)
+            }
+
             // 0xF8 — CLC ; 0xF9 — STC
             0xF8 => {
                 self.regs.flags.cf = false;
@@ -4559,6 +4570,7 @@ pub(crate) fn exec_mnemonic_hint(b: u8) -> &'static str {
         0xC9 => "LEAVE",
         0xCC => "INT3",
         0xD0..=0xD3 => "shift r/m, 1/cl",
+        0xD6 => "SALC",
         0xD8..=0xDF => "x87 FPU",
         0xE8 => "CALL rel32",
         0xE9 => "JMP rel32",
