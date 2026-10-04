@@ -32,6 +32,9 @@
 //!     --snaps snaps.jsonl --trace trace.jsonl --out dec
 //! ```
 
+// One-off reverse-engineering harness from the OxideAV docs rounds; not
+// held to the workspace pedantic lint set.
+#![allow(clippy::all, clippy::pedantic)]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -94,7 +97,9 @@ fn parse_args() -> Args {
         let k = argv[i].as_str();
         let mut val = || {
             i += 1;
-            argv.get(i).cloned().unwrap_or_else(|| panic!("missing value for {k}"))
+            argv.get(i)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing value for {k}"))
         };
         match k {
             "--dll" => a.dll = val(),
@@ -111,12 +116,14 @@ fn parse_args() -> Args {
                     "w" => WatchMode::Write,
                     _ => WatchMode::Both,
                 };
-                a.watches.push((parse_u32(parts[0]), parse_u32(parts[1]), mode));
+                a.watches
+                    .push((parse_u32(parts[0]), parse_u32(parts[1]), mode));
             }
             "--post-read" => {
                 let v = val();
                 let parts: Vec<&str> = v.split(':').collect();
-                a.post_reads.push((parse_u32(parts[0]), parse_u32(parts[1])));
+                a.post_reads
+                    .push((parse_u32(parts[0]), parse_u32(parts[1])));
             }
             "--snaps" => a.snaps = Some(val()),
             "--trace" => a.trace = Some(val()),
@@ -195,7 +202,9 @@ fn main() {
         ..Bih::default()
     };
 
-    let hic = sb.ic_open(fcc_type, fcc_h, ICMODE_DECOMPRESS).expect("ICOpen");
+    let hic = sb
+        .ic_open(fcc_type, fcc_h, ICMODE_DECOMPRESS)
+        .expect("ICOpen");
     assert!(hic != 0, "DRV_OPEN refused");
     let first = std::fs::read(&args.frames[0]).expect("frame 0");
     let q = sb
@@ -210,16 +219,12 @@ fn main() {
 
     // Drain snapshots produced during open/begin (constructor-time
     // sites such as the IDCT binder fire here, before any frame).
-    let mut dump_snaps = |sb: &mut Sandbox, phase: &str, snaps_out: &mut Box<dyn Write>| {
+    let dump_snaps = |sb: &mut Sandbox, phase: &str, snaps_out: &mut Box<dyn Write>| {
         let regs = std::mem::take(&mut sb.cpu.register_snapshots);
         let mems = sb.cpu.take_memory_snapshots();
         for (i, ((eip, r), m)) in regs.iter().zip(mems.iter()).enumerate() {
             debug_assert_eq!(*eip, m.0);
-            let probes: Vec<String> = m
-                .1
-                .iter()
-                .map(|(a, v)| format!("[{},{}]", a, v))
-                .collect();
+            let probes: Vec<String> = m.1.iter().map(|(a, v)| format!("[{},{}]", a, v)).collect();
             writeln!(
                 snaps_out,
                 "{{\"kind\":\"snap\",\"phase\":\"{}\",\"seq\":{},\"eip\":{},\"eax\":{},\"ecx\":{},\"edx\":{},\"ebx\":{},\"esp\":{},\"ebp\":{},\"esi\":{},\"edi\":{},\"probe\":[{}]}}",

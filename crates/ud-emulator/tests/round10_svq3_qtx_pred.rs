@@ -26,6 +26,9 @@
 //!
 //! Env: SVQ3_QTX, SVQ3_FIXTURE, SVQ3_OUT, SVQ3_TRIALS (direct, default 2000).
 
+// One-off reverse-engineering harness from the OxideAV docs rounds; not
+// held to the workspace pedantic lint set.
+#![allow(clippy::all, clippy::pedantic)]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -64,10 +67,14 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 fn r32(sb: &Sandbox, a: u32) -> u32 {
-    sb.mmu.load32(a).unwrap_or_else(|e| panic!("load32 {a:#x}: {e}"))
+    sb.mmu
+        .load32(a)
+        .unwrap_or_else(|e| panic!("load32 {a:#x}: {e}"))
 }
 fn w32(sb: &mut Sandbox, a: u32, v: u32) {
-    sb.mmu.store32(a, v).unwrap_or_else(|e| panic!("store32 {a:#x}: {e}"));
+    sb.mmu
+        .store32(a, v)
+        .unwrap_or_else(|e| panic!("store32 {a:#x}: {e}"));
 }
 fn read_bytes(sb: &Sandbox, a: u32, n: u32) -> Vec<u8> {
     (0..n).map(|i| sb.mmu.load8(a + i).unwrap_or(0)).collect()
@@ -81,8 +88,15 @@ fn galloc(sb: &mut Sandbox, n: u32) -> u32 {
 fn thiscall(sb: &mut Sandbox, va: u32, this: u32, args: &[u32]) -> Result<u32, String> {
     let esp = sb.cpu.regs.get32(Reg32::Esp);
     sb.cpu.regs.set32(Reg32::Ecx, this);
-    let r = call_guest(&mut sb.cpu, &mut sb.mmu, &mut sb.registry, &mut sb.host, va, args)
-        .map_err(|e| format!("{e} (eip={:#010x})", sb.cpu.regs.eip));
+    let r = call_guest(
+        &mut sb.cpu,
+        &mut sb.mmu,
+        &mut sb.registry,
+        &mut sb.host,
+        va,
+        args,
+    )
+    .map_err(|e| format!("{e} (eip={:#010x})", sb.cpu.regs.eip));
     sb.cpu.regs.set32(Reg32::Esp, esp);
     r
 }
@@ -111,15 +125,25 @@ fn setup(fixture: &PathBuf) -> (Sandbox, u32, u32, u32, u32) {
     });
     let bytes = std::fs::read(&qtx).expect("read qtx");
     let extradata = std::fs::read(fixture.join("extradata.bin")).expect("extradata");
-    let p = extradata.windows(4).position(|w| w == b"SEQH").expect("SEQH");
-    let seqh_len = u32::from_be_bytes([extradata[p + 4], extradata[p + 5], extradata[p + 6], extradata[p + 7]]);
+    let p = extradata
+        .windows(4)
+        .position(|w| w == b"SEQH")
+        .expect("SEQH");
+    let seqh_len = u32::from_be_bytes([
+        extradata[p + 4],
+        extradata[p + 5],
+        extradata[p + 6],
+        extradata[p + 7],
+    ]);
     let seqh = extradata[p + 8..p + 8 + seqh_len as usize].to_vec();
 
     let mut sb = Sandbox::new();
     sb.cpu.set_instr_limit(50_000_000_000);
     sb.host.instruction_budget = Some(50_000_000_000);
     sb.cpu.register_snapshots_cap = 20_000_000;
-    let (img, _unres) = sb.load_fail_soft("QuickTimeEssentials.qtx", &bytes).expect("load");
+    let (img, _unres) = sb
+        .load_fail_soft("QuickTimeEssentials.qtx", &bytes)
+        .expect("load");
     assert_eq!(img.image_base, 0x67d0_0000);
     sb.call_dll_main(&img, DLL_PROCESS_ATTACH).expect("DllMain");
     let core = cdecl(&mut sb, VA_ALLOC, &[CORE_SIZE]).expect("alloc core");
@@ -256,6 +280,7 @@ fn kern(src: &dyn Fn(i32, i32) -> i32, x: i32, y: i32, px: i32, py: i32, den: i3
 }
 
 #[test]
+#[ignore = "needs locally staged vendor codec binaries + fixtures (OxideAV docs harness); run with --ignored"]
 fn svq3_r10_direct() {
     let fixture = match env("SVQ3_FIXTURE") {
         Some(f) => PathBuf::from(f),
@@ -266,18 +291,34 @@ fn svq3_r10_direct() {
     };
     let out = PathBuf::from(env("SVQ3_OUT").unwrap_or_else(|| "/tmp/svq3-r10".into()));
     std::fs::create_dir_all(&out).unwrap();
-    let trials: u32 = env("SVQ3_TRIALS").and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let trials: u32 = env("SVQ3_TRIALS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
     let (mut sb, core, _pool, w, h) = setup(&fixture);
     let mut rep = std::fs::File::create(out.join("direct.txt")).unwrap();
     let interp = r32(&sb, core + 0x7c);
-    if let Some(v) = env("SVQ3_IVT").and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()) {
+    if let Some(v) =
+        env("SVQ3_IVT").and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    {
         let o = r32(&sb, interp);
         w32(&mut sb, interp, v);
         eprintln!("interp vtable override {o:#x} -> {v:#x}");
     }
     let ivt = if interp != 0 { r32(&sb, interp) } else { 0 };
-    writeln!(rep, "fixture {} {}x{} core={core:#x} [+0x7c]={interp:#x} interp-vtable={ivt:#x}", fixture.display(), w, h).unwrap();
-    writeln!(rep, "interp vtable slots +0x08..+0x34: {:x?}", (2..14).map(|k| r32(&sb, ivt + 4 * k)).collect::<Vec<_>>()).unwrap();
+    writeln!(
+        rep,
+        "fixture {} {}x{} core={core:#x} [+0x7c]={interp:#x} interp-vtable={ivt:#x}",
+        fixture.display(),
+        w,
+        h
+    )
+    .unwrap();
+    writeln!(
+        rep,
+        "interp vtable slots +0x08..+0x34: {:x?}",
+        (2..14).map(|k| r32(&sb, ivt + 4 * k)).collect::<Vec<_>>()
+    )
+    .unwrap();
 
     // harness-owned planes: luma stride 128 x 96 rows, chroma stride 64 x 48 rows
     const S: u32 = 128;
@@ -294,7 +335,12 @@ fn svq3_r10_direct() {
     w32(&mut sb, core + 0x11bc, ybuf);
     w32(&mut sb, core + 0x11c0, ubuf);
     w32(&mut sb, core + 0x11c4, vbuf);
-    writeln!(rep, "core plane fields before override (+0x11b0,+0x11b4,+0x11bc,+0x11c0,+0x11c4): {:x?}", old).unwrap();
+    writeln!(
+        rep,
+        "core plane fields before override (+0x11b0,+0x11b4,+0x11bc,+0x11c0,+0x11c4): {:x?}",
+        old
+    )
+    .unwrap();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
 
     // ---------------- 1. intra 16x16 plane (mode 3) ----------------
@@ -313,15 +359,27 @@ fn svq3_r10_direct() {
         for k in 0..17 {
             let i = k as i32 - 1;
             let noise = if kind == 0 { 0 } else { rng.range(-3, 3) };
-            t[k] = if kind == 2 { rng.range(0, 255) } else { (base + gx * i + noise).clamp(0, 255) };
+            t[k] = if kind == 2 {
+                rng.range(0, 255)
+            } else {
+                (base + gx * i + noise).clamp(0, 255)
+            };
             let noise = if kind == 0 { 0 } else { rng.range(-3, 3) };
-            l[k] = if kind == 2 { rng.range(0, 255) } else { (base + gy * i + noise).clamp(0, 255) };
+            l[k] = if kind == 2 {
+                rng.range(0, 255)
+            } else {
+                (base + gy * i + noise).clamp(0, 255)
+            };
         }
         l[0] = t[0];
         // write neighbours
         for k in 0..17u32 {
-            sb.mmu.write_initializer(ybuf + (y0 - 1) * S + x0 + k - 1, &[t[k as usize] as u8]).unwrap();
-            sb.mmu.write_initializer(ybuf + (y0 + k - 1) * S + x0 - 1, &[l[k as usize] as u8]).unwrap();
+            sb.mmu
+                .write_initializer(ybuf + (y0 - 1) * S + x0 + k - 1, &[t[k as usize] as u8])
+                .unwrap();
+            sb.mmu
+                .write_initializer(ybuf + (y0 + k - 1) * S + x0 - 1, &[l[k as usize] as u8])
+                .unwrap();
         }
         thiscall(&mut sb, VA_I16, core, &[x0, y0, 3]).expect("i16 plane");
         let mut got = [[0u8; 16]; 16];
@@ -365,7 +423,12 @@ fn svq3_r10_direct() {
         }
         if shown < 3 && kind == 1 {
             shown += 1;
-            writeln!(rep, "plane sample: top(-1..15)={:?} left(-1..15)={:?}", t, l).unwrap();
+            writeln!(
+                rep,
+                "plane sample: top(-1..15)={:?} left(-1..15)={:?}",
+                t, l
+            )
+            .unwrap();
             writeln!(rep, "  component row0={:?} row15={:?}", got[0], got[15]).unwrap();
             writeln!(rep, "  model     row0={:?} row15={:?}", m[0], m[15]).unwrap();
         }
@@ -394,10 +457,14 @@ fn svq3_r10_direct() {
         let pbase = ubuf + 16 * SC + 16;
         for k in 0..8u32 {
             if cy > 0 {
-                sb.mmu.write_initializer(pbase + (cy - 1) * SC + cx + k, &[t[k as usize] as u8]).unwrap();
+                sb.mmu
+                    .write_initializer(pbase + (cy - 1) * SC + cx + k, &[t[k as usize] as u8])
+                    .unwrap();
             }
             if cx > 0 {
-                sb.mmu.write_initializer(pbase + (cy + k) * SC + cx - 1, &[l[k as usize] as u8]).unwrap();
+                sb.mmu
+                    .write_initializer(pbase + (cy + k) * SC + cx - 1, &[l[k as usize] as u8])
+                    .unwrap();
             }
         }
         thiscall(&mut sb, VA_CDC, core, &[pbase, cx, cy]).expect("cdc");
@@ -405,7 +472,10 @@ fn svq3_r10_direct() {
         for r in 0..8 {
             got[r as usize].copy_from_slice(&read_bytes(&sb, pbase + (cy + r) * SC + cx, 8));
         }
-        let q = cdc_model(if cy > 0 { Some(t) } else { None }, if cx > 0 { Some(l) } else { None });
+        let q = cdc_model(
+            if cy > 0 { Some(t) } else { None },
+            if cx > 0 { Some(l) } else { None },
+        );
         let mut ok = true;
         let mut sym_ok = true;
         for r in 0..8 {
@@ -447,7 +517,11 @@ fn svq3_r10_direct() {
     sb.mmu.write_initializer(refy, &ry).unwrap();
     sb.mmu.write_initializer(refu, &ru).unwrap();
     sb.mmu.write_initializer(refv, &rv).unwrap();
-    for (name, va, den) in [("full", VA_MC_FULL, 1i32), ("half", VA_MC_HALF, 2), ("third", VA_MC_THIRD, 3)] {
+    for (name, va, den) in [
+        ("full", VA_MC_FULL, 1i32),
+        ("half", VA_MC_HALF, 2),
+        ("third", VA_MC_THIRD, 3),
+    ] {
         let mut mis_y = 0u32;
         let mut mis_c = 0u32;
         let mut mis_c_alt2 = 0u32;
@@ -464,7 +538,9 @@ fn svq3_r10_direct() {
             let dsty = ybuf + y * S + x;
             let dstu = ubuf + (y / 2) * SC + x / 2;
             let dstv = vbuf + (y / 2) * SC + x / 2;
-            let mut args = vec![x, y, mvx as u32, mvy as u32, pw, ph, refy, refu, refv, dsty, dstu, dstv, S, SC];
+            let mut args = vec![
+                x, y, mvx as u32, mvy as u32, pw, ph, refy, refu, refv, dsty, dstu, dstv, S, SC,
+            ];
             if den == 1 {
                 args.push(0);
                 args.push(0xffff_ffff);
@@ -511,14 +587,32 @@ fn svq3_r10_direct() {
                     // alternative reading: floor(mv/2) in the same unit (the "natural" chroma vector)
                     let (ax, ay) = (mvx.div_euclid(2), mvy.div_euclid(2));
                     let (afx, afy, apx, apy) = (fl(ax), fl(ay), fr(ax), fr(ay));
-                    if urow[c as usize] != kern(&su, (x / 2) as i32 + afx + c, (y / 2) as i32 + afy + r, apx, apy, den) {
+                    if urow[c as usize]
+                        != kern(
+                            &su,
+                            (x / 2) as i32 + afx + c,
+                            (y / 2) as i32 + afy + r,
+                            apx,
+                            apy,
+                            den,
+                        )
+                    {
                         badalt = true;
                     }
                     // second alternative (full-pel only): chroma vector = mv/2 chroma samples,
                     // odd component -> bilinear half-sample (floor for the integer part)
                     if den == 1 {
                         let (bx, by) = (mvx.div_euclid(2), mvy.div_euclid(2));
-                        if urow[c as usize] != kern(&su, (x / 2) as i32 + bx + c, (y / 2) as i32 + by + r, mvx.rem_euclid(2), mvy.rem_euclid(2), 2) {
+                        if urow[c as usize]
+                            != kern(
+                                &su,
+                                (x / 2) as i32 + bx + c,
+                                (y / 2) as i32 + by + r,
+                                mvx.rem_euclid(2),
+                                mvy.rem_euclid(2),
+                                2,
+                            )
+                        {
                             badalt2 = true;
                         }
                     }
@@ -530,7 +624,11 @@ fn svq3_r10_direct() {
             if badc {
                 mis_c += 1;
                 if mis_c <= 3 {
-                    writeln!(rep, "  {name} chroma mismatch: x={x} y={y} mv=({mvx},{mvy}) {pw}x{ph}").unwrap();
+                    writeln!(
+                        rep,
+                        "  {name} chroma mismatch: x={x} y={y} mv=({mvx},{mvy}) {pw}x{ph}"
+                    )
+                    .unwrap();
                 }
             }
             if badalt {
@@ -540,14 +638,21 @@ fn svq3_r10_direct() {
         writeln!(rep, "MC-{name} calls={n}: luma mismatches={mis_y}; chroma (int=trunc(F/2), phase=luma phase) mismatches={mis_c}; alternative chroma (floor(mv/2) same unit) mismatches={mis_c_alt}; full-pel alternative (mv/2 with bilinear half-sample on odd) mismatches={mis_c_alt2}; phase histogram={:?}", phase_hist).unwrap();
     }
     // restore fields
-    for (i, o) in [0x11b0u32, 0x11b4, 0x11bc, 0x11c0, 0x11c4].iter().enumerate() {
+    for (i, o) in [0x11b0u32, 0x11b4, 0x11bc, 0x11c0, 0x11c4]
+        .iter()
+        .enumerate()
+    {
         w32(&mut sb, core + o, old[i]);
     }
     drop(rep);
-    eprintln!("{}", std::fs::read_to_string(out.join("direct.txt")).unwrap());
+    eprintln!(
+        "{}",
+        std::fs::read_to_string(out.join("direct.txt")).unwrap()
+    );
 }
 
 #[test]
+#[ignore = "needs locally staged vendor codec binaries + fixtures (OxideAV docs harness); run with --ignored"]
 fn svq3_r10_fixture() {
     let fixture = match env("SVQ3_FIXTURE") {
         Some(f) => PathBuf::from(f),
@@ -612,7 +717,12 @@ fn svq3_r10_fixture() {
     w32(&mut sb, opts + 0x14, 1);
     let vt = r32(&sb, core);
     let mut summary = std::fs::File::create(out.join("summary.txt")).unwrap();
-    writeln!(summary, "{w}x{h} luma stride {st} chroma stride {cst} probes {}", probes.len()).unwrap();
+    writeln!(
+        summary,
+        "{w}x{h} luma stride {st} chroma stride {cst} probes {}",
+        probes.len()
+    )
+    .unwrap();
     for line in index.lines().skip(1) {
         let cols: Vec<&str> = line.split(',').collect();
         if cols.len() < 4 {
@@ -622,13 +732,17 @@ fn svq3_r10_fixture() {
         let off: usize = cols[1].parse().unwrap();
         let size: usize = cols[2].parse().unwrap();
         let buf = galloc(&mut sb, (size + 64) as u32);
-        sb.mmu.write_initializer(buf, &samples[off..off + size]).unwrap();
+        sb.mmu
+            .write_initializer(buf, &samples[off..off + size])
+            .unwrap();
         let f = r32(&sb, vt + 0x34);
         let res = thiscall(&mut sb, f, core, &[buf, size as u32, pool, opts]);
         let regs = std::mem::take(&mut sb.cpu.register_snapshots);
         let _ = sb.cpu.take_memory_snapshots();
         let (pv, _) = sb.cpu.take_snapshot_probes();
-        let mut fo = std::io::BufWriter::new(std::fs::File::create(out.join(format!("frame{frame}.pred.jsonl"))).unwrap());
+        let mut fo = std::io::BufWriter::new(
+            std::fs::File::create(out.join(format!("frame{frame}.pred.jsonl"))).unwrap(),
+        );
         for (i, (eip, r)) in regs.iter().enumerate() {
             let lab = labels.get(eip).copied().unwrap_or("?");
             // keep only the probe range relevant to the site
@@ -640,7 +754,15 @@ fn svq3_r10_fixture() {
                 l if l.starts_with("mc.") => (369, 375),
                 _ => (0, 0),
             };
-            let vals: Vec<String> = pv.get(i).map(|v| v[lo..hi].iter().map(|x| x.map_or("null".to_string(), |y| y.to_string())).collect()).unwrap_or_default();
+            let vals: Vec<String> = pv
+                .get(i)
+                .map(|v| {
+                    v[lo..hi]
+                        .iter()
+                        .map(|x| x.map_or("null".to_string(), |y| y.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
             writeln!(
                 fo,
                 "{{\"i\":{i},\"eip\":\"{eip:#010x}\",\"site\":\"{lab}\",\"regs\":[{},{},{},{},{},{},{},{}],\"probe\":[{}]}}",
@@ -648,7 +770,11 @@ fn svq3_r10_fixture() {
             )
             .unwrap();
         }
-        let line = format!("frame {frame}: rc={res:?} slice_type={} snaps={}", r32(&sb, core + 0x1c), regs.len());
+        let line = format!(
+            "frame {frame}: rc={res:?} slice_type={} snaps={}",
+            r32(&sb, core + 0x1c),
+            regs.len()
+        );
         eprintln!("{line}");
         writeln!(summary, "{line}").unwrap();
         if res.is_err() {

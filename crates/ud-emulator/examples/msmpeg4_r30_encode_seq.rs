@@ -17,7 +17,14 @@
 //!     --frame f0.bgr --frame f1.bgr --out enc \
 //!     [--watch 0x1c23a788:0xa8 --trace enc.trace.jsonl]   # read-watch (hex addr:len)
 //! ```
-#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::uninlined_format_args)]
+// One-off reverse-engineering harness from the OxideAV docs rounds; not
+// held to the workspace pedantic lint set.
+#![allow(clippy::all, clippy::pedantic)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::uninlined_format_args
+)]
 
 use ud_emulator::{Bih, Sandbox, WatchMode, DLL_PROCESS_ATTACH};
 
@@ -26,8 +33,14 @@ const ICCOMPRESS_KEYFRAME: u32 = 1;
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (mut dll, mut w, mut h, mut q, mut fcc, mut out) =
-        (String::new(), 0u32, 0u32, 5000u32, "MP43".to_string(), String::from("enc"));
+    let (mut dll, mut w, mut h, mut q, mut fcc, mut out) = (
+        String::new(),
+        0u32,
+        0u32,
+        5000u32,
+        "MP43".to_string(),
+        String::from("enc"),
+    );
     let mut frames = Vec::new();
     let mut all_key = false;
     let mut watches: Vec<(u32, u32)> = Vec::new();
@@ -59,7 +72,11 @@ fn main() {
         i += 2;
     }
     let bytes = std::fs::read(&dll).expect("dll");
-    let name = std::path::Path::new(&dll).file_name().unwrap().to_string_lossy().into_owned();
+    let name = std::path::Path::new(&dll)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let mut sb = Sandbox::new();
     sb.host.instruction_budget = Some(40_000_000_000);
     sb.cpu.set_instr_limit(40_000_000_000);
@@ -75,7 +92,11 @@ fn main() {
     sb.install_codec(&img).expect("install");
     let fb = fcc.as_bytes();
     let hic = sb
-        .ic_open(u32::from_le_bytes(*b"VIDC"), u32::from_le_bytes([fb[0], fb[1], fb[2], fb[3]]), ICMODE_COMPRESS)
+        .ic_open(
+            u32::from_le_bytes(*b"VIDC"),
+            u32::from_le_bytes([fb[0], fb[1], fb[2], fb[3]]),
+            ICMODE_COMPRESS,
+        )
         .expect("open");
     assert!(hic != 0);
     let in_bih = Bih {
@@ -89,9 +110,13 @@ fn main() {
         ..Bih::default()
     };
     let (_, out_bih) = sb.ic_compress_get_format(hic, &in_bih).expect("fmt");
-    let qr = sb.ic_compress_query(hic, &in_bih, Some(&out_bih)).expect("query");
+    let qr = sb
+        .ic_compress_query(hic, &in_bih, Some(&out_bih))
+        .expect("query");
     assert_eq!(qr as i32, 0, "query");
-    let cap = sb.ic_compress_get_size(hic, &in_bih, &out_bih).expect("size");
+    let cap = sb
+        .ic_compress_get_size(hic, &in_bih, &out_bih)
+        .expect("size");
     let _ = sb.ic_compress_begin(hic, &in_bih, &out_bih);
     let mut prev: Option<Vec<u8>> = None;
     for (k, p) in frames.iter().enumerate() {

@@ -908,8 +908,11 @@ impl Cpu {
             if let Some((eip, r, len)) = self.snapshot_block_dump {
                 if eip == entry_eip {
                     let base = snap[r as usize];
-                    let bytes: Vec<u8> = (0..len).map(|k| mmu.load8(base.wrapping_add(k)).unwrap_or(0)).collect();
-                    self.snapshot_block_dumps.push((self.register_snapshots.len() - 1, bytes));
+                    let bytes: Vec<u8> = (0..len)
+                        .map(|k| mmu.load8(base.wrapping_add(k)).unwrap_or(0))
+                        .collect();
+                    self.snapshot_block_dumps
+                        .push((self.register_snapshots.len() - 1, bytes));
                 }
             }
             let probe_addrs = [
@@ -4868,10 +4871,24 @@ mod tests {
     #[test]
     fn unknown_opcode_traps() {
         let (mut cpu, mut mmu) = make();
-        write_code(&mut mmu, 0x1000, &[0xD6]); // SALC: unimplemented in our table
+        write_code(&mut mmu, 0x1000, &[0xF1]); // ICEBP / INT1: unimplemented in our table
         match cpu.run(&mut mmu) {
-            Err(Trap::UndefinedOpcode { opcode: 0xD6, .. }) => (),
-            other => panic!("expected undefined-opcode trap for 0xD6, got {other:?}"),
+            Err(Trap::UndefinedOpcode { opcode: 0xF1, .. }) => (),
+            other => panic!("expected undefined-opcode trap for 0xF1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn salc_sets_al_from_carry() {
+        // SALC (0xD6): AL = CF ? 0xFF : 0x00; flags untouched.
+        for (cf, want) in [(true, 0xFFu8), (false, 0x00u8)] {
+            let (mut cpu, mut mmu) = make();
+            write_code(&mut mmu, 0x1000, &[0xD6]);
+            cpu.regs.set32(Reg32::Eax, 0x1234_5655);
+            cpu.regs.flags.cf = cf;
+            cpu.step(&mut mmu).unwrap();
+            assert_eq!(cpu.regs.get32(Reg32::Eax), 0x1234_5600 | u32::from(want));
+            assert_eq!(cpu.regs.flags.cf, cf);
         }
     }
 

@@ -16,7 +16,14 @@
 //! Everything is written under `RE2_OUT`. Run with
 //! `cargo test --release -p ud-emulator --features trace --test re2_indeo3_cells -- --nocapture`.
 
-#![allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::unreadable_literal)]
+// One-off reverse-engineering harness from the OxideAV docs rounds; not
+// held to the workspace pedantic lint set.
+#![allow(clippy::all, clippy::pedantic)]
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::unreadable_literal
+)]
 
 use std::fs;
 use std::io::Write;
@@ -50,6 +57,7 @@ fn dump_range(sb: &Sandbox, lo: u32, hi: u32) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "needs locally staged vendor codec binaries + fixtures (OxideAV docs harness); run with --ignored"]
 fn re2_indeo3_cells() {
     let dll_path = env_or(
         "RE2_IR32_DLL",
@@ -87,9 +95,15 @@ fn re2_indeo3_cells() {
         "yuy2" => (16, *b"YUY2", width * height * 2),
         other => panic!("unknown RE2_PIX {other}"),
     };
-    let bit_count: u16 = std::env::var("RE2_BITCOUNT").ok().map_or(bit_count, |v| v.parse().unwrap());
-    let out_size: u32 = std::env::var("RE2_SIZEIMAGE").ok().map_or(out_size, |v| v.parse().unwrap());
-    let planes: u16 = std::env::var("RE2_PLANES").ok().map_or(1, |v| v.parse().unwrap());
+    let bit_count: u16 = std::env::var("RE2_BITCOUNT")
+        .ok()
+        .map_or(bit_count, |v| v.parse().unwrap());
+    let out_size: u32 = std::env::var("RE2_SIZEIMAGE")
+        .ok()
+        .map_or(out_size, |v| v.parse().unwrap());
+    let planes: u16 = std::env::var("RE2_PLANES")
+        .ok()
+        .map_or(1, |v| v.parse().unwrap());
     println!("[re2] out BIH: bit_count={bit_count} planes={planes} size_image={out_size} compression={:?}", std::str::from_utf8(&compression).unwrap_or("?"));
     let first = fs::read(frames_dir.join("f0.bin")).expect("f0.bin");
     let in_bih = Bih {
@@ -112,8 +126,13 @@ fn re2_indeo3_cells() {
         size_image: out_size,
         ..Bih::default()
     };
-    let q = sb.ic_decompress_query(hic, &in_bih, Some(&out_bih)).expect("query");
-    println!("[re2] ICDecompressQuery({width}x{height} IV32 -> {pix}) = {}", q as i32);
+    let q = sb
+        .ic_decompress_query(hic, &in_bih, Some(&out_bih))
+        .expect("query");
+    println!(
+        "[re2] ICDecompressQuery({width}x{height} IV32 -> {pix}) = {}",
+        q as i32
+    );
     if q != 0 {
         println!("[re2] codec rejected {pix}; stopping");
         return;
@@ -121,7 +140,9 @@ fn re2_indeo3_cells() {
 
     sb.cpu.register_snapshots_cap = 64;
     sb.cpu.add_register_watchpoint(SITE_POPULATOR);
-    let b = sb.ic_decompress_begin(hic, &in_bih, &out_bih).expect("begin");
+    let b = sb
+        .ic_decompress_begin(hic, &in_bih, &out_bih)
+        .expect("begin");
     println!("[re2] ICDecompressBegin = {}", b as i32);
     let mem = sb.cpu.take_memory_snapshots();
     let snaps = sb.cpu.clear_register_watchpoints();
@@ -134,7 +155,11 @@ fn re2_indeo3_cells() {
     }
     println!("[re2] populator calls: {} banks {:x?}", banks.len(), banks);
     for (i, bank) in banks.iter().enumerate() {
-        fs::write(out_dir.join(format!("bank-{i}-{bank:08x}.bin")), dump_range(&sb, *bank, *bank + 0xb00)).unwrap();
+        fs::write(
+            out_dir.join(format!("bank-{i}-{bank:08x}.bin")),
+            dump_range(&sb, *bank, *bank + 0xb00),
+        )
+        .unwrap();
     }
     {
         let mut f = fs::File::create(out_dir.join("banks.csv")).unwrap();
@@ -145,16 +170,35 @@ fn re2_indeo3_cells() {
     }
 
     let mut all = fs::File::create(out_dir.join(format!("regsnaps-{pix}.tsv"))).unwrap();
-    writeln!(all, "frame\ti\teip\teax\tecx\tedx\tebx\tesp\tebp\tesi\tedi\t[esp]\t[esp+4]\tbyte_at_ebp").unwrap();
+    writeln!(
+        all,
+        "frame\ti\teip\teax\tecx\tedx\tebx\tesp\tebp\tesi\tedi\t[esp]\t[esp+4]\tbyte_at_ebp"
+    )
+    .unwrap();
     let mut summary = fs::File::create(out_dir.join(format!("frames-{pix}.csv"))).unwrap();
-    writeln!(summary, "frame,in_bytes,rc,out_bytes,instructions,snapshots").unwrap();
+    writeln!(
+        summary,
+        "frame,in_bytes,rc,out_bytes,instructions,snapshots"
+    )
+    .unwrap();
 
     for fr in 0..nframes {
         let frame = fs::read(frames_dir.join(format!("f{fr}.bin"))).expect("frame");
-        let in_bih_f = Bih { size_image: frame.len() as u32, ..in_bih.clone() };
+        let in_bih_f = Bih {
+            size_image: frame.len() as u32,
+            ..in_bih.clone()
+        };
         if watch_cells {
             sb.cpu.register_snapshots_cap = 8_000_000;
-            for wp in [SITE_SLOT_PLANE, SITE_STRIP_BUF, SITE_CELL, SITE_UNPACK, SITE_LUT, SITE_MC_MV, SITE_FAULT] {
+            for wp in [
+                SITE_SLOT_PLANE,
+                SITE_STRIP_BUF,
+                SITE_CELL,
+                SITE_UNPACK,
+                SITE_LUT,
+                SITE_MC_MV,
+                SITE_FAULT,
+            ] {
                 sb.cpu.add_register_watchpoint(wp);
             }
             for (wp, _) in FAMILIES {
@@ -177,7 +221,15 @@ fn re2_indeo3_cells() {
             instr,
             snaps.len()
         );
-        writeln!(summary, "{fr},{},{},{},{instr},{}", frame.len(), rc as i32, decoded.len(), snaps.len()).unwrap();
+        writeln!(
+            summary,
+            "{fr},{},{},{},{instr},{}",
+            frame.len(),
+            rc as i32,
+            decoded.len(),
+            snaps.len()
+        )
+        .unwrap();
         for (i, (eip, r)) in snaps.iter().enumerate() {
             let m = mem.get(i).map(|(_, m)| *m).unwrap_or([(0, 0); 4]);
             let byte = if *eip == SITE_UNPACK || *eip == SITE_MC_MV {

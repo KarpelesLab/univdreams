@@ -35,6 +35,9 @@
 //! (how many access units, default all), SVQ3_VTABLE (override the core
 //! vtable VA, default = base-class table left by the ctor).
 
+// One-off reverse-engineering harness from the OxideAV docs rounds; not
+// held to the workspace pedantic lint set.
+#![allow(clippy::all, clippy::pedantic)]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -113,12 +116,12 @@ const SNAP_SITES: &[(u32, &str)] = &[
     (0x67d13d30, "envelope.entry"),
     (0x67d14ea0, "driver.entry"),
     (0x67d14760, "seqh.entry"),
-    (0x67d24e4a, "i4.mode"),     // eax = 4x4 pred mode, esi = dest sample address
-    (0x67d255e3, "i16.mode"),    // edi = 16x16 pred mode
-    (0x67d230b5, "mvpred.x"),    // edi = horizontal predictor (clamped), edx = out ptr
-    (0x67d230d0, "mvpred.y_neg"),// eax = vertical predictor (negative-clamp path)
-    (0x67d230f1, "mvpred.y"),    // eax = vertical predictor
-    (0x67d1307c, "mvstore16"),   // esi = mv x (1/6), edi = mv y (1/6), ecx = slot
+    (0x67d24e4a, "i4.mode"), // eax = 4x4 pred mode, esi = dest sample address
+    (0x67d255e3, "i16.mode"), // edi = 16x16 pred mode
+    (0x67d230b5, "mvpred.x"), // edi = horizontal predictor (clamped), edx = out ptr
+    (0x67d230d0, "mvpred.y_neg"), // eax = vertical predictor (negative-clamp path)
+    (0x67d230f1, "mvpred.y"), // eax = vertical predictor
+    (0x67d1307c, "mvstore16"), // esi = mv x (1/6), edi = mv y (1/6), ecx = slot
     (0x67d13136, "mvstore.other"),
     (0x67d1313b, "mvstore16x8"),
     (0x67d131a8, "mvstore8"),
@@ -145,10 +148,14 @@ fn env(name: &str) -> Option<String> {
 }
 
 fn r32(sb: &Sandbox, a: u32) -> u32 {
-    sb.mmu.load32(a).unwrap_or_else(|e| panic!("load32 {a:#x}: {e}"))
+    sb.mmu
+        .load32(a)
+        .unwrap_or_else(|e| panic!("load32 {a:#x}: {e}"))
 }
 fn w32(sb: &mut Sandbox, a: u32, v: u32) {
-    sb.mmu.store32(a, v).unwrap_or_else(|e| panic!("store32 {a:#x}: {e}"));
+    sb.mmu
+        .store32(a, v)
+        .unwrap_or_else(|e| panic!("store32 {a:#x}: {e}"));
 }
 fn read_bytes(sb: &Sandbox, a: u32, n: u32) -> Vec<u8> {
     (0..n).map(|i| sb.mmu.load8(a + i).unwrap_or(0)).collect()
@@ -179,7 +186,11 @@ fn cdecl(sb: &mut Sandbox, va: u32, args: &[u32]) -> Result<u32, String> {
     thiscall(sb, va, 0, args)
 }
 
-fn dump_snaps(sb: &mut Sandbox, path: &PathBuf, labels: &std::collections::BTreeMap<u32, &str>) -> usize {
+fn dump_snaps(
+    sb: &mut Sandbox,
+    path: &PathBuf,
+    labels: &std::collections::BTreeMap<u32, &str>,
+) -> usize {
     let regs = std::mem::take(&mut sb.cpu.register_snapshots);
     let mems = std::mem::take(&mut sb.cpu.memory_snapshots);
     let mut f = std::io::BufWriter::new(std::fs::File::create(path).expect("create snap file"));
@@ -198,6 +209,7 @@ fn dump_snaps(sb: &mut Sandbox, path: &PathBuf, labels: &std::collections::BTree
 }
 
 #[test]
+#[ignore = "needs locally staged vendor codec binaries + fixtures (OxideAV docs harness); run with --ignored"]
 fn svq3_qtx_decode_fixture_r8() {
     let qtx = env("SVQ3_QTX").unwrap_or_else(|| {
         "/Users/magicaltux/projects/oxideav-workspace/docs/video/svq3/reference/binaries/QuickTimeEssentials.qtx".into()
@@ -211,9 +223,12 @@ fn svq3_qtx_decode_fixture_r8() {
     };
     let out = PathBuf::from(env("SVQ3_OUT").unwrap_or_else(|| "/tmp/svq3-out".into()));
     std::fs::create_dir_all(&out).unwrap();
-    let max_frames: usize = env("SVQ3_FRAMES").and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let max_frames: usize = env("SVQ3_FRAMES")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
     let only: Option<usize> = env("SVQ3_ONLY").and_then(|s| s.parse().ok());
-    let vt_override: Option<u32> = env("SVQ3_VTABLE").and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+    let vt_override: Option<u32> =
+        env("SVQ3_VTABLE").and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
 
     let bytes = std::fs::read(&qtx).expect("read qtx");
     let samples = std::fs::read(fixture.join("samples.bin")).expect("samples.bin");
@@ -223,11 +238,22 @@ fn svq3_qtx_decode_fixture_r8() {
     // Locate the SEQH atom inside the SMI wrapper: 'SEQH' fourcc, then
     // u32 big-endian payload length, then payload (matches the glue at
     // 0x67d10ccc..0x67d10d0a: payload = atom+8, len = bswap(atom+4)).
-    let p = extradata.windows(4).position(|w| w == b"SEQH").expect("SEQH");
-    let seqh_len = u32::from_be_bytes([extradata[p + 4], extradata[p + 5], extradata[p + 6], extradata[p + 7]]);
+    let p = extradata
+        .windows(4)
+        .position(|w| w == b"SEQH")
+        .expect("SEQH");
+    let seqh_len = u32::from_be_bytes([
+        extradata[p + 4],
+        extradata[p + 5],
+        extradata[p + 6],
+        extradata[p + 7],
+    ]);
     let seqh_vec: Vec<u8> = match env("SVQ3_SEQH_HEX") {
         // SVQ3_SEQH_HEX="d780": replace the SEQH payload bytes (same length)
-        Some(h) => (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect(),
+        Some(h) => (0..h.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
+            .collect(),
         None => extradata[p + 8..p + 8 + seqh_len as usize].to_vec(),
     };
     let seqh = &seqh_vec[..];
@@ -238,9 +264,19 @@ fn svq3_qtx_decode_fixture_r8() {
     sb.cpu.set_instr_limit(50_000_000_000);
     sb.host.instruction_budget = Some(50_000_000_000);
     sb.cpu.register_snapshots_cap = 20_000_000;
-    let (img, unresolved) = sb.load_fail_soft("QuickTimeEssentials.qtx", &bytes).expect("load");
-    eprintln!("loaded at {:#x}; {} fail-soft imports: {:?}", img.image_base, unresolved.len(), unresolved);
-    assert_eq!(img.image_base, 0x67d0_0000, "image must load at its preferred base (VAs are absolute)");
+    let (img, unresolved) = sb
+        .load_fail_soft("QuickTimeEssentials.qtx", &bytes)
+        .expect("load");
+    eprintln!(
+        "loaded at {:#x}; {} fail-soft imports: {:?}",
+        img.image_base,
+        unresolved.len(),
+        unresolved
+    );
+    assert_eq!(
+        img.image_base, 0x67d0_0000,
+        "image must load at its preferred base (VAs are absolute)"
+    );
     let r = sb.call_dll_main(&img, DLL_PROCESS_ATTACH).expect("DllMain");
     eprintln!("DllMain -> {r:#x}");
 
@@ -296,12 +332,23 @@ fn svq3_qtx_decode_fixture_r8() {
     let pb: Vec<u32> = (0..13).map(|i| r32(&sb, params + 4 * i)).collect();
     eprintln!("params rc={rc}: {pb:?}");
     let rc = thiscall(&mut sb, VA_POOL_ALLOC, pool, &[params]).expect("pool alloc");
-    eprintln!("pool alloc rc={rc} count={} stride={} cstride={}", r32(&sb, pool + 0x10), r32(&sb, pool + 0x14), r32(&sb, pool + 0x18));
+    eprintln!(
+        "pool alloc rc={rc} count={} stride={} cstride={}",
+        r32(&sb, pool + 0x10),
+        r32(&sb, pool + 0x14),
+        r32(&sb, pool + 0x18)
+    );
     assert_eq!(rc, 0);
     let o1 = galloc(&mut sb, 8);
     let f = slot(&sb, 0x30);
     let rc = thiscall(&mut sb, f, core, &[w, h, o1, o1 + 4]).expect("set size");
-    eprintln!("set-size rc={rc} o1={} o2={} mbw*16={} mbh*16={}", r32(&sb, o1), r32(&sb, o1 + 4), r32(&sb, core + 0x1198), r32(&sb, core + 0x119c));
+    eprintln!(
+        "set-size rc={rc} o1={} o2={} mbw*16={} mbh*16={}",
+        r32(&sb, o1),
+        r32(&sb, o1 + 4),
+        r32(&sb, core + 0x1198),
+        r32(&sb, core + 0x119c)
+    );
     assert_eq!(rc, 0);
     thiscall(&mut sb, VA_POOL_RESET, pool, &[]).expect("pool reset");
 
@@ -358,14 +405,25 @@ fn svq3_qtx_decode_fixture_r8() {
         #[cfg(feature = "trace")]
         if let Some(spec) = env("SVQ3_WATCH") {
             let v: Vec<u32> = spec.split(',').map(|s| s.trim().parse().unwrap()).collect();
-            let rec_i: u32 = env("SVQ3_WATCH_REC").and_then(|s| s.parse().ok()).unwrap_or(1);
+            let rec_i: u32 = env("SVQ3_WATCH_REC")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1);
             let st = r32(&sb, pool + 0x14);
             let recs = r32(&sb, pool + 0xc);
             let ybase = r32(&sb, recs + rec_i * 0x14);
-            eprintln!("watch: record {rec_i} ybase={ybase:#x} stride={st} region x={} y={} w={} h={}", v[0], v[1], v[2], v[3]);
-            sb.set_trace_sink(Box::new(std::fs::File::create(out.join(format!("frame{frame}.memwatch.jsonl"))).unwrap()));
+            eprintln!(
+                "watch: record {rec_i} ybase={ybase:#x} stride={st} region x={} y={} w={} h={}",
+                v[0], v[1], v[2], v[3]
+            );
+            sb.set_trace_sink(Box::new(
+                std::fs::File::create(out.join(format!("frame{frame}.memwatch.jsonl"))).unwrap(),
+            ));
             for row in 0..v[3] {
-                sb.watch(ybase + (v[1] + row) * st + v[0], v[2], ud_emulator::trace::WatchMode::Write);
+                sb.watch(
+                    ybase + (v[1] + row) * st + v[0],
+                    v[2],
+                    ud_emulator::trace::WatchMode::Write,
+                );
             }
         }
         let t0 = std::time::Instant::now();
@@ -376,7 +434,11 @@ fn svq3_qtx_decode_fixture_r8() {
         let bitpos = r32(&sb, reader + 4);
         let bitlim = r32(&sb, reader);
         let rerr = r32(&sb, reader + 0x18);
-        let nsnap = dump_snaps(&mut sb, &out.join(format!("frame{frame}.snap.jsonl")), &labels);
+        let nsnap = dump_snaps(
+            &mut sb,
+            &out.join(format!("frame{frame}.snap.jsonl")),
+            &labels,
+        );
         let line = format!(
             "frame {frame}: size={size} rc={:?} slice_type={} qp={} pic_id={} reader_pos={bitpos} reader_limit={bitlim} reader_err={rerr} snaps={nsnap} time={:.1}s pool_cur={} pool_ref={}",
             res,
@@ -393,8 +455,20 @@ fn svq3_qtx_decode_fixture_r8() {
             break;
         }
         // planes of the current display picture
-        thiscall(&mut sb, VA_POOL_PLANES, pool, &[outs, outs + 4, outs + 8, outs + 12, outs + 16]).expect("planes");
-        let (py, pu, pv, st, cst) = (r32(&sb, outs), r32(&sb, outs + 4), r32(&sb, outs + 8), r32(&sb, outs + 12), r32(&sb, outs + 16));
+        thiscall(
+            &mut sb,
+            VA_POOL_PLANES,
+            pool,
+            &[outs, outs + 4, outs + 8, outs + 12, outs + 16],
+        )
+        .expect("planes");
+        let (py, pu, pv, st, cst) = (
+            r32(&sb, outs),
+            r32(&sb, outs + 4),
+            r32(&sb, outs + 8),
+            r32(&sb, outs + 12),
+            r32(&sb, outs + 16),
+        );
         eprintln!("  planes y={py:#x} u={pu:#x} v={pv:#x} stride={st} cstride={cst}");
         let mut y = Vec::with_capacity((w * h) as usize);
         for row in 0..h {

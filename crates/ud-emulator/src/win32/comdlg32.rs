@@ -3,7 +3,7 @@
 //! `GetOpenFileNameA`; the decode path never reaches it. The stub
 //! reports "user cancelled" so any accidental call fails soft.
 
-use super::{Registry, StubFn, Win32Error, HostState};
+use super::{HostState, Registry, StubFn, Win32Error};
 use crate::emulator::{Cpu, Mmu};
 
 /// Register every comdlg32 stub.

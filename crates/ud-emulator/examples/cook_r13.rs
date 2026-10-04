@@ -40,6 +40,9 @@
 //!
 //! Env: COOK_WS (workspace dir, default the cook cleanroom path),
 //!      COOK_OUT (output dir, default ./cook_r12_out).
+// One-off reverse-engineering harness from the OxideAV docs rounds; not
+// held to the workspace pedantic lint set.
+#![allow(clippy::all, clippy::pedantic)]
 #![allow(clippy::all, clippy::pedantic)]
 
 use std::fs::File;
@@ -137,9 +140,7 @@ fn setup(dll: &[u8], cookie: &[u8]) -> Cook {
     println!("x87 control word at sandbox start: {:#06x}", sb.cpu.fpu_cw);
     let img = sb.load("cook.dll", dll).expect("load cook.dll");
     assert_eq!(img.image_base, IB, "image relocated");
-    let r = sb
-        .call_dll_main(&img, DLL_PROCESS_ATTACH)
-        .expect("DllMain");
+    let r = sb.call_dll_main(&img, DLL_PROCESS_ATTACH).expect("DllMain");
     assert_eq!(r, 1);
     let cookie_va = galloc(&mut sb, cookie);
     let mut desc = [0u8; 0x20];
@@ -149,7 +150,9 @@ fn setup(dll: &[u8], cookie: &[u8]) -> Cook {
     desc[0x16..0x1a].copy_from_slice(&cookie_va.to_le_bytes());
     let desc_va = galloc(&mut sb, &desc);
     let slot = galloc(&mut sb, &[0u8; 4]);
-    let hr = sb.call_export(&img, "RAOpenCodec", &[slot]).expect("RAOpenCodec");
+    let hr = sb
+        .call_export(&img, "RAOpenCodec", &[slot])
+        .expect("RAOpenCodec");
     let ra = sb.mmu.load32(slot).unwrap();
     println!("RAOpenCodec -> {hr:#x}, ctx={ra:#x}");
     let hr = sb
@@ -239,7 +242,8 @@ fn mode_pcm(flags: u32) {
     let (dll, cookie, pk) = load_inputs();
     let mut c = setup(&dll, &cookie);
     let out = outdir();
-    let mut log = BufWriter::new(File::create(out.join(format!("pcm-flags{flags:x}.log"))).unwrap());
+    let mut log =
+        BufWriter::new(File::create(out.join(format!("pcm-flags{flags:x}.log"))).unwrap());
     let mut pcm_all = Vec::new();
     // register snapshots on the driver's gate push (0x12ba: edx = (~flags)&1,
     // ebx = sub-packet index) and the flags shift store (0x12ce: eax = flags>>1)
@@ -320,11 +324,15 @@ fn mode_trace(p: usize) {
         let t = c.sb.mmu.load32(ctx + 0x4580 + 4 * k).unwrap();
         writeln!(meta, "spectree[{k}]=0x{t:08x}").unwrap();
     }
-    writeln!(meta, "cpltree=0x{:08x}", c.sb.mmu.load32(ctx + 0x459c).unwrap()).unwrap();
+    writeln!(
+        meta,
+        "cpltree=0x{:08x}",
+        c.sb.mmu.load32(ctx + 0x459c).unwrap()
+    )
+    .unwrap();
     // watches
     let jsonl = out.join(format!("trace-pkt{p}.jsonl"));
-    c.sb
-        .set_trace_sink(Box::new(BufWriter::new(File::create(&jsonl).unwrap())));
+    c.sb.set_trace_sink(Box::new(BufWriter::new(File::create(&jsonl).unwrap())));
     c.sb.watch(ctx + 0x479c, 0x10, WatchMode::Write); // word ptr / bit pos / cursor / limit
     c.sb.watch(wordbuf, 0x60, WatchMode::Write); // packed sub-packet words (24)
     c.sb.watch(ctx + 0x35c, 4, WatchMode::Write); // refinement count
@@ -341,9 +349,19 @@ fn mode_trace(p: usize) {
         .map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap())))
         .collect();
     writeln!(meta, "words_after={}", ws.join(",")).unwrap();
-    writeln!(meta, "bit_cursor_after={}", c.sb.mmu.load32(ctx + 0x47a4).unwrap()).unwrap();
+    writeln!(
+        meta,
+        "bit_cursor_after={}",
+        c.sb.mmu.load32(ctx + 0x47a4).unwrap()
+    )
+    .unwrap();
     writeln!(meta, "bit_limit={}", c.sb.mmu.load32(ctx + 0x47a8).unwrap()).unwrap();
-    writeln!(meta, "refine_count={}", c.sb.mmu.load32(ctx + 0x35c).unwrap()).unwrap();
+    writeln!(
+        meta,
+        "refine_count={}",
+        c.sb.mmu.load32(ctx + 0x35c).unwrap()
+    )
+    .unwrap();
     writeln!(meta, "decode_result={:?} pcm_bytes={}", r, pcm.len()).unwrap();
     println!(
         "trace pkt {p}: RADecode={:?} pcm={} bytes, cursor={} / {} -> {}",
@@ -382,14 +400,31 @@ fn mode_xform(p: usize) {
     writeln!(meta, "buf_eaf0=0x{:08x}", bufs[1]).unwrap();
     writeln!(meta, "buf_eaf4=0x{:08x}", bufs[2]).unwrap();
     writeln!(meta, "buf_work=0x{:08x}", bufs[3]).unwrap();
-    writeln!(meta, "blocklen_47c0={}", c.sb.mmu.load32(ctx + 0x47c0).unwrap()).unwrap();
-    writeln!(meta, "fft_n_47ac={}", c.sb.mmu.load32(ctx + 0x47ac).unwrap()).unwrap();
+    writeln!(
+        meta,
+        "blocklen_47c0={}",
+        c.sb.mmu.load32(ctx + 0x47c0).unwrap()
+    )
+    .unwrap();
+    writeln!(
+        meta,
+        "fft_n_47ac={}",
+        c.sb.mmu.load32(ctx + 0x47ac).unwrap()
+    )
+    .unwrap();
     // snapshot before: contents of the three buffers
     for (i, b) in bufs.iter().enumerate() {
-        std::fs::write(out.join(format!("xform-pkt{p}-buf{i}-before.bin")), c.sb.mmu.read(*b, 0x1000).unwrap()).unwrap();
+        std::fs::write(
+            out.join(format!("xform-pkt{p}-buf{i}-before.bin")),
+            c.sb.mmu.read(*b, 0x1000).unwrap(),
+        )
+        .unwrap();
     }
     c.sb.cpu.register_snapshots_cap = 256;
-    for rva in [0x37d0u32, 0x37ee, 0x37f6, 0x37fb, 0x3803, 0x3810, 0x3815, 0x3130, 0x3154, 0x2fe0, 0x2c28, 0x2c39] {
+    for rva in [
+        0x37d0u32, 0x37ee, 0x37f6, 0x37fb, 0x3803, 0x3810, 0x3815, 0x3130, 0x3154, 0x2fe0, 0x2c28,
+        0x2c39,
+    ] {
         c.sb.cpu.add_register_watchpoint(IB + rva);
     }
     let jsonl = out.join(format!("xform-pkt{p}.jsonl"));
@@ -414,11 +449,20 @@ fn mode_xform(p: usize) {
         .unwrap();
     }
     for (i, b) in bufs.iter().enumerate() {
-        std::fs::write(out.join(format!("xform-pkt{p}-buf{i}-after.bin")), c.sb.mmu.read(*b, 0x1000).unwrap()).unwrap();
+        std::fs::write(
+            out.join(format!("xform-pkt{p}-buf{i}-after.bin")),
+            c.sb.mmu.read(*b, 0x1000).unwrap(),
+        )
+        .unwrap();
     }
     std::fs::write(out.join(format!("xform-pkt{p}-pcm.raw")), &pcm).unwrap();
     writeln!(meta, "decode_result={:?} pcm_bytes={}", r, pcm.len()).unwrap();
-    println!("xform pkt {p}: RADecode={:?} snaps={} -> {}", r, snaps.len(), jsonl.display());
+    println!(
+        "xform pkt {p}: RADecode={:?} snaps={} -> {}",
+        r,
+        snaps.len(),
+        jsonl.display()
+    );
 }
 
 fn dump_u32_rows(path: PathBuf, rows: &[Vec<u32>]) {
@@ -460,7 +504,10 @@ fn mode_tables() {
         codes.push(read_u32s(sb, cp[i], counts[i] as usize));
     }
     println!("spectral counts={counts:?} len-ptrs={lp:x?} code-ptrs={cp:x?}");
-    dump_u32_rows(out.join("runtime-spectral-codebook-code-lengths.csv"), &lens);
+    dump_u32_rows(
+        out.join("runtime-spectral-codebook-code-lengths.csv"),
+        &lens,
+    );
     dump_u32_rows(out.join("runtime-spectral-codebook-codes.csv"), &codes);
     // envelope family: 50 books x 24; lengths BSS 0xc670 + 0x60k, codes BSS 0xf8f0 + 0x60k
     let mut el = Vec::new();
@@ -495,14 +542,37 @@ fn mode_tables() {
     println!(
         "N={nn} sine@{p_sine:#x} cos@{p_cos:#x} sin@{p_sin:#x} win@{p_win:#x} fft n={fw} tw@{p_tw:#x} perm@{p_perm:#x}"
     );
-    dump_f32(out.join("runtime-mdct-sine-1024.csv"), &read_u32s(sb, p_sine, nn), 1);
-    dump_f32(out.join("runtime-mdct-twiddle-cos-1024.csv"), &read_u32s(sb, p_cos, nn / 2), 1);
-    dump_f32(out.join("runtime-mdct-twiddle-sin-1024.csv"), &read_u32s(sb, p_sin, nn / 2), 1);
-    dump_f32(out.join("runtime-mdct-window-1024.csv"), &read_u32s(sb, p_win, nn / 2 + 1), 1);
-    dump_f32(out.join("runtime-coupling-rotation-coeffs.csv"), &read_u32s(sb, p_tw, fw), 2);
+    dump_f32(
+        out.join("runtime-mdct-sine-1024.csv"),
+        &read_u32s(sb, p_sine, nn),
+        1,
+    );
+    dump_f32(
+        out.join("runtime-mdct-twiddle-cos-1024.csv"),
+        &read_u32s(sb, p_cos, nn / 2),
+        1,
+    );
+    dump_f32(
+        out.join("runtime-mdct-twiddle-sin-1024.csv"),
+        &read_u32s(sb, p_sin, nn / 2),
+        1,
+    );
+    dump_f32(
+        out.join("runtime-mdct-window-1024.csv"),
+        &read_u32s(sb, p_win, nn / 2 + 1),
+        1,
+    );
+    dump_f32(
+        out.join("runtime-coupling-rotation-coeffs.csv"),
+        &read_u32s(sb, p_tw, fw),
+        2,
+    );
     dump_u32_rows(
         out.join("runtime-coupling-index-permutation.csv"),
-        &read_u32s(sb, p_perm, fw).iter().map(|v| vec![*v]).collect::<Vec<_>>(),
+        &read_u32s(sb, p_perm, fw)
+            .iter()
+            .map(|v| vec![*v])
+            .collect::<Vec<_>>(),
     );
     // tree pointer arrays, for the record
     let mut f = BufWriter::new(File::create(out.join("runtime-tables.meta")).unwrap());
@@ -548,7 +618,10 @@ fn mode_cw(flags: u32) {
     }
     let cw_end = c.sb.cpu.fpu_cw;
     let visited = c.sb.cpu.take_visited_eips();
-    let in_text = visited.iter().filter(|e| (IB + 0x1000..IB + 0x7c3c).contains(e)).count();
+    let in_text = visited
+        .iter()
+        .filter(|e| (IB + 0x1000..IB + 0x7c3c).contains(e))
+        .count();
     let sites: [(u32, &str); 14] = [
         (0x2d86, "fistp m32 (PCM loop 0x2bb0)"),
         (0x6a57, "fistp m32 (encoder quantiser 0x69f0)"),
@@ -570,11 +643,26 @@ fn mode_cw(flags: u32) {
         println!("{s}");
         writeln!(f, "{s}").unwrap();
     };
-    w(format!("flags={flags:#x}: {ok}/{} S_OK, {} PCM bytes, FNV-1a {:#010x}", pk.len(), pcm_all.len(), fnv1a(&pcm_all)));
+    w(format!(
+        "flags={flags:#x}: {ok}/{} S_OK, {} PCM bytes, FNV-1a {:#010x}",
+        pk.len(),
+        pcm_all.len(),
+        fnv1a(&pcm_all)
+    ));
     w(format!("x87 control word after RAInitDecoder: {cw_after_init:#06x}; after 144 RADecode: {cw_end:#06x}"));
-    w(format!("unique EIPs executed in cook.dll .text: {in_text} (of {} visited overall)", visited.len()));
+    w(format!(
+        "unique EIPs executed in cook.dll .text: {in_text} (of {} visited overall)",
+        visited.len()
+    ));
     for (rva, what) in sites {
-        w(format!("site 0x{rva:04x} {:<9} {what}", if visited.contains(&(IB + rva)) { "REACHED" } else { "never" }));
+        w(format!(
+            "site 0x{rva:04x} {:<9} {what}",
+            if visited.contains(&(IB + rva)) {
+                "REACHED"
+            } else {
+                "never"
+            }
+        ));
     }
     // dynamic control-word check: any executed instruction whose first bytes
     // are D9 /5 (FLDCW), D9 /7 (FNSTCW), DB E3 (FNINIT), D9 /4 (FLDENV)?
@@ -587,24 +675,38 @@ fn mode_cw(flags: u32) {
         let b1 = c.sb.mmu.load8(e + 1).unwrap_or(0);
         let modrm_reg = (b1 >> 3) & 7;
         let mem = (b1 >> 6) != 3;
-        if (b0 == 0xd9 && mem && (modrm_reg == 4 || modrm_reg == 5 || modrm_reg == 7)) || (b0 == 0xdb && b1 == 0xe3) {
+        if (b0 == 0xd9 && mem && (modrm_reg == 4 || modrm_reg == 5 || modrm_reg == 7))
+            || (b0 == 0xdb && b1 == 0xe3)
+        {
             cw_ops += 1;
-            w(format!("control-word op executed at rva 0x{:04x}: {b0:02x} {b1:02x}", e - IB));
+            w(format!(
+                "control-word op executed at rva 0x{:04x}: {b0:02x} {b1:02x}",
+                e - IB
+            ));
         }
     }
-    w(format!("executed FLDCW/FNSTCW/FLDENV/FNINIT instructions: {cw_ops}"));
+    w(format!(
+        "executed FLDCW/FNSTCW/FLDENV/FNINIT instructions: {cw_ops}"
+    ));
     // dump the executed .text EIP set (one RVA per line) so runs can be set-diffed
     {
-        let mut ef = BufWriter::new(File::create(out.join(format!("cw-flags{flags:x}.eips.txt"))).unwrap());
+        let mut ef =
+            BufWriter::new(File::create(out.join(format!("cw-flags{flags:x}.eips.txt"))).unwrap());
         for &e in &visited {
             if (IB + 0x1000..IB + 0x7c3c).contains(&e) {
                 writeln!(ef, "{:04x}", e - IB).unwrap();
             }
         }
     }
-    w(format!("RADecode calls entering the gain-control block processor 0x2fe0: {} of {}", gain_calls.len(), pk.len()));
+    w(format!(
+        "RADecode calls entering the gain-control block processor 0x2fe0: {} of {}",
+        gain_calls.len(),
+        pk.len()
+    ));
     for (i, nb, nr) in &gain_calls {
-        w(format!("  call {i:3}: 0x2fe0 entered {nb} x, 0x31a0 (gain-record reader) entered {nr} x"));
+        w(format!(
+            "  call {i:3}: 0x2fe0 entered {nb} x, 0x31a0 (gain-record reader) entered {nr} x"
+        ));
     }
 }
 
@@ -621,9 +723,25 @@ fn mode_sites(p: usize, flags: u32) {
     let (r, pcm) = c.decode(&pk[p], flags);
     c.sb.cpu.disable_visited_eip_tracking();
     let v = c.sb.cpu.take_visited_eips();
-    println!("packet {p} flags={flags:#x}: RADecode={r:?} pcm={} unique .text EIPs={}", pcm.len(), v.iter().filter(|e| (IB + 0x1000..IB + 0x7c3c).contains(e)).count());
-    for rva in [0x2d86u32, 0x2f41, 0x3369, 0x3540, 0x35d9, 0x3675, 0x43a6, 0x445a, 0x5bb3, 0x5bc1, 0x2fe0, 0x31a0, 0x3130, 0x36ef, 0x378e, 0x34a0] {
-        println!("  site 0x{rva:04x}: {}", if v.contains(&(IB + rva)) { "REACHED" } else { "never" });
+    println!(
+        "packet {p} flags={flags:#x}: RADecode={r:?} pcm={} unique .text EIPs={}",
+        pcm.len(),
+        v.iter()
+            .filter(|e| (IB + 0x1000..IB + 0x7c3c).contains(e))
+            .count()
+    );
+    for rva in [
+        0x2d86u32, 0x2f41, 0x3369, 0x3540, 0x35d9, 0x3675, 0x43a6, 0x445a, 0x5bb3, 0x5bc1, 0x2fe0,
+        0x31a0, 0x3130, 0x36ef, 0x378e, 0x34a0,
+    ] {
+        println!(
+            "  site 0x{rva:04x}: {}",
+            if v.contains(&(IB + rva)) {
+                "REACHED"
+            } else {
+                "never"
+            }
+        );
     }
 }
 

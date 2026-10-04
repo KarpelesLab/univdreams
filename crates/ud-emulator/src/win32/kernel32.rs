@@ -7502,13 +7502,16 @@ fn stub_get_environment_variable_a(
     state: &mut HostState,
     _registry: &mut Registry,
 ) -> Result<u32, Win32Error> {
-    let name_ptr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
+    let name_ptr =
+        arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
     let buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
     let n_size = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
     let mut name = Vec::new();
     let mut p = name_ptr;
     while name.len() < 256 {
-        let b = mmu.load8(p).map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
+        let b = mmu
+            .load8(p)
+            .map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
         if b == 0 {
             break;
         }

@@ -20,7 +20,14 @@
 //! Everything is written under `R18_OUT`. Run with
 //! `cargo test --release -p ud-emulator --test re2_indeo5_r18 -- --nocapture`.
 
-#![allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::unreadable_literal)]
+// One-off reverse-engineering harness from the OxideAV docs rounds; not
+// held to the workspace pedantic lint set.
+#![allow(clippy::all, clippy::pedantic)]
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::unreadable_literal
+)]
 
 use std::fs;
 use std::io::Write;
@@ -47,9 +54,17 @@ fn new_sandbox() -> (Sandbox, u32) {
     let img = sb.load("IR50_32.DLL", &dll).expect("load");
     sb.call_dll_main(&img, DLL_PROCESS_ATTACH).expect("DllMain");
     sb.install_codec(&img).expect("install_codec");
-    let mode = if env_or("R18_MODE", "dec") == "enc" { 1 } else { 2 };
+    let mode = if env_or("R18_MODE", "dec") == "enc" {
+        1
+    } else {
+        2
+    };
     let hic = sb
-        .ic_open(u32::from_le_bytes(*b"VIDC"), u32::from_le_bytes(*b"IV50"), mode)
+        .ic_open(
+            u32::from_le_bytes(*b"VIDC"),
+            u32::from_le_bytes(*b"IV50"),
+            mode,
+        )
         .expect("ICOpen");
     assert_ne!(hic, 0, "codec refused DRV_OPEN");
     (sb, hic)
@@ -61,10 +76,15 @@ fn dump_ring(sb: &Sandbox, out_dir: &PathBuf, tag: &str) {
     for e in ring.iter() {
         writeln!(f, "{e:#010x}").unwrap();
     }
-    println!("[r18] trace ring ({} eips) -> ring-{tag}.txt; last = {:#010x?}", ring.len(), ring.last());
+    println!(
+        "[r18] trace ring ({} eips) -> ring-{tag}.txt; last = {:#010x?}",
+        ring.len(),
+        ring.last()
+    );
 }
 
 #[test]
+#[ignore = "needs locally staged vendor codec binaries + fixtures (OxideAV docs harness); run with --ignored"]
 fn re2_indeo5_r18() {
     let out_dir = PathBuf::from(env_or("R18_OUT", "/tmp/re2-indeo5-r18"));
     fs::create_dir_all(&out_dir).unwrap();
@@ -122,7 +142,10 @@ fn run_enc(out_dir: &PathBuf) {
     if q.is_err() {
         dump_ring(&sb, out_dir, "query");
     }
-    let cap = sb.ic_compress_get_size(hic, &in_bih, &out_bih).unwrap_or(fsz as u32 * 2).max(fsz as u32);
+    let cap = sb
+        .ic_compress_get_size(hic, &in_bih, &out_bih)
+        .unwrap_or(fsz as u32 * 2)
+        .max(fsz as u32);
     println!("[r18] GetSize = {cap}");
     let b = sb.ic_compress_begin(hic, &in_bih, &out_bih);
     println!("[r18] CompressBegin = {:?}", b.as_ref().map(|v| *v as i32));
@@ -134,7 +157,11 @@ fn run_enc(out_dir: &PathBuf) {
     for i in 0..n {
         let cur = &input[i * fsz..(i + 1) * fsz];
         let key = i == 0 || (key_every > 0 && i % key_every == 0);
-        let prev = if key { None } else { Some(&input[(i - 1) * fsz..i * fsz]) };
+        let prev = if key {
+            None
+        } else {
+            Some(&input[(i - 1) * fsz..i * fsz])
+        };
         let r = sb.ic_compress(
             hic,
             u32::from(key),
@@ -158,7 +185,15 @@ fn run_enc(out_dir: &PathBuf) {
                     "[r18] ICCompress f{i} key={key} = {} len={len} flags={:#x}",
                     o.lresult as i32, o.returned_flags
                 );
-                writeln!(csv, "{i},{},{},{len},{:#x},{:#x}", u8::from(key), o.lresult as i32, o.returned_flags, o.ckid).unwrap();
+                writeln!(
+                    csv,
+                    "{i},{},{},{len},{:#x},{:#x}",
+                    u8::from(key),
+                    o.lresult as i32,
+                    o.returned_flags,
+                    o.ckid
+                )
+                .unwrap();
             }
             Err(e) => {
                 dump_ring(&sb, out_dir, &format!("compress-f{i}"));
@@ -192,7 +227,11 @@ fn run_dec(out_dir: &PathBuf) {
                 .filter(|t| !t.is_empty())
                 .map(|t| {
                     let p: Vec<&str> = t.split(':').collect();
-                    let off = if let Some(x) = p[1].strip_prefix('-') { -(hex(x) as i32) } else { hex(p[1]) as i32 };
+                    let off = if let Some(x) = p[1].strip_prefix('-') {
+                        -(hex(x) as i32)
+                    } else {
+                        hex(p[1]) as i32
+                    };
                     (p[0].parse().unwrap(), off, p[2].parse().unwrap())
                 })
                 .collect()
@@ -236,8 +275,13 @@ fn run_dec(out_dir: &PathBuf) {
         size_image: size,
         ..Bih::default()
     };
-    let q = sb.ic_decompress_query(hic, &in_bih, Some(&out_bih)).expect("query");
-    println!("[r18] ICDecompressQuery({width}x{height} IV50 -> {pix}) = {}", q as i32);
+    let q = sb
+        .ic_decompress_query(hic, &in_bih, Some(&out_bih))
+        .expect("query");
+    println!(
+        "[r18] ICDecompressQuery({width}x{height} IV50 -> {pix}) = {}",
+        q as i32
+    );
     if q != 0 {
         return;
     }
@@ -247,7 +291,9 @@ fn run_dec(out_dir: &PathBuf) {
         sb.set_trace_sink(Box::new(sink));
         sb.watch(hex(p[0]), hex(p[1]), ud_emulator::WatchMode::Write);
     }
-    let b = sb.ic_decompress_begin(hic, &in_bih, &out_bih).expect("begin");
+    let b = sb
+        .ic_decompress_begin(hic, &in_bih, &out_bih)
+        .expect("begin");
     println!("[r18] ICDecompressBegin = {}", b as i32);
 
     sb.cpu.register_snapshots_cap = 8_000_000;
@@ -265,22 +311,34 @@ fn run_dec(out_dir: &PathBuf) {
         let cur0 = sb.host.heap_cursor;
         if let Ok(w) = std::env::var("R18_WATCH") {
             // addr:len (write watch), armed only for the frame index R18_WATCH_FRAME (default last)
-            let wf: usize = env_or("R18_WATCH_FRAME", &format!("{}", frames.len() - 1)).parse().unwrap();
+            let wf: usize = env_or("R18_WATCH_FRAME", &format!("{}", frames.len() - 1))
+                .parse()
+                .unwrap();
             if wf == i {
                 let p: Vec<&str> = w.split(':').collect();
-                let sink = fs::File::create(out_dir.join(format!("trace-watch-f{i:02}.jsonl"))).unwrap();
+                let sink =
+                    fs::File::create(out_dir.join(format!("trace-watch-f{i:02}.jsonl"))).unwrap();
                 sb.set_trace_sink(Box::new(sink));
                 sb.watch(hex(p[0]), hex(p[1]), ud_emulator::WatchMode::Write);
             }
         }
-        let (rc, decoded) = sb.ic_decompress(hic, 0, &in_bih, &frame, &out_bih, size).expect("ICDecompress");
+        let (rc, decoded) = sb
+            .ic_decompress(hic, 0, &in_bih, &frame, &out_bih, size)
+            .expect("ICDecompress");
         for (a, v) in sb.host.heap.range(cur0..) {
             if v.len() == size as usize {
-                println!("[r18] f{i} candidate output buffer {a:#010x} len {}", v.len());
+                println!(
+                    "[r18] f{i} candidate output buffer {a:#010x} len {}",
+                    v.len()
+                );
             }
         }
         fs::write(out_dir.join(format!("decoded-{pix}-f{i:02}.bin")), &decoded).unwrap();
-        println!("[r18] f{i} ICDecompress = {} ({} bytes)", rc as i32, decoded.len());
+        println!(
+            "[r18] f{i} ICDecompress = {} ({} bytes)",
+            rc as i32,
+            decoded.len()
+        );
         // Post-frame plane dump: every writer call at 0x100342d0 in this frame
         // (dst = edx, dst stride = ecx, rows = ebp, width = esi).
         if env_or("R18_PLANEDUMP", "0") == "1" {
@@ -297,16 +355,32 @@ fn run_dec(out_dir: &PathBuf) {
                         plane.push(sb.mmu.load8(dst + y * stride + x).unwrap_or(0));
                     }
                 }
-                fs::write(out_dir.join(format!("plane-f{i:02}-{k}-{width}x{rows}.bin")), &plane).unwrap();
+                fs::write(
+                    out_dir.join(format!("plane-f{i:02}-{k}-{width}x{rows}.bin")),
+                    &plane,
+                )
+                .unwrap();
                 k += 1;
             }
         }
         snap_start = sb.cpu.register_snapshots.len();
-        writeln!(hashes, "{i},{path},{},{},{},{}", frame.len(), rc as i32, decoded.len(), sb.cpu.register_snapshots.len()).unwrap();
+        writeln!(
+            hashes,
+            "{i},{path},{},{},{},{}",
+            frame.len(),
+            rc as i32,
+            decoded.len(),
+            sb.cpu.register_snapshots.len()
+        )
+        .unwrap();
     }
     let (pvals, dumps) = sb.cpu.take_snapshot_probes();
     let snaps = sb.cpu.clear_register_watchpoints();
-    println!("[r18] register snapshots: {}, block dumps: {}", snaps.len(), dumps.len());
+    println!(
+        "[r18] register snapshots: {}, block dumps: {}",
+        snaps.len(),
+        dumps.len()
+    );
     let mut f = fs::File::create(out_dir.join("regsnaps.tsv")).unwrap();
     write!(f, "i\teip\teax\tecx\tedx\tebx\tesp\tebp\tesi\tedi").unwrap();
     for (r, o, w) in &probes {

@@ -21,6 +21,9 @@
 //!
 //! Clean-room: only the raw bytes of the vendor DLL and caller-generated
 //! synthetic pixel data are consumed. No third-party decoder source.
+// One-off reverse-engineering harness from the OxideAV docs rounds; not
+// held to the workspace pedantic lint set.
+#![allow(clippy::all, clippy::pedantic)]
 #![allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
@@ -129,12 +132,16 @@ fn boot(c: &Common, mode: u32) -> (Sandbox, u32) {
     sb.host.instruction_budget = Some(c.instr_limit);
     let img = sb.load("huffyuv.dll", &dll_bytes).expect("load");
     if let Some(iat) = c.iat {
-        let thunk = sb
-            .registry
-            .register("kernel32.dll", "GetPrivateProfileIntA#r22", stub_ini_override, 4);
+        let thunk = sb.registry.register(
+            "kernel32.dll",
+            "GetPrivateProfileIntA#r22",
+            stub_ini_override,
+            4,
+        );
         let before = sb.mmu.load32(iat).expect("iat read");
         let perm = sb.mmu.perm_at(iat).expect("iat page mapped");
-        sb.mmu.set_perm(iat, perm.or(ud_emulator::emulator::Perm::W));
+        sb.mmu
+            .set_perm(iat, perm.or(ud_emulator::emulator::Perm::W));
         sb.mmu.store32(iat, thunk).expect("iat write");
         sb.mmu.set_perm(iat, perm);
         eprintln!("[ini] IAT slot {iat:#010x}: {before:#010x} -> {thunk:#010x} (override stub)");
@@ -155,7 +162,11 @@ fn main() {
         std::process::exit(2);
     }
     let cmd = argv[0].clone();
-    let mut c = Common { dll: PathBuf::from(&argv[1]), iat: None, instr_limit: 50_000_000_000 };
+    let mut c = Common {
+        dll: PathBuf::from(&argv[1]),
+        iat: None,
+        instr_limit: 50_000_000_000,
+    };
     let (mut width, mut height) = (0u32, 0u32);
     let mut fmt = String::from("yuy2");
     let mut input = PathBuf::new();
@@ -208,7 +219,11 @@ fn main() {
             };
             let pixels = std::fs::read(&input).expect("read input");
             let need = (width * height * bpp) as usize;
-            assert!(pixels.len() >= need, "input too short: {} < {need}", pixels.len());
+            assert!(
+                pixels.len() >= need,
+                "input too short: {} < {need}",
+                pixels.len()
+            );
             let in_bih = Bih {
                 bi_size: 40,
                 width: width as i32,
@@ -229,9 +244,13 @@ fn main() {
                 out_bih.size_image,
                 out_bih.tail.len()
             );
-            let q = sb.ic_compress_query(hic, &in_bih, Some(&out_bih)).expect("Query");
+            let q = sb
+                .ic_compress_query(hic, &in_bih, Some(&out_bih))
+                .expect("Query");
             assert_eq!(q, 0, "ICCompressQuery rejected");
-            let cap = sb.ic_compress_get_size(hic, &in_bih, &out_bih).expect("GetSize");
+            let cap = sb
+                .ic_compress_get_size(hic, &in_bih, &out_bih)
+                .expect("GetSize");
             let rb = sb.ic_compress_begin(hic, &in_bih, &out_bih).expect("Begin");
             eprintln!("[encode] ICCompressBegin = {} cap = {cap}", rb as i32);
             let r = sb
@@ -265,7 +284,13 @@ fn main() {
             let mut fp = out_prefix.clone();
             fp.set_extension("frame");
             std::fs::write(&fp, frame).expect("write frame");
-            eprintln!("[encode] wrote {} ({} B) and {} ({} B)", bp.display(), 40 + out_bih.tail.len(), fp.display(), frame.len());
+            eprintln!(
+                "[encode] wrote {} ({} B) and {} ({} B)",
+                bp.display(),
+                40 + out_bih.tail.len(),
+                fp.display(),
+                frame.len()
+            );
             let _ = sb.ic_compress_end(hic);
             let _ = sb.ic_close(hic);
         }
@@ -279,7 +304,10 @@ fn main() {
             let mut bih_bytes = std::fs::read(&bih_path).expect("read bih");
             if let Some(f) = flag {
                 assert!(bih_bytes.len() > 0x2a);
-                eprintln!("[decode] patch BIH+0x2A: {:#04x} -> {:#04x}", bih_bytes[0x2a], f);
+                eprintln!(
+                    "[decode] patch BIH+0x2A: {:#04x} -> {:#04x}",
+                    bih_bytes[0x2a], f
+                );
                 bih_bytes[0x2a] = f;
             }
             let mut in_bih = bih_from_bytes(&bih_bytes);
@@ -302,15 +330,23 @@ fn main() {
                 ..Bih::default()
             };
             let (mut sb, hic) = boot(&c, ICMODE_DECOMPRESS);
-            let q = sb.ic_decompress_query(hic, &in_bih, Some(&out_bih)).expect("Query");
+            let q = sb
+                .ic_decompress_query(hic, &in_bih, Some(&out_bih))
+                .expect("Query");
             eprintln!("[decode] ICDecompressQuery = {}", q as i32);
             assert_eq!(q, 0, "ICDecompressQuery rejected");
-            let rb = sb.ic_decompress_begin(hic, &in_bih, &out_bih).expect("Begin");
+            let rb = sb
+                .ic_decompress_begin(hic, &in_bih, &out_bih)
+                .expect("Begin");
             eprintln!("[decode] ICDecompressBegin = {}", rb as i32);
             let (rc, decoded) = sb
                 .ic_decompress(hic, 0, &in_bih, &frame, &out_bih, w * h * bpp)
                 .expect("ICDecompress");
-            eprintln!("[decode] ICDecompress = {} ({} bytes)", rc as i32, decoded.len());
+            eprintln!(
+                "[decode] ICDecompress = {} ({} bytes)",
+                rc as i32,
+                decoded.len()
+            );
             std::fs::write(&out, &decoded).expect("write out");
             eprintln!("[decode] wrote {}", out.display());
             let _ = sb.ic_decompress_end(hic);

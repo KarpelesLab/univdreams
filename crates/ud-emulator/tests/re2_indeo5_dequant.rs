@@ -16,7 +16,14 @@
 //! Everything is written under `RE2_OUT`. Run with
 //! `cargo test --release -p ud-emulator --features trace --test re2_indeo5_dequant -- --nocapture`.
 
-#![allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::unreadable_literal)]
+// One-off reverse-engineering harness from the OxideAV docs rounds; not
+// held to the workspace pedantic lint set.
+#![allow(clippy::all, clippy::pedantic)]
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::unreadable_literal
+)]
 
 use std::fs;
 use std::io::Write;
@@ -45,6 +52,7 @@ fn write(path: &PathBuf, bytes: &[u8]) {
 }
 
 #[test]
+#[ignore = "needs locally staged vendor codec binaries + fixtures (OxideAV docs harness); run with --ignored"]
 fn re2_indeo5_dequant() {
     let dll_path = env_or(
         "RE2_IR50_DLL",
@@ -76,16 +84,25 @@ fn re2_indeo5_dequant() {
     let mut sb = Sandbox::new();
     sb.host.instruction_budget = Some(4_000_000_000);
     let img = sb.load("IR50_32.DLL", &dll).expect("load");
-    write(&out_dir.join("sdata-0-after-load.bin"), &dump_range(&sb, SDATA_LO, SDATA_HI));
+    write(
+        &out_dir.join("sdata-0-after-load.bin"),
+        &dump_range(&sb, SDATA_LO, SDATA_HI),
+    );
     sb.call_dll_main(&img, DLL_PROCESS_ATTACH).expect("DllMain");
-    write(&out_dir.join("sdata-1-after-dllmain.bin"), &dump_range(&sb, SDATA_LO, SDATA_HI));
+    write(
+        &out_dir.join("sdata-1-after-dllmain.bin"),
+        &dump_range(&sb, SDATA_LO, SDATA_HI),
+    );
     sb.install_codec(&img).expect("install_codec");
 
     let fcc_type = u32::from_le_bytes(*b"VIDC");
     let fcc_handler = u32::from_le_bytes(*b"IV50");
     let hic = sb.ic_open(fcc_type, fcc_handler, 1).expect("ICOpen");
     assert_ne!(hic, 0, "codec refused DRV_OPEN");
-    write(&out_dir.join("sdata-2-after-icopen.bin"), &dump_range(&sb, SDATA_LO, SDATA_HI));
+    write(
+        &out_dir.join("sdata-2-after-icopen.bin"),
+        &dump_range(&sb, SDATA_LO, SDATA_HI),
+    );
 
     let (bit_count, compression, bpp_num, bpp_den): (u16, [u8; 4], u32, u32) = match pix.as_str() {
         "yuv" => (16, *b"YUY2", 2, 1),
@@ -114,15 +131,27 @@ fn re2_indeo5_dequant() {
         size_image: out_size,
         ..Bih::default()
     };
-    let q = sb.ic_decompress_query(hic, &in_bih, Some(&out_bih)).expect("query");
-    println!("[re2] ICDecompressQuery({width}x{height} IV50 -> {pix}) = {}", q as i32);
+    let q = sb
+        .ic_decompress_query(hic, &in_bih, Some(&out_bih))
+        .expect("query");
+    println!(
+        "[re2] ICDecompressQuery({width}x{height} IV50 -> {pix}) = {}",
+        q as i32
+    );
     assert_eq!(q, 0, "codec rejected the BIH pair");
-    let b = sb.ic_decompress_begin(hic, &in_bih, &out_bih).expect("begin");
+    let b = sb
+        .ic_decompress_begin(hic, &in_bih, &out_bih)
+        .expect("begin");
     println!("[re2] ICDecompressBegin = {}", b as i32);
-    write(&out_dir.join("sdata-3-after-begin.bin"), &dump_range(&sb, SDATA_LO, SDATA_HI));
+    write(
+        &out_dir.join("sdata-3-after-begin.bin"),
+        &dump_range(&sb, SDATA_LO, SDATA_HI),
+    );
 
     // Reconstruction-table pointer array.
-    let ptrs: Vec<u32> = (0..256u32).map(|i| sb.mmu.load32(PTRARRAY + 4 * i).unwrap_or(0)).collect();
+    let ptrs: Vec<u32> = (0..256u32)
+        .map(|i| sb.mmu.load32(PTRARRAY + 4 * i).unwrap_or(0))
+        .collect();
     {
         let mut f = fs::File::create(out_dir.join("ptrarray-1009c770.csv")).unwrap();
         writeln!(f, "b,ptr_hex").unwrap();
@@ -132,11 +161,17 @@ fn re2_indeo5_dequant() {
     }
     let heap_lo = ptrs[1];
     let heap_hi = ptrs[255].wrapping_add(8 * (8192 / 255) + 8);
-    println!("[re2] recon heap {heap_lo:#010x}..{heap_hi:#010x} ({} bytes)", heap_hi.wrapping_sub(heap_lo));
+    println!(
+        "[re2] recon heap {heap_lo:#010x}..{heap_hi:#010x} ({} bytes)",
+        heap_hi.wrapping_sub(heap_lo)
+    );
 
     // Dump the whole reconstruction heap (post-begin, before decode).
     if heap_lo != 0 && heap_hi > heap_lo && heap_hi - heap_lo < 0x200000 {
-        write(&out_dir.join("recon-heap.bin"), &dump_range(&sb, heap_lo, heap_hi));
+        write(
+            &out_dir.join("recon-heap.bin"),
+            &dump_range(&sb, heap_lo, heap_hi),
+        );
     }
 
     if watch_recon && heap_lo != 0 {
@@ -146,7 +181,12 @@ fn re2_indeo5_dequant() {
     }
 
     sb.cpu.register_snapshots_cap = 8_000_000;
-    for wp in [SITE_BGQ_PTR, SITE_MB_FETCH, SITE_MB_STORE, SITE_MB_STORE_UNCODED] {
+    for wp in [
+        SITE_BGQ_PTR,
+        SITE_MB_FETCH,
+        SITE_MB_STORE,
+        SITE_MB_STORE_UNCODED,
+    ] {
         sb.cpu.add_register_watchpoint(wp);
     }
     for wp in &extra_wps {
@@ -169,7 +209,11 @@ fn re2_indeo5_dequant() {
     println!("[re2] register snapshots: {}", snaps.len());
     {
         let mut f = fs::File::create(out_dir.join("regsnaps.tsv")).unwrap();
-        writeln!(f, "i\teip\teax\tecx\tedx\tebx\tesp\tebp\tesi\tedi\t[esp]\t[esp+4]\t[ebp+8]\t[ebp-0x50]").unwrap();
+        writeln!(
+            f,
+            "i\teip\teax\tecx\tedx\tebx\tesp\tebp\tesi\tedi\t[esp]\t[esp+4]\t[ebp+8]\t[ebp-0x50]"
+        )
+        .unwrap();
         for (i, (eip, r)) in snaps.iter().enumerate() {
             let m = mem.get(i).map(|(_, m)| *m).unwrap_or([(0, 0); 4]);
             writeln!(
@@ -193,10 +237,16 @@ fn re2_indeo5_dequant() {
         writeln!(f, "class,quant,table_ptr_hex,pos,entry_ptr_hex,step_b").unwrap();
         for c in 0..2u32 {
             for qq in 0..24u32 {
-                let tp = sb.mmu.load32(instance + 0x33e8 + 4 * (qq + 24 * c)).unwrap_or(0);
+                let tp = sb
+                    .mmu
+                    .load32(instance + 0x33e8 + 4 * (qq + 24 * c))
+                    .unwrap_or(0);
                 for pos in 0..64u32 {
                     let ep = sb.mmu.load32(tp + 4 * pos).unwrap_or(0);
-                    let b = ptrs.iter().position(|p| *p == ep).map_or(-1i32, |x| x as i32);
+                    let b = ptrs
+                        .iter()
+                        .position(|p| *p == ep)
+                        .map_or(-1i32, |x| x as i32);
                     writeln!(f, "{c},{qq},{tp:#010x},{pos},{ep:#010x},{b}").unwrap();
                 }
             }
