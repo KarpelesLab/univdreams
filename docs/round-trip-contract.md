@@ -24,7 +24,7 @@ Each layer of the pipeline has its own round-trip property, and each is tested b
 
 The hand-rolled ELF64-LE reader/writer captures every byte: header fields, program-header table, section-header table, every section's content, every interstitial padding gap. Anything we don't interpret is preserved as opaque bytes and re-emitted verbatim.
 
-Tested in `crates/ud-format-elf/tests/fixtures.rs` against every ELF64-LE fixture in `testdata/`.
+Tested in `src/format/-elf/tests/fixtures.rs` against every ELF64-LE fixture in `testdata/`.
 
 ### Layer 2: x86 instruction stream
 
@@ -32,7 +32,7 @@ Tested in `crates/ud-format-elf/tests/fixtures.rs` against every ELF64-LE fixtur
 
 We deliberately do *not* round-trip via iced's `BlockEncoder` — it canonicalizes redundant prefixes (e.g. drops the `66` data16 override on alignment NOPs), and our test corpus exposed this immediately. Instead, decode captures each instruction's exact bytes; emit re-uses them. iced's structured `Instruction` lives alongside as the analysis form.
 
-Tested in `crates/ud-arch-x86/tests/text_roundtrip.rs` across every x86_64 executable section (12 sections, 259 instructions in the current corpus).
+Tested in `tests/text_roundtrip.rs` across every x86_64 executable section (12 sections, 259 instructions in the current corpus).
 
 ### Layer 3: IR Function
 
@@ -40,7 +40,7 @@ Tested in `crates/ud-arch-x86/tests/text_roundtrip.rs` across every x86_64 execu
 
 The IR is a *view* over the byte stream, not a transformation. CFG construction (leaders / blocks / terminators) doesn't change the bytes; emission concatenates each instruction's preserved bytes in address order.
 
-Tested in `crates/ud-arch-x86/tests/lift_fixtures.rs`: every function discovered in every fixture is lifted, then `emit_bytes` is compared against its original slice.
+Tested in `tests/lift_fixtures.rs`: every function discovered in every fixture is lifted, then `emit_bytes` is compared against its original slice.
 
 ### Layer 4: AST round-trip (synthetic)
 
@@ -49,7 +49,7 @@ Tested in `crates/ud-arch-x86/tests/lift_fixtures.rs`: every function discovered
 
 The pretty-printer is deterministic; the parser is whitespace-tolerant but normalizes to the canonical form on re-emit.
 
-Tested in `crates/ud-compile/tests/round_trip.rs` against synthetic ASTs.
+Tested in `tests/translate_round_trip.rs` against synthetic ASTs.
 
 ### Layer 5: Source-level round-trip via decompile
 
@@ -57,7 +57,7 @@ Tested in `crates/ud-compile/tests/round_trip.rs` against synthetic ASTs.
 
 The AST that comes out of `decompile`, pretty-printed, then parsed back, is structurally identical to the AST we started with. This is what defends the parser against drift in the decompiler's text output and vice versa.
 
-Tested in `crates/ud-decompile/tests/decompile_fixtures.rs`.
+Tested in `tests/decompile_fixtures.rs`.
 
 ### Layer 6: Per-function source round-trip
 
@@ -65,7 +65,7 @@ Tested in `crates/ud-decompile/tests/decompile_fixtures.rs`.
 
 12 functions, 562 bytes verified across the corpus.
 
-Tested in `crates/ud-compile/tests/source_round_trip.rs`.
+Tested in `tests/source_round_trip.rs`.
 
 ### Layer 7: Per-section source round-trip
 
@@ -73,7 +73,7 @@ Tested in `crates/ud-compile/tests/source_round_trip.rs`.
 
 68 sections, 9,093 bytes verified across the corpus — including `.text`, `.rodata`, `.dynamic`, `.data`, `.symtab`, `.strtab`, `.shstrtab`, debug sections.
 
-Tested in `crates/ud-compile/tests/section_round_trip.rs`.
+Tested in `tests/section_round_trip.rs`.
 
 ### Layer 8: Whole-binary round-trip via source
 
@@ -83,7 +83,7 @@ Every byte of the input ELF — header, program-header table, section-header tab
 
 **33,680 bytes across two real-world fixtures** (`hello-gcc13-O0`, `sqrt-gcc13-O0`) verified byte-identical.
 
-Tested in `crates/ud-compile/tests/whole_binary_round_trip.rs`.
+Tested in `tests/whole_binary_round_trip.rs`.
 
 ## What's preserved
 

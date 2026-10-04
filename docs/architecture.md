@@ -24,19 +24,19 @@ ud-format-elf::Elf64File::parse
    │  parses ehdr / phdrs / shdrs, captures every section's bytes,
    │  and every interstitial padding gap.
    ▼
-ud-analysis::discover_functions
+analysis::discover_functions
    │  layered sources merged into a FunctionMap:
    │    .symtab → names + sizes (when not stripped)
    │    .dynsym → names + sizes for dynamic exports
    │    .eh_frame → sizes via FDE walk; placeholder names
-   │    ud-signatures DB → CRT helpers by byte pattern
+   │    signatures DB → CRT helpers by byte pattern
    │    fill-in pass → size = distance to next neighbour
    ▼
-ud-debug::read_debug_info
+debug::read_debug_info
    │  parses .debug_info via gimli, returns DebugFunction
    │  records (addr → typed signature) for AST attachment.
    ▼
-ud-arch-x86::decode + ud-arch-x86::lift_function
+arch::x86::decode + arch::x86::lift_function
    │  per function: bytes → DecodedInsn[] → Function<DecodedInsn>
    │  with CFG (basic blocks + Terminators) recovered from iced
    │  flow-control classification.
@@ -48,7 +48,7 @@ ud-decompile::build_module + build_function
    │  attached signature when available), Item::Raw for the
    │  inter-function gaps and non-text sections.
    ▼
-ud-ast::emit
+ast::emit
    │  canonical pretty-printer.
    ▼
 .ud source text
@@ -62,7 +62,7 @@ ud-ast::emit
    ▼
 ud-compile::parse
    │  hand-rolled lexer + recursive-descent parser; produces
-   │  a ud_ast::UdFile.
+   │  a univdreams::ast::UdFile.
    ▼
 ud-compile::lower_to_elf
    │  Read @module.build to reconstruct Ehdr64 / Vec<Phdr64> /
@@ -81,7 +81,7 @@ The two pipelines are inverses. The AST is the pivot. Pinned bytes in `@asm` and
 
 The IR is **arch-tagged**, not generic. There is no aspiration to a single SSA form that works for every architecture.
 
-`ud-ir` provides shared concepts (`Function`, `BasicBlock`, `Terminator`) generic over an arch instruction type via the [`ArchInsn`] trait. Per-arch crates implement `ArchInsn` for their decoded type and provide the arch-specific lifter:
+`ir` provides shared concepts (`Function`, `BasicBlock`, `Terminator`) generic over an arch instruction type via the [`ArchInsn`] trait. Per-arch modules implement `ArchInsn` for their decoded type and provide the arch-specific lifter:
 
 ```rust
 pub trait ArchInsn {
@@ -97,33 +97,33 @@ The byte-identity contract for the IR layer:
 
 This is true by construction — `emit_bytes` concatenates each instruction's preserved `original_bytes` in address order. The CFG is a *view* over the byte stream, not a transformation of it.
 
-`ud-arch-x86::DecodedInsn` carries the iced `Instruction` for analysis plus the original byte slice. iced's `BlockEncoder` is available via `reencode_via_iced` for analysis-then-edit workflows where canonical encoding is acceptable; the round-trip path goes through `emit_preserved` which never re-encodes.
+`arch::x86::DecodedInsn` carries the iced `Instruction` for analysis plus the original byte slice. iced's `BlockEncoder` is available via `reencode_via_iced` for analysis-then-edit workflows where canonical encoding is acceptable; the round-trip path goes through `emit_preserved` which never re-encodes.
 
-[`ArchInsn`]: ../crates/ud-ir/src/lib.rs
+[`ArchInsn`]: ../src/ir/mod.rs
 
 ## Crate breakdown
 
 | Crate | Purpose |
 |-------|---------|
-| `ud-core` | Shared types: `VAddr`, `Result`, `Error`, `assert_bytes_equal`. |
+| `common` | Shared types: `VAddr`, `Result`, `Error`, `assert_bytes_equal`. |
 | `ud-format-elf` | ELF64-LE reader + writer with byte-identical round-trip. Public `Elf64File::from_parts` for reconstructive callers. |
-| `ud-arch-x86` | x86 backend: decode (iced), Intel formatter, lift to IR with CFG, `DecodedInsn` implementing `ArchInsn`. |
-| `ud-ir` | `Function<I>`, `BasicBlock<I>`, `Terminator`, `ArchInsn` trait. Generic over the per-arch instruction type. |
-| `ud-analysis` | Function discovery: layered sources (symtab / dynsym / eh_frame / signatures), merge logic in `FunctionMap`, size-filling pass. |
-| `ud-signatures` | Byte-pattern matcher with wildcards. v0 DB: x86-64 CRT helpers. |
-| `ud-debug` | DWARF reader (gimli). Returns `DebugFunction { addr, name, return_type, params }` for typed signature attachment. PDB / stabs / Mach-O dSYM are future modules. |
-| `ud-ast` | `UdFile`, `Module`, `Item`, `FnDecl`, `Stmt`, `Type`, `Param`, `Signature`. Canonical pretty-printer (`emit`). Source of truth for what `.ud` looks like. |
+| `arch::x86` | x86 backend: decode (iced), Intel formatter, lift to IR with CFG, `DecodedInsn` implementing `ArchInsn`. |
+| `ir` | `Function<I>`, `BasicBlock<I>`, `Terminator`, `ArchInsn` trait. Generic over the per-arch instruction type. |
+| `analysis` | Function discovery: layered sources (symtab / dynsym / eh_frame / signatures), merge logic in `FunctionMap`, size-filling pass. |
+| `signatures` | Byte-pattern matcher with wildcards. v0 DB: x86-64 CRT helpers. |
+| `debug` | DWARF reader (gimli). Returns `DebugFunction { addr, name, return_type, params }` for typed signature attachment. PDB / stabs / Mach-O dSYM are future modules. |
+| `ast` | `UdFile`, `Module`, `Item`, `FnDecl`, `Stmt`, `Type`, `Param`, `Signature`. Canonical pretty-printer (`emit`). Source of truth for what `.ud` looks like. |
 | `ud-compile` | `.ud` parser (text → AST). `lower_function_bytes`, `lower_section_bytes`, `lower_to_elf`. |
 | `ud-decompile` | Decompile orchestration: ELF → discover → lift → build AST. `decompile()` returns a `UdFile`; `decompile_to_text` is `emit(decompile(elf)?)`. |
-| `ud-cli` | The `ud` binary. Subcommands today: `roundtrip`, `decompile`. |
+| `cli` | The `ud` binary. Subcommands today: `roundtrip`, `decompile`. |
 
 ## Function-discovery strategy
 
-`ud-analysis::discover_functions` runs every available source in increasing-confidence order so the merge in `FunctionMap` resolves name conflicts in favour of the higher-confidence source:
+`analysis::discover_functions` runs every available source in increasing-confidence order so the merge in `FunctionMap` resolves name conflicts in favour of the higher-confidence source:
 
 1. **Prologue patterns** (Phase 0; not yet wired but the slot exists in `FunctionSource`).
 2. **`.eh_frame`** — FDE walks via gimli. Yields accurate sizes; placeholder `sub_<addr>` names. Survives stripping.
-3. **`ud-signatures`** — byte-pattern DB. Yields meaningful names (`deregister_tm_clones`, etc.) for functions that no other source covers. Sizes start at zero; filled in by the post-pass.
+3. **`signatures`** — byte-pattern DB. Yields meaningful names (`deregister_tm_clones`, etc.) for functions that no other source covers. Sizes start at zero; filled in by the post-pass.
 4. **`.dynsym`** — names for exported / imported symbols.
 5. **`.symtab`** — full symbol table (when not stripped). Authoritative names + sizes.
 6. **User overrides** (sidecar config; future).
@@ -154,7 +154,7 @@ Every layer of the pipeline has a round-trip property defended by CI. See [round
 The CI pipeline:
 
 - `cargo fmt --all --check`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test`
 
-All three jobs run in parallel on every push. 104 tests across 11 crates as of this writing.
+All three jobs run in parallel on every push.

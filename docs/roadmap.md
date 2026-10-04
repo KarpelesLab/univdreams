@@ -13,23 +13,23 @@ Phases are ordered by dependency, not calendar. Each phase has a definition of d
 ## Phase 1 — ELF + x86-64 instruction-level round-trip ✅
 
 - [x] `ud-format-elf`: hand-rolled ELF64-LE reader + writer, byte-identical.
-- [x] `ud-arch-x86`: iced-x86 integration; decode + dual-path emit (preserved bytes for round-trip; `BlockEncoder` for analysis-then-edit).
+- [x] `arch::x86`: iced-x86 integration; decode + dual-path emit (preserved bytes for round-trip; `BlockEncoder` for analysis-then-edit).
 - [x] CLI: `ud roundtrip <bin>` runs the loop and reports diffs.
 
 The phase exposed iced's canonicalization of redundant prefixes (e.g. drops the `66` data16 on alignment NOPs). The fix shaped the design: structured form ≠ encoder source; original bytes preserve fidelity.
 
 ## Phase 2 — Function discovery + IR lifting ✅
 
-- [x] `.symtab` / `.dynsym` consumer (`ud-analysis::discover_from_symbol_tables`).
-- [x] `.eh_frame` parser (`ud-analysis::discover_from_eh_frame`).
+- [x] `.symtab` / `.dynsym` consumer (`analysis::discover_from_symbol_tables`).
+- [x] `.eh_frame` parser (`analysis::discover_from_eh_frame`).
 - [x] Function-boundary fusion via `FunctionMap` merge logic.
-- [x] `ud-ir`: generic `Function<I>` / `BasicBlock<I>` / `Terminator` over an `ArchInsn` trait.
+- [x] `ir`: generic `Function<I>` / `BasicBlock<I>` / `Terminator` over an `ArchInsn` trait.
 - [x] x86 → IR lifter with CFG construction (leaders / blocks / terminators) using iced flow-control.
 - [x] Default `sub_<hex_addr>` naming with `@addr` ordering preserved.
 
 ## Phase 3 — Source language v0 ✅
 
-- [x] `ud-ast`: AST types + canonical pretty-printer.
+- [x] `ast`: AST types + canonical pretty-printer.
 - [x] `ud-compile`: hand-rolled lexer + recursive-descent parser; ParseError with line/col diagnostics.
 - [x] Round-trip property tests on parser/emitter (synthetic + against real decompile output).
 - [x] Directives wired up: `@module`, `@section`, `@addr`, `@asm` (with optional pinned bytes), `@raw`, top-level and section-level comments.
@@ -48,9 +48,9 @@ This phase wasn't in the original numbering — the original Phase 3 was "struct
 
 What's done:
 
-- [x] `ud-signatures` crate with byte-pattern matcher (exact + wildcard) and DB for x86-64 CRT helpers (`deregister_tm_clones`, `register_tm_clones`, `__do_global_dtors_aux`, `frame_dummy`).
+- [x] `signatures` module with byte-pattern matcher (exact + wildcard) and DB for x86-64 CRT helpers (`deregister_tm_clones`, `register_tm_clones`, `__do_global_dtors_aux`, `frame_dummy`).
 - [x] Size-filling pass for size-less discovery sources (signatures, symtab entries with `st_size = 0`).
-- [x] `ud-debug` crate with DWARF reader. `DW_TAG_subprogram` walks yield typed function signatures: parameter and return types via `DW_TAG_base_type` (size+encoding) and `DW_TAG_pointer_type` (recursive).
+- [x] `debug` module with DWARF reader. `DW_TAG_subprogram` walks yield typed function signatures: parameter and return types via `DW_TAG_base_type` (size+encoding) and `DW_TAG_pointer_type` (recursive).
 - [x] Decompile attaches DWARF signatures to `FnDecl` AST nodes.
 
 Still ahead:
@@ -101,9 +101,9 @@ The arch-trait abstraction (`ArchInsn`) is in place; adding a backend is mostly 
 
 ### NE (16-bit Windows New Executable) — round-trip + readable listing ✅
 
-- [x] `ud-format::ne`: hand-rolled NE reader (DOS stub, 64-byte NE header, segment / entry / resident+non-resident name / module-reference tables) with byte-identical `write_to_vec`.
-- [x] `ud-translate::decompile::decompile_ne`: `@module.format = "ne"` with the full structural decode in `build{}`, plus Ghidra-style `//` listings — imported modules (KERNEL/GDI/USER/…), exported entry points, and a per-segment 16-bit disassembly (`Bitness::Bits16`).
-- [x] `ud-translate::compile::lower_to_ne`: reconstructs the file from the authoritative `@raw` coverage; whole-binary source round-trip defended via the `SITEX10.EXE` external fixture.
+- [x] `format::ne`: hand-rolled NE reader (DOS stub, 64-byte NE header, segment / entry / resident+non-resident name / module-reference tables) with byte-identical `write_to_vec`.
+- [x] `translate::decompile::decompile_ne`: `@module.format = "ne"` with the full structural decode in `build{}`, plus Ghidra-style `//` listings — imported modules (KERNEL/GDI/USER/…), exported entry points, and a per-segment 16-bit disassembly (`Bitness::Bits16`).
+- [x] `translate::compile::lower_to_ne`: reconstructs the file from the authoritative `@raw` coverage; whole-binary source round-trip defended via the `SITEX10.EXE` external fixture.
 - [ ] Structured 16-bit lifting (segment:offset addressing, NE relocation records as imports, `if`/`switch`/`goto`) — the natural next increment, mirroring how PE/ELF grew from "skeleton + raw" into structured lifts.
 
 ### NE (Win16) execution — Phase 1: loader + 16-bit segmented CPU ✅
@@ -119,7 +119,7 @@ fail-soft-thunk / monitor-report machinery.
   `MOV Sreg`, and a selector→base table. The flat 32-bit codec path is
   behaviour-identical (all bases 0, default size 32-bit); 235 emulator unit
   tests stay green.
-- [x] NE loader (`ne::load_ne`): reuses `ud_format::ne::NeFile`, maps each
+- [x] NE loader (`ne::load_ne`): reuses `univdreams::format::ne::NeFile`, maps each
   segment to a 64 KiB linear window, applies internal + imported-ordinal
   relocations (imports → fail-soft thunks via `register_unknown_fallback`),
   and returns an `NeImage` (entry `CS:IP`, `SS:SP`, selector table).

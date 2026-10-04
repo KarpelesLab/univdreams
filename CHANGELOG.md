@@ -8,6 +8,38 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/KarpelesLab/univdreams/compare/v0.3.0...v0.4.0) - 2026-10-05
+
+### Changed
+
+- The workspace's 16 `ud-*` crates are now a single `univdreams` crate, one
+  module per former crate (`ud_format` → `univdreams::format`,
+  `ud_arch_x86` → `univdreams::arch::x86`, `ud_core` → `univdreams::common`,
+  …). The `ud` binary is behind the default `cli` feature; the browser
+  bindings are behind `wasm`; the emulator's `trace` / `kvm` / `fstool`
+  features keep their names. The `ud-*` crates stay at 0.3.0 on crates.io.
+- Rust edition 2024; minimum supported Rust is now 1.89.
+
+### Emulator
+
+- Linux guest host (ELF loader, syscall ABI, procfs/devfs mount table), with
+  an optional KVM backend (`kvm` feature) and real-filesystem mounts via
+  fstool (`fstool` feature, `--rootfs` / `--mount`)
+- x86-64 long mode and an AArch64 interpreter core
+- `ud script`: drive the sandbox from JavaScript (`script` feature),
+  including `ud.callAddr` for indirect guest calls
+- Win16: DOS INT 21h file I/O, IOCTL and file-attribute calls, FindFirst,
+  self-EXE staging (opt out with `UD_NE_NO_STAGE_SELF`), selector-stable
+  `GlobalReAlloc`, more KERNEL/USER/GDI stubs
+- Win32: QuickTime 7.7.9 / Apple Application Support / CoreFoundation /
+  pthreadVC2 host stubs, real `VS_FIXEDFILEINFO`, COMDLG32
+- SALC opcode; new codec-analysis harnesses (msmpeg4, svq3, wma, lagarith,
+  indeo3/5, cook, huffyuv)
+
+### Translate
+
+- PE i386 source round-trip fixes (arch name, tail-call double-encode)
+
 ## [0.3.0](https://github.com/KarpelesLab/univdreams/compare/v0.2.0...v0.3.0) - 2026-07-05
 
 ### Format

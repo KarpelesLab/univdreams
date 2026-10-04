@@ -34,8 +34,10 @@ jobs:
         with:
           key: pages-wasm
 
-      - name: Build ud-wasm
-        run: cargo build --release --target wasm32-unknown-unknown -p ud-wasm
+      - name: Build the wasm module
+        run: |
+          cargo rustc --lib --release --target wasm32-unknown-unknown \
+            --no-default-features --features wasm --crate-type cdylib
 
       # wasm-bindgen-cli must match the `wasm-bindgen` crate version exactly.
       # Cargo.lock isn't committed, so read the version the build resolved
@@ -52,8 +54,9 @@ jobs:
           wasm-bindgen \
             --target web \
             --no-typescript \
+            --out-name ud_wasm \
             --out-dir site/wasm \
-            target/wasm32-unknown-unknown/release/ud_wasm.wasm
+            target/wasm32-unknown-unknown/release/univdreams.wasm
 
       - uses: actions/upload-pages-artifact@v3
         with:

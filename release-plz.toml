@@ -2,9 +2,7 @@
 # https://release-plz.dev/docs/config
 
 [workspace]
-# Keep every workspace crate at the same version. A version bump
-# on one crate bumps them all — matches the project's "unified
-# workspace version" convention in `Cargo.toml::workspace.package`.
+# Refresh dependency versions in the lockfile when opening a release PR.
 dependencies_update = true
 
 # One CHANGELOG.md at the repo root, shared across all crates.
@@ -23,9 +21,7 @@ git_release_name = "v{{ version }}"
 # squash + merge to ship.
 release_always = false
 
-# Don't publish per-crate sub-tags (`crate-name-v0.1.5`). With a
-# unified workspace version, the single `v0.1.5` tag is the
-# canonical release marker.
+# Build the package before publishing it.
 publish_no_verify = false
 
 [changelog]

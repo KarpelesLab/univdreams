@@ -1,8 +1,8 @@
 # univdreams
 
 [![CI](https://github.com/KarpelesLab/univdreams/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/univdreams/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/ud-cli.svg)](https://crates.io/crates/ud-cli)
-[![docs.rs](https://img.shields.io/docsrs/ud-cli)](https://docs.rs/ud-cli)
+[![crates.io](https://img.shields.io/crates/v/univdreams.svg)](https://crates.io/crates/univdreams)
+[![docs.rs](https://img.shields.io/docsrs/univdreams)](https://docs.rs/univdreams)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A universal compiler **and** decompiler suite. The premise:
@@ -178,38 +178,42 @@ Rust. Reasoning, briefly:
 ```
 .
 ├── README.md
-├── Cargo.toml                  # workspace
+├── Cargo.toml                  # the single `univdreams` crate
 ├── docs/
 │   ├── architecture.md         # pipeline, IR, how directives preserve info
 │   ├── roadmap.md              # phased milestones, what's done
 │   ├── source-language.md      # the .ud language, directives, examples
 │   ├── round-trip-contract.md  # what "identical bytes" means precisely
 │   └── installers.md           # running Win32 installers under `ud analyze --monitor`
-└── crates/
-    ├── ud-core/                # shared types: VAddr, Result, byte helpers
-    ├── ud-format/              # ELF64 + PE/COFF + thin Mach-O + NE + raw readers + writers (byte-identical)
-    ├── ud-arch-x86/            # x86 decode + lift + Intel formatter + assembler
-    ├── ud-arch-aarch64/        # AArch64 decode + lift
-    ├── ud-arch-6502/           # 6502 decode + lift + assembler
-    ├── ud-ir/                  # Function, BasicBlock, Terminator (generic over arch)
-    ├── ud-analysis/            # function discovery (symtab / eh_frame / signatures)
-    ├── ud-signatures/          # byte-pattern DB (CRT helpers)
-    ├── ud-debug/               # DWARF reader → typed signatures
-    ├── ud-ast/                 # .ud AST + canonical pretty-printer
-    ├── ud-translate/           # .ud → binary lowering + binary → .ud decompile (all formats)
-    ├── ud-emulator/            # 32-bit i386 sandbox: MMU, CPU, PE loader, Win32 stubs, VfW IC*
-    ├── ud-cli/                 # the `ud` binary
-    └── ud-wasm/                # wasm-bindgen bindings for the browser playground
+└── src/                        # one crate, one module per subsystem
+    ├── common/                 # shared types: VAddr, Result, byte helpers
+    ├── format/                 # ELF64 + PE/COFF + thin Mach-O + NE + raw readers + writers (byte-identical)
+    ├── arch/
+    │   ├── codec/              # the arch-codec trait + registry every backend implements
+    │   ├── x86/                # x86 decode + lift + Intel formatter + assembler
+    │   ├── aarch64/            # AArch64 decode + lift
+    │   ├── mos6502/            # 6502 decode + lift + assembler
+    │   └── bpf/                # eBPF / Solana SBF decode + lift
+    ├── ir/                     # Function, BasicBlock, Terminator (generic over arch)
+    ├── analysis/               # function discovery (symtab / eh_frame / signatures)
+    ├── signatures/             # byte-pattern DB (CRT helpers)
+    ├── debug/                  # DWARF reader → typed signatures
+    ├── ast/                    # .ud AST + canonical pretty-printer
+    ├── translate/              # .ud → binary lowering + binary → .ud decompile (all formats)
+    ├── emulator/               # x86 sandbox: MMU, CPU, PE/NE/ELF loaders, Win16/Win32/Linux hosts
+    ├── cli/                    # library side of the `ud` driver (feature `cli`, on by default)
+    ├── wasm/                   # wasm-bindgen bindings for the browser playground (feature `wasm`)
+    └── bin/ud/                 # the `ud` binary
 ```
 
 ## Quick start
 
 ```bash
 # Build
-cargo build --workspace
+cargo build
 
 # Run end-to-end byte-identical round-trip on the test corpus
-cargo test --workspace
+cargo test
 
 # Decompile any supported binary to .ud (auto-detects ELF / PE / Mach-O / 6502)
 cargo run --bin ud -- decompile path/to/binary
@@ -223,10 +227,10 @@ cargo run --bin ud -- verify path/to/file.ud
 
 ## Library use: drive a guest like a foreign library
 
-`ud-emulator` ships an FFI-shaped front end over the underlying sandbox. A Rust consumer can drive a Windows DLL the same way they would `dlopen` a shared library — useful for codec analysis, malware triage, and any "load this 32-bit Win32 binary safely and tell me what it does" workflow. All in safe Rust; no `unsafe`, no host filesystem, network, or registry access from the guest unless an emulation [`Context`] explicitly attaches a virtual one.
+`univdreams::emulator` ships an FFI-shaped front end over the underlying sandbox. A Rust consumer can drive a Windows DLL the same way they would `dlopen` a shared library — useful for codec analysis, malware triage, and any "load this 32-bit Win32 binary safely and tell me what it does" workflow. All in safe Rust; no `unsafe`, no host filesystem, network, or registry access from the guest unless an emulation [`Context`] explicitly attaches a virtual one.
 
 ```rust
-use ud_emulator::Guest;
+use univdreams::emulator::Guest;
 
 let bytes = std::fs::read("codec.dll")?;
 let mut guest = Guest::load("codec.dll", &bytes)?;       // dlopen-shaped: also runs DllMain
@@ -255,7 +259,7 @@ The default call convention is **stdcall** (the Win32 norm — args pushed right
 
 Pre-built variants for less-common cases: `Guest::load_raw` skips `DllMain` (useful when you want to instrument the module before any guest code runs); `Guest::load_into` / `load_raw_into` accept a caller-provided `Sandbox` so you can attach a `Context`, set an instruction budget, or seed coverage tracking before loading.
 
-See `cargo doc -p ud-emulator --open` for the full API.
+See `cargo doc --open` (the `emulator` module) for the full API.
 
 ## How to read this repo
 

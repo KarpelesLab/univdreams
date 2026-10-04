@@ -6,7 +6,7 @@ The emulator is **headless and sandboxed**. Nothing the guest does reaches the h
 
 ## What's actually inside the box
 
-`ud-emulator` ships a pure-Rust 32-bit x86 interpreter, a PE/COFF loader, and ~250 Win32 stub functions across `kernel32`, `user32`, `gdi32`, `winmm`, `msvcrt`, `ole32`, `advapi32`, `comctl32`, `shell32`, `shlwapi`, `mfplat`, `vfw32`, `version`, and `msi`. The scheduler is preemptive (round-robin with priority + quantum), supports multiple processes through `CreateProcessA`, and models the standard sync surface — Event / Mutex / Semaphore / CriticalSection with real waiter wake-up, named-object registry, anonymous + named pipes, and per-thread TLS / TIB.
+`emulator` ships a pure-Rust 32-bit x86 interpreter, a PE/COFF loader, and ~250 Win32 stub functions across `kernel32`, `user32`, `gdi32`, `winmm`, `msvcrt`, `ole32`, `advapi32`, `comctl32`, `shell32`, `shlwapi`, `mfplat`, `vfw32`, `version`, and `msi`. The scheduler is preemptive (round-robin with priority + quantum), supports multiple processes through `CreateProcessA`, and models the standard sync surface — Event / Mutex / Semaphore / CriticalSection with real waiter wake-up, named-object registry, anonymous + named pipes, and per-thread TLS / TIB.
 
 `CreateProcessA` targeting `C:\Windows\System32\msiexec.exe` routes into a host-side MSI walker (`win32::msiexec`) that parses the referenced `.msi` via the [`msi`](https://crates.io/crates/msi) crate and synthesises the install effects — resolved file paths *with the actual decompressed file bytes* into the VFS, registry entries into the VirtualRegistry. Embedded `#name.cab` streams referenced by the MSI's `Media` table are unpacked through the [`cab`](https://crates.io/crates/cab) crate (LZX / MSZIP); external CAB files are recognised but require staging through the VFS in a future patch.
 
@@ -245,12 +245,12 @@ The big ones, in rough order of how often they surface:
 
 ## Reference: the wiring
 
-`crates/ud-emulator/src/win32/msiexec.rs` — the MSI walker and `CreateProcessA(msiexec)` dispatch site.
+`src/emulator/win32/msiexec.rs` — the MSI walker and `CreateProcessA(msiexec)` dispatch site.
 
-`crates/ud-emulator/src/win32/kernel32.rs::stub_create_process_a` — Phase 5c child-PE load, msiexec detection, synthetic immediate-exit fallback.
+`src/emulator/win32/kernel32.rs::stub_create_process_a` — Phase 5c child-PE load, msiexec detection, synthetic immediate-exit fallback.
 
-`crates/ud-emulator/src/context.rs` — `VirtualFs` + `VirtualRegistry`, the destinations every install effect routes into.
+`src/emulator/context.rs` — `VirtualFs` + `VirtualRegistry`, the destinations every install effect routes into.
 
-`crates/ud-emulator/src/sched.rs` — the preemptive scheduler, named-object registry, pipe buffers, wait-condition wake protocol.
+`src/emulator/sched.rs` — the preemptive scheduler, named-object registry, pipe buffers, wait-condition wake protocol.
 
-`crates/ud-cli/src/main.rs::monitor_install` — the `ud analyze --monitor` driver that stitches the above together and emits the JSON / text report.
+`src/cli/main.rs::monitor_install` — the `ud analyze --monitor` driver that stitches the above together and emits the JSON / text report.
