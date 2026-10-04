@@ -80,7 +80,10 @@ kvm-bindings = { version = "0.13", optional = true, features = ["fam-wrappers"] 
 # packages) into an ext4 root; the rest of fstool's archive/compression codecs
 # stay off. 0.4.18 fixes ext rename in directories larger than one block
 # (KarpelesLab/fstool#29), needed for `apk add git` and other big-dir packages.
-fstool = { version = "0.4.18", optional = true, default-features = false, features = [
+fstool = { version = "0.4.35", optional = true, default-features = false, features = [
+    # Since 0.4.35 the filesystem backends are opt-in; `filesystems` restores
+    # the full set (ext4 for --rootfs, NTFS/FAT/… for --mount images).
+    "filesystems",
     "gzip",
 ] }
 
