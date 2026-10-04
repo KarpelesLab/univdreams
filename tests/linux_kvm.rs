@@ -23,8 +23,7 @@ fn compile_static(src: &str, name: &str) -> Option<Vec<u8>> {
         .arg(&ofile)
         .arg(&cfile)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !ok {
         eprintln!("SKIP: no working `gcc -static` toolchain");
         let _ = std::fs::remove_dir_all(&dir);
@@ -100,8 +99,7 @@ fn kvm_runs_freestanding_raw_syscalls() {
         .arg(&ofile)
         .arg(&cfile)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !ok {
         eprintln!("SKIP: gcc freestanding build failed");
         let _ = std::fs::remove_dir_all(&dir);

@@ -3891,9 +3891,7 @@ fn monitor_install_elf(
     let entry =
         univdreams::format::elf::Elf64File::parse(bytes).map_or(0, |e| e.ehdr.e_entry as u32);
     #[cfg(feature = "kvm")]
-    let machine = univdreams::format::elf::Elf64File::parse(bytes)
-        .map(|e| e.ehdr.e_machine)
-        .unwrap_or(0);
+    let machine = univdreams::format::elf::Elf64File::parse(bytes).map_or(0, |e| e.ehdr.e_machine);
 
     let new_sandbox = || -> anyhow::Result<univdreams::emulator::Sandbox> {
         let mut sb = univdreams::emulator::Sandbox::new_linux();
