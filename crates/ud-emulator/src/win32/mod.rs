@@ -1882,7 +1882,7 @@ pub fn run_until_sentinel(
     registry: &mut Registry,
     state: &mut HostState,
 ) -> Result<(), crate::Error> {
-    use crate::emulator::isa_int::{StepOk, RET_SENTINEL};
+    use crate::emulator::isa_int::{RET_SENTINEL, StepOk};
     // Reset the per-run instruction counter so analysis
     // front-ends can ask "how many did this top-level call
     // burn?" without subtracting from a stale snapshot.
@@ -2237,7 +2237,7 @@ pub fn call_guest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emulator::{mmu::Perm, Mmu};
+    use crate::emulator::{Mmu, mmu::Perm};
 
     fn dummy_stub(
         _cpu: &mut Cpu,

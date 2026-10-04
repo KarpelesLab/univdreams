@@ -36,7 +36,7 @@
 
 mod common;
 
-use ud_emulator::{Bih, Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox};
 
 const ICMODE_COMPRESS: u32 = 1;
 const ICMODE_DECOMPRESS: u32 = 2;
@@ -435,11 +435,11 @@ fn run_one(entry: &Entry) -> Outcome {
             let mut condensed: Vec<(String, u32)> = Vec::new();
             for c in &sb.host.stub_calls {
                 let key = format!("{}!{}", c.dll, c.name);
-                if let Some((last, n)) = condensed.last_mut() {
-                    if *last == key {
-                        *n += 1;
-                        continue;
-                    }
+                if let Some((last, n)) = condensed.last_mut()
+                    && *last == key
+                {
+                    *n += 1;
+                    continue;
                 }
                 condensed.push((key, 1));
             }

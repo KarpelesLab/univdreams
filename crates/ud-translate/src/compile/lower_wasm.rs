@@ -31,9 +31,7 @@ pub enum WasmLowerError {
         "overlap: cursor was at 0x{cursor:x}, next block starts at 0x{addr:x} (still inside the previous block)"
     )]
     Overlap { cursor: u64, addr: u64 },
-    #[error(
-        "coverage mismatch: walked 0x{covered:x} bytes but file_size declares 0x{file_size:x}"
-    )]
+    #[error("coverage mismatch: walked 0x{covered:x} bytes but file_size declares 0x{file_size:x}")]
     SizeMismatch { covered: u64, file_size: u64 },
     #[error("WASM lower only knows how to handle `@raw` and `fn` items; got {kind}")]
     UnsupportedItem { kind: &'static str },
@@ -67,14 +65,14 @@ pub fn lower_to_wasm(file: &UdFile) -> Result<Vec<u8>, WasmLowerError> {
             }
             Item::Comment(_) => {}
             Item::Section { .. } => {
-                return Err(WasmLowerError::UnsupportedItem { kind: "section" })
+                return Err(WasmLowerError::UnsupportedItem { kind: "section" });
             }
             Item::Strings { .. } => {
-                return Err(WasmLowerError::UnsupportedItem { kind: "strings" })
+                return Err(WasmLowerError::UnsupportedItem { kind: "strings" });
             }
             Item::Notes { .. } => return Err(WasmLowerError::UnsupportedItem { kind: "notes" }),
             Item::JumpTable { .. } => {
-                return Err(WasmLowerError::UnsupportedItem { kind: "jump_table" })
+                return Err(WasmLowerError::UnsupportedItem { kind: "jump_table" });
             }
         }
     }
@@ -124,7 +122,7 @@ fn collect_fn_bytes(fd: &FnDecl) -> Result<Vec<u8>, WasmLowerError> {
                 return Err(WasmLowerError::UnsupportedStmt {
                     name: fd.name.clone(),
                     kind: "non-asm statement",
-                })
+                });
             }
         }
     }

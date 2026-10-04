@@ -11,8 +11,8 @@
 //! (`EM_BPF = 247` for Linux eBPF; `EM_SBF = 263` for Solana SBF).
 
 use crate::{
-    assemble_bpf, assemble_bpf_ifblock_cond, assemble_bpf_ja, desymbolize_bpf_text, BpfVariant,
-    INSN_SIZE,
+    BpfVariant, INSN_SIZE, assemble_bpf, assemble_bpf_ifblock_cond, assemble_bpf_ja,
+    desymbolize_bpf_text,
 };
 use ud_arch_codec::{ArchCodec, ArchError, EncodeHints, SwitchSpec};
 
@@ -301,10 +301,10 @@ fn split_size_suffix(s: &str) -> (&str, Option<u32>) {
     let s = s.trim();
     if let Some(idx) = s.rfind(":u") {
         let suffix = &s[idx + 2..];
-        if let Ok(n) = suffix.parse::<u32>() {
-            if matches!(n, 8 | 16 | 32 | 64) {
-                return (s[..idx].trim_end(), Some(n));
-            }
+        if let Ok(n) = suffix.parse::<u32>()
+            && matches!(n, 8 | 16 | 32 | 64)
+        {
+            return (s[..idx].trim_end(), Some(n));
         }
     }
     (s, None)

@@ -37,18 +37,18 @@ mod encode_text;
 mod expr;
 mod lift;
 mod prologue_codec;
-pub use assemble::{assemble_intel, AssembleError};
+pub use assemble::{AssembleError, assemble_intel};
 pub use call_site::{
-    detect_post_call_spill, identify_call_sites, ArgValue, CallSite, PostCallSpill,
+    ArgValue, CallSite, PostCallSpill, detect_post_call_spill, identify_call_sites,
 };
-pub use codec::{register, X86Codec};
+pub use codec::{X86Codec, register};
 pub use encode_text::{encode_cmp_or_test, encode_head_from_cond_text};
-pub use expr::{try_lift_value_block, ExprRenderCtx, LiftedValueBlock, ValueExpr};
-pub use lift::{lift_function, LiftError};
+pub use expr::{ExprRenderCtx, LiftedValueBlock, ValueExpr, try_lift_value_block};
+pub use lift::{LiftError, lift_function};
 pub use prologue_codec::{
-    decode_epilogue, decode_prologue, default_epilogue, default_prologue, encode_epilogue,
-    encode_prologue, epilogue_roundtrips, prologue_roundtrips, CodecBits, ProfileInputs,
-    StructuredEpilogue, StructuredPrologue,
+    CodecBits, ProfileInputs, StructuredEpilogue, StructuredPrologue, decode_epilogue,
+    decode_prologue, default_epilogue, default_prologue, encode_epilogue, encode_prologue,
+    epilogue_roundtrips, prologue_roundtrips,
 };
 
 /// If `insn` is a direct (relative) `call` whose target is statically
@@ -231,13 +231,12 @@ pub fn try_lift_prologue_pattern(insns: &[DecodedInsn]) -> Option<LiftedPrologue
     // attribute that last push to the frame rather than to saves.
     // Otherwise every push is a save.
     let mut has_frame = false;
-    if matches!(pushes.last(), Some(&0x55)) {
-        if let Some(b) = bytes_at(start) {
-            if is_mov_bp_sp(b) {
-                has_frame = true;
-                start += 1;
-            }
-        }
+    if matches!(pushes.last(), Some(&0x55))
+        && let Some(b) = bytes_at(start)
+        && is_mov_bp_sp(b)
+    {
+        has_frame = true;
+        start += 1;
     }
     let mut saves_count = pushes.len() - usize::from(has_frame);
 

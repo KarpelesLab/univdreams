@@ -27,14 +27,14 @@ mod verify;
 pub use module::resolve_arch_codec;
 
 pub use lower::{
-    lower_function_bytes, lower_function_bytes_at, lower_functions, lower_section_bytes,
-    lower_sections, LowerError, LoweredFunction, LoweredSection,
+    LowerError, LoweredFunction, LoweredSection, lower_function_bytes, lower_function_bytes_at,
+    lower_functions, lower_section_bytes, lower_sections,
 };
-pub use lower_elf::{build_elf64, lower_to_elf, ElfLowerError};
-pub use lower_macho::{lower_to_macho, MachoLowerError};
-pub use lower_ne::{lower_to_ne, NeLowerError};
-pub use lower_pe::{lower_to_pe, PeLowerError};
-pub use lower_raw::{lower_to_raw, RawLowerError};
-pub use lower_wasm::{lower_to_wasm, WasmLowerError};
-pub use parser::{parse, ParseError};
-pub use verify::{verify_asm, AsmLocation, AsmWarning};
+pub use lower_elf::{ElfLowerError, build_elf64, lower_to_elf};
+pub use lower_macho::{MachoLowerError, lower_to_macho};
+pub use lower_ne::{NeLowerError, lower_to_ne};
+pub use lower_pe::{PeLowerError, lower_to_pe};
+pub use lower_raw::{RawLowerError, lower_to_raw};
+pub use lower_wasm::{WasmLowerError, lower_to_wasm};
+pub use parser::{ParseError, parse};
+pub use verify::{AsmLocation, AsmWarning, verify_asm};

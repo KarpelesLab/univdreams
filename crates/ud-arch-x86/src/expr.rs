@@ -158,11 +158,7 @@ impl RegState {
 
 fn full_reg(reg: Register) -> Register {
     let full = reg.full_register();
-    if full == Register::None {
-        reg
-    } else {
-        full
-    }
+    if full == Register::None { reg } else { full }
 }
 
 fn apply_one(state: &mut RegState, insn: &Instruction, name_at: &HashMap<u64, String>) -> bool {
@@ -369,7 +365,7 @@ fn signed_immediate(insn: &Instruction) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decode, Bitness};
+    use crate::{Bitness, decode};
 
     fn empty_names() -> HashMap<u64, String> {
         HashMap::new()

@@ -22,7 +22,7 @@
 //! per instruction sequence — but the per-instruction effect
 //! reads as plain C arithmetic, which is what we want.
 
-use ud_arch_x86::{format_intel, DecodedInsn, Mnemonic};
+use ud_arch_x86::{DecodedInsn, Mnemonic, format_intel};
 use ud_ast::Stmt;
 
 use super::{Candidate, Pattern, PatternCtx};
@@ -178,10 +178,10 @@ fn normalize_st(s: &str) -> String {
     if s == "st" {
         return "st0".to_string();
     }
-    if let Some(rest) = s.strip_prefix("st(") {
-        if let Some(num) = rest.strip_suffix(')') {
-            return format!("st{num}");
-        }
+    if let Some(rest) = s.strip_prefix("st(")
+        && let Some(num) = rest.strip_suffix(')')
+    {
+        return format!("st{num}");
     }
     s.to_string()
 }

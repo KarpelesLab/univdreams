@@ -18,7 +18,7 @@
 //! [`WasmFile`]: ud_format::wasm::WasmFile
 
 use ud_ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
-use ud_format::wasm::{Section, WasmFile, SECTION_CODE};
+use ud_format::wasm::{SECTION_CODE, Section, WasmFile};
 
 use super::wasm_disasm;
 

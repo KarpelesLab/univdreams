@@ -20,8 +20,8 @@
 
 use ud_ast::{Field, Item, Module, UdFile, Value};
 use ud_format::pe::{
-    CoffHeader, DataDirectory, DosHeader, OptionalHeader, PeFile, PeKind, SectionHeader,
-    OPTIONAL_HEADER_MAGIC_PE32, OPTIONAL_HEADER_MAGIC_PE32_PLUS,
+    CoffHeader, DataDirectory, DosHeader, OPTIONAL_HEADER_MAGIC_PE32,
+    OPTIONAL_HEADER_MAGIC_PE32_PLUS, OptionalHeader, PeFile, PeKind, SectionHeader,
 };
 
 /// Errors specific to the PE lower path.

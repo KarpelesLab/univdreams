@@ -283,15 +283,15 @@ fn profile_inputs_from_fn(f: &FnDecl) -> ud_arch_x86::ProfileInputs {
             }
             ud_ast::LocalKind::Stack => {
                 if let Some(rest) = local.name.strip_prefix("var_") {
-                    if let Ok(n) = u32::from_str_radix(rest, 16) {
-                        if n > max_neg_off {
-                            max_neg_off = n;
-                        }
+                    if let Ok(n) = u32::from_str_radix(rest, 16)
+                        && n > max_neg_off
+                    {
+                        max_neg_off = n;
                     }
-                } else if let Some(rest) = local.name.strip_prefix("arg_") {
-                    if u32::from_str_radix(rest, 16).is_ok() {
-                        stack_arg_count += 1;
-                    }
+                } else if let Some(rest) = local.name.strip_prefix("arg_")
+                    && u32::from_str_radix(rest, 16).is_ok()
+                {
+                    stack_arg_count += 1;
                 }
             }
         }
@@ -1312,7 +1312,7 @@ mod tests {
         ];
         let bytes = lower_section_bytes(".text", 0x1000, &items, &arch()).unwrap();
         let mut expected = vec![0xc3];
-        expected.extend(std::iter::repeat(0u8).take(15));
+        expected.extend(std::iter::repeat_n(0u8, 15));
         expected.push(0x90);
         assert_eq!(bytes, expected);
     }

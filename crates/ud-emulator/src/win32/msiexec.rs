@@ -1007,11 +1007,7 @@ fn expand_once(s: &str, props: &BTreeMap<String, String>, strict: bool) -> Resul
         out.push(bytes[i] as char);
         i += 1;
     }
-    if changed {
-        Ok(out)
-    } else {
-        Ok(s.to_string())
-    }
+    if changed { Ok(out) } else { Ok(s.to_string()) }
 }
 
 /// Parse one MSI registry value-string into a typed
@@ -1179,8 +1175,9 @@ mod tests {
 
     #[test]
     fn parse_command_line_extracts_install_path() {
-        let (op, props) =
-            parse_msiexec_args("\"C:\\WINDOWS\\System32\\msiexec.exe\" /i \"C:\\foo\\bar.msi\" /quiet PROP=VAL OTHER=1");
+        let (op, props) = parse_msiexec_args(
+            "\"C:\\WINDOWS\\System32\\msiexec.exe\" /i \"C:\\foo\\bar.msi\" /quiet PROP=VAL OTHER=1",
+        );
         assert_eq!(op, Some(MsiexecOp::Install("C:\\foo\\bar.msi".into())));
         assert_eq!(props.get("PROP").map(String::as_str), Some("VAL"));
         assert_eq!(props.get("OTHER").map(String::as_str), Some("1"));

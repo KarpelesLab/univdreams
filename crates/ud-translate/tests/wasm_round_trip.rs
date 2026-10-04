@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ud_format::wasm::{is_wasm, WasmFile};
+use ud_format::wasm::{WasmFile, is_wasm};
 use ud_translate::compile::{lower_to_wasm, parse};
 use ud_translate::decompile::decompile_wasm_to_text;
 

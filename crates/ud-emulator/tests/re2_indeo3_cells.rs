@@ -29,7 +29,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use ud_emulator::{Bih, Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox};
 
 const SITE_POPULATOR: u32 = 0x100038f0; // [esp+4] = bank
 const SITE_SLOT_PLANE: u32 = 0x1000662f; // eax = 16*strip_slot, edi = plane
@@ -104,7 +104,10 @@ fn re2_indeo3_cells() {
     let planes: u16 = std::env::var("RE2_PLANES")
         .ok()
         .map_or(1, |v| v.parse().unwrap());
-    println!("[re2] out BIH: bit_count={bit_count} planes={planes} size_image={out_size} compression={:?}", std::str::from_utf8(&compression).unwrap_or("?"));
+    println!(
+        "[re2] out BIH: bit_count={bit_count} planes={planes} size_image={out_size} compression={:?}",
+        std::str::from_utf8(&compression).unwrap_or("?")
+    );
     let first = fs::read(frames_dir.join("f0.bin")).expect("f0.bin");
     let in_bih = Bih {
         bi_size: 40,

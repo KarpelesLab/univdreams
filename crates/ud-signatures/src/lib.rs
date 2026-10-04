@@ -85,10 +85,10 @@ pub fn pattern_matches_at(bytes: &[u8], pattern: &[PatternByte]) -> bool {
         return false;
     }
     for (i, p) in pattern.iter().enumerate() {
-        if let PatternByte::Exact(b) = p {
-            if bytes[i] != *b {
-                return false;
-            }
+        if let PatternByte::Exact(b) = p
+            && bytes[i] != *b
+        {
+            return false;
         }
     }
     true

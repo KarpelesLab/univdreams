@@ -14,7 +14,7 @@
 //!
 //! Reference: MSDN `user32` page-by-page; cited inline.
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
 use crate::emulator::{Cpu, Mmu};
 
 /// Register every user32 stub.
@@ -599,11 +599,7 @@ fn stub_set_timer(
         arg_dword(cpu, mmu, 2).map_err(|t| crate::win32::trap_to_win32_local("SetTimer", t))?;
     let _timer_proc =
         arg_dword(cpu, mmu, 3).map_err(|t| crate::win32::trap_to_win32_local("SetTimer", t))?;
-    if nid_event != 0 {
-        Ok(nid_event)
-    } else {
-        Ok(1)
-    }
+    if nid_event != 0 { Ok(nid_event) } else { Ok(1) }
 }
 
 /// `BOOL KillTimer(HWND hWnd, UINT_PTR uIDEvent)` — fail-soft TRUE.

@@ -9,9 +9,9 @@
 //! gate (`0F 05`) raises [`Trap::Syscall`] for the Linux run loop. SSE and
 //! the rest grow opcode-by-opcode against real binaries.
 
+use super::Trap;
 use super::isa_int::{Cpu, StepOk};
 use super::mmu::Mmu;
-use super::Trap;
 
 /// SSE2 shift-by-imm8. `op` is the 0F second byte (`0x71` word lanes, `0x72`
 /// dword lanes, `0x73` qword lanes + whole-register byte shifts), `sub` the
@@ -1190,7 +1190,7 @@ impl Cpu {
                 return Err(Trap::UndefinedOpcode {
                     eip: self.regs.rip as u32,
                     opcode: 0xFF00 | u32::from(ext),
-                })
+                });
             }
         }
         Ok(StepOk::Continued)
@@ -1722,11 +1722,7 @@ fn dword_lanes(a: u128, b: u128, f: impl Fn(u32, u32) -> u32) -> u128 {
 /// under a `0x66` prefix, otherwise a 4-byte immediate — sign-extended for
 /// 64-bit operands).
 fn imm_z_len(osz: u8) -> u8 {
-    if osz == 2 {
-        2
-    } else {
-        4
-    }
+    if osz == 2 { 2 } else { 4 }
 }
 
 fn mask(v: u64, size: u8) -> u64 {

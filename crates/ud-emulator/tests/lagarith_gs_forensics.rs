@@ -37,7 +37,7 @@
 
 mod common;
 
-use ud_emulator::{Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox};
 
 /// VA of `__security_check_cookie` inside `lagarith-i386.dll`.
 /// Identified by signature-scanning the binary for the canonical
@@ -182,7 +182,11 @@ fn lagarith_gs_failure_call_chain() {
         let ret_addr = sb.mmu.load32(frame_ebp.wrapping_add(4)).unwrap_or(0);
         println!(
             "  [{depth}] EBP={frame_ebp:#010x}  saved_EBP={saved_ebp:#010x}  ret_addr={ret_addr:#010x}{}",
-            if is_text_ptr(ret_addr) { "  (in .text)" } else { "" },
+            if is_text_ptr(ret_addr) {
+                "  (in .text)"
+            } else {
+                ""
+            },
         );
         if saved_ebp <= frame_ebp || saved_ebp == 0 {
             break;
@@ -194,25 +198,25 @@ fn lagarith_gs_failure_call_chain() {
     println!("(return-address candidates: each is the byte AFTER a call instruction)");
     for off in (0..0x400).step_by(4) {
         let addr = esp.wrapping_add(off);
-        if let Ok(v) = sb.mmu.load32(addr) {
-            if is_text_ptr(v) {
-                // Read 6 bytes BEFORE the candidate — typical
-                // x86 indirect call is `ff 15 ?? ?? ?? ??` (6
-                // bytes). The previous byte being `e8` (5-byte
-                // direct call) is also a return-address hint.
-                let prev6 = (0..6)
-                    .map(|i| sb.mmu.load8(v.wrapping_sub(6 + i)).unwrap_or(0))
-                    .collect::<Vec<_>>();
-                let looks_like_ret = (prev6[5] == 0xff && prev6[4] == 0x15) // call [mem]
+        if let Ok(v) = sb.mmu.load32(addr)
+            && is_text_ptr(v)
+        {
+            // Read 6 bytes BEFORE the candidate — typical
+            // x86 indirect call is `ff 15 ?? ?? ?? ??` (6
+            // bytes). The previous byte being `e8` (5-byte
+            // direct call) is also a return-address hint.
+            let prev6 = (0..6)
+                .map(|i| sb.mmu.load8(v.wrapping_sub(6 + i)).unwrap_or(0))
+                .collect::<Vec<_>>();
+            let looks_like_ret = (prev6[5] == 0xff && prev6[4] == 0x15) // call [mem]
                     || prev6[4] == 0xe8 // call rel32
                     || prev6[3] == 0xe8;
-                let marker = if looks_like_ret {
-                    "  <-- looks like saved return address"
-                } else {
-                    ""
-                };
-                println!("  esp+{off:#05x} [{addr:#010x}] = {v:#010x}{marker}");
-            }
+            let marker = if looks_like_ret {
+                "  <-- looks like saved return address"
+            } else {
+                ""
+            };
+            println!("  esp+{off:#05x} [{addr:#010x}] = {v:#010x}{marker}");
         }
     }
 }

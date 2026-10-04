@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use ud_ast::{Item, Type, UdFile, Value};
-use ud_format::elf::{is_elf64_le, Elf64File, EM_X86_64};
+use ud_format::elf::{EM_X86_64, Elf64File, is_elf64_le};
 
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -59,7 +59,9 @@ fn hello_fixture_module_header_is_canonical() {
     let names: Vec<&str> = ast.module.fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["arch", "abi", "format", "bits", "endian", "type", "entry", "build"]
+        vec![
+            "arch", "abi", "format", "bits", "endian", "type", "entry", "build"
+        ]
     );
 
     // arch/abi/format/endian are strings; bits/type/entry are ints; build is a block.

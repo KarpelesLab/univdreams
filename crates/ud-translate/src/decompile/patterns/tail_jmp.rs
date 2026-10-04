@@ -15,7 +15,7 @@
 //! glance — they read as `tail_call <addr>` rather than one bare
 //! `@asm("jmp …")` floating alone.
 
-use ud_arch_x86::{direct_unconditional_branch_target, format_intel, DecodedInsn, FlowControl};
+use ud_arch_x86::{DecodedInsn, FlowControl, direct_unconditional_branch_target, format_intel};
 use ud_ast::Stmt;
 
 use super::{Candidate, Pattern, PatternCtx};

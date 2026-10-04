@@ -58,17 +58,18 @@ pub mod host_iface;
 pub mod host_iface_r31;
 
 pub use asf_amt::{
-    extract_wma_amt_from_asf, locate_first_data_packet, AmtBlueprint, AsfParseError,
-    ASF_AUDIO_MEDIA, ASF_HEADER_OBJECT, ASF_STREAM_PROPERTIES_OBJECT,
+    ASF_AUDIO_MEDIA, ASF_HEADER_OBJECT, ASF_STREAM_PROPERTIES_OBJECT, AmtBlueprint, AsfParseError,
+    extract_wma_amt_from_asf, locate_first_data_packet,
 };
 pub use call::{add_ref, call_method, query_interface, release};
 pub use host_iface::{
-    all_set_properties, clear_query_info_log, clear_set_properties_log, last_set_properties,
-    media_sample_set_payload, mint_host_filter_graph, mint_host_media_sample,
-    mint_host_mem_allocator, mint_host_mem_allocator_class_factory,
-    mint_host_output_pin_with_connection, query_filter_info_call_count, query_filter_info_calls,
-    query_pin_info_call_count, query_pin_info_calls, AllocatorPropertiesCapture,
-    DEFAULT_MEM_ALLOCATOR_FACTORY_CAPACITY, DEFAULT_MEM_ALLOCATOR_FACTORY_POOL,
+    AllocatorPropertiesCapture, DEFAULT_MEM_ALLOCATOR_FACTORY_CAPACITY,
+    DEFAULT_MEM_ALLOCATOR_FACTORY_POOL, all_set_properties, clear_query_info_log,
+    clear_set_properties_log, last_set_properties, media_sample_set_payload,
+    mint_host_filter_graph, mint_host_media_sample, mint_host_mem_allocator,
+    mint_host_mem_allocator_class_factory, mint_host_output_pin_with_connection,
+    query_filter_info_call_count, query_filter_info_calls, query_pin_info_call_count,
+    query_pin_info_calls,
 };
 
 /// Canonical 128-bit globally-unique identifier.  Layout matches

@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ud_format::elf::{is_elf64_le, Elf64File, EM_BPF, EM_SBF};
+use ud_format::elf::{EM_BPF, EM_SBF, Elf64File, is_elf64_le};
 use ud_translate::compile::{lower_to_elf, parse};
 
 fn workspace_root() -> PathBuf {

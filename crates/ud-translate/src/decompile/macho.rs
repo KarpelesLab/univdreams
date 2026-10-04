@@ -16,10 +16,10 @@
 
 use ud_ast::{Field, Item, Module, UdFile, Value};
 use ud_format::macho::{
-    is_dylib_cmd, is_linkedit_data_cmd, LcBuildVersion, LcDylib, LcDylinker, LcDysymtab,
-    LcLinkeditData, LcMain, LcSourceVersion, LcSymtab, LcUuid, LoadCommand, MachoCpu, MachoFile,
-    Section64, Segment64, LC_BUILD_VERSION, LC_DYSYMTAB, LC_LOAD_DYLINKER, LC_MAIN, LC_SEGMENT_64,
-    LC_SOURCE_VERSION, LC_SYMTAB, LC_UUID,
+    LC_BUILD_VERSION, LC_DYSYMTAB, LC_LOAD_DYLINKER, LC_MAIN, LC_SEGMENT_64, LC_SOURCE_VERSION,
+    LC_SYMTAB, LC_UUID, LcBuildVersion, LcDylib, LcDylinker, LcDysymtab, LcLinkeditData, LcMain,
+    LcSourceVersion, LcSymtab, LcUuid, LoadCommand, MachoCpu, MachoFile, Section64, Segment64,
+    is_dylib_cmd, is_linkedit_data_cmd,
 };
 
 /// Build the AST for `macho`. Always succeeds — every byte of
@@ -732,10 +732,22 @@ fn linkedit_data_block(s: LcLinkeditData) -> Value {
 fn format_uuid(uuid: &[u8; 16]) -> String {
     format!(
         "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        uuid[0], uuid[1], uuid[2], uuid[3],
-        uuid[4], uuid[5], uuid[6], uuid[7],
-        uuid[8], uuid[9], uuid[10], uuid[11],
-        uuid[12], uuid[13], uuid[14], uuid[15],
+        uuid[0],
+        uuid[1],
+        uuid[2],
+        uuid[3],
+        uuid[4],
+        uuid[5],
+        uuid[6],
+        uuid[7],
+        uuid[8],
+        uuid[9],
+        uuid[10],
+        uuid[11],
+        uuid[12],
+        uuid[13],
+        uuid[14],
+        uuid[15],
     )
 }
 

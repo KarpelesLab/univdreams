@@ -43,9 +43,9 @@
 //! copy-back — an out-parameter is "alloc, pass the pointer,
 //! `read` it afterward".
 
-use crate::pe::Image;
-use crate::runtime::{Sandbox, DLL_PROCESS_ATTACH};
 use crate::Error;
+use crate::pe::Image;
+use crate::runtime::{DLL_PROCESS_ATTACH, Sandbox};
 
 /// A loaded guest module — the FFI-style handle a Rust
 /// consumer holds. Owns the [`Sandbox`] it runs in plus the

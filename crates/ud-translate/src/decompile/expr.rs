@@ -713,10 +713,10 @@ fn simplify_step(expr: Expr, width: BitWidth) -> Expr {
 fn simplify_binary(op: &'static str, l: Expr, r: Expr, width: BitWidth) -> Expr {
     let mask = width.mask();
     // Constant folding.
-    if let (Expr::Lit(a), Expr::Lit(b)) = (&l, &r) {
-        if let Some(v) = fold_binary(op, *a, *b, width) {
-            return Expr::Lit(v & mask);
-        }
+    if let (Expr::Lit(a), Expr::Lit(b)) = (&l, &r)
+        && let Some(v) = fold_binary(op, *a, *b, width)
+    {
+        return Expr::Lit(v & mask);
     }
     // Algebraic identities. Try lhs-zero, rhs-zero, mask forms.
     match op {
@@ -728,36 +728,36 @@ fn simplify_binary(op: &'static str, l: Expr, r: Expr, width: BitWidth) -> Expr 
                 return l;
             }
             // (x + a) + b → x + (a + b)
-            if let (Expr::Binary("+", ll, lr), Expr::Lit(b)) = (&l, &r) {
-                if let Expr::Lit(a) = **lr {
-                    let sum = a.wrapping_add(*b) & mask;
-                    if sum == 0 {
-                        return (**ll).clone();
-                    }
-                    return Expr::Binary("+", ll.clone(), Box::new(Expr::Lit(sum)));
+            if let (Expr::Binary("+", ll, lr), Expr::Lit(b)) = (&l, &r)
+                && let Expr::Lit(a) = **lr
+            {
+                let sum = a.wrapping_add(*b) & mask;
+                if sum == 0 {
+                    return (**ll).clone();
                 }
+                return Expr::Binary("+", ll.clone(), Box::new(Expr::Lit(sum)));
             }
             // (x - a) + b → x + (b - a) or x - (a - b)
-            if let (Expr::Binary("-", ll, lr), Expr::Lit(b)) = (&l, &r) {
-                if let Expr::Lit(a) = **lr {
-                    let net = b.wrapping_sub(a);
-                    if net == 0 {
-                        return (**ll).clone();
-                    }
-                    // Render as `x - LIT` when net is "small negative",
-                    // else `x + LIT`. We approximate by treating high
-                    // bits as negative.
-                    let half = 1u64
-                        << (match width {
-                            BitWidth::Bits32 => 31,
-                            BitWidth::Bits64 => 63,
-                        });
-                    if (net & mask) >= half {
-                        let abs = net.wrapping_neg() & mask;
-                        return Expr::Binary("-", ll.clone(), Box::new(Expr::Lit(abs)));
-                    }
-                    return Expr::Binary("+", ll.clone(), Box::new(Expr::Lit(net & mask)));
+            if let (Expr::Binary("-", ll, lr), Expr::Lit(b)) = (&l, &r)
+                && let Expr::Lit(a) = **lr
+            {
+                let net = b.wrapping_sub(a);
+                if net == 0 {
+                    return (**ll).clone();
                 }
+                // Render as `x - LIT` when net is "small negative",
+                // else `x + LIT`. We approximate by treating high
+                // bits as negative.
+                let half = 1u64
+                    << (match width {
+                        BitWidth::Bits32 => 31,
+                        BitWidth::Bits64 => 63,
+                    });
+                if (net & mask) >= half {
+                    let abs = net.wrapping_neg() & mask;
+                    return Expr::Binary("-", ll.clone(), Box::new(Expr::Lit(abs)));
+                }
+                return Expr::Binary("+", ll.clone(), Box::new(Expr::Lit(net & mask)));
             }
         }
         "-" => {
@@ -769,25 +769,25 @@ fn simplify_binary(op: &'static str, l: Expr, r: Expr, width: BitWidth) -> Expr 
                 return Expr::Lit(0);
             }
             // (x - a) - b → x - (a + b)
-            if let (Expr::Binary("-", ll, lr), Expr::Lit(b)) = (&l, &r) {
-                if let Expr::Lit(a) = **lr {
-                    let sum = a.wrapping_add(*b) & mask;
-                    return Expr::Binary("-", ll.clone(), Box::new(Expr::Lit(sum)));
-                }
+            if let (Expr::Binary("-", ll, lr), Expr::Lit(b)) = (&l, &r)
+                && let Expr::Lit(a) = **lr
+            {
+                let sum = a.wrapping_add(*b) & mask;
+                return Expr::Binary("-", ll.clone(), Box::new(Expr::Lit(sum)));
             }
             // (x + a) - b → x + (a - b) or x - (b - a)
-            if let (Expr::Binary("+", ll, lr), Expr::Lit(b)) = (&l, &r) {
-                if let Expr::Lit(a) = **lr {
-                    if a >= *b {
-                        let net = a.wrapping_sub(*b) & mask;
-                        if net == 0 {
-                            return (**ll).clone();
-                        }
-                        return Expr::Binary("+", ll.clone(), Box::new(Expr::Lit(net)));
+            if let (Expr::Binary("+", ll, lr), Expr::Lit(b)) = (&l, &r)
+                && let Expr::Lit(a) = **lr
+            {
+                if a >= *b {
+                    let net = a.wrapping_sub(*b) & mask;
+                    if net == 0 {
+                        return (**ll).clone();
                     }
-                    let net = b.wrapping_sub(a) & mask;
-                    return Expr::Binary("-", ll.clone(), Box::new(Expr::Lit(net)));
+                    return Expr::Binary("+", ll.clone(), Box::new(Expr::Lit(net)));
                 }
+                let net = b.wrapping_sub(a) & mask;
+                return Expr::Binary("-", ll.clone(), Box::new(Expr::Lit(net)));
             }
         }
         "*" => {
@@ -813,15 +813,15 @@ fn simplify_binary(op: &'static str, l: Expr, r: Expr, width: BitWidth) -> Expr 
             if matches!(l, Expr::Lit(0)) || matches!(r, Expr::Lit(0)) {
                 return Expr::Lit(0);
             }
-            if let Expr::Lit(n) = r {
-                if n == mask {
-                    return l;
-                }
+            if let Expr::Lit(n) = r
+                && n == mask
+            {
+                return l;
             }
-            if let Expr::Lit(n) = l {
-                if n == mask {
-                    return r;
-                }
+            if let Expr::Lit(n) = l
+                && n == mask
+            {
+                return r;
             }
             if expr_eq(&l, &r) {
                 return l;
@@ -834,15 +834,15 @@ fn simplify_binary(op: &'static str, l: Expr, r: Expr, width: BitWidth) -> Expr 
             if let Expr::Lit(0) = r {
                 return l;
             }
-            if let Expr::Lit(n) = r {
-                if n == mask {
-                    return Expr::Lit(mask);
-                }
+            if let Expr::Lit(n) = r
+                && n == mask
+            {
+                return Expr::Lit(mask);
             }
-            if let Expr::Lit(n) = l {
-                if n == mask {
-                    return Expr::Lit(mask);
-                }
+            if let Expr::Lit(n) = l
+                && n == mask
+            {
+                return Expr::Lit(mask);
             }
             if expr_eq(&l, &r) {
                 return l;

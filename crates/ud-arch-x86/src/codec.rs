@@ -12,8 +12,8 @@
 //! callers (tests, internal lifters) reference them directly.
 
 use crate::{
-    assemble_intel, encode_call_rel32, encode_jcc, encode_jmp, encode_msvc_jmp_table_dispatch,
-    encoded_jcc_size, encoded_jmp_size, Bitness,
+    Bitness, assemble_intel, encode_call_rel32, encode_jcc, encode_jmp,
+    encode_msvc_jmp_table_dispatch, encoded_jcc_size, encoded_jmp_size,
 };
 use ud_arch_codec::{ArchCodec, ArchError, EncodeHints, SwitchSpec};
 

@@ -22,7 +22,7 @@
 //! cleanly.
 
 use ud_core::VAddr;
-use ud_format::elf::{Elf64File, EM_BPF, EM_SBF};
+use ud_format::elf::{EM_BPF, EM_SBF, Elf64File};
 
 use crate::{Function, FunctionSource};
 

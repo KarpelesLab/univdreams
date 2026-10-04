@@ -10,7 +10,7 @@
 //! base, and execution starts in it with a full auxv (`AT_BASE`, `AT_PHDR`,
 //! `AT_ENTRY`, `AT_RANDOM`, …) so it can relocate and run the main object.
 
-use ud_format::elf::{Elf64File, EM_386, EM_AARCH64, EM_X86_64};
+use ud_format::elf::{EM_386, EM_AARCH64, EM_X86_64, Elf64File};
 
 use super::mem::GuestMem;
 use crate::emulator::Perm;

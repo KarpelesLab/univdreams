@@ -182,7 +182,7 @@ fn classify_terminator(insn: &DecodedInsn) -> Terminator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decode, Bitness};
+    use crate::{Bitness, decode};
 
     fn lift(bytes: &[u8], rip: u64) -> Function<DecodedInsn> {
         let insns = decode(Bitness::Bits64, bytes, rip).expect("decode");

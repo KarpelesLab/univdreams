@@ -26,7 +26,7 @@
     clippy::uninlined_format_args
 )]
 
-use ud_emulator::{Bih, Sandbox, WatchMode, DLL_PROCESS_ATTACH};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox, WatchMode};
 
 const ICMODE_COMPRESS: u32 = 0;
 const ICCOMPRESS_KEYFRAME: u32 = 1;

@@ -1004,7 +1004,7 @@ mod tests {
         v[4] = ELFCLASS64;
         v[5] = ELFDATA2LSB;
         v[6] = 1; // EV_CURRENT
-                  // e_type = ET_NONE; e_machine = 0; e_version = 1; rest zeroed.
+        // e_type = ET_NONE; e_machine = 0; e_version = 1; rest zeroed.
         v[20..24].copy_from_slice(&1u32.to_le_bytes());
         // e_ehsize = 64
         v[52..54].copy_from_slice(&EHDR64_SIZE.to_le_bytes());
@@ -1052,7 +1052,7 @@ mod tests {
         v[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum = 1
         v[54..56].copy_from_slice(&PHDR64_SIZE.to_le_bytes());
         v[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff = 64
-                                                         // file ends at 64 → no room for the phdr.
+        // file ends at 64 → no room for the phdr.
         let err = Elf64File::parse(&v).unwrap_err();
         assert!(matches!(err, Error::Truncated { .. }));
     }

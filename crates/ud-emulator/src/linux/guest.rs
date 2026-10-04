@@ -6,8 +6,8 @@
 //! `rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8..r15` order; aarch64 uses
 //! `x0..x30`. Memory is *not* here — it stays on the shared [`Mmu`](crate::emulator::Mmu).
 
-use crate::emulator::aarch64::Aarch64Cpu;
 use crate::emulator::Cpu;
+use crate::emulator::aarch64::Aarch64Cpu;
 
 /// What the Linux engine needs from any guest CPU.
 pub trait GuestCpu {
@@ -65,11 +65,7 @@ impl GuestCpu for Cpu {
 /// stack pointer (no canonical syscall arg uses it, but the engine may).
 impl GuestCpu for Aarch64Cpu {
     fn reg(&self, i: usize) -> u64 {
-        if i >= 31 {
-            self.sp
-        } else {
-            self.x[i]
-        }
+        if i >= 31 { self.sp } else { self.x[i] }
     }
     fn set_reg(&mut self, i: usize, v: u64) {
         if i >= 31 {

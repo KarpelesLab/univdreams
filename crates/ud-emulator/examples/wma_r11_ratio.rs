@@ -22,7 +22,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use ud_emulator::emulator::regs::Reg32;
 use ud_emulator::win32::call_guest;
-use ud_emulator::{Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox};
 
 const IB: u32 = 0x5370_0000;
 const NEXP: i32 = 40;

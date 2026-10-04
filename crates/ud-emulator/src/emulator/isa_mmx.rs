@@ -34,10 +34,10 @@
 //! Reference: Intel SDM Vol. 2A §2.1.5 (ModR/M) + Vol. 2A/2B
 //! per-instruction pages (`PADDB` … `PXOR`).
 
-use super::decode::{resolve_modrm32, ModRm, Operand};
-use super::isa_int::{mmx_mnemonic, Cpu, StepOk};
-use super::mmu::Mmu;
 use super::Trap;
+use super::decode::{ModRm, Operand, resolve_modrm32};
+use super::isa_int::{Cpu, StepOk, mmx_mnemonic};
+use super::mmu::Mmu;
 
 /// Resolve the (mm-reg, mm/m64) pair from a ModR/M byte for an
 /// MMX instruction. Returns `(reg_idx, source_value)`. If the
@@ -533,11 +533,7 @@ fn pslld(a: u64, count: u64) -> u64 {
 }
 #[inline]
 fn psllq(a: u64, count: u64) -> u64 {
-    if count >= 64 {
-        0
-    } else {
-        a << count
-    }
+    if count >= 64 { 0 } else { a << count }
 }
 #[inline]
 fn psrlw(a: u64, count: u64) -> u64 {
@@ -561,11 +557,7 @@ fn psrld(a: u64, count: u64) -> u64 {
 }
 #[inline]
 fn psrlq(a: u64, count: u64) -> u64 {
-    if count >= 64 {
-        0
-    } else {
-        a >> count
-    }
+    if count >= 64 { 0 } else { a >> count }
 }
 #[inline]
 fn psraw(a: u64, count: u64) -> u64 {

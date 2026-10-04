@@ -22,7 +22,7 @@
 //! `CFRunLoop*`, `CFType*`) —
 //! `https://opensource.apple.com/source/CF/`.
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
 use crate::emulator::{Cpu, Mmu};
 
 /// Magic word that lives at the head of every synthetic CF

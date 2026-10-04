@@ -26,8 +26,8 @@
 //! the implementations honour the public contract (return
 //! values, error semantics, side effects on `lastError`).
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
-use crate::emulator::mmu::{Perm, PAGE_SIZE};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
+use crate::emulator::mmu::{PAGE_SIZE, Perm};
 use crate::emulator::{Cpu, Mmu};
 
 /// Register every kernel32 stub into `registry`.
@@ -1709,7 +1709,7 @@ fn stub_get_proc_address(
     let dll = state
         .modules
         .iter()
-        .find(|(_, &base)| base == h)
+        .find(|&(_, &base)| base == h)
         .map(|(n, _)| n.clone());
     let Some(dll) = dll else {
         return Ok(0);

@@ -3,11 +3,11 @@
 use std::collections::{HashMap, HashSet};
 
 use ud_arch_x86::{
-    arg_spill_index, detect_post_call_spill, direct_call_target, direct_lea_rip_target,
+    ArgValue, CallSite, DecodedInsn, ExprRenderCtx, OpKind, Register, arg_spill_index,
+    detect_post_call_spill, direct_call_target, direct_lea_rip_target,
     direct_unconditional_branch_target, format_intel, identify_call_sites,
     try_lift_epilogue_pattern, try_lift_if_branch_head, try_lift_prologue_pattern,
-    try_lift_return_pattern, try_lift_return_via_jmp, try_lift_value_block, ArgValue, CallSite,
-    DecodedInsn, ExprRenderCtx, OpKind, Register,
+    try_lift_return_pattern, try_lift_return_via_jmp, try_lift_value_block,
 };
 use ud_ast::{FnDecl, LocalDecl, LocalKind, Signature, Stmt, Type};
 use ud_debug::DebugFunction;
@@ -335,10 +335,8 @@ pub fn build_function(
             && p.frame == default_pro.frame
             && p.sub_esp == default_pro.sub_esp
             && p.cf_protect == default_pro.cf_protect;
-        if !saves_is_subset {
-            if let Some(text) = describe_default_prologue(&default_pro) {
-                body.insert(0, Stmt::Comment(format!("default: {text}")));
-            }
+        if !saves_is_subset && let Some(text) = describe_default_prologue(&default_pro) {
+            body.insert(0, Stmt::Comment(format!("default: {text}")));
         }
     }
     if defaults_apply && epi_matches {
@@ -356,11 +354,9 @@ pub fn build_function(
             && e.pop_frame == default_epi.pop_frame
             && e.add_esp == default_epi.add_esp
             && e.ret_imm == default_epi.ret_imm;
-        if !saves_is_subset {
-            if let Some(text) = describe_default_epilogue(&default_epi) {
-                let last = body.len() - 1;
-                body.insert(last, Stmt::Comment(format!("default: {text}")));
-            }
+        if !saves_is_subset && let Some(text) = describe_default_epilogue(&default_epi) {
+            let last = body.len() - 1;
+            body.insert(last, Stmt::Comment(format!("default: {text}")));
         }
     }
     if pro_dropped {
@@ -556,13 +552,13 @@ fn reg_read_before_write(
             // function-entry def when the register hasn't been
             // written yet. So a use_at hit at the entry block
             // before any write means "read on entry".
-            if let Some(def) = ssa.use_at.get(&(ip, var.clone())) {
-                if matches!(
+            if let Some(def) = ssa.use_at.get(&(ip, var.clone()))
+                && matches!(
                     ssa.defs.get(def.0 as usize).map(|r| &r.site),
                     Some(crate::decompile::ssa::DefSite::Entry)
-                ) {
-                    return true;
-                }
+                )
+            {
+                return true;
             }
         }
         if ssa.def_at.contains_key(&(ip, var.clone())) {
@@ -1321,15 +1317,15 @@ pub fn profile_inputs_from_fn(f: &ud_ast::FnDecl) -> ud_arch_x86::ProfileInputs 
             }
             ud_ast::LocalKind::Stack => {
                 if let Some(rest) = local.name.strip_prefix("var_") {
-                    if let Ok(n) = u32::from_str_radix(rest, 16) {
-                        if n > max_neg_off {
-                            max_neg_off = n;
-                        }
+                    if let Ok(n) = u32::from_str_radix(rest, 16)
+                        && n > max_neg_off
+                    {
+                        max_neg_off = n;
                     }
-                } else if let Some(rest) = local.name.strip_prefix("arg_") {
-                    if u32::from_str_radix(rest, 16).is_ok() {
-                        stack_arg_count += 1;
-                    }
+                } else if let Some(rest) = local.name.strip_prefix("arg_")
+                    && u32::from_str_radix(rest, 16).is_ok()
+                {
+                    stack_arg_count += 1;
                 }
             }
         }
@@ -1537,10 +1533,10 @@ fn function_bitness(f: &Function<DecodedInsn>) -> ud_arch_x86::Bitness {
 /// determine the byte position of `pre_body`.
 fn ud_ast_head_bytes_attr(attrs: &[ud_ast::Attribute]) -> Option<&[u8]> {
     for a in attrs {
-        if a.key == "head_bytes" {
-            if let ud_ast::AttrValue::ByteList(b) = &a.value {
-                return Some(b.as_slice());
-            }
+        if a.key == "head_bytes"
+            && let ud_ast::AttrValue::ByteList(b) = &a.value
+        {
+            return Some(b.as_slice());
         }
     }
     None
@@ -1643,11 +1639,12 @@ fn annotate_in_seq(stmts: &mut Vec<Stmt>, state: &mut RegState) {
                     .or_else(|| state.values.get("rax"))
                     .cloned();
                 state.invalidate_all();
-                if let Some(expr) = ret {
-                    if expr != "eax" && expr != "rax" {
-                        let added = fold_or_annotate_return(stmts, i, &expr);
-                        i += added;
-                    }
+                if let Some(expr) = ret
+                    && expr != "eax"
+                    && expr != "rax"
+                {
+                    let added = fold_or_annotate_return(stmts, i, &expr);
+                    i += added;
                 }
                 i += 1;
                 continue;
@@ -1829,13 +1826,12 @@ fn fold_early_returns_in_seq(
         let stmt_start = *cursor;
         let advance = stmt_total_bytes(&stmts[i]);
         let mut replaced = false;
-        if let Stmt::Asm { text, bytes } = &stmts[i] {
-            if let Some(rewrite) =
+        if let Stmt::Asm { text, bytes } = &stmts[i]
+            && let Some(rewrite) =
                 try_fold_to_if_return(text, bytes, stmt_start, returns_at, bitness)
-            {
-                stmts[i] = rewrite;
-                replaced = true;
-            }
+        {
+            stmts[i] = rewrite;
+            replaced = true;
         }
         // Recurse into nested arms regardless of replacement (the
         // replacement is itself a single stmt with cond_bytes).
@@ -2236,55 +2232,54 @@ fn fold_dead_register_moves(
         let stmt_start = cursor;
         let stmt_len = stmt_total_bytes(&stmts[i]);
         let mut deleted = false;
-        if let Stmt::Move { dst, bytes, .. } = &stmts[i] {
-            if is_gpr_name(dst) && !bytes.is_empty() {
-                let last_insn_ip = stmt_start;
-                let var = crate::decompile::ssa::Var::Reg(dst.clone());
-                let dead_after = liveness
-                    .live_after_insn
-                    .get(&last_insn_ip)
-                    .is_some_and(|live| !live.contains(&var));
-                // The "forwarded" heuristic ("next stmt's text
-                // doesn't mention the register, so forward-prop
-                // inlined the value already") turns out to be
-                // unsound: it conflates "register isn't read by
-                // the immediate next stmt" with "register is
-                // dead". The former can be true while the
-                // register stays live to a later stmt — silently
-                // absorbing the Move's bytes then hides a
-                // semantic write that downstream code depends on.
-                //
-                // Rely on the real liveness signal (`dead_after`)
-                // exclusively. Cases the forwarded path used to
-                // catch — Move-into-Call where the call's args
-                // already render the inlined value — are still
-                // covered because the Move's dst is actually
-                // dead at the call site (its only use was the
-                // inline, and that was forwarded).
-                let forwarded = false;
-                if dead_after || forwarded {
-                    let prefix = match &stmts[i] {
-                        Stmt::Move { bytes, .. } => bytes.clone(),
-                        _ => unreachable!(),
-                    };
-                    // Never absorb a Move's bytes into a control-
-                    // transfer stmt (jmp / call / ret / jcc /
-                    // goto / if-goto): the target's code may read
-                    // the register, so silently merging hides a
-                    // semantic write behind misleading text.
-                    let next_is_transfer = stmts.get(i + 1).is_some_and(stmt_is_control_transfer);
-                    if !next_is_transfer {
-                        if let Some(next_bytes) =
-                            stmts.get_mut(i + 1).and_then(stmt_bytes_field_mut)
-                        {
-                            let mut merged = Vec::with_capacity(prefix.len() + next_bytes.len());
-                            merged.extend_from_slice(&prefix);
-                            merged.extend_from_slice(next_bytes);
-                            *next_bytes = merged;
-                            stmts.remove(i);
-                            deleted = true;
-                        }
-                    }
+        if let Stmt::Move { dst, bytes, .. } = &stmts[i]
+            && is_gpr_name(dst)
+            && !bytes.is_empty()
+        {
+            let last_insn_ip = stmt_start;
+            let var = crate::decompile::ssa::Var::Reg(dst.clone());
+            let dead_after = liveness
+                .live_after_insn
+                .get(&last_insn_ip)
+                .is_some_and(|live| !live.contains(&var));
+            // The "forwarded" heuristic ("next stmt's text
+            // doesn't mention the register, so forward-prop
+            // inlined the value already") turns out to be
+            // unsound: it conflates "register isn't read by
+            // the immediate next stmt" with "register is
+            // dead". The former can be true while the
+            // register stays live to a later stmt — silently
+            // absorbing the Move's bytes then hides a
+            // semantic write that downstream code depends on.
+            //
+            // Rely on the real liveness signal (`dead_after`)
+            // exclusively. Cases the forwarded path used to
+            // catch — Move-into-Call where the call's args
+            // already render the inlined value — are still
+            // covered because the Move's dst is actually
+            // dead at the call site (its only use was the
+            // inline, and that was forwarded).
+            let forwarded = false;
+            if dead_after || forwarded {
+                let prefix = match &stmts[i] {
+                    Stmt::Move { bytes, .. } => bytes.clone(),
+                    _ => unreachable!(),
+                };
+                // Never absorb a Move's bytes into a control-
+                // transfer stmt (jmp / call / ret / jcc /
+                // goto / if-goto): the target's code may read
+                // the register, so silently merging hides a
+                // semantic write behind misleading text.
+                let next_is_transfer = stmts.get(i + 1).is_some_and(stmt_is_control_transfer);
+                if !next_is_transfer
+                    && let Some(next_bytes) = stmts.get_mut(i + 1).and_then(stmt_bytes_field_mut)
+                {
+                    let mut merged = Vec::with_capacity(prefix.len() + next_bytes.len());
+                    merged.extend_from_slice(&prefix);
+                    merged.extend_from_slice(next_bytes);
+                    *next_bytes = merged;
+                    stmts.remove(i);
+                    deleted = true;
                 }
             }
         }
@@ -2665,12 +2660,10 @@ fn substitute_word_tokens(text: &str, subs: &std::collections::HashMap<String, S
             // Reject matches preceded by `.` or `'` (member access
             // / quote-bracketed ids).
             let prev = text[..start].chars().last();
-            let word_boundary_ok = prev.map_or(true, |p| !p.is_ascii_alphanumeric() && p != '_');
-            if word_boundary_ok {
-                if let Some(replacement) = subs.get(word) {
-                    out.push_str(replacement);
-                    continue;
-                }
+            let word_boundary_ok = prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '_');
+            if word_boundary_ok && let Some(replacement) = subs.get(word) {
+                out.push_str(replacement);
+                continue;
             }
             out.push_str(word);
             continue;
@@ -2840,7 +2833,7 @@ fn rewrite_intel_hex_in_text(text: &str) -> String {
         // for sub-16 letter-leading values, e.g. `0Ah`).
         if c.is_ascii_digit() {
             let prev = text[..i].chars().last();
-            let boundary_ok = prev.map_or(true, |p| !p.is_ascii_alphanumeric() && p != '_');
+            let boundary_ok = prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '_');
             if boundary_ok {
                 let start = i;
                 let mut end = i + c.len_utf8();
@@ -2856,9 +2849,9 @@ fn rewrite_intel_hex_in_text(text: &str) -> String {
                     let hex = &text[start..end];
                     if let Ok(n) = u64::from_str_radix(hex, 16) {
                         iter.next(); // consume the `h`
-                                     // Drop the iced "leading zero for letter-
-                                     // leading hex" convention by formatting `n`
-                                     // fresh.
+                        // Drop the iced "leading zero for letter-
+                        // leading hex" convention by formatting `n`
+                        // fresh.
                         let _ = write!(out, "0x{n:x}");
                         continue;
                     }
@@ -2901,7 +2894,7 @@ fn rewrite_label_refs_in_text(text: &str, labels: &std::collections::HashSet<u64
         // char (operand boundary).
         if c.is_ascii_hexdigit() {
             let prev = text[..i].chars().last();
-            let boundary_ok = prev.map_or(true, |p| !p.is_ascii_alphanumeric() && p != '_');
+            let boundary_ok = prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '_');
             if boundary_ok {
                 let start = i;
                 let mut end = i + c.len_utf8();
@@ -2916,13 +2909,13 @@ fn rewrite_label_refs_in_text(text: &str, labels: &std::collections::HashSet<u64
                 // Must be followed by `h` to be a hex literal.
                 if let Some(&(j, 'h')) = iter.peek() {
                     let hex = &text[start..end];
-                    if let Ok(addr) = u64::from_str_radix(hex, 16) {
-                        if labels.contains(&addr) {
-                            iter.next(); // consume the `h`
-                            let _ = j;
-                            let _ = write!(out, "label_{addr:x}");
-                            continue;
-                        }
+                    if let Ok(addr) = u64::from_str_radix(hex, 16)
+                        && labels.contains(&addr)
+                    {
+                        iter.next(); // consume the `h`
+                        let _ = j;
+                        let _ = write!(out, "label_{addr:x}");
+                        continue;
                     }
                 }
                 // Not a label hit: emit the digit run verbatim.
@@ -2949,10 +2942,10 @@ fn build_stack_local_map(locals: &[ud_ast::LocalDecl]) -> Vec<(i64, String)> {
             if let Ok(n) = i64::from_str_radix(rest, 16) {
                 out.push((-n, l.name.clone()));
             }
-        } else if let Some(rest) = l.name.strip_prefix("arg_") {
-            if let Ok(n) = i64::from_str_radix(rest, 16) {
-                out.push((n, l.name.clone()));
-            }
+        } else if let Some(rest) = l.name.strip_prefix("arg_")
+            && let Ok(n) = i64::from_str_radix(rest, 16)
+        {
+            out.push((n, l.name.clone()));
         }
     }
     out
@@ -3051,17 +3044,17 @@ fn rewrite_stack_refs_in_text(text: &str, map: &[(i64, String)]) -> String {
         // letter). Char-based iteration avoids UTF-8 slicing
         // panics on `@asm("…")` string-literal payloads that can
         // contain multibyte chars like `…`.
-        if matches!(c, '[' | 'd' | 'q' | 'w' | 'b' | 'x' | 't') {
-            if let Some((name, consumed)) = try_match_stack_ref(&text[i..], map) {
-                out.push_str(name);
-                // Advance `iter` past the consumed range so the
-                // outer loop continues from the new position.
-                let target = i + consumed;
-                while iter.peek().is_some_and(|&(j, _)| j < target) {
-                    iter.next();
-                }
-                continue;
+        if matches!(c, '[' | 'd' | 'q' | 'w' | 'b' | 'x' | 't')
+            && let Some((name, consumed)) = try_match_stack_ref(&text[i..], map)
+        {
+            out.push_str(name);
+            // Advance `iter` past the consumed range so the
+            // outer loop continues from the new position.
+            let target = i + consumed;
+            while iter.peek().is_some_and(|&(j, _)| j < target) {
+                iter.next();
             }
+            continue;
         }
         out.push(c);
     }
@@ -3092,7 +3085,7 @@ fn try_match_stack_ref<'a>(text: &str, map: &'a [(i64, String)]) -> Option<(&'a 
         return None;
     }
     i += 4; // past `[rbp` / `[ebp`
-            // Skip whitespace.
+    // Skip whitespace.
     while i < bytes.len() && bytes[i] == b' ' {
         i += 1;
     }
@@ -3845,10 +3838,11 @@ fn collect_goto_targets(
     for stmt in stmts {
         match stmt {
             Stmt::Asm { bytes, .. } => {
-                if let Some(target) = jump_target_of(bytes, cursor, bitness) {
-                    if target >= fn_start && target < fn_end {
-                        out.insert(target);
-                    }
+                if let Some(target) = jump_target_of(bytes, cursor, bitness)
+                    && target >= fn_start
+                    && target < fn_end
+                {
+                    out.insert(target);
                 }
                 cursor += bytes.len() as u64;
             }
@@ -3894,10 +3888,11 @@ fn collect_goto_targets(
                 // the destination block gets a visible `label_<hex>:`
                 // anchor — otherwise the reader sees `to_22b1(…)`
                 // pointing at nothing.
-                if let Some(addr) = parse_addr_prefix_call_name(name) {
-                    if addr >= fn_start && addr < fn_end {
-                        out.insert(addr);
-                    }
+                if let Some(addr) = parse_addr_prefix_call_name(name)
+                    && addr >= fn_start
+                    && addr < fn_end
+                {
+                    out.insert(addr);
                 }
                 cursor += bytes.len() as u64;
             }
@@ -3949,10 +3944,11 @@ fn collect_goto_targets(
 /// so anything that parses as hex *is* an intra-function address.
 fn parse_addr_prefix_call_name(name: &str) -> Option<u64> {
     for prefix in ["goto_", "to_", "tail_"] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()) {
-                return u64::from_str_radix(rest, 16).ok();
-            }
+        if let Some(rest) = name.strip_prefix(prefix)
+            && !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return u64::from_str_radix(rest, 16).ok();
         }
     }
     None
@@ -4000,16 +3996,16 @@ fn rewrite_gotos_in_seq(
         let stmt_start = *cursor;
         let advance = stmt_total_bytes_at(stmt, stmt_start) as u64;
         let mut replaced = false;
-        if let Stmt::Asm { text: _, bytes } = stmt {
-            if let Some(target) = jump_target_of(bytes, stmt_start, bitness) {
-                if target >= fn_start && target < fn_end {
-                    let bytes_owned = bytes.clone();
-                    let new_stmt = make_goto_stmt(&bytes_owned, stmt_start, target, bitness);
-                    if let Some(s) = new_stmt {
-                        *stmt = s;
-                        replaced = true;
-                    }
-                }
+        if let Stmt::Asm { text: _, bytes } = stmt
+            && let Some(target) = jump_target_of(bytes, stmt_start, bitness)
+            && target >= fn_start
+            && target < fn_end
+        {
+            let bytes_owned = bytes.clone();
+            let new_stmt = make_goto_stmt(&bytes_owned, stmt_start, target, bitness);
+            if let Some(s) = new_stmt {
+                *stmt = s;
+                replaced = true;
             }
         }
         if !replaced {
@@ -4229,12 +4225,9 @@ fn absorb_save_restore(stmts: &mut [Stmt]) {
         match kind {
             SaveKind::Push => stack.push((mark, reg)),
             SaveKind::Pop => {
-                if let Some(top) = stack.last() {
-                    if top.1 == reg {
-                        let (push_mark, _) = stack.pop().unwrap();
-                        transforms.insert(push_mark, SaveKind::Push);
-                        transforms.insert(mark, SaveKind::Pop);
-                    }
+                if let Some((push_mark, _)) = stack.pop_if(|top| top.1 == reg) {
+                    transforms.insert(push_mark, SaveKind::Push);
+                    transforms.insert(mark, SaveKind::Pop);
                 }
             }
         }
@@ -4474,14 +4467,12 @@ fn asm_state_effect(text: &str, state: &mut RegState) {
             | "rcl"
             | "rcr"
     );
-    if modifies_single_dst {
-        if let Some(rest) = text.split_once(' ').map(|(_, r)| r) {
-            // First operand ends at the first comma (or end).
-            let first = rest.split(',').next().unwrap_or("").trim();
-            if is_gpr_name(first) {
-                state.invalidate(first);
-                return;
-            }
+    if modifies_single_dst && let Some(rest) = text.split_once(' ').map(|(_, r)| r) {
+        // First operand ends at the first comma (or end).
+        let first = rest.split(',').next().unwrap_or("").trim();
+        if is_gpr_name(first) {
+            state.invalidate(first);
+            return;
         }
     }
     state.invalidate_all();
@@ -4743,8 +4734,8 @@ fn memory_size_bytes(size: ud_arch_x86::MemorySize) -> u32 {
 /// participate in the high-level variable naming.
 fn canonical_register_name(reg: Register) -> Option<String> {
     use Register::{
-        EAX, EBP, EBX, ECX, EDI, EDX, ESI, ESP, R10, R10D, R11, R11D, R12, R12D, R13, R13D, R14,
-        R14D, R15, R15D, R8, R8D, R9, R9D, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
+        EAX, EBP, EBX, ECX, EDI, EDX, ESI, ESP, R8, R8D, R9, R9D, R10, R10D, R11, R11D, R12, R12D,
+        R13, R13D, R14, R14D, R15, R15D, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
     };
     let full = match reg {
         // 8-bit / 16-bit / 32-bit halves of the eight legacy GPRs
@@ -5436,14 +5427,12 @@ fn compute_block_tail_lifts(
 
     for (i, block) in f.blocks.iter().enumerate() {
         if i == last_idx {
-            if return_lift_allowed {
-                if let Some(lifted) = try_lift_return_pattern(&block.insns) {
-                    out[i] = Some(BlockTailLift::Return {
-                        insns_consumed: lifted.insns_consumed,
-                        value: lifted.value,
-                    });
-                    continue;
-                }
+            if return_lift_allowed && let Some(lifted) = try_lift_return_pattern(&block.insns) {
+                out[i] = Some(BlockTailLift::Return {
+                    insns_consumed: lifted.insns_consumed,
+                    value: lifted.value,
+                });
+                continue;
             }
             // Try lifting the tail block as "value computation +
             // epilogue" → @return_expr. The leading insns
@@ -5451,22 +5440,20 @@ fn compute_block_tail_lifts(
             // EAX-bearing expression; the trailing 2 must be a
             // recognised epilogue. Folds patterns like
             // `mov eax, [rbp-8]; leave; ret` into one directive.
-            if return_lift_allowed {
-                if let Some(epi) = try_lift_epilogue_pattern(&block.insns) {
-                    let split = block.insns.len() - epi.insns_consumed;
-                    if split > 0 {
-                        let leading = &block.insns[..split];
-                        if let Some(value) = try_lift_value_block(leading, name_at) {
-                            let render_ctx = ExprRenderCtx {
-                                slot_to_name,
-                                name_at,
-                            };
-                            out[i] = Some(BlockTailLift::ReturnExpr {
-                                insns_consumed: block.insns.len(),
-                                text: value.expr.render(&render_ctx),
-                            });
-                            continue;
-                        }
+            if return_lift_allowed && let Some(epi) = try_lift_epilogue_pattern(&block.insns) {
+                let split = block.insns.len() - epi.insns_consumed;
+                if split > 0 {
+                    let leading = &block.insns[..split];
+                    if let Some(value) = try_lift_value_block(leading, name_at) {
+                        let render_ctx = ExprRenderCtx {
+                            slot_to_name,
+                            name_at,
+                        };
+                        out[i] = Some(BlockTailLift::ReturnExpr {
+                            insns_consumed: block.insns.len(),
+                            text: value.expr.render(&render_ctx),
+                        });
+                        continue;
                     }
                 }
             }
@@ -5479,49 +5466,48 @@ fn compute_block_tail_lifts(
             continue;
         }
 
-        if return_lift_allowed {
-            if let Some(lifted) = try_lift_return_via_jmp(&block.insns, epilogue_addr) {
-                out[i] = Some(BlockTailLift::Return {
-                    insns_consumed: lifted.insns_consumed,
-                    value: lifted.value,
-                });
-                continue;
-            }
+        if return_lift_allowed
+            && let Some(lifted) = try_lift_return_via_jmp(&block.insns, epilogue_addr)
+        {
+            out[i] = Some(BlockTailLift::Return {
+                insns_consumed: lifted.insns_consumed,
+                value: lifted.value,
+            });
+            continue;
         }
 
         // Any return-terminated block can carry an epilogue lift —
         // not just the function's last block. Windows i386 routines
         // typically have multiple `pop edi; pop esi; pop ebp; pop ebx;
         // ret 0Ch` exit points, one per arm of a switch.
-        if matches!(block.terminator, Terminator::Return) {
-            if let Some(lifted) = try_lift_epilogue_pattern(&block.insns) {
-                out[i] = Some(BlockTailLift::Epilogue {
-                    insns_consumed: lifted.insns_consumed,
-                    kind: lifted.kind,
-                });
-                continue;
-            }
+        if matches!(block.terminator, Terminator::Return)
+            && let Some(lifted) = try_lift_epilogue_pattern(&block.insns)
+        {
+            out[i] = Some(BlockTailLift::Epilogue {
+                insns_consumed: lifted.insns_consumed,
+                kind: lifted.kind,
+            });
+            continue;
         }
 
         // ReturnExpr: this block falls through directly to the
         // function's tail block, which itself is a recognised
         // epilogue. The block's instructions all model into an
         // expression that lives in EAX at fall-through.
-        if return_lift_allowed && tail_is_epilogue {
-            if let Terminator::Fallthrough = block.terminator {
-                if i + 1 == last_idx {
-                    if let Some(lifted) = try_lift_value_block(&block.insns, name_at) {
-                        let render_ctx = ExprRenderCtx {
-                            slot_to_name,
-                            name_at,
-                        };
-                        out[i] = Some(BlockTailLift::ReturnExpr {
-                            insns_consumed: lifted.insns_consumed,
-                            text: lifted.expr.render(&render_ctx),
-                        });
-                    }
-                }
-            }
+        if return_lift_allowed
+            && tail_is_epilogue
+            && let Terminator::Fallthrough = block.terminator
+            && i + 1 == last_idx
+            && let Some(lifted) = try_lift_value_block(&block.insns, name_at)
+        {
+            let render_ctx = ExprRenderCtx {
+                slot_to_name,
+                name_at,
+            };
+            out[i] = Some(BlockTailLift::ReturnExpr {
+                insns_consumed: lifted.insns_consumed,
+                text: lifted.expr.render(&render_ctx),
+            });
         }
     }
     out
@@ -6108,17 +6094,15 @@ fn call_annotation(
     fn_end: u64,
     name_at: &HashMap<u64, String>,
 ) -> Option<String> {
-    if let Some(target) = direct_call_target(&insn.iced) {
-        if let Some(name) = name_at.get(&target) {
-            return Some(format!("-> {name}"));
-        }
+    if let Some(target) = direct_call_target(&insn.iced)
+        && let Some(name) = name_at.get(&target)
+    {
+        return Some(format!("-> {name}"));
     }
     if let Some(target) = direct_unconditional_branch_target(&insn.iced) {
         let outside_function = target < fn_start || target >= fn_end;
-        if outside_function {
-            if let Some(name) = name_at.get(&target) {
-                return Some(format!("tail-call -> {name}"));
-            }
+        if outside_function && let Some(name) = name_at.get(&target) {
+            return Some(format!("tail-call -> {name}"));
         }
     }
     None
@@ -6145,18 +6129,17 @@ fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
             if let Some(name) = ctx.name_at.get(&addr) {
                 return format!("&{name}");
             }
-            if let Some((section_name, data, off)) = ctx.data.section_at(addr) {
-                if is_string_data_section(section_name) {
-                    if let Some(s) = read_cstring_at(data, off) {
-                        // Return the raw string content — the emitter
-                        // owns the quoting policy (auto-wraps any arg
-                        // whose unquoted form would be ambiguous). Using
-                        // `{:?}` here pre-wraps with quotes and the
-                        // emitter then re-quotes, producing the
-                        // `"\"Hello\""` double-quoting bug.
-                        return shorten_for_display(s);
-                    }
-                }
+            if let Some((section_name, data, off)) = ctx.data.section_at(addr)
+                && is_string_data_section(section_name)
+                && let Some(s) = read_cstring_at(data, off)
+            {
+                // Return the raw string content — the emitter
+                // owns the quoting policy (auto-wraps any arg
+                // whose unquoted form would be ambiguous). Using
+                // `{:?}` here pre-wraps with quotes and the
+                // emitter then re-quotes, producing the
+                // `"\"Hello\""` double-quoting bug.
+                return shorten_for_display(s);
             }
             n.to_string()
         }
@@ -6165,12 +6148,11 @@ fn render_arg_value(value: &ArgValue, ctx: &EmitCtx<'_>) -> String {
             if let Some(name) = ctx.name_at.get(addr) {
                 return format!("&{name}");
             }
-            if let Some((section_name, data, off)) = ctx.data.section_at(*addr) {
-                if is_string_data_section(section_name) {
-                    if let Some(s) = read_cstring_at(data, off) {
-                        return shorten_for_display(s);
-                    }
-                }
+            if let Some((section_name, data, off)) = ctx.data.section_at(*addr)
+                && is_string_data_section(section_name)
+                && let Some(s) = read_cstring_at(data, off)
+            {
+                return shorten_for_display(s);
             }
             // Drop the `{section_name} @ 0x{addr:x}` form: it contains
             // a space and `@`, which the emit layer would auto-quote
@@ -6228,13 +6210,13 @@ fn lea_target_annotation(
         return Some(format!("= &{name}"));
     }
     let (section_name, section_data, sec_offset) = data.section_at(addr)?;
-    if is_string_data_section(section_name) {
-        if let Some(text) = read_cstring_at(section_data, sec_offset) {
-            return Some(format!(
-                "= {section_name} @ 0x{addr:x} ({:?})",
-                shorten_for_display(text)
-            ));
-        }
+    if is_string_data_section(section_name)
+        && let Some(text) = read_cstring_at(section_data, sec_offset)
+    {
+        return Some(format!(
+            "= {section_name} @ 0x{addr:x} ({:?})",
+            shorten_for_display(text)
+        ));
     }
     if section_name.is_empty() {
         return Some(format!("= 0x{addr:x}"));

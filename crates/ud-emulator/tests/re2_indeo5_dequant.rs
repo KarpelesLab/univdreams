@@ -29,7 +29,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use ud_emulator::{Bih, Sandbox, WatchMode, DLL_PROCESS_ATTACH};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox, WatchMode};
 
 const SDATA_LO: u32 = 0x1007b000;
 const SDATA_HI: u32 = 0x1007f800;

@@ -18,7 +18,7 @@
 
 mod codec;
 
-pub use codec::{register, Aarch64Codec};
+pub use codec::{Aarch64Codec, register};
 
 use ud_core::VAddr;
 use ud_ir::{ArchInsn, BasicBlock, Function, Terminator};
@@ -98,11 +98,11 @@ impl ArchInsn for DecodedInsn {
 /// `INSN_SIZE` — AArch64 has no concept of "the rest is data" the
 /// way x86 does, so a misaligned tail is a hard error.
 pub fn decode(bytes: &[u8], start: u64) -> Result<Vec<DecodedInsn>> {
-    if bytes.len() % INSN_SIZE != 0 {
+    if !bytes.len().is_multiple_of(INSN_SIZE) {
         return Err(Error::Misaligned { len: bytes.len() });
     }
     let mut out = Vec::with_capacity(bytes.len() / INSN_SIZE);
-    for (i, chunk) in bytes.chunks_exact(INSN_SIZE).enumerate() {
+    for (i, chunk) in bytes.as_chunks::<INSN_SIZE>().0.iter().enumerate() {
         let addr = start.saturating_add((i * INSN_SIZE) as u64);
         let mut raw = [0u8; INSN_SIZE];
         raw.copy_from_slice(chunk);

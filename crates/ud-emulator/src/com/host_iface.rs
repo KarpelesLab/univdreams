@@ -1652,8 +1652,8 @@ pub struct AllocatorPropertiesCapture {
 /// codec drove against any host allocator.  Lives behind a static
 /// mutex keyed by `&HostState as usize` (same pattern the round-31
 /// `host_iface_r31` queue uses).
-fn set_properties_log(
-) -> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<AllocatorPropertiesCapture>>> {
+fn set_properties_log()
+-> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<AllocatorPropertiesCapture>>> {
     static L: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<usize, Vec<AllocatorPropertiesCapture>>>,
     > = std::sync::OnceLock::new();
@@ -2368,8 +2368,8 @@ fn sample_get_properties(
     put(0x04, 0); // dwTypeSpecificFlags
     put(0x08, sample_flags); // dwSampleFlags
     put(0x0c, actual_len); // lActual
-                           // tStart / tStop kept zero — we don't track timestamps on
-                           // the host-sample side.
+    // tStart / tStop kept zero — we don't track timestamps on
+    // the host-sample side.
     put(0x20, 0); // dwStreamId
     put(0x24, media_type_ptr); // pMediaType
     put(0x28, data_region); // pbBuffer
@@ -2436,8 +2436,8 @@ fn trap(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::com::call::call_method;
     use crate::Sandbox;
+    use crate::com::call::call_method;
 
     #[test]
     fn host_filter_graph_layout_has_eleven_method_slots() {

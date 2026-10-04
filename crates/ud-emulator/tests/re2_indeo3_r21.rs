@@ -31,7 +31,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use ud_emulator::{Bih, Sandbox, WatchMode, DLL_PROCESS_ATTACH};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox, WatchMode};
 
 const STAGING_PTR: u32 = 0x1004d25a;
 const SITES: [u32; 30] = [

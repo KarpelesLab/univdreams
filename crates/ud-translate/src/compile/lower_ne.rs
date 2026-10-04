@@ -37,9 +37,7 @@ pub enum NeLowerError {
     Overlap { cursor: u64, addr: u64 },
     #[error("gap in coverage: cursor at 0x{cursor:x}, next block at 0x{addr:x}")]
     Gap { cursor: u64, addr: u64 },
-    #[error(
-        "coverage mismatch: walked 0x{covered:x} bytes but file_size declares 0x{file_size:x}"
-    )]
+    #[error("coverage mismatch: walked 0x{covered:x} bytes but file_size declares 0x{file_size:x}")]
     SizeMismatch { covered: u64, file_size: u64 },
     #[error("NE lower expects byte content only via `@raw`; found unsupported item `{kind}`")]
     UnsupportedItem { kind: &'static str },

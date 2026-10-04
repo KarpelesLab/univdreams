@@ -11,7 +11,7 @@
 //! verification is "does the user's text agree with the canonical
 //! form iced would produce for these bytes."
 
-use ud_arch_x86::{verify_intel_text, Bitness, VerifyAsm};
+use ud_arch_x86::{Bitness, VerifyAsm, verify_intel_text};
 use ud_ast::{Item, Stmt, UdFile, Value};
 
 /// One verification finding. Emitted to stderr by the CLI; collected

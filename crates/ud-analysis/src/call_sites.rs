@@ -24,9 +24,9 @@
 
 use std::collections::HashMap;
 
-use ud_arch_bpf::{call_target, decode, BpfVariant, InsnKind};
+use ud_arch_bpf::{BpfVariant, InsnKind, call_target, decode};
 use ud_core::VAddr;
-use ud_format::elf::{Elf64File, EM_BPF, EM_SBF, SHF_EXECINSTR};
+use ud_format::elf::{EM_BPF, EM_SBF, Elf64File, SHF_EXECINSTR};
 
 use crate::function_map::{Function, FunctionSource};
 
@@ -118,7 +118,7 @@ pub fn discover_from_bpf_call_sites(
             // BPF instructions are slot-aligned; a target that
             // isn't 8-byte aligned is a decode error somewhere
             // upstream.
-            if target % ud_arch_bpf::INSN_SIZE as u64 != 0 {
+            if !target.is_multiple_of(ud_arch_bpf::INSN_SIZE as u64) {
                 continue;
             }
             targets.insert(target);

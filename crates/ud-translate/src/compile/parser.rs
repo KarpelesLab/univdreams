@@ -5,7 +5,7 @@
 
 use ud_ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
 
-use crate::compile::lexer::{tokenize, LexError, Token, TokenKind};
+use crate::compile::lexer::{LexError, Token, TokenKind, tokenize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -147,10 +147,10 @@ impl Parser {
         // module fields per stmt.
         for f in &module.fields {
             if f.name == "bits" {
-                if let ud_ast::Value::Int(n) = &f.value {
-                    if let Ok(n) = u32::try_from(*n) {
-                        self.bits = n;
-                    }
+                if let ud_ast::Value::Int(n) = &f.value
+                    && let Ok(n) = u32::try_from(*n)
+                {
+                    self.bits = n;
                 }
                 break;
             }
@@ -677,10 +677,10 @@ impl Parser {
                 return Ok(out);
             }
             self.bump(); // consume `let`
-                         // Accept a comma-separated list of `name: ty` entries
-                         // on one `let`. The emitter coalesces register-backed
-                         // locals onto a single line to reduce visual noise:
-                         //   `let ebp: u64, esp: u64, edi: u32 @reg;`
+            // Accept a comma-separated list of `name: ty` entries
+            // on one `let`. The emitter coalesces register-backed
+            // locals onto a single line to reduce visual noise:
+            //   `let ebp: u64, esp: u64, edi: u32 @reg;`
             let mut group: Vec<(String, ud_ast::Type)> = Vec::new();
             loop {
                 let name = self.expect_ident("local variable name")?;
@@ -856,13 +856,13 @@ impl Parser {
         // bracketed expression names the call target. Otherwise this
         // is a move whose destination is the bracketed expression.
         let close_idx = self.find_matching_close(self.pos);
-        if let Some(close) = close_idx {
-            if matches!(
+        if let Some(close) = close_idx
+            && matches!(
                 self.tokens.get(close + 1).map(|t| &t.kind),
                 Some(TokenKind::LParen)
-            ) {
-                return self.parse_call_stmt();
-            }
+            )
+        {
+            return self.parse_call_stmt();
         }
         self.parse_move_stmt()
     }
@@ -1220,11 +1220,11 @@ impl Parser {
             // Trailing comma or empty list — emit nothing.
             return;
         }
-        if let Some(s) = seg_string {
-            if token_count == 1 {
-                out.push(s.to_string());
-                return;
-            }
+        if let Some(s) = seg_string
+            && token_count == 1
+        {
+            out.push(s.to_string());
+            return;
         }
         let raw = self.src[seg_start..seg_end].trim().to_string();
         if !raw.is_empty() {
@@ -1559,7 +1559,7 @@ impl Parser {
     fn parse_if_return_tail(&mut self, cond_text: String) -> Result<Stmt, ParseError> {
         let anchor_tok = self.peek().clone();
         self.bump(); // consume `return`
-                     // Optional value expression — anything up to the `;` or `#[…]` attrs.
+        // Optional value expression — anything up to the `;` or `#[…]` attrs.
         let value_text = if matches!(self.peek().kind, TokenKind::Semicolon | TokenKind::Hash) {
             String::new()
         } else {
@@ -1643,22 +1643,21 @@ impl Parser {
             // Probe for `@then` / `@else` directives.
             if self.peek().kind == TokenKind::At {
                 let next_ident = self.tokens.get(self.pos + 1).cloned();
-                if let Some(tok) = &next_ident {
-                    if let TokenKind::Ident(name) = &tok.kind {
-                        if name == "then" || name == "else" {
-                            self.bump(); // `@`
-                            let arm_name = self.expect_ident("`then` or `else`")?;
-                            self.expect(&TokenKind::LBrace, "`{` to open `@then` / `@else` arm")?;
-                            let arm = self.parse_stmt_list_until_rbrace()?;
-                            self.expect(&TokenKind::RBrace, "`}` to close arm")?;
-                            match arm_name.as_str() {
-                                "then" => then_body = Some(arm),
-                                "else" => else_body = Some(arm),
-                                _ => unreachable!(),
-                            }
-                            continue;
-                        }
+                if let Some(tok) = &next_ident
+                    && let TokenKind::Ident(name) = &tok.kind
+                    && (name == "then" || name == "else")
+                {
+                    self.bump(); // `@`
+                    let arm_name = self.expect_ident("`then` or `else`")?;
+                    self.expect(&TokenKind::LBrace, "`{` to open `@then` / `@else` arm")?;
+                    let arm = self.parse_stmt_list_until_rbrace()?;
+                    self.expect(&TokenKind::RBrace, "`}` to close arm")?;
+                    match arm_name.as_str() {
+                        "then" => then_body = Some(arm),
+                        "else" => else_body = Some(arm),
+                        _ => unreachable!(),
                     }
+                    continue;
                 }
             }
             if self.peek().kind == TokenKind::RBrace {
@@ -1828,11 +1827,11 @@ impl Parser {
     /// Expect a specific identifier keyword (e.g. `entry`, `tail`).
     fn expect_keyword(&mut self, kw: &str) -> Result<(), ParseError> {
         let tok = self.peek().clone();
-        if let TokenKind::Ident(name) = &tok.kind {
-            if name == kw {
-                self.bump();
-                return Ok(());
-            }
+        if let TokenKind::Ident(name) = &tok.kind
+            && name == kw
+        {
+            self.bump();
+            return Ok(());
         }
         Err(ParseError::Expected {
             expected: format!("`{kw}`"),

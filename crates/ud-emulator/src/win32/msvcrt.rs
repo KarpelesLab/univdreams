@@ -41,7 +41,7 @@
 //! * MSDN "Structured Exception Handling" — `_except_handler3`
 //!   ABI.
 
-use super::{arg_dword, call_guest, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword, call_guest};
 use crate::emulator::{Cpu, Mmu};
 
 /// Register every msvcrt stub.
@@ -992,11 +992,7 @@ fn stub_strnicmp(
     }
 
     fn ascii_tolower(b: u8) -> u8 {
-        if b.is_ascii_uppercase() {
-            b + 0x20
-        } else {
-            b
-        }
+        if b.is_ascii_uppercase() { b + 0x20 } else { b }
     }
 
     for i in 0..count {

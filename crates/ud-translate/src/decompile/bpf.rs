@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 
-use ud_arch_bpf::{call_target, format_insn, jump_target, BpfVariant, DecodedInsn, InsnKind};
+use ud_arch_bpf::{BpfVariant, DecodedInsn, InsnKind, call_target, format_insn, jump_target};
 use ud_ast::{FnDecl, Stmt};
 use ud_ir::Function;
 
@@ -204,18 +204,18 @@ pub fn build_function(
                     // 16-byte Move but the lift declined, emit
                     // the continuation as its own Asm so its
                     // bytes survive.
-                    if let Some(cont) = block.insns.get(idx + 1) {
-                        if consumed_extra > 0 {
-                            let cont_text = render_text(
-                                cont,
-                                variant,
-                                name_at,
-                                call_site_names,
-                                &intra_targets,
-                                data,
-                            );
-                            body.push(Stmt::asm(cont_text, cont.bytes.to_vec()));
-                        }
+                    if let Some(cont) = block.insns.get(idx + 1)
+                        && consumed_extra > 0
+                    {
+                        let cont_text = render_text(
+                            cont,
+                            variant,
+                            name_at,
+                            call_site_names,
+                            &intra_targets,
+                            data,
+                        );
+                        body.push(Stmt::asm(cont_text, cont.bytes.to_vec()));
                     }
                 }
             }
@@ -228,31 +228,31 @@ pub fn build_function(
             // recap that used to live here is now redundant
             // (the lifted `Stmt::Call` renders the same info
             // directly) — emit it only when we couldn't lift.
-            if matches!(insn.kind, InsnKind::Call) {
-                if let Some(args) = call_args {
-                    let callee_name = call_site_names.get(&insn.addr.0).cloned();
-                    if let Some(name) = &callee_name {
-                        let sig = solana_syscall_signature(name);
-                        if let Some(sig_str) = sig {
-                            body.push(Stmt::Comment(sig_str.to_string()));
-                        }
-                        if let Some(semantic) = solana_semantic_comment(name, &args) {
-                            body.push(Stmt::Comment(semantic));
-                        }
+            if matches!(insn.kind, InsnKind::Call)
+                && let Some(args) = call_args
+            {
+                let callee_name = call_site_names.get(&insn.addr.0).cloned();
+                if let Some(name) = &callee_name {
+                    let sig = solana_syscall_signature(name);
+                    if let Some(sig_str) = sig {
+                        body.push(Stmt::Comment(sig_str.to_string()));
                     }
-                    if !lifted_to_call {
-                        let line = if let Some(name) = callee_name {
-                            let sig = solana_syscall_signature(&name);
-                            let arity = sig.map_or(5, syscall_arity);
-                            format_call_invocation(&name, arity, &args)
-                        } else if let Some(callee) = name_at.get(&call_target(insn)) {
-                            format_call_invocation(callee, 5, &args)
-                        } else {
-                            render_call_args(&args).unwrap_or_default()
-                        };
-                        if !line.is_empty() {
-                            body.push(Stmt::Comment(line));
-                        }
+                    if let Some(semantic) = solana_semantic_comment(name, &args) {
+                        body.push(Stmt::Comment(semantic));
+                    }
+                }
+                if !lifted_to_call {
+                    let line = if let Some(name) = callee_name {
+                        let sig = solana_syscall_signature(&name);
+                        let arity = sig.map_or(5, syscall_arity);
+                        format_call_invocation(&name, arity, &args)
+                    } else if let Some(callee) = name_at.get(&call_target(insn)) {
+                        format_call_invocation(callee, 5, &args)
+                    } else {
+                        render_call_args(&args).unwrap_or_default()
+                    };
+                    if !line.is_empty() {
+                        body.push(Stmt::Comment(line));
                     }
                 }
             }
@@ -263,10 +263,10 @@ pub fn build_function(
             // too (no-op for the tracker but keeps state
             // consistent with the linear instruction stream).
             tracker.apply(insn, data);
-            if consumed_extra > 0 {
-                if let Some(cont) = block.insns.get(idx + 1) {
-                    tracker.apply(cont, data);
-                }
+            if consumed_extra > 0
+                && let Some(cont) = block.insns.get(idx + 1)
+            {
+                tracker.apply(cont, data);
             }
             idx += 1 + consumed_extra;
         }
@@ -661,72 +661,72 @@ fn wrap_if_blocks_in_seq(
         // label exists later in the body, and the body
         // statements in between have no jumps escaping the
         // [jcc_addr, target) range.
-        if let Stmt::Asm { bytes, .. } = &body[i] {
-            if bytes.len() == 8 {
-                let insn_addr = peek_insn_addr(&body, i);
-                if let Some(jcc) = insn_addr.and_then(|a| jcc_by_addr.get(&a)) {
-                    let target = jcc.0;
-                    if let Some(&label_idx) = label_pos.get(&target) {
-                        if label_idx > i {
-                            let inner = &body[i + 1..label_idx];
-                            // Try while-loop shape first: the
-                            // jcc must be the FIRST statement
-                            // after an entry label, and the
-                            // last `@asm` of the body must be
-                            // `ja label_<entry>`.
-                            if let Some((body_stmts, tail_bytes)) =
-                                try_match_while(inner, insn_addr.unwrap(), &out)
-                            {
-                                let body_recursed = wrap_if_blocks_in_seq(body_stmts, jcc_by_addr);
-                                out.push(Stmt::WhileBlock {
-                                    cond_text: jcc.2.clone(),
-                                    entry_bytes: jcc.1.clone(),
-                                    tail_bytes,
-                                    body: body_recursed,
-                                });
-                                i = label_idx;
-                                continue;
-                            }
-                            // First: try the if-then-else
-                            // shape. The "then" arm's tail
-                            // `ja label_DONE` would violate
-                            // strict self-containment, so we
-                            // need to factor it out before the
-                            // self-containment check.
-                            if let Some((then_body, tail, else_body, advance)) = try_split_then_else(
-                                inner,
-                                target,
-                                &label_pos,
-                                &body,
-                                label_idx,
-                                insn_addr.unwrap(),
-                                jcc_by_addr,
-                            ) {
-                                out.push(Stmt::IfBlock {
-                                    cond_text: jcc.2.clone(),
-                                    cond_bytes: jcc.1.clone(),
-                                    then_body,
-                                    then_tail_jmp: tail,
-                                    else_body,
-                                });
-                                i = advance;
-                                continue;
-                            }
-                            // Otherwise: simple if-then.
-                            if region_is_self_contained(inner, insn_addr.unwrap(), target) {
-                                let inner_owned: Vec<Stmt> = inner.to_vec();
-                                let then_body = wrap_if_blocks_in_seq(inner_owned, jcc_by_addr);
-                                out.push(Stmt::IfBlock {
-                                    cond_text: jcc.2.clone(),
-                                    cond_bytes: jcc.1.clone(),
-                                    then_body,
-                                    then_tail_jmp: Vec::new(),
-                                    else_body: Vec::new(),
-                                });
-                                i = label_idx;
-                                continue;
-                            }
-                        }
+        if let Stmt::Asm { bytes, .. } = &body[i]
+            && bytes.len() == 8
+        {
+            let insn_addr = peek_insn_addr(&body, i);
+            if let Some(jcc) = insn_addr.and_then(|a| jcc_by_addr.get(&a)) {
+                let target = jcc.0;
+                if let Some(&label_idx) = label_pos.get(&target)
+                    && label_idx > i
+                {
+                    let inner = &body[i + 1..label_idx];
+                    // Try while-loop shape first: the
+                    // jcc must be the FIRST statement
+                    // after an entry label, and the
+                    // last `@asm` of the body must be
+                    // `ja label_<entry>`.
+                    if let Some((body_stmts, tail_bytes)) =
+                        try_match_while(inner, insn_addr.unwrap(), &out)
+                    {
+                        let body_recursed = wrap_if_blocks_in_seq(body_stmts, jcc_by_addr);
+                        out.push(Stmt::WhileBlock {
+                            cond_text: jcc.2.clone(),
+                            entry_bytes: jcc.1.clone(),
+                            tail_bytes,
+                            body: body_recursed,
+                        });
+                        i = label_idx;
+                        continue;
+                    }
+                    // First: try the if-then-else
+                    // shape. The "then" arm's tail
+                    // `ja label_DONE` would violate
+                    // strict self-containment, so we
+                    // need to factor it out before the
+                    // self-containment check.
+                    if let Some((then_body, tail, else_body, advance)) = try_split_then_else(
+                        inner,
+                        target,
+                        &label_pos,
+                        &body,
+                        label_idx,
+                        insn_addr.unwrap(),
+                        jcc_by_addr,
+                    ) {
+                        out.push(Stmt::IfBlock {
+                            cond_text: jcc.2.clone(),
+                            cond_bytes: jcc.1.clone(),
+                            then_body,
+                            then_tail_jmp: tail,
+                            else_body,
+                        });
+                        i = advance;
+                        continue;
+                    }
+                    // Otherwise: simple if-then.
+                    if region_is_self_contained(inner, insn_addr.unwrap(), target) {
+                        let inner_owned: Vec<Stmt> = inner.to_vec();
+                        let then_body = wrap_if_blocks_in_seq(inner_owned, jcc_by_addr);
+                        out.push(Stmt::IfBlock {
+                            cond_text: jcc.2.clone(),
+                            cond_bytes: jcc.1.clone(),
+                            then_body,
+                            then_tail_jmp: Vec::new(),
+                            else_body: Vec::new(),
+                        });
+                        i = label_idx;
+                        continue;
                     }
                 }
             }
@@ -762,11 +762,11 @@ fn try_match_while(
     // Search out_so_far for a Label with addr == ja_target.
     let mut found = false;
     for s in out_so_far.iter().rev() {
-        if let Stmt::Label { addr } = s {
-            if *addr == ja_target {
-                found = true;
-                break;
-            }
+        if let Stmt::Label { addr } = s
+            && *addr == ja_target
+        {
+            found = true;
+            break;
         }
     }
     if !found {
@@ -937,10 +937,10 @@ fn region_is_self_contained(region: &[Stmt], jcc_addr: u64, target: u64) -> bool
             for tok in text.split_whitespace() {
                 if let Some(rest) = tok.strip_prefix("label_") {
                     let hex = rest.trim_end_matches(',');
-                    if let Ok(t) = u64::from_str_radix(hex, 16) {
-                        if t < jcc_addr || t >= target {
-                            return false;
-                        }
+                    if let Ok(t) = u64::from_str_radix(hex, 16)
+                        && (t < jcc_addr || t >= target)
+                    {
+                        return false;
                     }
                 }
             }
@@ -999,12 +999,11 @@ fn render_text(
     // (overlapping suffixes), so a string→address table
     // can't disambiguate, but a per-call-site annotation
     // can.
-    if matches!(insn.kind, InsnKind::Lddw) {
-        if let (Some(imm), Some(lookup)) = (insn.imm64, data) {
-            if let Some(s) = read_inline_string(lookup, imm) {
-                return format!("lddw r{}, {s} @0x{imm:x}", insn.dst);
-            }
-        }
+    if matches!(insn.kind, InsnKind::Lddw)
+        && let (Some(imm), Some(lookup)) = (insn.imm64, data)
+        && let Some(s) = read_inline_string(lookup, imm)
+    {
+        return format!("lddw r{}, {s} @0x{imm:x}", insn.dst);
     }
     // Layer-4: rewrite the relative-offset operand of intra-
     // function jumps to a `label_<addr>` reference. The trailing

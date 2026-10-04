@@ -743,15 +743,15 @@ pub fn desymbolize_bpf_text(text: &str, insn_addr: u64, opcode_hint: Option<u8>)
     // We rewrite to `call_internal -1` / `call_local -1`;
     // the byte-drop pass's match-test catches sites whose
     // original imm wasn't `-1` and keeps those pinned.
-    if let Some(name) = text.strip_prefix("call ") {
-        if is_symbolic_callee(name) {
-            return Some("call_internal -1".to_string());
-        }
+    if let Some(name) = text.strip_prefix("call ")
+        && is_symbolic_callee(name)
+    {
+        return Some("call_internal -1".to_string());
     }
-    if let Some(name) = text.strip_prefix("call_local ") {
-        if is_symbolic_callee(name) {
-            return Some("call_local -1".to_string());
-        }
+    if let Some(name) = text.strip_prefix("call_local ")
+        && is_symbolic_callee(name)
+    {
+        return Some("call_local -1".to_string());
     }
 
     // Conditional jumps + `ja`: replace a trailing
@@ -796,17 +796,17 @@ pub fn desymbolize_bpf_text(text: &str, insn_addr: u64, opcode_hint: Option<u8>)
     // readability and appends `@0x<imm>` so the address is
     // still recoverable. We strip the string and substitute
     // the numeric form the assembler accepts.
-    if let Some(rest) = text.strip_prefix("lddw ") {
-        if let Some(at) = rest.find(" @0x") {
-            let head_with_reg = &rest[..at]; // "rN, \"string\""
-            let imm_text = &rest[at + 4..]; // "<hex>"
-                                            // The bit before the comma is the register
-                                            // (it carries no rewritable syntax). Keep that
-                                            // and drop the string literal.
-            if let Some(comma) = head_with_reg.find(',') {
-                let reg = head_with_reg[..comma].trim();
-                return Some(format!("lddw {reg}, 0x{}", imm_text.trim()));
-            }
+    if let Some(rest) = text.strip_prefix("lddw ")
+        && let Some(at) = rest.find(" @0x")
+    {
+        let head_with_reg = &rest[..at]; // "rN, \"string\""
+        let imm_text = &rest[at + 4..]; // "<hex>"
+        // The bit before the comma is the register
+        // (it carries no rewritable syntax). Keep that
+        // and drop the string literal.
+        if let Some(comma) = head_with_reg.find(',') {
+            let reg = head_with_reg[..comma].trim();
+            return Some(format!("lddw {reg}, 0x{}", imm_text.trim()));
         }
     }
 
@@ -866,7 +866,7 @@ fn rewrite_stack_slot(text: &str, prefix: &str, replacement: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decode, format_insn, BpfVariant};
+    use crate::{BpfVariant, decode, format_insn};
 
     /// Round-trip property: for every decodable instruction
     /// the assembler reproduces the same bytes from the

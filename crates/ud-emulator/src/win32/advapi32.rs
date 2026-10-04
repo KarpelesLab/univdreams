@@ -13,7 +13,7 @@
 //! `https://learn.microsoft.com/en-us/windows/win32/api/winreg/`.
 
 use super::{
-    arg_dword, read_cstr_local, read_wide_cstr_local, HostState, Registry, StubFn, Win32Error,
+    HostState, Registry, StubFn, Win32Error, arg_dword, read_cstr_local, read_wide_cstr_local,
 };
 use crate::context::RegistryValue;
 use crate::emulator::{Cpu, Mmu};

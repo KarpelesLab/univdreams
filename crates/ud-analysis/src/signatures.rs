@@ -7,8 +7,8 @@
 //! them in based on neighbouring functions.
 
 use ud_core::VAddr;
-use ud_format::elf::{Elf64File, EM_X86_64, SHF_EXECINSTR};
-use ud_signatures::{scan, CRT_HELPERS_X86_64};
+use ud_format::elf::{EM_X86_64, Elf64File, SHF_EXECINSTR};
+use ud_signatures::{CRT_HELPERS_X86_64, scan};
 
 use crate::function_map::{Function, FunctionSource};
 

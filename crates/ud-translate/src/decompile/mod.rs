@@ -57,12 +57,12 @@ pub use wasm::{decompile_wasm, decompile_wasm_to_text};
 
 use std::collections::HashMap;
 
-use ud_analysis::{discover_functions, FunctionMap};
-use ud_arch_x86::{decode, lift_function, Bitness};
+use ud_analysis::{FunctionMap, discover_functions};
+use ud_arch_x86::{Bitness, decode, lift_function};
 use ud_ast::{Item, UdFile};
 use ud_debug::DebugFunction;
 use ud_format::elf::{
-    Elf64File, ElfClass, Shdr64, EM_386, EM_AARCH64, EM_BPF, EM_SBF, EM_X86_64, SHF_EXECINSTR,
+    EM_386, EM_AARCH64, EM_BPF, EM_SBF, EM_X86_64, Elf64File, ElfClass, SHF_EXECINSTR, Shdr64,
 };
 
 /// Which arch backend to drive for a given ELF.
@@ -281,31 +281,29 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                     // (BPF's `call sub_<hex>`, `jeq …,
                     // label_<hex>`) need desymbolize first.
                     let mut dropped = false;
-                    if let Ok(encoded) = arch.assemble_one(text, here) {
-                        if encoded == *bytes {
-                            bytes.clear();
-                            dropped = true;
-                        }
+                    if let Ok(encoded) = arch.assemble_one(text, here)
+                        && encoded == *bytes
+                    {
+                        bytes.clear();
+                        dropped = true;
                     }
                     if !dropped {
                         let desym = arch.desymbolize(text, here);
-                        if desym != *text {
-                            if let Ok(encoded) = arch.assemble_one(&desym, here) {
-                                if encoded == *bytes {
-                                    bytes.clear();
-                                }
-                            }
+                        if desym != *text
+                            && let Ok(encoded) = arch.assemble_one(&desym, here)
+                            && encoded == *bytes
+                        {
+                            bytes.clear();
                         }
                     }
                     *ip = ip.saturating_add(slot_size);
                 }
                 ud_ast::Stmt::Move { dst, src, bytes } => {
-                    if !bytes.is_empty() {
-                        if let Ok(encoded) = arch.encode_move(dst, src) {
-                            if encoded == *bytes {
-                                bytes.clear();
-                            }
-                        }
+                    if !bytes.is_empty()
+                        && let Ok(encoded) = arch.encode_move(dst, src)
+                        && encoded == *bytes
+                    {
+                        bytes.clear();
                     }
                     // 1 slot for plain Move, 2 for LDDW Move
                     // (16 pinned bytes); after byte-drop bytes
@@ -323,22 +321,20 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                     src,
                     bytes,
                 } => {
-                    if !bytes.is_empty() {
-                        if let Ok(encoded) = arch.encode_arith(dst, op, src) {
-                            if encoded == *bytes {
-                                bytes.clear();
-                            }
-                        }
+                    if !bytes.is_empty()
+                        && let Ok(encoded) = arch.encode_arith(dst, op, src)
+                        && encoded == *bytes
+                    {
+                        bytes.clear();
                     }
                     *ip = ip.saturating_add(slot_size);
                 }
                 ud_ast::Stmt::Return { value, bytes } => {
-                    if !bytes.is_empty() {
-                        if let Ok(encoded) = arch.encode_return(Some(*value)) {
-                            if encoded == *bytes {
-                                bytes.clear();
-                            }
-                        }
+                    if !bytes.is_empty()
+                        && let Ok(encoded) = arch.encode_return(Some(*value))
+                        && encoded == *bytes
+                    {
+                        bytes.clear();
                     }
                     *ip = ip.saturating_add(slot_size);
                 }
@@ -354,34 +350,31 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                     // their pinned bytes — the imm carries a
                     // relocation hash the codec can't
                     // reproduce without external context.
-                    if !bytes.is_empty() && arch.direct_call_bytes_contain_call() {
-                        if let Some(target) = *direct_target {
-                            // BPF has two intra-program call
-                            // shapes (0x8d Linux call_local
-                            // vs 0x85 src=1 Solana sBPF
-                            // call_internal). The codec's
-                            // default regen at lower time is
-                            // call_internal, so only drop
-                            // bytes when the original ALSO
-                            // used call_internal — call_local
-                            // sites keep their pinned bytes
-                            // so the lower-time regen doesn't
-                            // silently switch encodings.
-                            // Storing the original encoding
-                            // in the AST is a follow-up if
-                            // call_local sites become more
-                            // common in real fixtures.
-                            if bytes.first() == Some(&0x85) {
-                                if let Ok(encoded) = arch.encode_call(
-                                    *ip,
-                                    target,
-                                    ud_arch_codec::EncodeHints::default(),
-                                ) {
-                                    if encoded == *bytes {
-                                        bytes.clear();
-                                    }
-                                }
-                            }
+                    if !bytes.is_empty()
+                        && arch.direct_call_bytes_contain_call()
+                        && let Some(target) = *direct_target
+                    {
+                        // BPF has two intra-program call
+                        // shapes (0x8d Linux call_local
+                        // vs 0x85 src=1 Solana sBPF
+                        // call_internal). The codec's
+                        // default regen at lower time is
+                        // call_internal, so only drop
+                        // bytes when the original ALSO
+                        // used call_internal — call_local
+                        // sites keep their pinned bytes
+                        // so the lower-time regen doesn't
+                        // silently switch encodings.
+                        // Storing the original encoding
+                        // in the AST is a follow-up if
+                        // call_local sites become more
+                        // common in real fixtures.
+                        if bytes.first() == Some(&0x85)
+                            && let Ok(encoded) =
+                                arch.encode_call(*ip, target, ud_arch_codec::EncodeHints::default())
+                            && encoded == *bytes
+                        {
+                            bytes.clear();
                         }
                     }
                     *ip = ip.saturating_add(slot_size);
@@ -411,10 +404,9 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                             cond_ip,
                             target,
                             ud_arch_codec::EncodeHints::default(),
-                        ) {
-                            if encoded == *cond_bytes {
-                                cond_bytes.clear();
-                            }
+                        ) && encoded == *cond_bytes
+                        {
+                            cond_bytes.clear();
                         }
                     }
                     *ip = ip.saturating_add(slot_size);
@@ -430,10 +422,9 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                         let target = ttj_ip.saturating_add(slot_size).saturating_add(else_size);
                         if let Ok(encoded) =
                             arch.encode_jump(ttj_ip, target, ud_arch_codec::EncodeHints::default())
+                            && encoded == *then_tail_jmp
                         {
-                            if encoded == *then_tail_jmp {
-                                then_tail_jmp.clear();
-                            }
+                            then_tail_jmp.clear();
                         }
                         *ip = ip.saturating_add(slot_size);
                     }
@@ -460,10 +451,9 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                             entry_ip,
                             target,
                             ud_arch_codec::EncodeHints::default(),
-                        ) {
-                            if encoded == *entry_bytes {
-                                entry_bytes.clear();
-                            }
+                        ) && encoded == *entry_bytes
+                        {
+                            entry_bytes.clear();
                         }
                     }
                     *ip = ip.saturating_add(slot_size);
@@ -473,10 +463,9 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
                         // Back-edge: jump to entry_ip.
                         if let Ok(encoded) =
                             arch.encode_jump(ja_ip, entry_ip, ud_arch_codec::EncodeHints::default())
+                            && encoded == *tail_bytes
                         {
-                            if encoded == *tail_bytes {
-                                tail_bytes.clear();
-                            }
+                            tail_bytes.clear();
                         }
                         *ip = ip.saturating_add(slot_size);
                     }
@@ -513,10 +502,10 @@ fn drop_regenerable_bytes(items: &mut [Item], arch: &dyn ud_arch_codec::ArchCode
         if let Some(a) = fd.addr {
             return a;
         }
-        if let Some(rest) = fd.name.strip_prefix("sub_") {
-            if let Ok(a) = u64::from_str_radix(rest, 16) {
-                return a;
-            }
+        if let Some(rest) = fd.name.strip_prefix("sub_")
+            && let Ok(a) = u64::from_str_radix(rest, 16)
+        {
+            return a;
         }
         0
     }
@@ -621,10 +610,10 @@ fn drop_regenerable_asm_bytes(items: &mut [Item], bitness: ud_arch_x86::Bitness)
                         *ip = ip.saturating_add(asm_size(stmt, bitness, here));
                         continue;
                     }
-                    if let Ok(encoded) = ud_arch_x86::assemble_intel(bitness, text, here) {
-                        if encoded == *bytes {
-                            bytes.clear();
-                        }
+                    if let Ok(encoded) = ud_arch_x86::assemble_intel(bitness, text, here)
+                        && encoded == *bytes
+                    {
+                        bytes.clear();
                     }
                     *ip = ip.saturating_add(asm_size(stmt, bitness, here));
                 }
@@ -1143,21 +1132,21 @@ fn build_section_items(
     // single null-terminated path to the dynamic linker. Decoding it
     // as a one-entry `@strings` matches the lower-side encoder.
     let is_interp = section_name == ".interp";
-    if sh.sh_type == SHT_STRTAB || is_interp {
-        if let Some(strings) = decode_strtab(data) {
-            return Ok(vec![Item::Strings {
-                addr: sh.sh_addr,
-                strings,
-            }]);
-        }
+    if (sh.sh_type == SHT_STRTAB || is_interp)
+        && let Some(strings) = decode_strtab(data)
+    {
+        return Ok(vec![Item::Strings {
+            addr: sh.sh_addr,
+            strings,
+        }]);
     }
-    if sh.sh_type == SHT_NOTE {
-        if let Some(entries) = decode_notes(data) {
-            return Ok(vec![Item::Notes {
-                addr: sh.sh_addr,
-                entries,
-            }]);
-        }
+    if sh.sh_type == SHT_NOTE
+        && let Some(entries) = decode_notes(data)
+    {
+        return Ok(vec![Item::Notes {
+            addr: sh.sh_addr,
+            entries,
+        }]);
     }
 
     let section_start = sh.sh_addr;
@@ -1282,37 +1271,34 @@ fn emit_gap(
     if bytes.is_empty() {
         return Ok(());
     }
-    if is_exec {
-        if let Arch::Bpf { variant } = arch {
-            // BPF slots are 8 bytes. If the gap doesn't align
-            // to that, the leading misaligned bytes ride out as
-            // `@raw` and the rest gets lifted. This usually
-            // means the section has padding ahead of the first
-            // instruction; rare on Solana programs but cheap
-            // to defend against.
-            let prefix_len = bytes.len() % ud_arch_bpf::INSN_SIZE;
-            let (prefix, code) = bytes.split_at(prefix_len);
-            if !prefix.is_empty() {
-                out.push(Item::Raw {
-                    addr,
-                    bytes: prefix.to_vec(),
-                });
-            }
-            let code_addr = addr + prefix_len as u64;
-            if !code.is_empty() {
-                let insns =
-                    ud_arch_bpf::decode(code, code_addr, variant).map_err(Error::BpfDecode)?;
-                let lifted = ud_arch_bpf::lift_function(format!("fragment_{code_addr:x}"), &insns);
-                out.push(Item::Function(bpf::build_function(
-                    &lifted,
-                    name_at,
-                    call_site_names,
-                    variant,
-                    Some(elf),
-                )));
-            }
-            return Ok(());
+    if is_exec && let Arch::Bpf { variant } = arch {
+        // BPF slots are 8 bytes. If the gap doesn't align
+        // to that, the leading misaligned bytes ride out as
+        // `@raw` and the rest gets lifted. This usually
+        // means the section has padding ahead of the first
+        // instruction; rare on Solana programs but cheap
+        // to defend against.
+        let prefix_len = bytes.len() % ud_arch_bpf::INSN_SIZE;
+        let (prefix, code) = bytes.split_at(prefix_len);
+        if !prefix.is_empty() {
+            out.push(Item::Raw {
+                addr,
+                bytes: prefix.to_vec(),
+            });
         }
+        let code_addr = addr + prefix_len as u64;
+        if !code.is_empty() {
+            let insns = ud_arch_bpf::decode(code, code_addr, variant).map_err(Error::BpfDecode)?;
+            let lifted = ud_arch_bpf::lift_function(format!("fragment_{code_addr:x}"), &insns);
+            out.push(Item::Function(bpf::build_function(
+                &lifted,
+                name_at,
+                call_site_names,
+                variant,
+                Some(elf),
+            )));
+        }
+        return Ok(());
     }
     out.push(Item::Raw {
         addr,

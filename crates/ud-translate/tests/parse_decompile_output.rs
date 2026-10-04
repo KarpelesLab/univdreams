@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use ud_ast::{Item, Stmt};
-use ud_format::elf::{is_elf64_le, Elf64File, EM_X86_64};
+use ud_format::elf::{EM_X86_64, Elf64File, is_elf64_le};
 use ud_translate::compile::parse;
 
 fn workspace_root() -> PathBuf {

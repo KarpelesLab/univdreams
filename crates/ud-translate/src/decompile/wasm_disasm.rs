@@ -317,7 +317,7 @@ fn decode_one(body: &[u8], cursor: &mut usize) -> Result<(&'static str, String),
             return Err(DisasmError::UnknownOpcode {
                 op,
                 at: *cursor - 1,
-            })
+            });
         }
     })
 }

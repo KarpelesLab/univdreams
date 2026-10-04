@@ -556,7 +556,7 @@ mod tests {
         out.extend_from_slice(&1u32.to_le_bytes()); // NumHeaderObjects = 1
         out.push(0x01); // Reserved1
         out.push(0x02); // Reserved2
-                        // --- Stream Properties Object ---
+        // --- Stream Properties Object ---
         let spo_start = out.len();
         out.extend_from_slice(&ASF_STREAM_PROPERTIES_OBJECT.write_le()); // GUID
         let spo_size_off = out.len();
@@ -568,7 +568,7 @@ mod tests {
         out.extend_from_slice(&0u32.to_le_bytes()); // ECC Data Length
         out.extend_from_slice(&0u16.to_le_bytes()); // Flags
         out.extend_from_slice(&0u32.to_le_bytes()); // Reserved
-                                                    // WAVEFORMATEX (18 bytes) + 4-byte extra:
+        // WAVEFORMATEX (18 bytes) + 4-byte extra:
         out.extend_from_slice(&0x0160u16.to_le_bytes()); // WMA1
         out.extend_from_slice(&1u16.to_le_bytes()); // 1 channel
         out.extend_from_slice(&44_100u32.to_le_bytes()); // 44.1 kHz

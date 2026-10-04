@@ -5,7 +5,7 @@
 //! > * `parse(emit(ast))` is structurally equal to `ast`.
 //! > * `emit(parse(canonical_text))` is byte-equal to `canonical_text`.
 
-use ud_ast::{emit, Field, FnDecl, Item, Module, Stmt, UdFile, Value};
+use ud_ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value, emit};
 use ud_translate::compile::parse;
 
 fn sample_ast() -> UdFile {

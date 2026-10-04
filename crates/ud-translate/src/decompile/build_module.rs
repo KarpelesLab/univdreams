@@ -9,7 +9,7 @@
 //! [`Elf64File::from_parts`]: ud_format::elf::Elf64File::from_parts
 
 use ud_ast::{Field, Module, Value};
-use ud_format::elf::{Elf64File, Phdr64, EM_386, EM_AARCH64, EM_BPF, EM_SBF, EM_X86_64};
+use ud_format::elf::{EM_386, EM_AARCH64, EM_BPF, EM_SBF, EM_X86_64, Elf64File, Phdr64};
 
 /// Construct a [`Module`] capturing the full ELF metadata: the
 /// interpreted header fields, the program-header table, the section-

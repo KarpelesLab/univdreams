@@ -32,10 +32,10 @@
 //! "FNSTSW", "FCHS", "FABS", "FCOM", "FUCOM", "FXCH",
 //! "FRNDINT", "FSQRT".
 
-use super::decode::{resolve_modrm32, Operand};
+use super::Trap;
+use super::decode::{Operand, resolve_modrm32};
 use super::isa_int::{Cpu, StepOk};
 use super::mmu::Mmu;
-use super::Trap;
 
 /// FPU stack depth — the architectural x87 has eight ST(i)
 /// registers.

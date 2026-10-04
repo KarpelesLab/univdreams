@@ -30,7 +30,7 @@
 //! guest boundary, by design — the entire crate is
 //! `#![forbid(unsafe_code)]`.
 
-use super::{call_guest, HicEntry, HostState, Registry, Win32Error};
+use super::{HicEntry, HostState, Registry, Win32Error, call_guest};
 use crate::emulator::{Cpu, Mmu};
 
 // --- Constants — vfw.h transcriptions --------------------------------
@@ -1589,10 +1589,10 @@ pub fn ic_compress(
 mod tests {
     use super::*;
     use crate::emulator::{
+        Cpu,
         isa_int::RET_SENTINEL,
         mmu::{Mmu, Perm},
         regs::Reg32,
-        Cpu,
     };
     use crate::win32::{HostState, Registry};
 

@@ -132,15 +132,14 @@ pub fn decode_prologue(bytes: &[u8], bits: CodecBits) -> Option<StructuredProlog
     // Step 3: frame setup. `push ebp; mov ebp, esp` (and 64-bit
     // variants). The `push ebp` (0x55) may also have already
     // been counted as a save above — detect and re-attribute.
-    if matches!(p.saves.last().map(String::as_str), Some("ebp" | "rbp")) {
-        if let Some(mov_b) = bytes.get(i..i + mov_bp_sp_len(bits)) {
-            if let Some(alt) = mov_bp_sp_form(mov_b, bits) {
-                p.frame = true;
-                p.frame_alt_encoding = alt;
-                p.saves.pop(); // re-attribute the last push
-                i += mov_bp_sp_len(bits);
-            }
-        }
+    if matches!(p.saves.last().map(String::as_str), Some("ebp" | "rbp"))
+        && let Some(mov_b) = bytes.get(i..i + mov_bp_sp_len(bits))
+        && let Some(alt) = mov_bp_sp_form(mov_b, bits)
+    {
+        p.frame = true;
+        p.frame_alt_encoding = alt;
+        p.saves.pop(); // re-attribute the last push
+        i += mov_bp_sp_len(bits);
     }
 
     // Step 4: sub esp, IMM.

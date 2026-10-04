@@ -1478,10 +1478,10 @@ fn preload_qt_runtime(sandbox: &mut ud_emulator::Sandbox) {
 }
 
 fn fourcc_be(s: &str) -> u32 {
-    if let Ok(v) = parse_u32(s) {
-        if v == 0 {
-            return 0;
-        }
+    if let Ok(v) = parse_u32(s)
+        && v == 0
+    {
+        return 0;
     }
     let mut b = [b' '; 4];
     for (i, c) in s.bytes().take(4).enumerate() {
@@ -1684,86 +1684,86 @@ fn qtcodec_register(
             }
         }
     }
-    if found != 0 {
-        if let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "OpenComponent") {
-            let before = sandbox.host.stub_calls.len();
-            match ud_emulator::win32::call_guest(
-                &mut sandbox.cpu,
-                &mut sandbox.mmu,
-                &mut sandbox.registry,
-                &mut sandbox.host,
-                target,
-                &[found],
-            ) {
-                Ok(v) => println!("OpenComponent({found:#010x}) = {v:#010x}"),
-                Err(e) => eprintln!("OpenComponent trapped: {e}"),
-            }
-            {
-                let v0 = sandbox.mmu.load32(0x67dd_c000).unwrap_or(0);
-                let vc = sandbox.mmu.load32(0x67dd_c00c).unwrap_or(0);
-                eprintln!(
-                    "codec vtable: [0x67ddc000]={v0:#010x} \
+    if found != 0
+        && let Some(target) = sandbox.registry.resolve("qtmlclient.dll", "OpenComponent")
+    {
+        let before = sandbox.host.stub_calls.len();
+        match ud_emulator::win32::call_guest(
+            &mut sandbox.cpu,
+            &mut sandbox.mmu,
+            &mut sandbox.registry,
+            &mut sandbox.host,
+            target,
+            &[found],
+        ) {
+            Ok(v) => println!("OpenComponent({found:#010x}) = {v:#010x}"),
+            Err(e) => eprintln!("OpenComponent trapped: {e}"),
+        }
+        {
+            let v0 = sandbox.mmu.load32(0x67dd_c000).unwrap_or(0);
+            let vc = sandbox.mmu.load32(0x67dd_c00c).unwrap_or(0);
+            eprintln!(
+                "codec vtable: [0x67ddc000]={v0:#010x} \
                      [0x67ddc00c]={vc:#010x} (post-Open)"
-                );
-                // qts CM records struct — also dump instance-list
-                // count/limit at +0x0c/+0x0e since qts!0x66881ab1
-                // reads those to decide whether to grow.
-                let recs_ptr = sandbox.mmu.load32(0x6734_a4ec).unwrap_or(0);
-                if recs_ptr != 0 {
-                    let inst_cnt = sandbox.mmu.load16(recs_ptr.wrapping_add(0x0c)).unwrap_or(0);
-                    let inst_lim = sandbox.mmu.load16(recs_ptr.wrapping_add(0x0e)).unwrap_or(0);
-                    let count = sandbox.mmu.load16(recs_ptr.wrapping_add(0x14)).unwrap_or(0);
-                    let arr_ptr = sandbox.mmu.load32(recs_ptr.wrapping_add(0x18)).unwrap_or(0);
-                    let pool = sandbox.mmu.load32(recs_ptr.wrapping_add(0x20)).unwrap_or(0);
-                    eprintln!(
-                        "qts records: ptr={recs_ptr:#010x} \
+            );
+            // qts CM records struct — also dump instance-list
+            // count/limit at +0x0c/+0x0e since qts!0x66881ab1
+            // reads those to decide whether to grow.
+            let recs_ptr = sandbox.mmu.load32(0x6734_a4ec).unwrap_or(0);
+            if recs_ptr != 0 {
+                let inst_cnt = sandbox.mmu.load16(recs_ptr.wrapping_add(0x0c)).unwrap_or(0);
+                let inst_lim = sandbox.mmu.load16(recs_ptr.wrapping_add(0x0e)).unwrap_or(0);
+                let count = sandbox.mmu.load16(recs_ptr.wrapping_add(0x14)).unwrap_or(0);
+                let arr_ptr = sandbox.mmu.load32(recs_ptr.wrapping_add(0x18)).unwrap_or(0);
+                let pool = sandbox.mmu.load32(recs_ptr.wrapping_add(0x20)).unwrap_or(0);
+                eprintln!(
+                    "qts records: ptr={recs_ptr:#010x} \
                          inst_cnt=0x{inst_cnt:04x} inst_lim=0x{inst_lim:04x} \
                          count=0x{count:04x} arr=0x{arr_ptr:08x} pool=0x{pool:08x}"
-                    );
-                    // Dump record[0]
-                    if arr_ptr != 0 {
-                        eprintln!("  record[0] @ {arr_ptr:#010x}:");
-                        for row in 0..7u32 {
-                            let off = arr_ptr.wrapping_add(row * 16);
-                            let bytes: Vec<String> = (0..16u32)
-                                .map(|i| format!("{:02x}", sandbox.mmu.load8(off + i).unwrap_or(0)))
-                                .collect();
-                            eprintln!("    +{:#04x}: {}", row * 16, bytes.join(" "));
-                        }
+                );
+                // Dump record[0]
+                if arr_ptr != 0 {
+                    eprintln!("  record[0] @ {arr_ptr:#010x}:");
+                    for row in 0..7u32 {
+                        let off = arr_ptr.wrapping_add(row * 16);
+                        let bytes: Vec<String> = (0..16u32)
+                            .map(|i| format!("{:02x}", sandbox.mmu.load8(off + i).unwrap_or(0)))
+                            .collect();
+                        eprintln!("    +{:#04x}: {}", row * 16, bytes.join(" "));
                     }
                 }
             }
-            let calls = &sandbox.host.stub_calls[before..];
-            eprintln!("--- {} stub calls during OpenComponent ---", calls.len());
-            // Show head + tail; the codec's kComponentOpenSelect
-            // handler is usually called near the END of qts's
-            // open path so the tail is the most informative.
-            let n = calls.len();
-            let head = 60;
-            let tail = 60;
-            let log_call = |c: &ud_emulator::win32::StubCall| {
-                let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
-                let eip = c.call_site_eip;
-                eprintln!(
-                    "  {eip:#010x} {}!{}({}) -> {:#x}",
-                    c.dll,
-                    c.name,
-                    args.join(", "),
-                    c.ret
-                );
-            };
-            if n <= head + tail {
-                for c in calls {
-                    log_call(c);
-                }
-            } else {
-                for c in calls.iter().take(head) {
-                    log_call(c);
-                }
-                eprintln!("  … ({} more, last {} below)", n - head - tail, tail);
-                for c in calls.iter().skip(n - tail) {
-                    log_call(c);
-                }
+        }
+        let calls = &sandbox.host.stub_calls[before..];
+        eprintln!("--- {} stub calls during OpenComponent ---", calls.len());
+        // Show head + tail; the codec's kComponentOpenSelect
+        // handler is usually called near the END of qts's
+        // open path so the tail is the most informative.
+        let n = calls.len();
+        let head = 60;
+        let tail = 60;
+        let log_call = |c: &ud_emulator::win32::StubCall| {
+            let args: Vec<String> = c.args.iter().map(|a| format!("{a:#x}")).collect();
+            let eip = c.call_site_eip;
+            eprintln!(
+                "  {eip:#010x} {}!{}({}) -> {:#x}",
+                c.dll,
+                c.name,
+                args.join(", "),
+                c.ret
+            );
+        };
+        if n <= head + tail {
+            for c in calls {
+                log_call(c);
+            }
+        } else {
+            for c in calls.iter().take(head) {
+                log_call(c);
+            }
+            eprintln!("  … ({} more, last {} below)", n - head - tail, tail);
+            for c in calls.iter().skip(n - tail) {
+                log_call(c);
             }
         }
     }
@@ -2593,18 +2593,18 @@ fn decode_cmd(
         if i == dump_idx {
             for spec in &dump_specs {
                 let dump = capture_dump(&sandbox, spec)?;
-                if dump.file.is_none() {
-                    if let Some(hex) = &dump.hex {
-                        eprintln!(
-                            "[decode] memory dump after frame {} [0x{:x}..0x{:x}] ({} of {} bytes mapped):",
-                            i + 1,
-                            dump.addr,
-                            dump.addr.wrapping_add(dump.len as u32),
-                            dump.mapped_bytes,
-                            dump.len
-                        );
-                        eprint!("{}", render_hexdump(dump.addr, hex));
-                    }
+                if dump.file.is_none()
+                    && let Some(hex) = &dump.hex
+                {
+                    eprintln!(
+                        "[decode] memory dump after frame {} [0x{:x}..0x{:x}] ({} of {} bytes mapped):",
+                        i + 1,
+                        dump.addr,
+                        dump.addr.wrapping_add(dump.len as u32),
+                        dump.mapped_bytes,
+                        dump.len
+                    );
+                    eprint!("{}", render_hexdump(dump.addr, hex));
                 }
             }
         }
@@ -3236,10 +3236,10 @@ fn monitor_msi_install(
         // Pull effects back from the sandbox.
         if let Some(sb_vfs) = sandbox.context().vfs.as_ref() {
             for (p, _) in sb_vfs.list() {
-                if !vfs.contains(p) {
-                    if let Some(b) = sb_vfs.read(p) {
-                        vfs.insert(p, b.to_vec());
-                    }
+                if !vfs.contains(p)
+                    && let Some(b) = sb_vfs.read(p)
+                {
+                    vfs.insert(p, b.to_vec());
                 }
             }
         }
@@ -3407,22 +3407,22 @@ fn monitor_install_ne(
                 .collect()
         })
         .unwrap_or_default();
-    if let Some(dump_root) = dump_vfs {
-        if let Some(vfs) = ctx.vfs.as_ref() {
-            std::fs::create_dir_all(dump_root)
-                .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
-            for (vpath, _) in vfs.list() {
-                if vpath.ends_with("/.dir") {
-                    continue;
-                }
-                let out = dump_root.join(sanitise_vfs_path(vpath));
-                if let Some(parent) = out.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                if let Some(data) = vfs.read(vpath) {
-                    std::fs::write(&out, data)
-                        .with_context(|| format!("write VFS dump file {}", out.display()))?;
-                }
+    if let Some(dump_root) = dump_vfs
+        && let Some(vfs) = ctx.vfs.as_ref()
+    {
+        std::fs::create_dir_all(dump_root)
+            .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
+        for (vpath, _) in vfs.list() {
+            if vpath.ends_with("/.dir") {
+                continue;
+            }
+            let out = dump_root.join(sanitise_vfs_path(vpath));
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            if let Some(data) = vfs.read(vpath) {
+                std::fs::write(&out, data)
+                    .with_context(|| format!("write VFS dump file {}", out.display()))?;
             }
         }
     }
@@ -3600,10 +3600,10 @@ fn rootfs_image_path(source: &std::path::Path) -> anyhow::Result<std::path::Path
     let mut h = std::collections::hash_map::DefaultHasher::new();
     canon.hash(&mut h);
     meta.len().hash(&mut h);
-    if let Ok(mtime) = meta.modified() {
-        if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
-            dur.as_secs().hash(&mut h);
-        }
+    if let Ok(mtime) = meta.modified()
+        && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
+    {
+        dur.as_secs().hash(&mut h);
     }
     ROOTFS_HEADROOM.hash(&mut h);
     let stem = canon
@@ -3636,7 +3636,8 @@ fn alpine_branch_for(spec: &str) -> Option<String> {
 /// Build (if needed) and mount the `--rootfs` source as a writable ext4 root.
 #[cfg(feature = "fstool")]
 fn install_rootfs(table: &mut ud_emulator::fsmount::MountTable, spec: &str) -> anyhow::Result<()> {
-    use ud_emulator::fsmount::fstool::{build_ext_image, FsToolMount};
+    use ud_emulator::context::FileAccess;
+    use ud_emulator::fsmount::fstool::{FsToolMount, build_ext_image};
     let source = resolve_rootfs_source(spec)?;
     let image = rootfs_image_path(&source)?;
     if !image.is_file() {
@@ -3658,7 +3659,6 @@ fn install_rootfs(table: &mut ud_emulator::fsmount::MountTable, spec: &str) -> a
 
     // Seed a resolver so guest DNS (musl reads /etc/resolv.conf) works; without
     // one musl defaults to 127.0.0.1, which usually goes nowhere and hangs.
-    use ud_emulator::context::FileAccess;
     let resolv = b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
     if let Some(h) = table.open("/etc/resolv.conf", FileAccess::ReadWrite) {
         table.write_handle(h, resolv);
@@ -3797,12 +3797,12 @@ impl RawTerminal {
         // SAFETY: `termios` is plain-old-data; the ioctls act on our own stdin.
         unsafe {
             let mut saved: libc::termios = std::mem::zeroed();
-            if libc::isatty(fd) != 1 || libc::tcgetattr(fd, &mut saved) != 0 {
+            if libc::isatty(fd) != 1 || libc::tcgetattr(fd, &raw mut saved) != 0 {
                 return Self { saved: None };
             }
             let mut raw = saved;
-            libc::cfmakeraw(&mut raw);
-            libc::tcsetattr(fd, libc::TCSANOW, &raw);
+            libc::cfmakeraw(&raw mut raw);
+            libc::tcsetattr(fd, libc::TCSANOW, &raw const raw);
             Self { saved: Some(saved) }
         }
     }
@@ -3814,7 +3814,7 @@ impl Drop for RawTerminal {
         if let Some(saved) = self.saved {
             // SAFETY: restoring the settings we captured in `enable`.
             unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved);
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const saved);
             }
         }
     }
@@ -3958,21 +3958,21 @@ fn monitor_install_elf(
     };
 
     // Dump VFS writes if requested.
-    if let Some(dump_root) = dump_vfs {
-        if let Some(vfs) = sandbox.context().vfs.as_ref() {
-            std::fs::create_dir_all(dump_root)
-                .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
-            for (vpath, _) in vfs.list() {
-                if vpath.ends_with("/.dir") {
-                    continue;
-                }
-                let out = dump_root.join(sanitise_vfs_path(vpath));
-                if let Some(parent) = out.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                if let Some(data) = vfs.read(vpath) {
-                    std::fs::write(&out, data).ok();
-                }
+    if let Some(dump_root) = dump_vfs
+        && let Some(vfs) = sandbox.context().vfs.as_ref()
+    {
+        std::fs::create_dir_all(dump_root)
+            .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
+        for (vpath, _) in vfs.list() {
+            if vpath.ends_with("/.dir") {
+                continue;
+            }
+            let out = dump_root.join(sanitise_vfs_path(vpath));
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            if let Some(data) = vfs.read(vpath) {
+                std::fs::write(&out, data).ok();
             }
         }
     }
@@ -4274,23 +4274,23 @@ fn monitor_install(
     // a follow-up `ud analyze --monitor`. Paths are sanitised
     // (drive letters / forward-slash separators preserved as
     // subdirectories under `dump_root`).
-    if let Some(dump_root) = dump_vfs {
-        if let Some(vfs) = ctx.vfs.as_ref() {
-            std::fs::create_dir_all(dump_root)
-                .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
-            for (vpath, _) in vfs.list() {
-                if vpath.ends_with("/.dir") {
-                    continue;
-                }
-                let safe = sanitise_vfs_path(vpath);
-                let out = dump_root.join(safe);
-                if let Some(parent) = out.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                if let Some(data) = vfs.read(vpath) {
-                    std::fs::write(&out, data)
-                        .with_context(|| format!("write VFS dump file {}", out.display()))?;
-                }
+    if let Some(dump_root) = dump_vfs
+        && let Some(vfs) = ctx.vfs.as_ref()
+    {
+        std::fs::create_dir_all(dump_root)
+            .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
+        for (vpath, _) in vfs.list() {
+            if vpath.ends_with("/.dir") {
+                continue;
+            }
+            let safe = sanitise_vfs_path(vpath);
+            let out = dump_root.join(safe);
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            if let Some(data) = vfs.read(vpath) {
+                std::fs::write(&out, data)
+                    .with_context(|| format!("write VFS dump file {}", out.display()))?;
             }
         }
     }
@@ -5038,20 +5038,19 @@ fn scan_ascii_strings(buf: &[u8], out: &mut Vec<String>) {
         let printable = matches!(b, 0x20..=0x7e);
         if printable {
             start.get_or_insert(i);
-        } else if let Some(s) = start.take() {
-            if i - s >= STRING_MIN_LEN {
-                if let Ok(text) = std::str::from_utf8(&buf[s..i]) {
-                    out.push(text.to_string());
-                }
-            }
+        } else if let Some(s) = start.take()
+            && i - s >= STRING_MIN_LEN
+            && let Ok(text) = std::str::from_utf8(&buf[s..i])
+        {
+            out.push(text.to_string());
         }
     }
     if let Some(s) = start {
         let end = buf.len();
-        if end - s >= STRING_MIN_LEN {
-            if let Ok(text) = std::str::from_utf8(&buf[s..end]) {
-                out.push(text.to_string());
-            }
+        if end - s >= STRING_MIN_LEN
+            && let Ok(text) = std::str::from_utf8(&buf[s..end])
+        {
+            out.push(text.to_string());
         }
     }
 }

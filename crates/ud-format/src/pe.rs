@@ -825,15 +825,14 @@ impl PeFile {
         // their slot in this map empty.
         let mut name_of_ordinal: std::collections::HashMap<u32, String> =
             std::collections::HashMap::new();
-        if let Some(names) = self.slice_at_rva(addr_of_names, n_names.saturating_mul(4)) {
-            if let Some(ords) = self.slice_at_rva(addr_of_name_ordinals, n_names.saturating_mul(2))
-            {
-                for i in 0..n_names {
-                    let name_rva = read_u32(names, i * 4);
-                    let ord_idx = u32::from(read_u16(ords, i * 2));
-                    if let Some(name) = self.read_cstring_at_rva(name_rva) {
-                        name_of_ordinal.insert(ord_idx, name);
-                    }
+        if let Some(names) = self.slice_at_rva(addr_of_names, n_names.saturating_mul(4))
+            && let Some(ords) = self.slice_at_rva(addr_of_name_ordinals, n_names.saturating_mul(2))
+        {
+            for i in 0..n_names {
+                let name_rva = read_u32(names, i * 4);
+                let ord_idx = u32::from(read_u16(ords, i * 2));
+                if let Some(name) = self.read_cstring_at_rva(name_rva) {
+                    name_of_ordinal.insert(ord_idx, name);
                 }
             }
         }

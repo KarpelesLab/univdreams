@@ -34,7 +34,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use ud_emulator::{Sandbox, WatchMode, DLL_PROCESS_ATTACH};
+use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox, WatchMode};
 
 const IB: u32 = 0x60bd_0000;
 const STACK_BOTTOM: u32 = 0x9000_0000;

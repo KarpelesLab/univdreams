@@ -53,7 +53,7 @@ use anyhow::Context as _;
 use kataan::parser::Parser;
 use kataan::{Ctx, Interp, NanBox};
 use ud_emulator::emulator::{Mmu, Perm};
-use ud_emulator::{Bih, Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox};
 
 /// Prelude that assembles the `ud` namespace from the registered `__ud_*`
 /// primitives, wrapping the byte-returning ones in `Uint8Array` (host closures
@@ -588,7 +588,9 @@ mod tests {
     fn mapblob_dumpmem_roundtrip() {
         // Namespaced API; dumpMem returns a Uint8Array.
         assert_eq!(
-            eval("ud.mapBlob(0x40000000, [1,2,3,4]); Array.from(ud.dumpMem(0x40000000, 4)).join(',');"),
+            eval(
+                "ud.mapBlob(0x40000000, [1,2,3,4]); Array.from(ud.dumpMem(0x40000000, 4)).join(',');"
+            ),
             "1,2,3,4"
         );
     }

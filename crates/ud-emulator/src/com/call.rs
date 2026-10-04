@@ -22,7 +22,7 @@
 //! Microsoft's "stdcall calling convention" page on MSDN for the
 //! argument-push order.
 
-use super::{method_va, vtable_ptr, SLOT_ADD_REF, SLOT_QUERY_INTERFACE, SLOT_RELEASE};
+use super::{SLOT_ADD_REF, SLOT_QUERY_INTERFACE, SLOT_RELEASE, method_va, vtable_ptr};
 use crate::emulator::{Cpu, Mmu};
 use crate::win32::{HostState, Registry};
 

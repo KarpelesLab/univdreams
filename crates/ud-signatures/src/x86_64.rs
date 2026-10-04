@@ -5,7 +5,7 @@
 //! displacements (which depend on link layout) and short-jump targets
 //! (which depend on the function's exact length).
 
-use crate::{pat, Signature};
+use crate::{Signature, pat};
 
 /// CRT helper functions inserted by GCC into x86-64 ELF executables.
 ///

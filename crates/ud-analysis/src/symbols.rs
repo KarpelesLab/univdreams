@@ -95,7 +95,7 @@ fn collect_one_table(
         });
     }
     let table = elf.section_data(idx).unwrap_or(&[]);
-    if table.len() % entry_size != 0 {
+    if !table.len().is_multiple_of(entry_size) {
         return Err(SymbolError::BadTableSize {
             idx,
             size: table.len() as u64,

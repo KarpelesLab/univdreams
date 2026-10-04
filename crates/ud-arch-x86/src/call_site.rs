@@ -528,13 +528,12 @@ impl Analyzer {
         }
         if insn.memory_index() == Register::None
             && (insn.memory_base() == Register::ESP || insn.memory_base() == Register::RSP)
+            && let Some(val) = self.fpu_top.take()
         {
-            if let Some(val) = self.fpu_top.take() {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                let off = insn.memory_displacement64() as i32;
-                self.stack_args.insert(off, val);
-                return true;
-            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let off = insn.memory_displacement64() as i32;
+            self.stack_args.insert(off, val);
+            return true;
         }
         self.fpu_top = None;
         true
@@ -559,11 +558,7 @@ impl Analyzer {
 
 fn full_reg(reg: Register) -> Register {
     let full = reg.full_register();
-    if full == Register::None {
-        reg
-    } else {
-        full
-    }
+    if full == Register::None { reg } else { full }
 }
 
 pub(crate) use crate::signed_memory_displacement as signed_displacement;
@@ -586,7 +581,7 @@ fn read_signed_immediate(insn: &Instruction) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decode, Bitness};
+    use crate::{Bitness, decode};
 
     #[test]
     fn lifts_direct_call_with_one_immediate_arg() {

@@ -23,7 +23,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use ud_arch_6502::{
-    classify, decode_range, format_insn_with, AddressingMode, DecodedInsn, InsnKind, Mnemonic,
+    AddressingMode, DecodedInsn, InsnKind, Mnemonic, classify, decode_range, format_insn_with,
 };
 use ud_ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
 use ud_format::raw::RawImage;
@@ -115,10 +115,11 @@ fn discover_entries(
     let mut set: BTreeSet<u64> = BTreeSet::new();
     set.insert(reset_addr);
     for ins in insns {
-        if let InsnKind::Call { target, .. } = classify(ins) {
-            if target >= code_start && target < code_end {
-                set.insert(target);
-            }
+        if let InsnKind::Call { target, .. } = classify(ins)
+            && target >= code_start
+            && target < code_end
+        {
+            set.insert(target);
         }
     }
     // Only retain entries that actually align with a decoded
@@ -859,10 +860,11 @@ fn back_branch_into_range(local: &[&DecodedInsn], range_start: usize, range_end:
     let low = local[range_start].addr.0;
     let high = local[range_end - 1].addr.0;
     for ins in local.iter().skip(range_end) {
-        if let InsnKind::Branch { taken, .. } = classify(ins) {
-            if taken >= low && taken <= high {
-                return true;
-            }
+        if let InsnKind::Branch { taken, .. } = classify(ins)
+            && taken >= low
+            && taken <= high
+        {
+            return true;
         }
     }
     false
@@ -938,10 +940,10 @@ fn find_back_branch_target<'a>(
 ) -> Option<(usize, &'a DecodedInsn)> {
     let head_addr = local[start_idx].addr.0;
     for (j, ins) in local.iter().enumerate().skip(start_idx + 1) {
-        if let InsnKind::Branch { taken, .. } = classify(ins) {
-            if taken == head_addr {
-                return Some((j, ins));
-            }
+        if let InsnKind::Branch { taken, .. } = classify(ins)
+            && taken == head_addr
+        {
+            return Some((j, ins));
         }
     }
     None

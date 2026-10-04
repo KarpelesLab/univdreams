@@ -8,7 +8,7 @@ pub mod solana;
 
 use std::path::Path;
 
-use ud_core::{assert_bytes_equal, Error, Result};
+use ud_core::{Error, Result, assert_bytes_equal};
 use ud_translate::compile::AsmWarning;
 
 /// Run the round-trip pipeline on `input`, write the result to `output`,
@@ -51,40 +51,40 @@ pub fn roundtrip(input: &Path, output: &Path) -> Result<()> {
 ///
 /// Split out so it's directly testable without filesystem I/O.
 fn pipeline_bytes(bytes: &[u8]) -> Vec<u8> {
-    if ud_format::elf::is_elf64_le(bytes) {
-        if let Ok(elf) = ud_format::elf::Elf64File::parse(bytes) {
-            return elf.write_to_vec();
-        }
-        // ELF that we still can't parse (e.g. malformed header sizes).
-        // Fall through to byte-copy so the round-trip contract holds.
+    if ud_format::elf::is_elf64_le(bytes)
+        && let Ok(elf) = ud_format::elf::Elf64File::parse(bytes)
+    {
+        return elf.write_to_vec();
     }
+    // ELF that we still can't parse (e.g. malformed header sizes).
+    // Fall through to byte-copy so the round-trip contract holds.
     // NE must be tested before PE: both carry an `MZ` DOS header, and
     // `is_pe` only checks that, so an NE would otherwise misroute.
-    if ud_format::ne::is_ne(bytes) {
-        if let Ok(ne) = ud_format::ne::NeFile::parse(bytes) {
-            return ne.write_to_vec();
-        }
-        // NE-shaped but invalid; fall through to byte-copy.
+    if ud_format::ne::is_ne(bytes)
+        && let Ok(ne) = ud_format::ne::NeFile::parse(bytes)
+    {
+        return ne.write_to_vec();
     }
-    if ud_format::pe::is_pe(bytes) {
-        if let Ok(pe) = ud_format::pe::PeFile::parse(bytes) {
-            return pe.write_to_vec();
-        }
-        // PE-shaped but invalid; fall through to byte-copy.
+    // NE-shaped but invalid; fall through to byte-copy.
+    if ud_format::pe::is_pe(bytes)
+        && let Ok(pe) = ud_format::pe::PeFile::parse(bytes)
+    {
+        return pe.write_to_vec();
     }
-    if ud_format::macho::is_macho64(bytes) {
-        if let Ok(macho) = ud_format::macho::MachoFile::parse(bytes) {
-            return macho.write_to_vec();
-        }
-        // Mach-O-shaped but rejected by v1 (32-bit, unsupported
-        // cputype, fat wrapper); fall through to byte-copy.
+    // PE-shaped but invalid; fall through to byte-copy.
+    if ud_format::macho::is_macho64(bytes)
+        && let Ok(macho) = ud_format::macho::MachoFile::parse(bytes)
+    {
+        return macho.write_to_vec();
     }
-    if ud_format::wasm::is_wasm(bytes) {
-        if let Ok(wasm) = ud_format::wasm::WasmFile::parse(bytes) {
-            return wasm.write_to_vec();
-        }
-        // WASM-shaped but rejected; fall through to byte-copy.
+    // Mach-O-shaped but rejected by v1 (32-bit, unsupported
+    // cputype, fat wrapper); fall through to byte-copy.
+    if ud_format::wasm::is_wasm(bytes)
+        && let Ok(wasm) = ud_format::wasm::WasmFile::parse(bytes)
+    {
+        return wasm.write_to_vec();
     }
+    // WASM-shaped but rejected; fall through to byte-copy.
     bytes.to_vec()
 }
 

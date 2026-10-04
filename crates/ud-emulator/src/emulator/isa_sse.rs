@@ -25,10 +25,10 @@
 //! Reference: Intel® 64 and IA-32 Architectures Software
 //! Developer's Manual, Volume 2A/2B per-instruction pages.
 
-use super::decode::{resolve_modrm32, Operand};
+use super::Trap;
+use super::decode::{Operand, resolve_modrm32};
 use super::isa_int::{Cpu, StepOk};
 use super::mmu::Mmu;
-use super::Trap;
 
 /// Discriminator for the SSE mandatory prefix attached to the
 /// current instruction.

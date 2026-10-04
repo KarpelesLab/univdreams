@@ -148,14 +148,14 @@
 
 use std::path::PathBuf;
 use ud_emulator::com::{
-    call::{call_method, vtable_is_plausible},
     AmtBlueprint, Guid, MSADDS_AUDIO_DECODER_CLSID, PIN_DIRECTION_INPUT, PIN_DIRECTION_OUTPUT,
     SLOT_BASEFILTER_ENUM_PINS, SLOT_BASEFILTER_STOP, SLOT_ENUMPINS_NEXT, SLOT_MEDIAFILTER_PAUSE,
     SLOT_MEDIAFILTER_RUN, SLOT_MEMALLOCATOR_COMMIT, SLOT_MEMALLOCATOR_SET_PROPERTIES,
     SLOT_MEMINPUTPIN_GET_ALLOCATOR, SLOT_MEMINPUTPIN_NOTIFY_ALLOCATOR, SLOT_MEMINPUTPIN_RECEIVE,
     SLOT_PIN_QUERY_DIRECTION, SLOT_PIN_RECEIVE_CONNECTION,
+    call::{call_method, vtable_is_plausible},
 };
-use ud_emulator::{Sandbox, IID_IBASEFILTER, IID_ICLASSFACTORY, IID_IMEMINPUTPIN, IID_IUNKNOWN};
+use ud_emulator::{IID_IBASEFILTER, IID_ICLASSFACTORY, IID_IMEMINPUTPIN, IID_IUNKNOWN, Sandbox};
 
 // ── Sentinel RVAs ──────────────────────────────────────────────────────
 
@@ -792,14 +792,14 @@ fn phase1_walk_ea3a_branches_and_caller_bail_predicate() {
                 fmt_snapshot(s, image_base)
             );
         }
-        if let Some(s) = last {
-            if first.map(|f| f.fire_order) != Some(s.fire_order) {
-                eprintln!(
-                    "round70 phase1: LAST  snapshot at rva={:#06x}\n{}",
-                    rva,
-                    fmt_snapshot(s, image_base)
-                );
-            }
+        if let Some(s) = last
+            && first.map(|f| f.fire_order) != Some(s.fire_order)
+        {
+            eprintln!(
+                "round70 phase1: LAST  snapshot at rva={:#06x}\n{}",
+                rva,
+                fmt_snapshot(s, image_base)
+            );
         }
     }
 

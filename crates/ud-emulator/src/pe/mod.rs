@@ -28,7 +28,7 @@ pub mod sections;
 
 use std::collections::BTreeMap;
 
-use crate::emulator::{mmu::Mmu, Trap};
+use crate::emulator::{Trap, mmu::Mmu};
 use crate::win32::{HostState, Registry};
 
 /// PE-loader-specific error variants.

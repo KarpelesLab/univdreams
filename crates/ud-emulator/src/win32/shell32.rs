@@ -9,7 +9,7 @@
 //!
 //! Reference: MSDN `shell32` API — cited inline.
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
 use crate::emulator::{Cpu, Mmu};
 
 /// `ShellExecute` success sentinel — MSDN: a return value

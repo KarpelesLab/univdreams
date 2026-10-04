@@ -72,7 +72,7 @@ fn format_fs(
         other => {
             return Err(fstool::Error::Unsupported(format!(
                 "unknown / unsupported filesystem type {other:?}"
-            )))
+            )));
         }
     })
 }
@@ -88,7 +88,7 @@ fn open_fs(fs_type: &str, dev: &mut dyn BlockDevice) -> fstool::Result<Box<dyn F
         other => {
             return Err(fstool::Error::Unsupported(format!(
                 "unknown / unsupported filesystem type {other:?}"
-            )))
+            )));
         }
     })
 }
@@ -183,7 +183,7 @@ pub fn build_ext_image(
 ) -> io::Result<()> {
     use fstool::fs::ext::{Ext, FsKind};
     use fstool::repack::{
-        ext_build_plan_for_source, walk_source_into_sink, FsSink, RepackSink, Source,
+        FsSink, RepackSink, Source, ext_build_plan_for_source, walk_source_into_sink,
     };
 
     let kind = match fs_type {

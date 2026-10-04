@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ud_format::macho::{is_macho64, MachoFile};
+use ud_format::macho::{MachoFile, is_macho64};
 
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

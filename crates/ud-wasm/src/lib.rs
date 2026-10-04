@@ -126,9 +126,8 @@ pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to ELF: {e}"), &warnings))),
         "pe" => ud_translate::compile::lower_to_pe(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to PE: {e}"), &warnings))),
-        "macho" => ud_translate::compile::lower_to_macho(&ast).map_err(|e| {
-            JsError::new(&with_warnings(&format!("lower to Mach-O: {e}"), &warnings))
-        }),
+        "macho" => ud_translate::compile::lower_to_macho(&ast)
+            .map_err(|e| JsError::new(&with_warnings(&format!("lower to Mach-O: {e}"), &warnings))),
         "wasm" => ud_translate::compile::lower_to_wasm(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to WASM: {e}"), &warnings))),
         "raw" => ud_translate::compile::lower_to_raw(&ast)
@@ -208,7 +207,7 @@ pub fn solana_strip_elf(account_data: &[u8], loader: &str) -> Result<Vec<u8>, Js
         other => {
             return Err(JsError::new(&format!(
                 "unknown loader hint {other:?} (expected \"bpf_loader_2\", \"upgradeable\", \"loader_v4\")"
-            )))
+            )));
         }
     };
     Ok(stripped.to_vec())

@@ -102,10 +102,10 @@ fn read_case_insensitive(dir: &Path, name: &str) -> std::io::Result<Option<Vec<u
         // Recurse one level for the user-staged dir case (the
         // corpus has codecs grouped by family, so a typical
         // staged layout mirrors the URL hierarchy).
-        if entry.file_type()?.is_dir() {
-            if let Some(bytes) = read_case_insensitive(&entry.path(), name)? {
-                return Ok(Some(bytes));
-            }
+        if entry.file_type()?.is_dir()
+            && let Some(bytes) = read_case_insensitive(&entry.path(), name)?
+        {
+            return Ok(Some(bytes));
         }
     }
     Ok(None)

@@ -9,7 +9,7 @@
 //! Reference: MSDN `DefDriverProc` —
 //! <https://learn.microsoft.com/en-us/windows/win32/api/mmiscapi/nf-mmiscapi-defdriverproc>
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
 use crate::emulator::{Cpu, Mmu};
 
 // Driver-message ids — `mmsystem.h`.

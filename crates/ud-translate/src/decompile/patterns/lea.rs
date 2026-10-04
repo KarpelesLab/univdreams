@@ -10,7 +10,7 @@
 //! `&` prefix as the LEA marker without losing the original
 //! syntax.
 
-use ud_arch_x86::{format_intel, DecodedInsn, Mnemonic};
+use ud_arch_x86::{DecodedInsn, Mnemonic, format_intel};
 use ud_ast::Stmt;
 
 use super::{Candidate, Pattern, PatternCtx};
@@ -57,7 +57,7 @@ impl Pattern for Lea {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use ud_arch_x86::{decode, Bitness};
+    use ud_arch_x86::{Bitness, decode};
 
     fn ctx() -> PatternCtx<'static> {
         let map: &'static HashMap<u64, String> = Box::leak(Box::new(HashMap::new()));

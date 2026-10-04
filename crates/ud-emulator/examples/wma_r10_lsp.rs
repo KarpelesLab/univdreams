@@ -44,7 +44,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use ud_emulator::emulator::regs::Reg32;
 use ud_emulator::win32::call_guest;
-use ud_emulator::{Sandbox, WatchMode, DLL_PROCESS_ATTACH};
+use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox, WatchMode};
 
 const IB: u32 = 0x5370_0000;
 const VA_ALLOC_STATE: u32 = IB + 0x78b0;
@@ -177,15 +177,34 @@ fn main() {
     let f = |o: u32| r32(&sb, ctx + o);
     eprintln!(
         "ctx={ctx:#x}: frame_length={} N(0xa4)={} grid_flag(0xb0)={} sr={} ch={} class={} noise_enable(0x7c)={} n_block_sizes(0xc8)={} byte_offset_bits(0x54)={} dither(0x388)={} dispatch(0x42c)={:#x} coef_start(0x36c)={} coef_end(0x370)={} cutoff(0x404)={} start_band(0x400)={} version(0x90)={}",
-        f(0x364), f(0xa4), f(0xb0), f(0x9c), f(0xa0) & 0xffff, f(0x384), f(0x7c), f(0xc8), f(0x54),
-        f32::from_bits(f(0x388)), f(0x42c), f(0x36c), f(0x370), f(0x404), f(0x400), f(0x90)
+        f(0x364),
+        f(0xa4),
+        f(0xb0),
+        f(0x9c),
+        f(0xa0) & 0xffff,
+        f(0x384),
+        f(0x7c),
+        f(0xc8),
+        f(0x54),
+        f32::from_bits(f(0x388)),
+        f(0x42c),
+        f(0x36c),
+        f(0x370),
+        f(0x404),
+        f(0x400),
+        f(0x90)
     );
     let chan0 = r32(&sb, ctx + 0x3e0);
     let env_buf = r32(&sb, chan0 + 0x6c);
     let frame_length = f(0x364);
     eprintln!(
         "chan0={chan0:#x}: env(0x6c)={env_buf:#x} deq_in(0x2c)={:#x} q(0x0)={:#x} out(0x64)={:#x} flags(0x8)={:#x} ratios(0xc)={:#x} gains(0x10)={:#x}",
-        r32(&sb, chan0 + 0x2c), r32(&sb, chan0), r32(&sb, chan0 + 0x64), r32(&sb, chan0 + 0x8), r32(&sb, chan0 + 0xc), r32(&sb, chan0 + 0x10)
+        r32(&sb, chan0 + 0x2c),
+        r32(&sb, chan0),
+        r32(&sb, chan0 + 0x64),
+        r32(&sb, chan0 + 0x8),
+        r32(&sb, chan0 + 0xc),
+        r32(&sb, chan0 + 0x10)
     );
     assert_eq!(
         r32(&sb, chan0 + 0x2c),
@@ -390,7 +409,10 @@ fn main() {
         };
         writeln!(log, "{p},{rc:#x},{consumed},{written},{extra},{di}").unwrap();
         if p < 5 || p % 50 == 0 {
-            eprintln!("packet {p}: rc={rc:#x} consumed={consumed} written={written} extra={extra} instr={di} t={:.1}s", t0.elapsed().as_secs_f64());
+            eprintln!(
+                "packet {p}: rc={rc:#x} consumed={consumed} written={written} extra={extra} instr={di} t={:.1}s",
+                t0.elapsed().as_secs_f64()
+            );
         }
         if res.is_err() {
             break;
@@ -415,7 +437,11 @@ fn main() {
         }
     }
     let cw_after = sb.cpu.fpu_cw;
-    eprintln!("decoded {n_packets} packets, {total_written} PCM bytes, {} instructions, {:.1}s; fpu_cw before={cw_before:#06x} after={cw_after:#06x}", sb.cpu.instr_count, t0.elapsed().as_secs_f64());
+    eprintln!(
+        "decoded {n_packets} packets, {total_written} PCM bytes, {} instructions, {:.1}s; fpu_cw before={cw_before:#06x} after={cw_after:#06x}",
+        sb.cpu.instr_count,
+        t0.elapsed().as_secs_f64()
+    );
     writeln!(meta, "packets_decoded={n_packets}\npcm_bytes={total_written}\ninstructions={}\ncw_before={cw_before:#06x}\ncw_after={cw_after:#06x}", sb.cpu.instr_count).unwrap();
     // drop the sink so the JSONL is flushed
     sb.set_trace_sink(Box::new(std::io::sink()));

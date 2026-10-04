@@ -11,7 +11,7 @@
 //! they often imply more than a plain assignment and deserve
 //! their own treatment.
 
-use ud_arch_x86::{format_intel, DecodedInsn, Mnemonic};
+use ud_arch_x86::{DecodedInsn, Mnemonic, format_intel};
 use ud_ast::Stmt;
 
 use super::{Candidate, Pattern, PatternCtx};
@@ -66,7 +66,7 @@ pub(super) fn split_two_operands(full: &str, prefix: &str) -> Option<(String, St
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use ud_arch_x86::{decode, Bitness};
+    use ud_arch_x86::{Bitness, decode};
 
     fn ctx() -> PatternCtx<'static> {
         let map: &'static HashMap<u64, String> = Box::leak(Box::new(HashMap::new()));

@@ -101,14 +101,14 @@
 
 use std::path::PathBuf;
 use ud_emulator::com::{
-    call::{call_method, vtable_is_plausible},
     AmtBlueprint, Guid, MSADDS_AUDIO_DECODER_CLSID, PIN_DIRECTION_INPUT, PIN_DIRECTION_OUTPUT,
     SLOT_BASEFILTER_ENUM_PINS, SLOT_BASEFILTER_STOP, SLOT_ENUMPINS_NEXT, SLOT_MEDIAFILTER_PAUSE,
     SLOT_MEDIAFILTER_RUN, SLOT_MEMALLOCATOR_COMMIT, SLOT_MEMALLOCATOR_SET_PROPERTIES,
     SLOT_MEMINPUTPIN_GET_ALLOCATOR, SLOT_MEMINPUTPIN_NOTIFY_ALLOCATOR, SLOT_MEMINPUTPIN_RECEIVE,
     SLOT_PIN_QUERY_DIRECTION, SLOT_PIN_RECEIVE_CONNECTION,
+    call::{call_method, vtable_is_plausible},
 };
-use ud_emulator::{Sandbox, IID_IBASEFILTER, IID_ICLASSFACTORY, IID_IMEMINPUTPIN, IID_IUNKNOWN};
+use ud_emulator::{IID_IBASEFILTER, IID_ICLASSFACTORY, IID_IMEMINPUTPIN, IID_IUNKNOWN, Sandbox};
 
 // ─── inner-decode site sentinels (clean-room from raw bytes) ─────────
 
@@ -714,10 +714,10 @@ fn phase2_watch_inner_decode_arg_guards_with_patch_and_ffmpeg_extradata() {
         return;
     };
     let base: u32 = 0; // we report RVAs relative to image_base; base
-                       // itself is captured implicitly because every
-                       // snapshot's eip is an absolute guest address.
-                       // We accept that the report's `rva` field is
-                       // computed as `eip - image_base` further down.
+    // itself is captured implicitly because every
+    // snapshot's eip is an absolute guest address.
+    // We accept that the report's `rva` field is
+    // computed as `eip - image_base` further down.
 
     // Look up image_base by re-loading the same DLL — or, more cheaply,
     // derive it from the eip of the entry watchpoint hit which equals
@@ -811,7 +811,9 @@ fn phase2_watch_inner_decode_arg_guards_with_patch_and_ffmpeg_extradata() {
             }
         }
     } else {
-        eprintln!("round69 phase2: NO bail-sink hit — either Receive succeeded, the inner decode was never reached, or it exited via the success path");
+        eprintln!(
+            "round69 phase2: NO bail-sink hit — either Receive succeeded, the inner decode was never reached, or it exited via the success path"
+        );
     }
 
     // Hard A/B sanity: round 68 reported E_FAIL on this combo.  If

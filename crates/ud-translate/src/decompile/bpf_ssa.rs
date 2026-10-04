@@ -58,8 +58,8 @@
 //! through `ud_ir::ssa`.
 
 use ud_arch_bpf::{DecodedInsn, InsnKind};
-use ud_ir::ssa::{Liveness, SsaInfo, Var};
 use ud_ir::Function;
+use ud_ir::ssa::{Liveness, SsaInfo, Var};
 
 /// Build SSA for a BPF function.
 #[must_use]
@@ -213,7 +213,7 @@ fn push_unique(v: &mut Vec<Var>, x: Var) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ud_arch_bpf::{decode, BpfVariant};
+    use ud_arch_bpf::{BpfVariant, decode};
     use ud_ir::ssa::DefSite;
 
     /// Build a `Function<DecodedInsn>` from raw BPF bytes by

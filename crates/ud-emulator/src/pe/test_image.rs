@@ -248,7 +248,7 @@ pub fn build_minimal_dll() -> Vec<u8> {
     bytes[imp0 + 8..imp0 + 12].copy_from_slice(&0u32.to_le_bytes()); // ForwarderChain
     bytes[imp0 + 12..imp0 + 16].copy_from_slice(&0x2400u32.to_le_bytes()); // Name (kernel32.dll)
     bytes[imp0 + 16..imp0 + 20].copy_from_slice(&IAT_RVA.to_le_bytes()); // FirstThunk (IAT)
-                                                                         // Descriptor 1: sentinel (all zeros). bytes already zero.
+    // Descriptor 1: sentinel (all zeros). bytes already zero.
 
     // -- ILT at RVA 0x2150 -----------------------------------------
     let ilt = off(0x2150);

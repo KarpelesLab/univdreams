@@ -4,7 +4,7 @@
 //! a simple unary transformation; folding them to `@move` puts them
 //! in the same shape as the binary [`super::arith`] lifts.
 
-use ud_arch_x86::{format_intel, DecodedInsn, Mnemonic};
+use ud_arch_x86::{DecodedInsn, Mnemonic, format_intel};
 use ud_ast::Stmt;
 
 use super::{Candidate, Pattern, PatternCtx};

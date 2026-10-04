@@ -20,7 +20,7 @@
 //! not as raw push/pop opcodes.
 
 use ud_arch_x86::{
-    detect_post_call_spill, format_intel, CodeSize, DecodedInsn, FlowControl, Mnemonic,
+    CodeSize, DecodedInsn, FlowControl, Mnemonic, detect_post_call_spill, format_intel,
 };
 use ud_ast::Stmt;
 
@@ -133,27 +133,25 @@ impl Pattern for StackArgCall {
                 // `call_at`. If a spill rides along we must keep
                 // the call inline so the spill follows.
                 let mut direct_target = direct_call_target;
-                if is_call {
-                    if let Some(spill) = detect_post_call_spill(insns, i + 1) {
-                        // Restore the call bytes since we're not
-                        // going to regenerate them.
-                        if direct_target.is_some() {
-                            bytes.extend_from_slice(&ins.original_bytes);
-                            direct_target = None;
-                        }
-                        for j in 0..spill.insns_consumed {
-                            if let Some(s) = insns.get(i + 1 + j) {
-                                bytes.extend_from_slice(&s.original_bytes);
-                            }
-                        }
-                        consumed_extra = spill.insns_consumed;
-                        let dest = if spill.displacement < 0 {
-                            format!("[rbp-0x{:x}]", spill.displacement.unsigned_abs())
-                        } else {
-                            format!("[rbp+0x{:x}]", spill.displacement)
-                        };
-                        spill_comment = Some(format!("result -> {dest}"));
+                if is_call && let Some(spill) = detect_post_call_spill(insns, i + 1) {
+                    // Restore the call bytes since we're not
+                    // going to regenerate them.
+                    if direct_target.is_some() {
+                        bytes.extend_from_slice(&ins.original_bytes);
+                        direct_target = None;
                     }
+                    for j in 0..spill.insns_consumed {
+                        if let Some(s) = insns.get(i + 1 + j) {
+                            bytes.extend_from_slice(&s.original_bytes);
+                        }
+                    }
+                    consumed_extra = spill.insns_consumed;
+                    let dest = if spill.displacement < 0 {
+                        format!("[rbp-0x{:x}]", spill.displacement.unsigned_abs())
+                    } else {
+                        format!("[rbp+0x{:x}]", spill.displacement)
+                    };
+                    spill_comment = Some(format!("result -> {dest}"));
                 }
                 // Args were pushed right-to-left; reverse for
                 // natural left-to-right reading order.
@@ -331,7 +329,7 @@ fn lookup_indirect_absolute(operand: &str, ctx: &PatternCtx) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use ud_arch_x86::{decode, Bitness};
+    use ud_arch_x86::{Bitness, decode};
 
     fn ctx_empty() -> (HashMap<u64, String>, PatternCtx<'static>) {
         let map: HashMap<u64, String> = HashMap::new();

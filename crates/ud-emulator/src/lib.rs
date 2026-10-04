@@ -222,20 +222,20 @@ pub mod win16;
 pub mod win32;
 
 pub use context::{
-    Context, FileAccess, FileHandle, OpenKey, RegistryKey, RegistryValue, VirtualFs,
-    VirtualRegistry, HKCR, HKCU, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
-    HKEY_USERS, HKLM, HKU,
+    Context, FileAccess, FileHandle, HKCR, HKCU, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER,
+    HKEY_LOCAL_MACHINE, HKEY_USERS, HKLM, HKU, OpenKey, RegistryKey, RegistryValue, VirtualFs,
+    VirtualRegistry,
 };
 pub use coverage::CoverageMap;
 pub use ffi::{CallArgs, Dword, FromRet, Guest};
 
 pub use com::{
-    Guid, GuidParseError, CLSID_MEMORY_ALLOCATOR, IID_IBASEFILTER, IID_ICLASSFACTORY,
+    CLSID_MEMORY_ALLOCATOR, Guid, GuidParseError, IID_IBASEFILTER, IID_ICLASSFACTORY,
     IID_IENUMPINS, IID_IFILTERGRAPH, IID_IMEDIAFILTER, IID_IMEDIASAMPLE, IID_IMEMALLOCATOR,
     IID_IMEMINPUTPIN, IID_IPERSIST, IID_IPIN, IID_IUNKNOWN, MSADDS_AUDIO_DECODER_CLSID,
     MSADDS_AUDIO_PROPERTY_PAGE_CLSID,
 };
-pub use runtime::{Sandbox, DLL_PROCESS_ATTACH};
+pub use runtime::{DLL_PROCESS_ATTACH, Sandbox};
 #[cfg(feature = "trace")]
 pub use trace::{TraceState, WatchMode, Watchpoint};
 pub use win32::vfw32::Bih;

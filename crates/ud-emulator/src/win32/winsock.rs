@@ -13,7 +13,7 @@
 //! also resolve cleanly. Reference: Microsoft "Winsock 2 API
 //! Reference" — `https://learn.microsoft.com/en-us/windows/win32/api/winsock2/`.
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
 use crate::emulator::{Cpu, Mmu};
 
 /// Register both `wsock32.dll` and `ws2_32.dll` stubs.

@@ -91,7 +91,7 @@ impl Pattern for PushImmPopReg {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use ud_arch_x86::{decode, Bitness};
+    use ud_arch_x86::{Bitness, decode};
 
     fn ctx() -> PatternCtx<'static> {
         let map: &'static HashMap<u64, String> = Box::leak(Box::new(HashMap::new()));

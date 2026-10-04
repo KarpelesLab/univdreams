@@ -38,7 +38,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
-use ud_emulator::{Bih, Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox};
 
 /// Mirrors `ud vfw` (crates/ud-cli): the CLI opens the decoder with
 /// mode 1 and the encoder with mode 2 and Lagarith accepts both, so
@@ -182,10 +182,13 @@ fn do_encode(
     let n = fmt.frame_bytes(w, h) as usize;
     let mut last = (0u32, Vec::new(), 0u32);
     if repeat > 1 {
-        std::env::set_var(
-            "LAG_ENCODE_OUT",
-            std::env::var_os("LAG_ENCODE_OUT").unwrap_or_default(),
-        );
+        // SAFETY: single-threaded example binary; no other thread reads the env.
+        unsafe {
+            std::env::set_var(
+                "LAG_ENCODE_OUT",
+                std::env::var_os("LAG_ENCODE_OUT").unwrap_or_default(),
+            );
+        }
     }
     for i in 0..repeat.max(1) {
         // Only the first frame is requested as a keyframe; later
@@ -327,15 +330,27 @@ fn sites(set: &str) -> Vec<(u32, &'static str)> {
         (0x1002_02f2, "YUY2 coord: Y[1]=Y[0] patch taken"),
     ];
     let ff: Vec<(u32, &'static str)> = vec![
-        (0x1002_3e4d, "disp: movzx eax,[esi] (header byte; ebx=count, ebp=plane)"),
+        (
+            0x1002_3e4d,
+            "disp: movzx eax,[esi] (header byte; ebx=count, ebp=plane)",
+        ),
         (0x1002_3ec4, "disp: cmp eax,0xff"),
-        (0x1002_3ecb, "disp-ff: push ebx (memset(plane,0,count) about to run)"),
-        (0x1002_3ed4, "disp-ff: mov cl,[esi+1] (after memset; [ebp]=0)"),
+        (
+            0x1002_3ecb,
+            "disp-ff: push ebx (memset(plane,0,count) about to run)",
+        ),
+        (
+            0x1002_3ed4,
+            "disp-ff: mov cl,[esi+1] (after memset; [ebp]=0)",
+        ),
         (0x1002_3edd, "disp-ff: pop esi (after plane[0]=byte1)"),
         (0x1002_3ee3, "disp: inc esi (header 4..7 path)"),
         (0x1002_3eed, "disp: call RLE-only expander (header 5..7)"),
         (0x1002_3efb, "disp: call memcpy (header 4)"),
-        (0x1002_3e8f, "disp: call range coder (header 1..3 with len>=count → as 0)"),
+        (
+            0x1002_3e8f,
+            "disp: call range coder (header 1..3 with len>=count → as 0)",
+        ),
         (0x1002_3eb9, "disp: call range coder (header 1..3)"),
         (0x1002_3f28, "disp: call range coder (header 0)"),
         (0x1001_fe50, "per-plane dispatcher entry"),
@@ -343,7 +358,10 @@ fn sites(set: &str) -> Vec<(u32, &'static str)> {
         (0x1001_a4a0, "RGB predictor B (24-bit) entry"),
         (0x1001_a320, "RGB predictor C (32-bit) entry"),
         (0x1001_da10, "YUY2 predictor entry"),
-        (0x1001_d8a0, "YV12 predictor entry (dispatcher; called from the YV12 coordinator 0x1002007a/0x100201f6)"),
+        (
+            0x1001_d8a0,
+            "YV12 predictor entry (dispatcher; called from the YV12 coordinator 0x1002007a/0x100201f6)",
+        ),
     ];
     match set {
         "stepb" => stepb,
@@ -400,7 +418,8 @@ fn main() {
             let (w, h) = (args[4].parse().unwrap(), args[5].parse().unwrap());
             let raw = std::fs::read(&args[6]).expect("read input");
             let repeat = args.get(8).map_or(1, |s| s.parse().unwrap());
-            std::env::set_var("LAG_ENCODE_OUT", &args[7]);
+            // SAFETY: single-threaded example binary; no other thread reads the env.
+            unsafe { std::env::set_var("LAG_ENCODE_OUT", &args[7]) };
             let (mut sb, _) = open(dll);
             let (rc, bytes, flags) = do_encode(&mut sb, fmt, w, h, &raw, repeat);
             std::fs::write(&args[7], &bytes).expect("write");
@@ -505,7 +524,14 @@ fn main() {
                     line,
                     "{{\"i\":{i},\"pc\":\"{pc:#010x}\",\"label\":{:?},\"eax\":\"{:#010x}\",\"ecx\":\"{:#010x}\",\"edx\":\"{:#010x}\",\"ebx\":\"{:#010x}\",\"esp\":\"{:#010x}\",\"ebp\":\"{:#010x}\",\"esi\":\"{:#010x}\",\"edi\":\"{:#010x}\",\"probe\":{{",
                     labels.get(pc).copied().unwrap_or("?"),
-                    regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7]
+                    regs[0],
+                    regs[1],
+                    regs[2],
+                    regs[3],
+                    regs[4],
+                    regs[5],
+                    regs[6],
+                    regs[7]
                 );
                 let mut first = true;
                 for (k, (label, _reg, _off, _width)) in probes.iter().enumerate() {

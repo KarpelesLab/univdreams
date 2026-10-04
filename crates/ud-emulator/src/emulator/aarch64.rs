@@ -72,11 +72,7 @@ impl Aarch64Cpu {
     #[inline]
     fn rd(&self, i: u32, sf: bool) -> u64 {
         let v = if i == 31 { 0 } else { self.x[i as usize] };
-        if sf {
-            v
-        } else {
-            v & 0xffff_ffff
-        }
+        if sf { v } else { v & 0xffff_ffff }
     }
 
     /// Write `Xn`/`Wn` where index 31 **discards** (zero register). A 32-bit
@@ -93,11 +89,7 @@ impl Aarch64Cpu {
     #[inline]
     fn rd_sp(&self, i: u32, sf: bool) -> u64 {
         let v = if i == 31 { self.sp } else { self.x[i as usize] };
-        if sf {
-            v
-        } else {
-            v & 0xffff_ffff
-        }
+        if sf { v } else { v & 0xffff_ffff }
     }
 
     /// Write where index 31 is the **stack pointer**.
@@ -272,11 +264,7 @@ impl Aarch64Cpu {
                 // top: sign bit for SBFM, dst for BFM, zeros for UBFM
                 let top = if opc == 0b00 {
                     // SBFM: replicate bit imms
-                    if (src >> imms) & 1 == 1 {
-                        u64::MAX
-                    } else {
-                        0
-                    }
+                    if (src >> imms) & 1 == 1 { u64::MAX } else { 0 }
                 } else if opc == 0b01 {
                     dst
                 } else {
@@ -572,7 +560,7 @@ impl Aarch64Cpu {
             let l = (instr >> 21) & 1; // 1 = MRS (read sysreg)
             let rt = instr & 0x1f;
             let sysreg = (instr >> 5) & 0x7fff; // op0:op1:CRn:CRm:op2
-                                                // TPIDR_EL0 = MRS x, S3_3_C13_C2_2 → encoded sysreg 0b11_011_1101_0010_010
+            // TPIDR_EL0 = MRS x, S3_3_C13_C2_2 → encoded sysreg 0b11_011_1101_0010_010
             const TPIDR_EL0: u32 = 0b11_011_1101_0010_010;
             if sysreg == TPIDR_EL0 {
                 if l == 1 {
@@ -807,11 +795,7 @@ fn sign_extend(v: u64, bits: u32) -> u64 {
 }
 
 fn mask_bits(w: u32) -> u64 {
-    if w >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << w) - 1
-    }
+    if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
 }
 
 /// Rotate the low `width` bits of `v` right by `r`.
@@ -874,11 +858,7 @@ fn shift_reg(v: u64, shift_type: u32, amount: u32, sf: bool) -> u64 {
         }
         _ => ror_width(v, amount, width), // ROR
     };
-    if sf {
-        res
-    } else {
-        res & 0xffff_ffff
-    }
+    if sf { res } else { res & 0xffff_ffff }
 }
 
 /// `ExtendReg`: extend `v` per the option field then shift left by
@@ -896,11 +876,7 @@ fn extend_reg(v: u64, option: u32, shift: u32, sf: bool) -> u64 {
         _ => v,                      // SXTX
     };
     let res = extended << shift;
-    if sf {
-        res
-    } else {
-        res & 0xffff_ffff
-    }
+    if sf { res } else { res & 0xffff_ffff }
 }
 
 /// `DecodeBitMasks` (ARM ARM). Returns `(wmask, tmask)`. `immediate` is

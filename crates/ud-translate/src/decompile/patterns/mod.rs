@@ -112,7 +112,7 @@ pub trait Pattern: Sync {
     /// generous here: emit a [`Candidate`] whenever the syntactic
     /// shape fits. Confirmation runs in a second pass.
     fn tentative(&self, ctx: &PatternCtx, insns: &[DecodedInsn], start: usize)
-        -> Option<Candidate>;
+    -> Option<Candidate>;
 
     /// Second-pass confirmation. The default returns `true` (every
     /// tentative match stands). Override to cross-check against the

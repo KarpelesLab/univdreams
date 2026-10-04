@@ -48,7 +48,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use ud_emulator::{Sandbox, WatchMode, DLL_PROCESS_ATTACH};
+use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox, WatchMode};
 
 const IB: u32 = 0x60bd_0000;
 const STACK_BOTTOM: u32 = 0x9000_0000;
@@ -584,7 +584,8 @@ fn mode_tables() {
 }
 
 fn mode_cw(flags: u32) {
-    std::env::set_var("COOK_TRACK", "1");
+    // SAFETY: single-threaded example binary; no other thread reads the env.
+    unsafe { std::env::set_var("COOK_TRACK", "1") };
     let (dll, cookie, pk) = load_inputs();
     let mut c = setup(&dll, &cookie);
     let out = outdir();
@@ -649,7 +650,9 @@ fn mode_cw(flags: u32) {
         pcm_all.len(),
         fnv1a(&pcm_all)
     ));
-    w(format!("x87 control word after RAInitDecoder: {cw_after_init:#06x}; after 144 RADecode: {cw_end:#06x}"));
+    w(format!(
+        "x87 control word after RAInitDecoder: {cw_after_init:#06x}; after 144 RADecode: {cw_end:#06x}"
+    ));
     w(format!(
         "unique EIPs executed in cook.dll .text: {in_text} (of {} visited overall)",
         visited.len()
@@ -763,6 +766,8 @@ fn main() {
             let f = u32::from_str_radix(a.get(2).map(String::as_str).unwrap_or("1f"), 16).unwrap();
             mode_cw(f)
         }
-        _ => eprintln!("usage: cook_r13 pcm <flags-hex> | trace <packet> | tables | xform <packet> | cw <flags-hex>"),
+        _ => eprintln!(
+            "usage: cook_r13 pcm <flags-hex> | trace <packet> | tables | xform <packet> | cw <flags-hex>"
+        ),
     }
 }

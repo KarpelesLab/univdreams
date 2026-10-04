@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use ud_ast::{Item, Module, UdFile, Value};
 use ud_format::elf::{Ehdr64, Elf64File, ElfClass, Phdr64, Shdr64};
 
-use crate::compile::lower::{lower_section_bytes, LowerError};
+use crate::compile::lower::{LowerError, lower_section_bytes};
 use crate::compile::module::resolve_arch_codec;
 
 /// Errors specific to the ELF lower path.
@@ -313,10 +313,10 @@ fn shdr_name(file: &UdFile, idx: usize) -> Result<String, ElfLowerError> {
         });
     };
     for f in fields {
-        if f.name == "name" {
-            if let Value::String(s) = &f.value {
-                return Ok(s.clone());
-            }
+        if f.name == "name"
+            && let Value::String(s) = &f.value
+        {
+            return Ok(s.clone());
         }
     }
     Err(ElfLowerError::MissingField {

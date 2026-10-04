@@ -46,7 +46,7 @@
 
 use std::io::Write;
 
-use ud_emulator::{Bih, Sandbox, WatchMode, DLL_PROCESS_ATTACH};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox, WatchMode};
 
 const ICMODE_DECOMPRESS: u32 = 1;
 

@@ -17,8 +17,8 @@
 
 use std::collections::BTreeMap;
 
-use super::header::{Parsed, IMAGE_DIRECTORY_ENTRY_EXPORT};
 use super::PeError;
+use super::header::{IMAGE_DIRECTORY_ENTRY_EXPORT, Parsed};
 
 /// Parse the export directory from the file bytes (all RVAs are
 /// resolved against the file image; we don't go through the MMU

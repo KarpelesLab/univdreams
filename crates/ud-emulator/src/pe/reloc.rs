@@ -13,8 +13,8 @@
 //!
 //! Other types trip [`super::PeError::BadRelocBlock`].
 
-use super::header::{Parsed, IMAGE_DIRECTORY_ENTRY_BASERELOC};
 use super::PeError;
+use super::header::{IMAGE_DIRECTORY_ENTRY_BASERELOC, Parsed};
 use crate::emulator::mmu::Mmu;
 
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;

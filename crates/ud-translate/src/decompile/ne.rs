@@ -19,7 +19,7 @@
 //!
 //! [`NeFile`]: ud_format::ne::NeFile
 
-use ud_arch_x86::{decode_tolerant, format_intel, Bitness};
+use ud_arch_x86::{Bitness, decode_tolerant, format_intel};
 use ud_ast::{Field, Item, Module, UdFile, Value};
 use ud_format::ne::{NeFile, NeName, NeSegment};
 
@@ -355,7 +355,7 @@ mod tests {
         put_w(&mut ne, 0x22, 0x40); // seg_table_off -> file 0x80
         put_w(&mut ne, 0x32, 4); // align_shift -> 16-byte units
         out.extend_from_slice(&ne); // 0x40..0x80
-                                    // segment table entry (8 bytes) at 0x80
+        // segment table entry (8 bytes) at 0x80
         let seg_code = [0x33u8, 0xc0, 0xc3]; // xor ax,ax ; ret
         let seg_data_off = 0xC0usize;
         let mut seg = vec![0u8; 8];

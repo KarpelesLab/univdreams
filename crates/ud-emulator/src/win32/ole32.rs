@@ -16,10 +16,10 @@
 //! `IClassFactory::CreateInstance(NULL, riid, ppv)` to fulfil
 //! the request; otherwise return `CLASS_E_CLASSNOTAVAILABLE`.
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
 use crate::com::{
-    call::vtable_is_plausible, call_method, Guid, CLASS_E_CLASSNOTAVAILABLE, E_POINTER,
-    SLOT_CLASS_FACTORY_CREATE_INSTANCE,
+    CLASS_E_CLASSNOTAVAILABLE, E_POINTER, Guid, SLOT_CLASS_FACTORY_CREATE_INSTANCE,
+    call::vtable_is_plausible, call_method,
 };
 use crate::emulator::{Cpu, Mmu};
 

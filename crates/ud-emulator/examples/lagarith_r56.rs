@@ -35,7 +35,7 @@
 )]
 
 use ud_emulator::win32::vfw32::{self, Bih};
-use ud_emulator::{Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox};
 
 const MODE_DECODE: u32 = 1;
 const MODE_ENCODE: u32 = 2;

@@ -384,15 +384,15 @@ fn parse_mem_dword(s: &str) -> Option<MemOperand> {
         .trim();
 
     // Base + (optional) displacement.
-    if let Some((base, disp_part)) = split_after_reg(inner) {
-        if let Some(reg) = parse_reg32(base) {
-            let disp = if disp_part.is_empty() {
-                0i64
-            } else {
-                parse_int_literal(disp_part)?
-            };
-            return Some(MemOperand::BasedDisp { base: reg, disp });
-        }
+    if let Some((base, disp_part)) = split_after_reg(inner)
+        && let Some(reg) = parse_reg32(base)
+    {
+        let disp = if disp_part.is_empty() {
+            0i64
+        } else {
+            parse_int_literal(disp_part)?
+        };
+        return Some(MemOperand::BasedDisp { base: reg, disp });
     }
     // Absolute address — just an integer literal between `[` `]`.
     if let Some(addr) = parse_int_literal(inner) {

@@ -55,7 +55,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use ud_emulator::emulator::regs::Reg32;
 use ud_emulator::win32::call_guest;
-use ud_emulator::{Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox};
 
 const VA_ALLOC: u32 = 0x67d1_1620; // cdecl(size) -> zero-filled block (CRT malloc + memset)
 const VA_CORE_CTOR: u32 = 0x67d1_5d30; // thiscall
@@ -489,7 +489,14 @@ fn svq3_qtx_decode_fixture_r8() {
         let recs = r32(&sb, pool + 0xc);
         let pline = format!(
             "  pool: cur={} ref={} [8]={} [0x44]={} [0x48]={} [0x5c]={} [0x60]={} [0x64]={} count={count}",
-            r32(&sb, pool), r32(&sb, pool + 4), r32(&sb, pool + 8), r32(&sb, pool + 0x44), r32(&sb, pool + 0x48), r32(&sb, pool + 0x5c), r32(&sb, pool + 0x60), r32(&sb, pool + 0x64)
+            r32(&sb, pool),
+            r32(&sb, pool + 4),
+            r32(&sb, pool + 8),
+            r32(&sb, pool + 0x44),
+            r32(&sb, pool + 0x48),
+            r32(&sb, pool + 0x5c),
+            r32(&sb, pool + 0x60),
+            r32(&sb, pool + 0x64)
         );
         eprintln!("{pline}");
         writeln!(summary, "{pline}").unwrap();

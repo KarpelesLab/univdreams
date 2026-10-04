@@ -495,8 +495,8 @@ pub struct Aarch64Abi;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emulator::regs::Reg32;
     use crate::emulator::Cpu;
+    use crate::emulator::regs::Reg32;
 
     #[test]
     fn i386_reads_nr_args_and_writes_return() {

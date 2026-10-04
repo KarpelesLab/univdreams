@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ud_format::macho::{is_macho64, MachoFile};
+use ud_format::macho::{MachoFile, is_macho64};
 use ud_translate::compile::{lower_to_macho, parse};
 
 fn workspace_root() -> PathBuf {

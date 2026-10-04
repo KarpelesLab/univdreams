@@ -70,7 +70,7 @@ pub fn build_call_site_names(elf: &Elf64File) -> Result<HashMap<u64, String>, Bp
                 entry: REL_SIZE,
             });
         }
-        for chunk in data.chunks_exact(REL_SIZE) {
+        for chunk in data.as_chunks::<REL_SIZE>().0 {
             let r_offset = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             let r_info = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
             #[allow(clippy::cast_possible_truncation)]

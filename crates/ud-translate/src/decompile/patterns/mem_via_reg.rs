@@ -32,7 +32,7 @@
 //! sees the loaded value — the fold is purely a source-language
 //! abstraction over the byte-level routing.
 
-use ud_arch_x86::{format_intel, DecodedInsn, Mnemonic, OpKind};
+use ud_arch_x86::{DecodedInsn, Mnemonic, OpKind, format_intel};
 use ud_ast::Stmt;
 
 use super::{Candidate, Pattern, PatternCtx};
@@ -98,7 +98,7 @@ impl Pattern for MemViaReg {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use ud_arch_x86::{decode, Bitness};
+    use ud_arch_x86::{Bitness, decode};
 
     fn ctx() -> PatternCtx<'static> {
         let map: &'static HashMap<u64, String> = Box::leak(Box::new(HashMap::new()));

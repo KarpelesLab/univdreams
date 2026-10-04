@@ -27,7 +27,7 @@
 //! Reference: POSIX `pthread.h` —
 //! `https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/pthread.h.html`.
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
 use crate::emulator::{Cpu, Mmu};
 
 /// Register the host-side pthread stubs under

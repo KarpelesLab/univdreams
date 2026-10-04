@@ -54,8 +54,8 @@
 use std::collections::HashMap;
 
 use ud_arch_bpf::{DecodedInsn, InsnKind};
-use ud_ir::ssa::{DefSite, SsaInfo, Var};
 use ud_ir::Function;
+use ud_ir::ssa::{DefSite, SsaInfo, Var};
 
 use super::data_lookup::DataLookup;
 
@@ -195,10 +195,10 @@ fn resolve_insn(
     match insn.kind {
         InsnKind::Lddw => {
             let imm = insn.imm64?;
-            if let Some(d) = data {
-                if let Some(s) = super::bpf::read_inline_string(d, imm) {
-                    return Some(s);
-                }
+            if let Some(d) = data
+                && let Some(s) = super::bpf::read_inline_string(d, imm)
+            {
+                return Some(s);
             }
             Some(format!("0x{imm:x}"))
         }
@@ -312,7 +312,7 @@ pub fn index_by_addr(f: &Function<DecodedInsn>) -> HashMap<u64, &DecodedInsn> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ud_arch_bpf::{decode, BpfVariant};
+    use ud_arch_bpf::{BpfVariant, decode};
     use ud_core::VAddr;
     use ud_ir::{BasicBlock, Terminator};
 

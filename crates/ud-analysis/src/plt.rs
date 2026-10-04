@@ -103,15 +103,15 @@ fn scan_plt_section(
     let mut offset = if skip_first { entry_size } else { 0 };
     while offset + 6 <= data.len() {
         let entry_addr = base_addr.saturating_add(offset as u64);
-        if let Some(slot_addr) = decode_plt_entry_target(data, offset, entry_addr) {
-            if let Some(name) = slot_to_name.get(&slot_addr) {
-                out.push(Function {
-                    addr: VAddr(entry_addr),
-                    size: entry_size as u64,
-                    name: name.clone(),
-                    sources: vec![FunctionSource::Plt],
-                });
-            }
+        if let Some(slot_addr) = decode_plt_entry_target(data, offset, entry_addr)
+            && let Some(name) = slot_to_name.get(&slot_addr)
+        {
+            out.push(Function {
+                addr: VAddr(entry_addr),
+                size: entry_size as u64,
+                name: name.clone(),
+                sources: vec![FunctionSource::Plt],
+            });
         }
         offset += entry_size;
     }
@@ -189,7 +189,7 @@ fn build_jump_slot_name_map(elf: &Elf64File) -> Result<Option<HashMap<u64, Strin
                 entry: RELA_SIZE,
             });
         }
-        for chunk in data.chunks_exact(RELA_SIZE) {
+        for chunk in data.as_chunks::<RELA_SIZE>().0 {
             let r_offset = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             let r_info = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
             #[allow(clippy::cast_possible_truncation)]

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use ud_arch_aarch64::{format_text, DecodedInsn, InsnKind};
+use ud_arch_aarch64::{DecodedInsn, InsnKind, format_text};
 use ud_ast::{FnDecl, Stmt};
 use ud_ir::Function;
 

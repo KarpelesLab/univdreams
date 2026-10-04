@@ -45,7 +45,7 @@
 mod common;
 
 use std::path::PathBuf;
-use ud_emulator::{Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

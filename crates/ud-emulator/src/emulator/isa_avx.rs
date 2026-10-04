@@ -33,11 +33,11 @@
 //! Developer's Manual, Volume 2A §2.3 (VEX prefix) and
 //! Volume 2C (per-instruction pages).
 
-use super::decode::{resolve_modrm32, Operand};
+use super::Trap;
+use super::decode::{Operand, resolve_modrm32};
 use super::isa_int::{Cpu, StepOk};
 use super::mmu::Mmu;
 use super::regs::Reg32;
-use super::Trap;
 
 /// Decoded VEX prefix — the architecturally-meaningful fields
 /// after both forms collapse onto a common shape.
@@ -674,11 +674,7 @@ fn simd_op_apply(op: SimdOp, src1: u128, src2: u128) -> u128 {
             let a = lanes_u8(src1);
             let b = lanes_u8(src2);
             from_lanes_u8(core::array::from_fn(|i| {
-                if (a[i] as i8) > (b[i] as i8) {
-                    0xFF
-                } else {
-                    0
-                }
+                if (a[i] as i8) > (b[i] as i8) { 0xFF } else { 0 }
             }))
         }
         SimdOp::CmpGtW => {
@@ -1303,7 +1299,7 @@ fn vex_group14_xmm(cpu: &mut Cpu, mmu: &Mmu, vex: &Vex) -> Result<StepOk, Trap> 
             return Err(Trap::UndefinedOpcode {
                 eip: 0,
                 opcode: 0x73_0000 | u32::from(sub),
-            })
+            });
         }
     };
     cpu.xmm[dst] = result;
@@ -1336,7 +1332,7 @@ fn vex_group14_ymm(cpu: &mut Cpu, mmu: &Mmu, vex: &Vex) -> Result<StepOk, Trap> 
             return Err(Trap::UndefinedOpcode {
                 eip: 0,
                 opcode: 0x73_0000 | u32::from(sub),
-            })
+            });
         }
     };
     cpu.xmm[dst] = low;
@@ -1475,7 +1471,7 @@ fn vbroadcasti128(cpu: &mut Cpu, mmu: &Mmu) -> Result<StepOk, Trap> {
             return Err(Trap::UndefinedOpcode {
                 eip: cpu.regs.eip.wrapping_sub(consumed as u32 + 3),
                 opcode: 0x0F38_5A_00,
-            })
+            });
         }
     };
     let dst = (mr.reg & 0x7) as usize;

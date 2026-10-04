@@ -2,8 +2,8 @@
 //!
 //! Reference: PE/COFF spec §"Section Table" + §"Section Flags".
 
-use super::header::{Parsed, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE};
 use super::PeError;
+use super::header::{IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, Parsed};
 use crate::emulator::mmu::{Mmu, Perm};
 
 /// Loaded-section descriptor — the union of the file header's

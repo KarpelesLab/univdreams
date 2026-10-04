@@ -75,7 +75,7 @@ fn build_version_block() -> [u8; VERSION_BLOCK_SIZE as usize] {
     buf
 }
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
 use crate::emulator::{Cpu, Mmu};
 
 /// Register every version.dll stub.

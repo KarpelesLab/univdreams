@@ -818,7 +818,7 @@ mod tests {
         let mut mmu = Mmu::new();
         mmu.map(0x1000, PAGE_SIZE as u32, Perm::R | Perm::W);
         mmu.map(0x2000, PAGE_SIZE as u32, Perm::R); // RO follower
-                                                    // dword straddles the page boundary at 0x2000
+        // dword straddles the page boundary at 0x2000
         match mmu.store32(0x1FFE, 0x1122_3344) {
             Err(Trap::WriteProtectFault { addr }) => {
                 assert!(addr == 0x2000 || addr == 0x2001);

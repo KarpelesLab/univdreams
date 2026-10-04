@@ -44,7 +44,7 @@ fn build_elf(code: &[u8], data: &[u8]) -> Vec<u8> {
     e.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
     e.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
     e.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
-                                              // --- program header (PT_LOAD, whole file, R+X) ---
+    // --- program header (PT_LOAD, whole file, R+X) ---
     e.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
     e.extend_from_slice(&0u32.to_le_bytes()); // p_offset
     e.extend_from_slice(&LOAD.to_le_bytes()); // p_vaddr
@@ -53,7 +53,7 @@ fn build_elf(code: &[u8], data: &[u8]) -> Vec<u8> {
     e.extend_from_slice(&filesz.to_le_bytes()); // p_memsz
     e.extend_from_slice(&5u32.to_le_bytes()); // p_flags = R|X
     e.extend_from_slice(&0x1000u32.to_le_bytes()); // p_align
-                                                   // --- code + data ---
+    // --- code + data ---
     e.extend_from_slice(code);
     e.extend_from_slice(data);
     e
@@ -87,7 +87,7 @@ fn build_elf64(machine: u16, code: &[u8], data: &[u8]) -> Vec<u8> {
     e.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
     e.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
     e.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
-                                              // --- program header (PT_LOAD, whole file, R+X) ---
+    // --- program header (PT_LOAD, whole file, R+X) ---
     e.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
     e.extend_from_slice(&5u32.to_le_bytes()); // p_flags = R|X (ELF64: flags here)
     e.extend_from_slice(&0u64.to_le_bytes()); // p_offset
@@ -96,7 +96,7 @@ fn build_elf64(machine: u16, code: &[u8], data: &[u8]) -> Vec<u8> {
     e.extend_from_slice(&filesz.to_le_bytes()); // p_filesz
     e.extend_from_slice(&filesz.to_le_bytes()); // p_memsz
     e.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
-                                                   // --- code + data ---
+    // --- code + data ---
     e.extend_from_slice(code);
     e.extend_from_slice(data);
     e
@@ -197,7 +197,7 @@ fn static_aarch64_adrp_add_write() {
     let immlo = (imm as u32) & 0x3;
     let immhi = ((imm as u32) >> 2) & 0x7ffff;
     let adrp = 0x9000_0000 | (immlo << 29) | (immhi << 5) | 1; // Rd = x1
-                                                               // add x1, x1, #(msg_addr & 0xfff)
+    // add x1, x1, #(msg_addr & 0xfff)
     let add = 0x9100_0000 | (((msg_addr as u32) & 0xfff) << 10) | (1 << 5) | 1;
 
     let words: [u32; 9] = [

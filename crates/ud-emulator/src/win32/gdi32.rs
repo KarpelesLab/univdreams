@@ -10,7 +10,7 @@
 //! Reference: MSDN `gdi32` page-by-page; cited inline next to
 //! each stub.
 
-use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use super::{HostState, Registry, StubFn, Win32Error, arg_dword};
 use crate::emulator::{Cpu, Mmu};
 use std::collections::BTreeSet;
 

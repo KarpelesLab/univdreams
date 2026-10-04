@@ -154,11 +154,11 @@ fn emit_fn_indented(out: &mut String, f: &FnDecl, depth: usize) {
         emit_params(out, &sig.params);
     }
     write!(out, ")").unwrap();
-    if let Some(sig) = &f.signature {
-        if !matches!(sig.return_type, Type::Void) {
-            write!(out, " -> ").unwrap();
-            emit_type(out, &sig.return_type);
-        }
+    if let Some(sig) = &f.signature
+        && !matches!(sig.return_type, Type::Void)
+    {
+        write!(out, " -> ").unwrap();
+        emit_type(out, &sig.return_type);
     }
     if !f.attrs.is_empty() {
         let before = out.len();

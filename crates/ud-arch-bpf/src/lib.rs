@@ -41,9 +41,9 @@ use ud_ir::{ArchInsn, BasicBlock, Function, Terminator};
 mod assemble;
 mod codec;
 pub use assemble::{
-    assemble_bpf, assemble_bpf_ifblock_cond, assemble_bpf_ja, desymbolize_bpf_text, AssembleError,
+    AssembleError, assemble_bpf, assemble_bpf_ifblock_cond, assemble_bpf_ja, desymbolize_bpf_text,
 };
-pub use codec::{register, BpfCodec, EM_BPF, EM_SBF};
+pub use codec::{BpfCodec, EM_BPF, EM_SBF, register};
 
 /// On-disk size of one BPF instruction slot.
 pub const INSN_SIZE: usize = 8;
@@ -167,7 +167,7 @@ impl ArchInsn for DecodedInsn {
 /// 64-bit immediate, plus a `LddwSecondHalf` continuation —
 /// so each output `DecodedInsn` still has exactly 8 bytes.
 pub fn decode(bytes: &[u8], start: u64, variant: BpfVariant) -> Result<Vec<DecodedInsn>> {
-    if bytes.len() % INSN_SIZE != 0 {
+    if !bytes.len().is_multiple_of(INSN_SIZE) {
         return Err(Error::Misaligned { len: bytes.len() });
     }
     let mut out = Vec::with_capacity(bytes.len() / INSN_SIZE);

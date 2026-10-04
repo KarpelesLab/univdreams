@@ -18,7 +18,7 @@ pub mod gui;
 use std::collections::BTreeMap;
 
 use crate::emulator::mmu::Perm;
-use crate::emulator::regs::{Reg16, Reg8};
+use crate::emulator::regs::{Reg8, Reg16};
 use crate::emulator::{Cpu, Mmu};
 use crate::win32::{HostState, Registry, Win32Error};
 

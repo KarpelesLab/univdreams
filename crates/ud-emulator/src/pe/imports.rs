@@ -11,8 +11,8 @@
 //! load attempt) and writes the registry's thunk address into
 //! the corresponding IAT slot.
 
-use super::header::{Parsed, IMAGE_DIRECTORY_ENTRY_IMPORT};
 use super::PeError;
+use super::header::{IMAGE_DIRECTORY_ENTRY_IMPORT, Parsed};
 use crate::emulator::mmu::Mmu;
 use crate::win32::Registry;
 

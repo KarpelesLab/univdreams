@@ -19,7 +19,7 @@
 //! Reference: MSDN `msi.h`.
 
 use super::{
-    arg_dword, read_cstr_local, trap_to_win32_local, HostState, Registry, StubFn, Win32Error,
+    HostState, Registry, StubFn, Win32Error, arg_dword, read_cstr_local, trap_to_win32_local,
 };
 use crate::emulator::{Cpu, Mmu};
 

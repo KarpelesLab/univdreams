@@ -132,9 +132,7 @@ pub enum Error {
     #[error("unsupported cputype {0:#x}: v1 covers x86-64 (0x01000007) and arm64 (0x0100000c)")]
     UnsupportedCpu(u32),
 
-    #[error(
-        "load command at offset {offset}: declared cmdsize {cmdsize} is too small (minimum 8)"
-    )]
+    #[error("load command at offset {offset}: declared cmdsize {cmdsize} is too small (minimum 8)")]
     BadLoadCmdSize { offset: u64, cmdsize: u32 },
 
     #[error("load-command table runs past sizeofcmds: cursor {cursor}, end {end}")]
@@ -517,11 +515,12 @@ impl MachoFile {
                 .commands
                 .get(cmd_idx)
                 .and_then(|c| Segment64::parse(cmd_idx, c));
-            if let Some(seg) = seg {
-                if seg.filesize > 0 && !data.is_empty() {
-                    let off = seg.fileoff as usize;
-                    out[off..off + data.len()].copy_from_slice(data);
-                }
+            if let Some(seg) = seg
+                && seg.filesize > 0
+                && !data.is_empty()
+            {
+                let off = seg.fileoff as usize;
+                out[off..off + data.len()].copy_from_slice(data);
             }
         }
 

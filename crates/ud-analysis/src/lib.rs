@@ -29,12 +29,12 @@ mod plt;
 mod signatures;
 mod symbols;
 
-pub use call_sites::{discover_from_bpf_call_sites, CallSiteError};
-pub use eh_frame::{discover_from_eh_frame, EhFrameError};
+pub use call_sites::{CallSiteError, discover_from_bpf_call_sites};
+pub use eh_frame::{EhFrameError, discover_from_eh_frame};
 pub use function_map::{Function, FunctionMap, FunctionSource};
-pub use plt::{discover_plt_thunks, PltError};
+pub use plt::{PltError, discover_plt_thunks};
 pub use signatures::discover_from_signatures;
-pub use symbols::{discover_from_symbol_tables, SymbolError};
+pub use symbols::{SymbolError, discover_from_symbol_tables};
 
 use ud_core::VAddr;
 use ud_format::elf::Elf64File;

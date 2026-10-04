@@ -34,7 +34,7 @@
 
 pub mod registry;
 
-pub use registry::{for_arch, register, CodecFactory};
+pub use registry::{CodecFactory, for_arch, register};
 
 /// Errors raised by [`ArchCodec`] implementations.
 ///

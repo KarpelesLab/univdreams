@@ -33,7 +33,7 @@
 #![allow(unsafe_code)]
 
 use kvm_bindings::{
-    kvm_msr_entry, kvm_segment, kvm_userspace_memory_region, Msrs, KVM_MEM_LOG_DIRTY_PAGES,
+    KVM_MEM_LOG_DIRTY_PAGES, Msrs, kvm_msr_entry, kvm_segment, kvm_userspace_memory_region,
 };
 use kvm_ioctls::{Kvm, VcpuExit};
 

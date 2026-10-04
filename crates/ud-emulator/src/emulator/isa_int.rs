@@ -18,13 +18,13 @@
 //! reference), Volume 1 §3 (basic execution environment), Volume
 //! 1 Appendix B (EFLAGS Cross-Reference).
 
+use super::Trap;
 use super::decode::{
-    read_operand16, read_operand32, resolve_modrm16, resolve_modrm32, sign_ext_8_to_16,
-    sign_ext_8_to_32, write_operand16, write_operand32, ModRm, Operand,
+    ModRm, Operand, read_operand16, read_operand32, resolve_modrm16, resolve_modrm32,
+    sign_ext_8_to_16, sign_ext_8_to_32, write_operand16, write_operand32,
 };
 use super::mmu::Mmu;
-use super::regs::{Flags, Reg16, Reg32, Reg8, Regs};
-use super::Trap;
+use super::regs::{Flags, Reg8, Reg16, Reg32, Regs};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Sentinel return address pushed by host-initiated calls. When
@@ -2957,11 +2957,7 @@ impl Cpu {
             7 => {
                 let signed = val as i32;
                 let r = if count >= 32 {
-                    if signed < 0 {
-                        -1i32 as u32
-                    } else {
-                        0
-                    }
+                    if signed < 0 { -1i32 as u32 } else { 0 }
                 } else {
                     (signed >> count) as u32
                 };
@@ -3027,7 +3023,7 @@ impl Cpu {
                 return Err(Trap::UndefinedOpcode {
                     eip: self.regs.eip,
                     opcode: 0xC100 | u32::from(other),
-                })
+                });
             }
         };
         write_operand32(op, result, &mut self.regs, mmu)?;
@@ -3075,11 +3071,7 @@ impl Cpu {
             7 => {
                 let signed = val as i16 as i32;
                 let r = if count >= 16 {
-                    if signed < 0 {
-                        0xFFFFu16
-                    } else {
-                        0u16
-                    }
+                    if signed < 0 { 0xFFFFu16 } else { 0u16 }
                 } else {
                     (signed >> count) as u16
                 };
@@ -3384,11 +3376,7 @@ impl Cpu {
             7 => {
                 let signed = val as i8 as i32;
                 let r = if count >= 8 {
-                    if signed < 0 {
-                        0xFFu8
-                    } else {
-                        0u8
-                    }
+                    if signed < 0 { 0xFFu8 } else { 0u8 }
                 } else {
                     (signed >> count) as u8
                 };
@@ -3824,11 +3812,7 @@ impl Cpu {
             StringSize::W16 => 2,
             StringSize::D32 => 4,
         };
-        if self.regs.flags.df {
-            -inc
-        } else {
-            inc
-        }
+        if self.regs.flags.df { -inc } else { inc }
     }
 
     /// Common REP/REPE/REPNE wrapper. `compare` selects the
@@ -3899,7 +3883,7 @@ impl Cpu {
                 return Err(Trap::PrivilegedOpcode {
                     eip: entry_eip,
                     mnemonic: "far call/jmp m",
-                })
+                });
             }
             4 => {
                 // JMP r/m32 (near, absolute)
@@ -3913,7 +3897,7 @@ impl Cpu {
                 return Err(Trap::UndefinedOpcode {
                     eip: entry_eip,
                     opcode: 0xFF00 | u32::from(mr.reg),
-                })
+                });
             }
         }
         Ok(StepOk::Continued)
@@ -3995,7 +3979,7 @@ impl Cpu {
                 return Err(Trap::UndefinedOpcode {
                     eip: entry_eip,
                     opcode: 0xFF00 | u32::from(mr.reg),
-                })
+                });
             }
         }
         Ok(StepOk::Continued)

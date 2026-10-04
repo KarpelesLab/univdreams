@@ -7,7 +7,7 @@
 //! this test pins the API shape so consumers can build
 //! against it today.
 
-use ud_emulator::{FileAccess, RegistryValue, Sandbox, VirtualFs, VirtualRegistry, HKLM};
+use ud_emulator::{FileAccess, HKLM, RegistryValue, Sandbox, VirtualFs, VirtualRegistry};
 
 #[test]
 fn default_sandbox_has_empty_context() {

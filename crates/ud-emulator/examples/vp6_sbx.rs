@@ -31,7 +31,7 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use ud_emulator::{Bih, Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox};
 
 const ICMODE_DECOMPRESS: u32 = 2;
 

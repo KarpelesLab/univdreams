@@ -19,11 +19,11 @@
 
 use std::collections::HashMap;
 
-use ud_arch_x86::{lift_function, Bitness};
+use ud_arch_x86::{Bitness, lift_function};
 use ud_ast::{Field, Item, Module, UdFile, Value};
 use ud_format::pe::{
-    CoffSymbol, PeExport, PeFile, PeKind, COFF_SYM_CLASS_EXTERNAL, COFF_SYM_CLASS_STATIC,
-    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386,
+    COFF_SYM_CLASS_EXTERNAL, COFF_SYM_CLASS_STATIC, CoffSymbol, IMAGE_FILE_MACHINE_AMD64,
+    IMAGE_FILE_MACHINE_I386, PeExport, PeFile, PeKind,
 };
 
 use crate::decompile::build_function;
@@ -395,10 +395,11 @@ fn rva_to_section(pe: &PeFile, rva: u32) -> Option<(usize, u32)> {
     for (idx, sh) in pe.sections.iter().enumerate() {
         let start = sh.virtual_address;
         let size = sh.virtual_size.max(sh.size_of_raw_data);
-        if let Some(end) = start.checked_add(size) {
-            if rva >= start && rva < end {
-                return Some((idx, rva - start));
-            }
+        if let Some(end) = start.checked_add(size)
+            && rva >= start
+            && rva < end
+        {
+            return Some((idx, rva - start));
         }
     }
     None
@@ -605,13 +606,12 @@ fn emit_section_with_function_split(
         // Falls back to a per-function `@raw` block on hard
         // failures (zero decoded bytes, unsupported machine type,
         // CFG construction failure).
-        if let Some(bn) = bitness {
-            if let Some(emitted) =
+        if let Some(bn) = bitness
+            && let Some(emitted) =
                 lift_pe_function(pe, &f.name, lo as u64, f.rva, bn, func_bytes, &name_at)
-            {
-                items.extend(emitted);
-                continue;
-            }
+        {
+            items.extend(emitted);
+            continue;
         }
         let section_name = pe.section_name(sec_idx).unwrap_or_default();
         items.push(Item::Comment(format!(

@@ -16,7 +16,7 @@
 //! input (`adc`, `sbb`) are also omitted; their semantic depends
 //! on carry, which a pure "dst = dst + src" rendering would hide.
 
-use ud_arch_x86::{format_intel, DecodedInsn, Mnemonic};
+use ud_arch_x86::{DecodedInsn, Mnemonic, format_intel};
 use ud_ast::Stmt;
 
 use super::{Candidate, Pattern, PatternCtx};

@@ -35,8 +35,8 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use ud_emulator::emulator::{Cpu, Mmu};
-use ud_emulator::win32::{arg_dword, read_cstr_local, HostState, Registry, Win32Error};
-use ud_emulator::{Bih, Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::win32::{HostState, Registry, Win32Error, arg_dword, read_cstr_local};
+use ud_emulator::{Bih, DLL_PROCESS_ATTACH, Sandbox};
 
 const ICMODE_COMPRESS: u32 = 1;
 const ICMODE_DECOMPRESS: u32 = 2;

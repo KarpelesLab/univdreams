@@ -251,12 +251,13 @@ fn memory_var(i: &Instruction, sp: Option<i64>) -> Var {
     // ESP-relative with a known SP delta — map to EBP-style
     // by adding the delta. Approximate; full alias analysis
     // would refine this.
-    if (base == Register::ESP || base == Register::RSP) && !has_index {
-        if let Some(delta) = sp {
-            #[allow(clippy::cast_possible_wrap)]
-            let disp = i.memory_displacement64() as i64;
-            return Var::Stack(disp.wrapping_add(delta));
-        }
+    if (base == Register::ESP || base == Register::RSP)
+        && !has_index
+        && let Some(delta) = sp
+    {
+        #[allow(clippy::cast_possible_wrap)]
+        let disp = i.memory_displacement64() as i64;
+        return Var::Stack(disp.wrapping_add(delta));
     }
     Var::Memory
 }
@@ -265,7 +266,7 @@ fn memory_var(i: &Instruction, sp: Option<i64>) -> Var {
 mod tests {
     use super::*;
     use ud_arch_x86::lift_function;
-    use ud_arch_x86::{decode, Bitness};
+    use ud_arch_x86::{Bitness, decode};
 
     fn lift(bytes: &[u8]) -> Function<DecodedInsn> {
         let insns = decode(Bitness::Bits32, bytes, 0x1000).unwrap();

@@ -47,7 +47,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use ud_emulator::emulator::regs::Reg32;
 use ud_emulator::win32::call_guest;
-use ud_emulator::{Sandbox, DLL_PROCESS_ATTACH};
+use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox};
 
 const VA_ALLOC: u32 = 0x67d1_1620;
 const VA_CORE_CTOR: u32 = 0x67d1_5d30;

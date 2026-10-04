@@ -12,9 +12,9 @@
 //! and SIB encodings, and the small set of operand-fetch
 //! primitives the executor needs.
 
+use super::Trap;
 use super::mmu::Mmu;
 use super::regs::{Reg16, Reg32, Regs};
-use super::Trap;
 
 /// Decoded ModR/M byte.
 #[derive(Copy, Clone, Debug)]

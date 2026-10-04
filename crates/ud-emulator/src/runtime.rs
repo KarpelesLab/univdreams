@@ -9,11 +9,11 @@
 //! the `vfw32` host stubs use to invoke the codec's `DriverProc`
 //! synchronously.
 
-use crate::emulator::{mmu::Perm, Cpu, Mmu};
+use crate::emulator::{Cpu, Mmu, mmu::Perm};
 use crate::pe::{Image, Loader};
 use crate::win32::{
-    call_guest, run_until_sentinel as run_until_sentinel_free, vfw32, HostState, Registry,
-    DATA_IMPORT_BASE,
+    DATA_IMPORT_BASE, HostState, Registry, call_guest,
+    run_until_sentinel as run_until_sentinel_free, vfw32,
 };
 
 /// `DllMain` reason code: process is loading the DLL.
@@ -517,9 +517,9 @@ impl Sandbox {
         // that only consult these for diagnostic logging.
         mmu.map(0x7F00_0000, 0x00FC_0000, Perm::R | Perm::W); // 0x7F00_0000..0x7FFC_0000
         mmu.map(0x7FFD_F000, 0x0002_1000, Perm::R | Perm::W); // 0x7FFD_F000..0x8000_0000
-                                                              // Child-process heap pool (R+W+X). Each `CreateProcessA`
-                                                              // carves a 16 MiB heap arena from this region for the
-                                                              // spawned child.
+        // Child-process heap pool (R+W+X). Each `CreateProcessA`
+        // carves a 16 MiB heap arena from this region for the
+        // spawned child.
         mmu.map(
             CHILD_HEAP_POOL_START,
             CHILD_HEAP_POOL_SIZE,
@@ -790,8 +790,8 @@ impl Sandbox {
         &mut self,
         vfs: &mut crate::fsmount::MountTable,
     ) -> Result<i32, crate::Error> {
-        use crate::emulator::isa_int::StepOk;
         use crate::emulator::Trap;
+        use crate::emulator::isa_int::StepOk;
         let abi = crate::linux::abi::I386Abi;
         let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
         loop {
@@ -1131,8 +1131,8 @@ impl Sandbox {
         budget: u64,
         next_pid: &mut i32,
     ) -> i32 {
-        use crate::emulator::isa_int::StepOk;
         use crate::emulator::Trap;
+        use crate::emulator::isa_int::StepOk;
         use crate::linux::abi::{Amd64Abi, LinuxAbi, Sysno};
         const CLONE_SETTLS: u64 = 0x0008_0000;
         const CLONE_THREAD: u64 = 0x0001_0000;
@@ -1225,8 +1225,8 @@ impl Sandbox {
         &mut self,
         vfs: &mut crate::fsmount::MountTable,
     ) -> Result<i32, crate::Error> {
-        use crate::emulator::isa_int::StepOk;
         use crate::emulator::Trap;
+        use crate::emulator::isa_int::StepOk;
         let abi = crate::linux::abi::Aarch64Abi;
         let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
         let Some(cpu) = self.aarch64.as_mut() else {
@@ -2018,7 +2018,7 @@ impl Sandbox {
     /// [`crate::emulator::Trap::UnresolvedImport`] that marks the first
     /// unimplemented Win16 API).
     pub fn call_ne_entry(&mut self, image: &crate::ne::NeImage) -> Result<u32, crate::Error> {
-        use crate::emulator::isa_int::{Seg, RET_SENTINEL};
+        use crate::emulator::isa_int::{RET_SENTINEL, Seg};
         use crate::emulator::regs::Reg32;
 
         // Enter 16-bit segmented mode and install the selector table.

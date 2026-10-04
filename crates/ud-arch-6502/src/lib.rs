@@ -18,7 +18,7 @@ use ud_ir::ArchInsn;
 mod codec;
 mod table;
 
-pub use codec::{register, M6502Codec};
+pub use codec::{M6502Codec, register};
 pub use table::{AddressingMode, Mnemonic, OpInfo};
 
 /// One decoded 6502 instruction.
@@ -53,7 +53,9 @@ impl ArchInsn for DecodedInsn {
 /// Errors returned by the 6502 decoder.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("truncated instruction at offset {offset}: opcode {opcode:#04x} needs {needs} operand byte(s), only {have} available")]
+    #[error(
+        "truncated instruction at offset {offset}: opcode {opcode:#04x} needs {needs} operand byte(s), only {have} available"
+    )]
     Truncated {
         offset: usize,
         opcode: u8,
