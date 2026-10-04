@@ -28,6 +28,14 @@ release_always = false
 # canonical release marker.
 publish_no_verify = false
 
+# The published ud-emulator 0.3.0 can't be built with all features (its
+# optional `fstool` dep predates fstool 0.4.35's opt-in filesystem
+# backends), and cargo-semver-checks builds the baseline that way. Drop
+# this once a release after 0.3.0 is on crates.io.
+[[package]]
+name = "ud-emulator"
+semver_check = false
+
 [changelog]
 # Keep-a-changelog-flavored sections; conventional-commit prefixes
 # map to the standard groups.
