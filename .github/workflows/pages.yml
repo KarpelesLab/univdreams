@@ -16,10 +16,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pin wasm-bindgen-cli to the same version the workspace resolves
-  # so the JS glue matches the runtime exactly. Bump in lockstep
-  # when ud-wasm's Cargo.lock entry changes.
-  WASM_BINDGEN_VERSION: "0.2.122"
 
 jobs:
   build:
@@ -38,11 +34,18 @@ jobs:
         with:
           key: pages-wasm
 
-      - name: Install wasm-bindgen-cli
-        run: cargo install --locked wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}"
-
       - name: Build ud-wasm
         run: cargo build --release --target wasm32-unknown-unknown -p ud-wasm
+
+      # wasm-bindgen-cli must match the `wasm-bindgen` crate version exactly.
+      # Cargo.lock isn't committed, so read the version the build resolved
+      # instead of pinning one that drifts.
+      - name: Install wasm-bindgen-cli
+        run: |
+          v=$(cargo metadata --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          echo "wasm-bindgen ${v}"
+          cargo install --locked wasm-bindgen-cli --version "${v}"
 
       - name: Generate JS bindings
         run: |
