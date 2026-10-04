@@ -87,12 +87,266 @@ const CHILD_HEAP_POOL_START: u32 = 0xA000_0000;
 const CHILD_HEAP_POOL_SIZE: u32 = 0x1000_0000; // 256 MiB → 16 children
 const CHILD_HEAP_POOL_END: u32 = CHILD_HEAP_POOL_START + CHILD_HEAP_POOL_SIZE;
 
+/// A guest thread under the amd64 Linux scheduler: its own [`Cpu`] (register
+/// file + `%fs` TLS base) over the process-shared [`Mmu`].
+struct AmdThread {
+    cpu: Cpu,
+    tid: i32,
+    /// `Some(addr)` while parked in `FUTEX_WAIT` on `addr`.
+    blocked_on: Option<u32>,
+    /// `CLONE_CHILD_CLEARTID` address: on thread exit, zero it and futex-wake
+    /// (this is what `pthread_join` waits on). `0` if unset.
+    clear_child_tid: u32,
+    exited: bool,
+    /// True for a child **process** (clone without `CLONE_THREAD`, or
+    /// `fork`/`vfork`) — these are reapable by `wait4`. False for a sibling
+    /// thread of the same process (`pthread_create`).
+    is_process: bool,
+    /// `Some((pid, status_ptr))` while parked in `wait4` for a child to exit
+    /// (`pid == -1` waits for any child).
+    waiting: Option<(i32, u32)>,
+}
+
+/// Wake up to `n` threads parked in `FUTEX_WAIT` on `addr`; returns the count.
+fn wake_futex(threads: &mut [AmdThread], addr: u32, n: i32) -> i32 {
+    let mut woke = 0;
+    for t in threads.iter_mut() {
+        if woke >= n {
+            break;
+        }
+        if t.blocked_on == Some(addr) {
+            t.blocked_on = None;
+            woke += 1;
+        }
+    }
+    woke
+}
+
+/// Format a normal-exit `wait4` status word: `(code & 0xff) << 8`.
+fn exit_status(code: i32) -> i32 {
+    (code & 0xff) << 8
+}
+
+/// Does the thread at `widx` have any child it could still wait on (a live
+/// child process or an unreaped zombie)?
+fn has_child(threads: &[AmdThread], widx: usize) -> bool {
+    threads
+        .iter()
+        .enumerate()
+        .any(|(i, t)| i != widx && t.is_process && !t.exited)
+}
+
+/// Try to satisfy the `wait4` parked on thread `widx` from `zombies`. On a
+/// match: write the status word, set the waiter's `rax` to the child tid, clear
+/// its `waiting`, and return true.
+fn reap_one(
+    threads: &mut [AmdThread],
+    zombies: &mut Vec<(i32, i32)>,
+    mmu: &mut crate::emulator::Mmu,
+    widx: usize,
+) -> bool {
+    let Some((want, status_ptr)) = threads[widx].waiting else {
+        return false;
+    };
+    let Some(pos) = zombies
+        .iter()
+        .position(|(tid, _)| want == -1 || want == *tid)
+    else {
+        return false;
+    };
+    let (tid, status) = zombies.remove(pos);
+    if status_ptr != 0 {
+        let _ = mmu.store32(status_ptr, status as u32);
+    }
+    threads[widx].cpu.regs.gp64[0] = tid as u64; // rax = reaped child tid
+    threads[widx].waiting = None;
+    true
+}
+
+/// Re-check every parked `wait4` against the zombie list (called after a child
+/// exits), reaping as many as match.
+fn reap_waiters(
+    threads: &mut [AmdThread],
+    zombies: &mut Vec<(i32, i32)>,
+    mmu: &mut crate::emulator::Mmu,
+) {
+    loop {
+        let mut progressed = false;
+        for i in 0..threads.len() {
+            if threads[i].waiting.is_some() && reap_one(threads, zombies, mmu, i) {
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
+/// Read a NUL-terminated C string from guest memory (for `execve`'s path arg).
+fn read_cstr_guest(mmu: &crate::emulator::Mmu, addr: u32) -> Option<String> {
+    let mut out = Vec::new();
+    for i in 0..4096u32 {
+        match mmu.load8(addr.wrapping_add(i)) {
+            Ok(0) => return Some(String::from_utf8_lossy(&out).into_owned()),
+            Ok(b) => out.push(b),
+            Err(_) => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Run `path argv…` to completion in a **fresh** [`Sandbox`] (its own address
+/// space), sharing the same root filesystem (`vfs` is moved in and back).
+/// Handles one level of `#!` shebang. Returns `(exit_code, stdout, stderr)`, or
+/// `None` if the program can't be read / loaded (the caller's `execve` then
+/// fails with `ENOENT`).
+pub(crate) fn exec_nested(
+    vfs: &mut crate::fsmount::MountTable,
+    path: &str,
+    argv: &[String],
+    envp: &[String],
+    budget: u64,
+) -> Option<(i32, Vec<u8>, Vec<u8>)> {
+    let bytes = vfs.read_file(path)?;
+
+    // Shebang: re-exec the named interpreter with the script as its argument.
+    if bytes.starts_with(b"#!") {
+        let line_end = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len());
+        let line = String::from_utf8_lossy(&bytes[2..line_end]);
+        let mut parts = line.split_whitespace();
+        let interp = parts.next()?.to_string();
+        let interp_arg = parts.next().map(ToString::to_string);
+        let mut new_argv = vec![interp.clone()];
+        if let Some(a) = interp_arg {
+            new_argv.push(a);
+        }
+        new_argv.push(path.to_string());
+        new_argv.extend(argv.iter().skip(1).cloned());
+        return exec_nested(vfs, &interp, &new_argv, envp, budget);
+    }
+
+    if !crate::linux::loader::is_runnable(&bytes) {
+        return None;
+    }
+
+    let mut child = Sandbox::new_linux();
+    child.host.instruction_budget = Some(budget);
+    child.linux_default_mounts = false;
+    let name = argv.first().cloned().unwrap_or_else(|| path.to_string());
+    child.linux_argv = argv.iter().skip(1).cloned().collect();
+    child.linux_env = envp.to_vec();
+    child.host.context.vfs = Some(std::mem::replace(vfs, crate::fsmount::MountTable::new()));
+    let code = match child.load_linux_elf(&name, &bytes) {
+        Ok(_) => child.run_linux().unwrap_or(-1),
+        Err(_) => 127,
+    };
+    *vfs = child
+        .host
+        .context
+        .vfs
+        .take()
+        .unwrap_or_else(crate::fsmount::MountTable::new);
+    Some((code, child.linux.stdout, child.linux.stderr))
+}
+
+/// Synthetic `/proc/cpuinfo` — one generic x86-64 CPU.
+const PROC_CPUINFO: &str = "processor\t: 0\nvendor_id\t: GenuineIntel\n\
+cpu family\t: 6\nmodel\t\t: 158\nmodel name\t: univdreams virtual CPU\n\
+flags\t\t: fpu tsc cmov mmx fxsr sse sse2\nbogomips\t: 8000.00\n\n";
+
+/// Synthetic `/proc/meminfo` — a fixed 2 GiB.
+const PROC_MEMINFO: &str = "MemTotal:        2097152 kB\nMemFree:         1048576 kB\n\
+MemAvailable:    1572864 kB\nBuffers:               0 kB\nCached:                0 kB\n";
+
+/// Install the default synthetic Linux mounts (`/proc`, `/dev`) into `mounts`,
+/// populating `/proc` from the current process image (`name`) and the mapped
+/// memory regions.
+fn install_linux_synthetic(
+    mounts: &mut crate::fsmount::MountTable,
+    regions: &[(u32, u64, crate::emulator::Perm)],
+    name: &str,
+) {
+    use crate::fsmount::{devfs::DevFs, procfs::ProcFs};
+
+    let exe = format!("/{}", name.trim_start_matches('/'));
+    let mut procfs = ProcFs::new();
+    procfs.set_file("/cpuinfo", PROC_CPUINFO.as_bytes().to_vec());
+    procfs.set_file("/meminfo", PROC_MEMINFO.as_bytes().to_vec());
+    procfs.set_file(
+        "/version",
+        b"Linux version 5.15.0 (univdreams) #1 SMP\n".to_vec(),
+    );
+    let mut cmdline = name.as_bytes().to_vec();
+    cmdline.push(0);
+    procfs.set_file("/self/cmdline", cmdline);
+    procfs.set_symlink("/self/exe", &exe);
+    procfs.set_file("/self/maps", ProcFs::render_maps(regions, &exe));
+    procfs.set_file(
+        "/self/stat",
+        format!("1 ({name}) R 0 1 1 0 -1 0 0 0 0 0 0 0\n").into_bytes(),
+    );
+
+    mounts.mount("/proc", Box::new(procfs));
+    mounts.mount("/dev", Box::new(DevFs::new()));
+}
+
+/// `PT_LOAD` regions of a static ELF as `(start, end, perm)` — renders
+/// `/proc/self/maps` for the KVM path (its flat guest memory has no useful
+/// page-granular region list).
+#[cfg(feature = "kvm")]
+fn elf_load_regions(bytes: &[u8]) -> Vec<(u32, u64, crate::emulator::Perm)> {
+    use crate::emulator::Perm;
+    let Ok(elf) = ud_format::elf::Elf64File::parse(bytes) else {
+        return Vec::new();
+    };
+    elf.phdrs
+        .iter()
+        .filter(|p| p.p_type == 1) // PT_LOAD
+        .map(|p| {
+            let mut perm = Perm::default();
+            if p.p_flags & 4 != 0 {
+                perm = perm | Perm::R;
+            }
+            if p.p_flags & 2 != 0 {
+                perm = perm | Perm::W;
+            }
+            if p.p_flags & 1 != 0 {
+                perm = perm | Perm::X;
+            }
+            let start = (p.p_vaddr as u32) & !0xFFF;
+            let end = (p.p_vaddr + p.p_memsz + 0xFFF) & !0xFFF;
+            (start, end, perm)
+        })
+        .collect()
+}
+
 /// One sandbox instance per loaded codec DLL.
 pub struct Sandbox {
     pub mmu: Mmu,
     pub cpu: Cpu,
     pub registry: Registry,
     pub host: HostState,
+    /// Linux personality state (fd table, brk/mmap, captured output, exit
+    /// code). Default/empty for Windows runs; populated by
+    /// [`Sandbox::load_linux_elf`].
+    pub linux: crate::linux::LinuxKernel,
+    /// `e_machine` of the loaded Linux ELF (selects the run loop / ABI).
+    /// `0` until [`Sandbox::load_linux_elf`] runs.
+    pub linux_machine: u16,
+    /// The aarch64 CPU, allocated lazily when an `EM_AARCH64` image loads
+    /// (the x86 [`Cpu`] cannot host that ISA).
+    pub aarch64: Option<Box<crate::emulator::aarch64::Aarch64Cpu>>,
+    /// Auto-mount synthetic `/proc` + `/dev` for Linux runs. Default `true`;
+    /// the CLI's `--no-default-mounts` clears it.
+    pub linux_default_mounts: bool,
+    /// Extra guest `argv` (after `argv[0]`, the program name) and the guest
+    /// environment. Empty by default; the CLI fills these from `--args`.
+    pub linux_argv: Vec<String>,
+    pub linux_env: Vec<String>,
 }
 
 impl Default for Sandbox {
@@ -140,7 +394,7 @@ impl Sandbox {
     /// what's-written workflow.
     #[must_use]
     pub fn with_vfs(mut self, vfs: crate::context::VirtualFs) -> Self {
-        self.host.context.vfs = Some(vfs);
+        self.host.context.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         self
     }
 
@@ -157,6 +411,39 @@ impl Sandbox {
     /// pre-mapped, the kernel32 stub set registered, and the
     /// CPU's `esp` pointing at a freshly-allocated stack.
     pub fn new() -> Self {
+        Self::new_with_heap_end(HEAP_ARENA_END)
+    }
+
+    /// Like [`Self::new`] but with a caller-chosen top for the
+    /// malloc / `HeapAlloc` bump arena, giving decoders more
+    /// allocation headroom. The arena spans
+    /// `[HEAP_ARENA_START, heap_end)`; `heap_end` is clamped to
+    /// `[HEAP_ARENA_END, CONST_ARENA_START)`, so it can only grow
+    /// past the 96 MiB default (never shrink) and never overruns
+    /// the const-arena / stack regions above it — the hard ceiling
+    /// is `CONST_ARENA_START` (a 256 MiB arena).
+    ///
+    /// Caveat: the band above the default end is also where the
+    /// fixed-base QuickTime helper DLLs (`.qts` / `.qtx`) load, so
+    /// only raise it for single-DLL codecs that don't pull those in.
+    /// Default heap-arena size in MiB (the [`Self::new`] value).
+    pub const DEFAULT_HEAP_MB: u32 = (HEAP_ARENA_END - HEAP_ARENA_START) >> 20;
+    /// Largest heap-arena size in MiB before the const-arena
+    /// ceiling; `new_with_heap_mb` clamps to this.
+    pub const MAX_HEAP_MB: u32 = (CONST_ARENA_START - HEAP_ARENA_START) >> 20;
+
+    /// [`Self::new_with_heap_end`] addressed in MiB: the arena is
+    /// sized to `heap_mb` mebibytes, clamped to
+    /// `[DEFAULT_HEAP_MB, MAX_HEAP_MB]`.
+    #[must_use]
+    pub fn new_with_heap_mb(heap_mb: u32) -> Self {
+        let end = HEAP_ARENA_START.saturating_add(heap_mb.saturating_mul(1 << 20));
+        Self::new_with_heap_end(end)
+    }
+
+    #[must_use]
+    pub fn new_with_heap_end(heap_end: u32) -> Self {
+        let heap_end = heap_end.clamp(HEAP_ARENA_END, CONST_ARENA_START);
         let mut mmu = Mmu::new();
         // Heap arena (R+W+X). Old codecs (e.g. Cinepak) ship
         // architecture-specific inner-loop assembly that they
@@ -168,7 +455,7 @@ impl Sandbox {
         // perm rules; only the X bit is broader.
         mmu.map(
             HEAP_ARENA_START,
-            HEAP_ARENA_END - HEAP_ARENA_START,
+            heap_end - HEAP_ARENA_START,
             Perm::R | Perm::W | Perm::X,
         );
         // Const-arena for canned strings (R+W mapped; the caller
@@ -253,7 +540,7 @@ impl Sandbox {
                 .expect("seed data import");
         }
 
-        let mut host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
+        let mut host = HostState::new(HEAP_ARENA_START, heap_end)
             .with_const_arena(CONST_ARENA_START, CONST_ARENA_END)
             .with_thread_stack_pool(THREAD_STACK_POOL_BOTTOM, THREAD_STACK_POOL_TOP)
             .with_tib_pool(TIB_POOL_BOTTOM, TIB_POOL_TOP)
@@ -344,6 +631,622 @@ impl Sandbox {
             cpu,
             registry,
             host,
+            linux: crate::linux::LinuxKernel::default(),
+            linux_machine: 0,
+            aarch64: None,
+            linux_default_mounts: true,
+            linux_argv: Vec::new(),
+            linux_env: Vec::new(),
+        }
+    }
+
+    /// A bare sandbox for the **Linux** personality: a fresh empty MMU and
+    /// CPU with none of the Win32 arenas / TEB / stub registry mapped. The
+    /// ELF loader maps the program's own segments and stack; syscalls are
+    /// serviced by [`Self::run_linux`].
+    #[must_use]
+    pub fn new_linux() -> Self {
+        Sandbox {
+            mmu: Mmu::new(),
+            cpu: Cpu::new(),
+            registry: Registry::new(),
+            host: HostState::default(),
+            linux: crate::linux::LinuxKernel::default(),
+            linux_machine: 0,
+            aarch64: None,
+            linux_default_mounts: true,
+            linux_argv: Vec::new(),
+            linux_env: Vec::new(),
+        }
+    }
+
+    /// Load a static Linux ELF executable: map its `PT_LOAD` segments and
+    /// stack, prime the CPU (flat 32-bit, `esp`/`eip`), and initialise the
+    /// kernel's process state. Ensures a [`VirtualFs`](crate::context::VirtualFs)
+    /// is attached so file syscalls have somewhere to land.
+    ///
+    /// # Errors
+    /// [`crate::Error::NeLoader`]-style wrapping of a
+    /// [`crate::linux::loader::LoadError`] (bad ELF, dynamic, etc.).
+    pub fn load_linux_elf(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<crate::linux::loader::ElfImage, crate::Error> {
+        use ud_format::elf::{EM_386, EM_AARCH64, EM_X86_64};
+        // argv[0] is the program name, then any extra `--args`; envp is the
+        // configured guest environment.
+        let mut argv: Vec<&str> = vec![name];
+        argv.extend(self.linux_argv.iter().map(String::as_str));
+        let envp: Vec<&str> = self.linux_env.iter().map(String::as_str).collect();
+        // The mount table must exist before loading so the dynamic linker
+        // (`PT_INTERP`) can be read from the guest rootfs.
+        let mounts = self
+            .host
+            .context
+            .vfs
+            .get_or_insert_with(crate::fsmount::MountTable::new);
+        let image =
+            crate::linux::loader::load_elf(&mut self.mmu, Some(mounts), bytes, &argv, &envp)
+                .map_err(|e| crate::Error::NeLoader(e.to_string()))?;
+        self.linux_machine = image.machine;
+        match image.machine {
+            EM_X86_64 => {
+                // x86-64 long mode on the shared x86 CPU.
+                self.cpu.set_code16(false);
+                self.cpu.set_long64(true);
+                self.cpu.regs.gp64 = [0; 16];
+                self.cpu.regs.gp64[4] = u64::from(image.stack_ptr); // rsp
+                self.cpu.regs.rip = u64::from(image.entry);
+            }
+            EM_AARCH64 => {
+                let mut cpu = Box::new(crate::emulator::aarch64::Aarch64Cpu::new());
+                cpu.sp = u64::from(image.stack_ptr);
+                cpu.pc = u64::from(image.entry);
+                self.aarch64 = Some(cpu);
+            }
+            // EM_386 and anything else default to the 32-bit path.
+            _ => {
+                debug_assert_eq!(image.machine, EM_386);
+                self.cpu.set_code16(false);
+                self.cpu.set_long64(false);
+                self.cpu.regs.set_esp(image.stack_ptr);
+                self.cpu.regs.eip = image.entry;
+            }
+        }
+        self.linux.init(image.brk);
+        self.host
+            .context
+            .vfs
+            .get_or_insert_with(crate::fsmount::MountTable::new);
+        if self.linux_default_mounts {
+            let regions = self.mmu.regions();
+            if let Some(mounts) = self.host.context.vfs.as_mut() {
+                install_linux_synthetic(mounts, &regions, name);
+            }
+        }
+        Ok(image)
+    }
+
+    /// Run an amd64 static ELF under **KVM** (native execution), servicing its
+    /// syscalls through the shared [`LinuxKernel`](crate::linux::LinuxKernel).
+    /// The ELF is loaded into the KVM guest-memory region directly, so this
+    /// does *not* require a prior [`Self::load_linux_elf`]. Returns the exit
+    /// code. Captured stdout/stderr live in `self.linux`.
+    ///
+    /// Only built with the `kvm` cargo feature (Linux x86-64 host).
+    ///
+    /// # Errors
+    /// [`crate::Error::NeLoader`]-wrapped string if KVM is unavailable or the
+    /// guest faults — the caller can fall back to [`Self::run_linux`].
+    #[cfg(feature = "kvm")]
+    pub fn run_linux_kvm(&mut self, name: &str, bytes: &[u8]) -> Result<i32, crate::Error> {
+        let mut vfs = self
+            .host
+            .context
+            .vfs
+            .take()
+            .unwrap_or_else(crate::fsmount::MountTable::new);
+        // The KVM loader runs inside `kvm::run`, so install the synthetic
+        // mounts here, deriving `/proc/self/maps` from the ELF's PT_LOADs.
+        if self.linux_default_mounts {
+            install_linux_synthetic(&mut vfs, &elf_load_regions(bytes), name);
+        }
+        let mut argv: Vec<&str> = vec![name];
+        argv.extend(self.linux_argv.iter().map(String::as_str));
+        let envp: Vec<&str> = self.linux_env.iter().map(String::as_str).collect();
+        let result = crate::linux::kvm::run(&mut self.linux, &mut vfs, bytes, &argv, &envp)
+            .map_err(|e| crate::Error::NeLoader(format!("kvm: {e}")));
+        self.host.context.vfs = Some(vfs);
+        result
+    }
+
+    /// Run the loaded Linux program until it calls `exit`/`exit_group`,
+    /// faults, or hits the instruction budget. Returns the exit code.
+    /// Captured stdout/stderr and any unsupported syscalls live in
+    /// `self.linux`.
+    ///
+    /// # Errors
+    /// [`crate::Error::Trap`] for a CPU fault that isn't the syscall gate.
+    pub fn run_linux(&mut self) -> Result<i32, crate::Error> {
+        use ud_format::elf::{EM_AARCH64, EM_X86_64};
+        let mut vfs = self
+            .host
+            .context
+            .vfs
+            .take()
+            .unwrap_or_else(crate::fsmount::MountTable::new);
+        let result = match self.linux_machine {
+            EM_X86_64 => self.run_linux_amd64(&mut vfs),
+            EM_AARCH64 => self.run_linux_aarch64(&mut vfs),
+            _ => self.run_linux_i386(&mut vfs),
+        };
+        self.host.context.vfs = Some(vfs);
+        result
+    }
+
+    /// i386 run loop: services the `int 0x80` gate via [`I386Abi`].
+    fn run_linux_i386(
+        &mut self,
+        vfs: &mut crate::fsmount::MountTable,
+    ) -> Result<i32, crate::Error> {
+        use crate::emulator::isa_int::StepOk;
+        use crate::emulator::Trap;
+        let abi = crate::linux::abi::I386Abi;
+        let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
+        loop {
+            if self.cpu.instr_count >= budget {
+                break Ok(self.linux.exit_code.unwrap_or(-1));
+            }
+            match self.cpu.step(&mut self.mmu) {
+                Ok(StepOk::Continued) => {}
+                Ok(StepOk::Halted) => break Ok(self.linux.exit_code.unwrap_or(0)),
+                Err(Trap::SoftwareInterrupt { num: 0x80, .. }) => {
+                    self.linux.dispatch(&abi, &mut self.cpu, &mut self.mmu, vfs);
+                    if let Some(code) = self.linux.exit_code {
+                        break Ok(code);
+                    }
+                }
+                Err(t) => break Err(crate::Error::Trap(t)),
+            }
+        }
+    }
+
+    /// x86-64 run loop with a cooperative **thread scheduler**.
+    ///
+    /// Each guest thread is a [`Cpu`] sharing the one [`Mmu`]; the scheduler
+    /// round-robins them with an instruction quantum and services the
+    /// `syscall` gate. `clone` (no `clone3`; glibc falls back) spawns a child
+    /// CPU with its own stack + `%fs` TLS base; `futex` blocks/wakes threads;
+    /// thread `exit` honours `CLONE_CHILD_CLEARTID` (zero + futex-wake) so
+    /// `pthread_join` returns; `exit_group` ends the whole process.
+    fn run_linux_amd64(
+        &mut self,
+        vfs: &mut crate::fsmount::MountTable,
+    ) -> Result<i32, crate::Error> {
+        use crate::emulator::isa_int::StepOk;
+        use crate::emulator::{Cpu, Trap};
+        use crate::linux::abi::{Amd64Abi, LinuxAbi, Sysno};
+
+        // clone(2) flag bits we honour.
+        const CLONE_SETTLS: u64 = 0x0008_0000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+        const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+        let abi = Amd64Abi;
+        let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
+        let trace = std::env::var("UD_LINUX_TRACE").is_ok();
+        const QUANTUM: u64 = 20_000;
+
+        // Thread 0 = main; take the prepared CPU out of `self.cpu`.
+        let main_cpu = std::mem::replace(&mut self.cpu, Cpu::new());
+        let mut threads: Vec<AmdThread> = vec![AmdThread {
+            cpu: main_cpu,
+            tid: 1,
+            blocked_on: None,
+            clear_child_tid: 0,
+            exited: false,
+            is_process: true,
+            waiting: None,
+        }];
+        let mut next_tid: i32 = 2;
+        let mut cur = 0usize;
+        // Reaped-but-not-yet-waited child processes: (tid, wait-status).
+        let mut zombies: Vec<(i32, i32)> = Vec::new();
+
+        let result = 'sched: loop {
+            if let Some(code) = self.linux.exit_code {
+                break 'sched Ok(code);
+            }
+            let total: u64 = threads.iter().map(|t| t.cpu.instr_count).sum();
+            if total >= budget {
+                break 'sched Ok(self.linux.exit_code.unwrap_or(-1));
+            }
+
+            // Round-robin to the next runnable (not exited, not blocked) thread.
+            let n = threads.len();
+            let mut pick = None;
+            for off in 0..n {
+                let i = (cur + off) % n;
+                if !threads[i].exited
+                    && threads[i].blocked_on.is_none()
+                    && threads[i].waiting.is_none()
+                {
+                    pick = Some(i);
+                    break;
+                }
+            }
+            let Some(idx) = pick else {
+                // Nothing runnable: clean finish if all exited, else deadlock.
+                let code = self.linux.exit_code.unwrap_or(0);
+                break 'sched Ok(code);
+            };
+            cur = (idx + 1) % n;
+            self.linux.current_tid = threads[idx].tid;
+
+            let start = threads[idx].cpu.instr_count;
+            let mut spawn: Option<AmdThread> = None;
+            loop {
+                if threads[idx].cpu.instr_count - start >= QUANTUM {
+                    break;
+                }
+                match threads[idx].cpu.step(&mut self.mmu) {
+                    Ok(StepOk::Continued) => {}
+                    Ok(StepOk::Halted) => {
+                        threads[idx].exited = true;
+                        break;
+                    }
+                    Err(Trap::Syscall { .. }) => {
+                        let nr = abi.syscall_nr(&threads[idx].cpu);
+                        let a = abi.syscall_args(&threads[idx].cpu);
+                        match abi.map_syscall(nr) {
+                            Some(Sysno::ExitGroup | Sysno::Exit) => {
+                                let code = a[0] as i32;
+                                threads[idx].exited = true;
+                                let cct = threads[idx].clear_child_tid;
+                                if cct != 0 {
+                                    let _ = self.mmu.store32(cct, 0);
+                                    wake_futex(&mut threads, cct, i32::MAX);
+                                }
+                                if threads[idx].tid == 1 {
+                                    // The main process exiting ends the run.
+                                    self.linux.exit_code = Some(code);
+                                } else if threads[idx].is_process {
+                                    // A child process: becomes a zombie for its
+                                    // parent's wait4, doesn't end the run.
+                                    zombies.push((threads[idx].tid, exit_status(code)));
+                                    reap_waiters(&mut threads, &mut zombies, &mut self.mmu);
+                                }
+                                if threads.iter().all(|t| t.exited) {
+                                    self.linux.exit_code.get_or_insert(0);
+                                }
+                                break;
+                            }
+                            Some(kind @ (Sysno::Clone | Sysno::Fork | Sysno::Vfork)) => {
+                                // fork/vfork carry no args; clone gets flags +
+                                // child stack.
+                                const CLONE_THREAD: u64 = 0x0001_0000;
+                                const CLONE_VM: u64 = 0x0000_0100;
+                                let (flags, child_stack) = match kind {
+                                    Sysno::Clone => (a[0], a[1]),
+                                    _ => (0, 0),
+                                };
+                                let (ptid, ctid, newtls) = (a[2] as u32, a[3] as u32, a[4]);
+                                let tid = next_tid;
+                                next_tid += 1;
+                                let mut child = threads[idx].cpu.clone();
+                                child.regs.gp64[0] = 0; // child sees rax = 0
+                                if child_stack != 0 {
+                                    child.regs.gp64[4] = child_stack; // rsp
+                                }
+                                if flags & CLONE_SETTLS != 0 {
+                                    child.set_fs_base(newtls as u32);
+                                }
+                                abi.set_return(&mut threads[idx].cpu, i64::from(tid));
+                                if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+                                    let _ = self.mmu.store32(ptid, tid as u32);
+                                }
+                                if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
+                                    let _ = self.mmu.store32(ctid, tid as u32);
+                                }
+                                if flags & CLONE_THREAD != 0 {
+                                    // A sibling thread: runs concurrently sharing
+                                    // this process's address space.
+                                    let cct = if flags & CLONE_CHILD_CLEARTID != 0 {
+                                        ctid
+                                    } else {
+                                        0
+                                    };
+                                    spawn = Some(AmdThread {
+                                        cpu: child,
+                                        tid,
+                                        blocked_on: None,
+                                        clear_child_tid: cct,
+                                        exited: false,
+                                        is_process: false,
+                                        waiting: None,
+                                    });
+                                } else {
+                                    // A child **process**: run it to completion
+                                    // in its own copied address space, then it
+                                    // becomes a zombie for the parent's wait4.
+                                    // (CLONE_VM children get a copy too — they
+                                    // exec immediately, so it's equivalent.)
+                                    let _ = CLONE_VM;
+                                    let mut cmmu = self.mmu.fork_copy();
+                                    let st = self.run_amd64_child(
+                                        child,
+                                        &mut cmmu,
+                                        vfs,
+                                        budget,
+                                        &mut next_tid,
+                                    );
+                                    if let Some(code) = self.linux.exit_code {
+                                        // The child propagated a whole-process exit.
+                                        let _ = code;
+                                    }
+                                    zombies.push((tid, exit_status(st)));
+                                    reap_waiters(&mut threads, &mut zombies, &mut self.mmu);
+                                }
+                                break;
+                            }
+                            Some(Sysno::Execve) => {
+                                // Replace this thread's image: run the new
+                                // program to completion in a fresh address space
+                                // (its own Sandbox), then exit the thread with
+                                // that program's status.
+                                let path = read_cstr_guest(&self.mmu, a[0] as u32);
+                                let argv = self.linux.read_str_array(&self.mmu, a[1] as u32);
+                                let envp = self.linux.read_str_array(&self.mmu, a[2] as u32);
+                                if trace {
+                                    eprintln!("execve({path:?}, {argv:?})");
+                                }
+                                match path.and_then(|p| exec_nested(vfs, &p, &argv, &envp, budget))
+                                {
+                                    Some((code, out, err)) => {
+                                        self.linux.stdout.extend_from_slice(&out);
+                                        self.linux.stderr.extend_from_slice(&err);
+                                        threads[idx].exited = true;
+                                        if threads[idx].tid == 1 {
+                                            self.linux.exit_code = Some(code);
+                                        } else if threads[idx].is_process {
+                                            zombies.push((threads[idx].tid, exit_status(code)));
+                                            reap_waiters(&mut threads, &mut zombies, &mut self.mmu);
+                                        }
+                                        if threads.iter().all(|t| t.exited) {
+                                            self.linux.exit_code.get_or_insert(0);
+                                        }
+                                        break;
+                                    }
+                                    // exec failed (no such file): returns to caller.
+                                    None => abi.set_return(&mut threads[idx].cpu, -2),
+                                }
+                            }
+                            Some(Sysno::Wait4) => {
+                                let want = a[0] as i32;
+                                let status_ptr = a[1] as u32;
+                                let options = a[2] as u32;
+                                threads[idx].waiting = Some((want, status_ptr));
+                                if reap_one(&mut threads, &mut zombies, &mut self.mmu, idx) {
+                                    // Reaped immediately; rax already set.
+                                } else if options & 1 != 0 {
+                                    // WNOHANG: don't block.
+                                    threads[idx].waiting = None;
+                                    abi.set_return(&mut threads[idx].cpu, 0);
+                                } else if !has_child(&threads, idx) {
+                                    threads[idx].waiting = None;
+                                    abi.set_return(&mut threads[idx].cpu, -10); // ECHILD
+                                } else {
+                                    // Block until a child exits.
+                                    break;
+                                }
+                            }
+                            Some(Sysno::Futex) => {
+                                let uaddr = a[0] as u32;
+                                let cmd = (a[1] as u32) & 0x7f;
+                                let val = a[2] as u32;
+                                match cmd {
+                                    0 | 9 => {
+                                        // WAIT: block iff the word still equals `val`.
+                                        if self.mmu.load32(uaddr).unwrap_or(!val) == val {
+                                            threads[idx].blocked_on = Some(uaddr);
+                                            abi.set_return(&mut threads[idx].cpu, 0);
+                                            break;
+                                        }
+                                        abi.set_return(&mut threads[idx].cpu, -11);
+                                        // EAGAIN
+                                    }
+                                    1 | 10 => {
+                                        let woke = wake_futex(&mut threads, uaddr, val as i32);
+                                        abi.set_return(&mut threads[idx].cpu, i64::from(woke));
+                                    }
+                                    _ => abi.set_return(&mut threads[idx].cpu, 0),
+                                }
+                            }
+                            Some(Sysno::SchedYield) => {
+                                abi.set_return(&mut threads[idx].cpu, 0);
+                                break;
+                            }
+                            _ => {
+                                self.linux.dispatch(
+                                    &abi,
+                                    &mut threads[idx].cpu,
+                                    &mut self.mmu,
+                                    vfs,
+                                );
+                                if self.linux.exit_code.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(t) => {
+                        if trace {
+                            let rip = threads[idx].cpu.regs.rip as u32;
+                            let mut bytes = [0u8; 16];
+                            for (i, b) in bytes.iter_mut().enumerate() {
+                                *b = self.mmu.load8(rip.wrapping_add(i as u32)).unwrap_or(0);
+                            }
+                            let regs = &threads[idx].cpu.regs.gp64;
+                            eprintln!(
+                                "amd64 trap (tid {}) at rip={:#018x} (#{}): {t}\n  bytes: {bytes:02x?}\n  gp64={regs:#x?}",
+                                threads[idx].tid,
+                                threads[idx].cpu.regs.rip,
+                                threads[idx].cpu.instr_count,
+                            );
+                        }
+                        if let Some(m) = threads.iter().find(|t| t.tid == 1) {
+                            self.cpu = m.cpu.clone();
+                        }
+                        break 'sched Err(crate::Error::Trap(t));
+                    }
+                }
+            }
+            if let Some(child) = spawn {
+                threads.push(child);
+            }
+        };
+
+        // Restore the main thread's CPU for post-run inspection (instr count,
+        // captured state).
+        if let Some(m) = threads.into_iter().find(|t| t.tid == 1) {
+            self.cpu = m.cpu;
+        }
+        result
+    }
+
+    /// Run a forked **child process** to completion in its own copied address
+    /// space (`mmu`), synchronously, and return its exit code. The `fork`
+    /// model: the parent blocks until the child finishes, which fits our single
+    /// shared-MMU engine. Handles the child's `execve` (a fresh nested
+    /// [`Sandbox`]), nested `fork`+`wait4`, and ordinary syscalls (which share
+    /// the kernel fd table + captured output). Concurrent *threads* inside a
+    /// forked child are not modelled (rare before `exec`).
+    fn run_amd64_child(
+        &mut self,
+        mut cpu: crate::emulator::Cpu,
+        mmu: &mut crate::emulator::Mmu,
+        vfs: &mut crate::fsmount::MountTable,
+        budget: u64,
+        next_pid: &mut i32,
+    ) -> i32 {
+        use crate::emulator::isa_int::StepOk;
+        use crate::emulator::Trap;
+        use crate::linux::abi::{Amd64Abi, LinuxAbi, Sysno};
+        const CLONE_SETTLS: u64 = 0x0008_0000;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        let abi = Amd64Abi;
+        let mut zombies: Vec<(i32, i32)> = Vec::new();
+        let mut steps = 0u64;
+        loop {
+            if steps >= budget {
+                return -1;
+            }
+            match cpu.step(mmu) {
+                Ok(StepOk::Continued) => steps += 1,
+                Ok(StepOk::Halted) => return 0,
+                Err(Trap::Syscall { .. }) => {
+                    steps += 1;
+                    let nr = abi.syscall_nr(&cpu);
+                    let a = abi.syscall_args(&cpu);
+                    match abi.map_syscall(nr) {
+                        Some(Sysno::Exit | Sysno::ExitGroup) => return a[0] as i32,
+                        Some(Sysno::Execve) => {
+                            let path = read_cstr_guest(mmu, a[0] as u32);
+                            let argv = self.linux.read_str_array(mmu, a[1] as u32);
+                            let envp = self.linux.read_str_array(mmu, a[2] as u32);
+                            match path.and_then(|p| exec_nested(vfs, &p, &argv, &envp, budget)) {
+                                Some((code, out, err)) => {
+                                    self.linux.stdout.extend_from_slice(&out);
+                                    self.linux.stderr.extend_from_slice(&err);
+                                    return code;
+                                }
+                                None => abi.set_return(&mut cpu, -2),
+                            }
+                        }
+                        Some(kind @ (Sysno::Fork | Sysno::Vfork | Sysno::Clone)) => {
+                            let (flags, child_stack) = match kind {
+                                Sysno::Clone => (a[0], a[1]),
+                                _ => (0, 0),
+                            };
+                            if flags & CLONE_THREAD != 0 {
+                                // A thread inside a forked child — not modelled.
+                                abi.set_return(&mut cpu, -38); // ENOSYS
+                            } else {
+                                let mut gchild = cpu.clone();
+                                gchild.regs.gp64[0] = 0;
+                                if child_stack != 0 {
+                                    gchild.regs.gp64[4] = child_stack;
+                                }
+                                if flags & CLONE_SETTLS != 0 {
+                                    gchild.set_fs_base(a[4] as u32);
+                                }
+                                let mut gmmu = mmu.fork_copy();
+                                let tid = *next_pid;
+                                *next_pid += 1;
+                                abi.set_return(&mut cpu, i64::from(tid));
+                                let st =
+                                    self.run_amd64_child(gchild, &mut gmmu, vfs, budget, next_pid);
+                                zombies.push((tid, exit_status(st)));
+                            }
+                        }
+                        Some(Sysno::Wait4) => {
+                            let want = a[0] as i32;
+                            let status_ptr = a[1] as u32;
+                            if let Some(pos) =
+                                zombies.iter().position(|(t, _)| want == -1 || want == *t)
+                            {
+                                let (t, s) = zombies.remove(pos);
+                                if status_ptr != 0 {
+                                    let _ = mmu.store32(status_ptr, s as u32);
+                                }
+                                abi.set_return(&mut cpu, i64::from(t));
+                            } else {
+                                abi.set_return(&mut cpu, -10); // ECHILD
+                            }
+                        }
+                        _ => {
+                            self.linux.dispatch(&abi, &mut cpu, mmu, vfs);
+                            if let Some(code) = self.linux.exit_code {
+                                return code;
+                            }
+                        }
+                    }
+                }
+                Err(_) => return -1, // child fault: report failure to the parent
+            }
+        }
+    }
+
+    /// aarch64 run loop: steps the [`Aarch64Cpu`] and services the `svc`
+    /// gate ([`Trap::Syscall`]) via [`Aarch64Abi`].
+    fn run_linux_aarch64(
+        &mut self,
+        vfs: &mut crate::fsmount::MountTable,
+    ) -> Result<i32, crate::Error> {
+        use crate::emulator::isa_int::StepOk;
+        use crate::emulator::Trap;
+        let abi = crate::linux::abi::Aarch64Abi;
+        let budget = self.host.instruction_budget.unwrap_or(u64::MAX);
+        let Some(cpu) = self.aarch64.as_mut() else {
+            return Err(crate::Error::NeLoader("no aarch64 CPU loaded".into()));
+        };
+        loop {
+            if cpu.instr_count >= budget {
+                break Ok(self.linux.exit_code.unwrap_or(-1));
+            }
+            match cpu.step(&mut self.mmu) {
+                Ok(StepOk::Continued) => {}
+                Ok(StepOk::Halted) => break Ok(self.linux.exit_code.unwrap_or(0)),
+                Err(Trap::Syscall { .. }) => {
+                    self.linux.dispatch(&abi, cpu.as_mut(), &mut self.mmu, vfs);
+                    if let Some(code) = self.linux.exit_code {
+                        break Ok(code);
+                    }
+                }
+                Err(t) => break Err(crate::Error::Trap(t)),
+            }
         }
     }
 
@@ -972,6 +1875,42 @@ impl Sandbox {
         )
     }
 
+    /// Call an arbitrary guest code address — an indirect / computed
+    /// call target the export table can't name. Pushes `args`
+    /// right-to-left + the `RET_SENTINEL` and runs until the callee
+    /// returns; returns `eax`.
+    ///
+    /// This is the address-taking analogue of [`Self::call_export`]:
+    /// where `call_export` resolves a name against an image's export
+    /// table, `call_addr` takes the resolved VA directly. That lets a
+    /// script drive dispatch paths a name lookup can't reach — COM
+    /// vtable slots (walk `*ppv` → `*obj` → `*(vtbl + n*4)`), callback
+    /// thunks staged via `mapBlob`, or jump-table entries — by reading
+    /// the target pointer out of guest memory and calling through it.
+    ///
+    /// # Errors
+    /// Returns [`crate::win32::Win32Error::InvalidArgument`] for a null
+    /// target, and propagates any CPU trap raised while running the
+    /// callee (unresolved import, instruction-budget exhaustion, …).
+    pub fn call_addr(&mut self, addr: u32, args: &[u32]) -> Result<u32, crate::Error> {
+        if addr == 0 {
+            return Err(crate::Error::Win32(
+                crate::win32::Win32Error::InvalidArgument {
+                    stub: "call_addr",
+                    reason: "null call target".into(),
+                },
+            ));
+        }
+        call_guest(
+            &mut self.cpu,
+            &mut self.mmu,
+            &mut self.registry,
+            &mut self.host,
+            addr,
+            args,
+        )
+    }
+
     /// Load a 16-bit Windows NE module in fail-soft mode: every
     /// imported ordinal is wired to a trap-on-call thunk, so the run
     /// stops at the first Win16 API the stub surface doesn't cover
@@ -1011,7 +1950,7 @@ impl Sandbox {
                 .host
                 .context
                 .vfs
-                .get_or_insert_with(crate::context::VirtualFs::new);
+                .get_or_insert_with(crate::fsmount::MountTable::new);
             vfs.insert(&self_path, bytes.to_vec());
         }
         // Parse string + general resources for LoadString / FindResource.
@@ -2412,7 +3351,7 @@ mod tests {
         // Stage a child binary in the VFS.
         let dll_bytes = build_minimal_dll();
         let child_path = "c:\\setup\\helper.exe";
-        let mut vfs = crate::context::VirtualFs::new();
+        let mut vfs = crate::fsmount::MountTable::new();
         vfs.insert(child_path, dll_bytes);
         sb.host.context.vfs = Some(vfs);
 

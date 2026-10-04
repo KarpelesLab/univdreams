@@ -34,10 +34,14 @@ use std::collections::BTreeMap;
 /// Top-level optional context layer. Owned by
 /// [`HostState`](crate::win32::HostState); each guest call to a
 /// Win32 stub backed by a virtual surface goes through here.
-#[derive(Debug, Default, Clone)]
+///
+/// (Not `Clone`: the filesystem is now a [`MountTable`](crate::fsmount::MountTable)
+/// which may carry non-cloneable overlay backends.)
+#[derive(Debug, Default)]
 pub struct Context {
-    /// In-memory filesystem, if attached.
-    pub vfs: Option<VirtualFs>,
+    /// Per-instance filesystem (a mount table whose default root is the
+    /// in-memory [`VirtualFs`]), if attached.
+    pub vfs: Option<crate::fsmount::MountTable>,
     /// In-memory registry, if attached.
     pub registry: Option<VirtualRegistry>,
 }
@@ -50,10 +54,10 @@ impl Context {
         Self::default()
     }
 
-    /// Builder: attach the given VFS.
+    /// Builder: attach the given VFS as the root of a fresh mount table.
     #[must_use]
     pub fn with_vfs(mut self, vfs: VirtualFs) -> Self {
-        self.vfs = Some(vfs);
+        self.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         self
     }
 
@@ -265,6 +269,21 @@ impl VirtualFs {
         self.open.get(&handle).map(|fh| fh.pos)
     }
 
+    /// Seek by `off` relative to `whence` (0 = SET, 1 = CUR, 2 = END,
+    /// matching DOS `INT 21h/42h` / C `SEEK_*`). Returns the new absolute
+    /// position, or `None` if the handle is unknown.
+    pub fn seek_handle(&mut self, handle: u32, off: i32, whence: u8) -> Option<u64> {
+        let base = match whence {
+            1 => self.open.get(&handle)?.pos as i64,
+            2 => self.size(handle)? as i64,
+            _ => 0,
+        };
+        let pos = (base + i64::from(off)).max(0) as u64;
+        let fh = self.open.get_mut(&handle)?;
+        fh.pos = pos;
+        Some(pos)
+    }
+
     /// Current size of the file the handle refers to.
     /// Returns `None` if the handle is unknown.
     #[must_use]
@@ -281,6 +300,78 @@ impl VirtualFs {
     #[must_use]
     pub fn owns(&self, handle: u32) -> bool {
         self.open.contains_key(&handle)
+    }
+
+    /// Directory-aware stat over the flat namespace. Returns `(is_dir, size)`
+    /// for a path that is a stored file, or a *synthesised* directory (the
+    /// root, or any prefix beneath which a stored file lives). `None` if no
+    /// file or directory matches.
+    #[must_use]
+    pub fn stat_node(&self, path: &str) -> Option<(bool, u64)> {
+        let key = normalize_path(path);
+        if let Some(bytes) = self.files.get(&key) {
+            return Some((false, bytes.len() as u64));
+        }
+        if key.is_empty() || key == "/" {
+            return Some((true, 0));
+        }
+        let prefix = format!("{key}/");
+        if self.files.keys().any(|k| k.starts_with(&prefix)) {
+            return Some((true, 0));
+        }
+        None
+    }
+
+    /// List the immediate children of directory `path` as `(name, is_dir)`,
+    /// synthesising intermediate directories from stored paths. Returns `None`
+    /// if `path` names a stored file (not a directory).
+    #[must_use]
+    pub fn readdir(&self, path: &str) -> Option<Vec<(String, bool)>> {
+        let key = normalize_path(path);
+        if self.files.contains_key(&key) {
+            return None; // it is a file, not a directory
+        }
+        let prefix = if key.is_empty() || key == "/" {
+            String::new()
+        } else {
+            format!("{key}/")
+        };
+        let mut children: BTreeMap<String, bool> = BTreeMap::new();
+        for k in self.files.keys() {
+            let rest = if prefix.is_empty() {
+                k.trim_start_matches('/')
+            } else if let Some(r) = k.strip_prefix(&prefix) {
+                r
+            } else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            match rest.split_once('/') {
+                // A deeper path: the first segment is a subdirectory.
+                Some((seg, _)) => {
+                    children.entry(seg.to_string()).or_insert(true);
+                }
+                // A leaf: a regular file. A file shadows a same-named synth dir.
+                None => {
+                    children.insert(rest.to_string(), false);
+                }
+            }
+        }
+        Some(children.into_iter().collect())
+    }
+
+    /// Resize the file at `path` to `len` bytes (zero-extending a grow,
+    /// dropping the tail on a shrink). Returns `false` if no such file.
+    pub fn truncate(&mut self, path: &str, len: u64) -> bool {
+        match self.files.get_mut(&normalize_path(path)) {
+            Some(b) => {
+                b.resize(len as usize, 0);
+                true
+            }
+            None => false,
+        }
     }
 }
 

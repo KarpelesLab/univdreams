@@ -25,13 +25,13 @@
 //!    the live `Cpu` into the active thread's `parked_cpu`,
 //!    records the requested `WaitCondition` on that thread,
 //!    transitions it to `ThreadStatus::Waiting`, picks the next
-//!    `Ready` thread via [`Scheduler::pick_next`], and restores
+//!    `Ready` thread via `Scheduler::pick_next`, and restores
 //!    its parked `Cpu`.
 //! 3. Wake-up: stubs that signal a wait object (`SetEvent`,
 //!    `ReleaseMutex`, `ReleaseSemaphore`, …) call
-//!    [`wake_waiters_on`] which moves matching threads back to
+//!    `wake_waiters_on` which moves matching threads back to
 //!    `Ready`. The Sleep wake-up is driven by the run loop
-//!    polling [`reap_sleep_wakeups`] on each scheduler tick.
+//!    polling `reap_sleep_wakeups` on each scheduler tick.
 
 use std::collections::BTreeMap;
 
@@ -46,7 +46,7 @@ pub const WAIT_OBJECT_HANDLE_BASE: u32 = 0x6B00_0000;
 pub const PRIORITY_NORMAL: i32 = 0;
 
 /// Sleep wake-ups are driven by a monotonic instruction counter
-/// kept on [`crate::win32::HostState::instructions_global`].
+/// kept on `crate::win32::HostState::instructions_global`.
 /// One Windows millisecond is approximated as
 /// [`INSTRUCTIONS_PER_MS`] guest instructions — chosen so a
 /// `Sleep(100)` doesn't stall the scheduler for an eternity in

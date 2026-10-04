@@ -444,7 +444,7 @@ pub struct ThreadState {
     /// Active wait, if `status == Waiting`. Cleared on wake.
     pub wait: Option<crate::sched::WaitCondition>,
     /// Per-thread TIB (Thread Information Block) base — guest
-    /// VA the thread's CPU references via FS:[0]. `0` for the
+    /// VA the thread's CPU references via `FS:[0]`. `0` for the
     /// bootstrap thread (which uses the runtime's shared
     /// `TEB_BASE`); `CreateThread` carves a fresh page out of
     /// the per-process TIB pool for each new thread.
@@ -526,7 +526,7 @@ pub struct HostState {
     pub next_pid: u32,
     /// Image base for the next child PE loaded via
     /// `CreateProcessA`. `0` until a child-image arena is
-    /// configured (via [`Self::with_child_image_arena`]); the
+    /// configured (via `Self::with_child_image_arena`); the
     /// runtime walks the cursor forward by [`CHILD_IMAGE_STRIDE`]
     /// per spawn.
     pub next_child_image_base: u32,
@@ -552,7 +552,7 @@ pub struct HostState {
     pub next_tid: u32,
     /// Last error code (`SetLastError` / `GetLastError`). Phase
     /// 6 will mirror this through the per-thread TIB at
-    /// FS:[0x34] so guest code reading it directly sees the
+    /// `FS:[0x34]` so guest code reading it directly sees the
     /// per-thread value. For now (single thread) the field on
     /// HostState is the source of truth.
     pub last_error: u32,
@@ -603,6 +603,9 @@ pub struct HostState {
     /// Button/checkbox check state, keyed by control HWND (`BM_GETCHECK` /
     /// `BM_SETCHECK` / `CheckDlgButton`).
     pub dialog_checks: std::collections::BTreeMap<u16, u16>,
+    /// DOS Disk Transfer Address (selector:offset) set via INT 21h/1Ah,
+    /// where FindFirst/FindNext write the directory entry.
+    pub dos_dta: (u16, u16),
     /// Optional per-run instruction budget. Decremented at each
     /// top-of-loop iteration in [`run_until_sentinel`] (both
     /// instruction steps and stub dispatches count). When it
@@ -704,6 +707,8 @@ impl Default for HostState {
             dialog_result: 0,
             dialog_items: BTreeMap::new(),
             dialog_checks: BTreeMap::new(),
+            // Default DTA is the PSP's command-tail area (PSP:0x80).
+            dos_dta: (crate::ne::PSP_SELECTOR, 0x80),
             active_pid: 1,
             next_pid: 2,
             next_child_image_base: 0,
@@ -1605,6 +1610,9 @@ pub fn dispatch_stub(
     };
     // Run the host-side stub.
     let ret = (entry.func)(cpu, mmu, state, registry)?;
+    if cpu.is_code16() && std::env::var("UD_NE_STUB_DEBUG").is_ok() {
+        eprintln!("STUB {}!{} -> {ret:#x}", entry.dll, entry.name);
+    }
     if state.trace_stubs {
         let (call_site_eip, args) = snapshot.clone().unwrap_or((0, Vec::new()));
         let args_str = args

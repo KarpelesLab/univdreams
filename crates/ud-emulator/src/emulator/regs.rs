@@ -224,6 +224,13 @@ impl Flags {
         self.sf = (result & 0x80) != 0;
         self.pf = parity8(result);
     }
+
+    /// Set ZF / SF / PF from a 64-bit result (amd64 long mode).
+    pub fn set_szp_64(&mut self, result: u64) {
+        self.zf = result == 0;
+        self.sf = (result & 0x8000_0000_0000_0000) != 0;
+        self.pf = parity8(result as u8);
+    }
 }
 
 fn parity8(b: u8) -> bool {
@@ -235,12 +242,18 @@ fn parity8(b: u8) -> bool {
     (x & 1) == 0
 }
 
-/// 32-bit x86 register file.
+/// x86 register file. The 32-bit `gp`/`eip` back the 16/32-bit modes; the
+/// `gp64`/`rip` fields back the amd64 long-mode path (kept separate so the
+/// 32-bit interpreter is untouched).
 #[derive(Clone, Debug, Default)]
 pub struct Regs {
     pub gp: [u32; 8], // indexed by Reg32
     pub eip: u32,
     pub flags: Flags,
+    /// 64-bit general registers `rax`..`r15` (long mode only).
+    pub gp64: [u64; 16],
+    /// 64-bit instruction pointer (long mode only).
+    pub rip: u64,
 }
 
 impl Regs {

@@ -14,17 +14,19 @@
 //! no host-CPU dependence. See `OxideAV/docs/winmf/winmf-emulator.md`
 //! §"The emulator" for the design rationale.
 
+pub mod aarch64;
 pub mod decode;
 pub mod isa_avx;
 pub mod isa_fpu;
 pub mod isa_int;
 pub mod isa_mmx;
 pub mod isa_sse;
+pub mod long64;
 pub mod mmu;
 pub mod regs;
 
 pub use isa_int::Cpu;
-pub use mmu::{Mmu, Perm};
+pub use mmu::{Mmu, Perm, WatchEvent};
 pub use regs::{Flags, Regs};
 
 /// Reasons the interpreter halts other than reaching the
@@ -53,6 +55,11 @@ pub enum Trap {
     /// `INT 21h`) and resumes; unhandled vectors surface as an error.
     /// `eip` is the address of the instruction after the `INT`.
     SoftwareInterrupt { num: u8, eip: u32 },
+    /// A syscall-gate instruction executed: x86-64 `syscall` (0F 05) or
+    /// AArch64 `SVC`. The Linux run loop reads the arch's syscall
+    /// registers, services it, and resumes; `pc` already points past the
+    /// gate instruction.
+    Syscall { pc: u64 },
     /// Integer divide by zero.
     DivideByZero { eip: u32 },
     /// Codec called a Win32 function we have not stubbed.
@@ -101,6 +108,7 @@ impl core::fmt::Display for Trap {
             Trap::SoftwareInterrupt { num, eip } => {
                 write!(f, "unhandled INT {num:#04x} at eip={eip:#010x}")
             }
+            Trap::Syscall { pc } => write!(f, "unhandled syscall gate at pc={pc:#018x}"),
             Trap::DivideByZero { eip } => write!(f, "divide-by-zero at eip={eip:#010x}"),
             Trap::UnresolvedImport { dll, name } => {
                 write!(f, "unresolved import {dll}!{name}")

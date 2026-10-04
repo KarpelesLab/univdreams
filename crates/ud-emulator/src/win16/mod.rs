@@ -28,6 +28,8 @@ const WIN16_HEAP_BASE: u32 = 0x0040_0000;
 /// First selector handed out for a `GlobalAlloc` block (avoids the
 /// segment numbers, HINSTANCE, import/PSP/sentinel selectors).
 const WIN16_HEAP_FIRST_SEL: u16 = 0x0200;
+/// Per-block window size: a Win16 selector addresses up to 64 KiB.
+const WIN16_HEAP_WINDOW: u32 = 0x0001_0000;
 
 /// A simple Win16 global heap. Each `GlobalAlloc` gets its own linear
 /// window and a unique selector (handle == selector, GMEM_FIXED-style);
@@ -41,38 +43,17 @@ pub struct Win16Heap {
 }
 
 impl Win16Heap {
-    /// The 64 KiB selector window used as the minimum allocation
-    /// grain for [`Win16Heap::alloc`] and as the in-place-resize
-    /// ceiling for [`Win16Heap::realloc`].
-    const SEGMENT: u32 = 0x10000;
-
     /// Allocate `size` bytes: map a fresh window, assign a selector,
-    /// register it on the CPU, and return the selector (the handle).
-    ///
-    /// The mapped window is padded to at least one full 16-bit
-    /// segment (64 KiB). A Win16 selector is a base + limit pair;
-    /// 16-bit guest code accesses `sel:offset` where `offset` is a
-    /// u16, so the selector can legally address any byte 0..0xFFFF
-    /// even when the program only requested a smaller block.
-    /// `GlobalAlloc` on real Win9x pads small requests to the
-    /// allocation granularity, and selectors carry a fence the
-    /// guest rarely consults; emulating an exact-size byte map turns
-    /// every legal-on-real-Win16 high-offset poke into a fault.
-    /// Padding to 64 KiB matches Win9x's effective behaviour for
-    /// blocks below that size and frees the guest to use the full
-    /// selector range.
-    ///
-    /// For requests larger than 64 KiB (decompression buffers,
-    /// large bitmaps), we still round up to a 4 KiB page boundary
-    /// — those programs allocate exactly what they need and don't
-    /// generally over-poke past it.
+    /// register it on the CPU, and return the selector (the handle). Each
+    /// block gets a full 64 KiB window — a Win16 selector addresses up to
+    /// 64 KiB, and programs routinely read/write the whole segment.
     fn alloc(&mut self, cpu: &mut Cpu, mmu: &mut Mmu, size: u32) -> u16 {
         if self.next_base < WIN16_HEAP_BASE {
             self.next_base = WIN16_HEAP_BASE;
             self.next_selector = WIN16_HEAP_FIRST_SEL;
         }
         let page_rounded = size.max(1).wrapping_add(0xFFF) & !0xFFF;
-        let mapped = page_rounded.max(Self::SEGMENT);
+        let mapped = page_rounded.max(WIN16_HEAP_WINDOW);
         let base = self.next_base;
         let sel = self.next_selector;
         mmu.map(base, mapped, Perm::R | Perm::W | Perm::X);
@@ -90,34 +71,36 @@ impl Win16Heap {
         sel
     }
 
-    /// Grow `handle` to `size` bytes in place when its existing 64
-    /// KiB selector window can absorb the new size; otherwise fall
-    /// back to a fresh selector via [`Self::alloc`].
-    ///
-    /// Real `GlobalReAlloc` keeps the handle stable across resizes
-    /// when the heap manager doesn't need to relocate the block.
-    /// Win16 code routinely captures the original selector in a
-    /// `DS`/`ES` and continues using it after a resize; minting a
-    /// fresh selector on every grow strands those captures and turns
-    /// post-resize accesses into reads of a stale, zero-filled window.
-    /// In-place growth honours that contract for the common case
-    /// where the requested size still fits the segment we already
-    /// mapped.
-    fn realloc(&mut self, cpu: &mut Cpu, mmu: &mut Mmu, handle: u16, size: u32) -> u16 {
-        let Some(&(base, _old_size)) = self.blocks.get(&handle) else {
-            return self.alloc(cpu, mmu, size);
+    /// Resize the block at `sel`, **keeping the same selector** (handle).
+    /// Win16 programs check that `GlobalReAlloc` returns the original handle
+    /// (the memory may move underneath, but the handle is stable). If it
+    /// fits in the already-mapped window, update in place; otherwise map a
+    /// fresh window, copy the data, and rebase the selector to it.
+    fn realloc(&mut self, cpu: &mut Cpu, mmu: &mut Mmu, sel: u16, new_size: u32) -> u16 {
+        let Some(&(old_base, old_size)) = self.blocks.get(&sel) else {
+            return self.alloc(cpu, mmu, new_size);
         };
-        if size <= Self::SEGMENT {
-            self.blocks.insert(handle, (base, size));
-            if std::env::var("UD_NE_HEAP_DEBUG").is_ok() {
-                eprintln!(
-                    "win16_heap: realloc-in-place sel={handle:#06x} \
-                     base={base:#010x} new_size={size:#x}"
-                );
-            }
-            return handle;
+        // Fits in the existing 64 KiB window → resize in place.
+        if new_size <= WIN16_HEAP_WINDOW {
+            self.blocks.insert(sel, (old_base, new_size));
+            return sel;
         }
-        self.alloc(cpu, mmu, size)
+        // Huge (>64 KiB) grow: move to a fresh window and copy the contents.
+        let new_window = new_size.wrapping_add(0xFFF) & !0xFFF;
+        if self.next_base < WIN16_HEAP_BASE {
+            self.next_base = WIN16_HEAP_BASE;
+            self.next_selector = WIN16_HEAP_FIRST_SEL;
+        }
+        let new_base = self.next_base;
+        mmu.map(new_base, new_window, Perm::R | Perm::W | Perm::X);
+        for i in 0..old_size.min(new_size) {
+            let b = mmu.load8(old_base.wrapping_add(i)).unwrap_or(0);
+            let _ = mmu.store8(new_base.wrapping_add(i), b);
+        }
+        cpu.define_selector(sel, new_base); // same selector, new base
+        self.blocks.insert(sel, (new_base, new_size));
+        self.next_base = self.next_base.wrapping_add(new_window);
+        sel
     }
 }
 
@@ -205,11 +188,12 @@ fn register_gdi(registry: &mut Registry) {
     registry.register_far_pascal("gdi", "@69", stub_ret1_1word, 2);
     // GDI.87 GetStockObject(fnObject) → HGDIOBJ.
     registry.register_far_pascal("gdi", "@87", stub_create_object, 2);
-    // GDI.442 CreateDIBitmap(hDC, lpbmih far, fdwInit, lpbInit far,
-    // lpbmi far, fuUsage) → HBITMAP. Used by the installer to load its
-    // dialog backdrop / banner bitmaps. Return a synthetic non-zero
-    // handle; the bitmap content is not rendered in the headless GUI.
-    registry.register_far_pascal("gdi", "@442", stub_create_object, 14);
+    // GDI.442 CreateDIBitmap(hdc, lpbmih, init, lpInit, lpbmi, usage) → HBITMAP.
+    registry.register_far_pascal("gdi", "@442", stub_create_object, 20);
+    // GDI.36 CreateCompatibleDC(hdc) / GDI.72 CreateBitmap / GDI.444
+    // SetDIBits / GDI.27 BitBlt — bitmap plumbing the splash uses.
+    registry.register_far_pascal("gdi", "@36", stub_create_object, 2);
+    registry.register_far_pascal("gdi", "@72", stub_create_object, 10);
 }
 
 /// Generic GDI object factory → a fresh unique object handle. The
@@ -294,20 +278,18 @@ fn register_user(registry: &mut Registry) {
     registry.register_far_pascal("user", "@87", stub_dialog_box, 12);
     // USER.88 EndDialog(hDlg, nResult).
     registry.register_far_pascal("user", "@88", stub_end_dialog, 4);
-    // USER.89 CreateDialog(hInst, lpTemplate far, hWndParent, lpDialogFunc far)
-    // → HWND. Modeless variant: record the dialog like DialogBox but
-    // return a synthetic HWND instead of running the message pump.
+    // USER.89 CreateDialog(hInst, lpTemplate far, hWndParent, lpDialogFunc far).
     registry.register_far_pascal("user", "@89", stub_create_dialog, 12);
-    // USER.42 ShowWindow(hWnd, nCmdShow) → previously-visible BOOL. We
-    // have no real window manager, but the installer just wants
-    // confirmation; return 1.
-    registry.register_far_pascal("user", "@42", stub_ret1_2word, 4);
     // USER.292 UnhookWindowsHookEx(hHook far) → BOOL.
     registry.register_far_pascal("user", "@292", stub_ret1_2word, 4);
     // USER.1 MessageBox(hWnd, lpText far, lpCaption far, wType) → int.
     registry.register_far_pascal("user", "@1", stub_message_box, 12);
     // USER.229 GetTopWindow(hWnd) → first child HWND (none in our model).
     registry.register_far_pascal("user", "@229", stub_ret0_1word, 2);
+    // USER.69 SetCursor(hCursor) → previous HCURSOR.
+    registry.register_far_pascal("user", "@69", stub_create_object, 2);
+    // USER.42 ShowWindow(hWnd, nCmdShow) → previous visibility.
+    registry.register_far_pascal("user", "@42", stub_ret1_2word, 4);
     // USER.262 GetWindow(hWnd, uCmd) → related HWND (none in our model).
     registry.register_far_pascal("user", "@262", stub_ret0_1word, 4);
     // USER.32 GetWindowRect(hWnd, lpRect far).
@@ -428,14 +410,17 @@ pub fn service_interrupt(num: u8, cpu: &mut Cpu, mmu: &mut Mmu, state: &mut Host
     }
 }
 
-/// Minimal DOS `INT 21h` dispatcher keyed on `AH`.
+/// DOS `INT 21h` dispatcher. Handles the version/date stubs plus the file
+/// I/O handle functions (open/create/read/write/seek/close/mkdir), wired
+/// to the [`crate::context::VirtualFs`] so an installer's extraction writes
+/// land where `--dump-vfs` can collect them.
 fn dos_int21(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
+    use crate::emulator::isa_int::Seg;
     let ah = cpu.regs.get8(Reg8::Ah);
     if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
         eprintln!("DOS INT21 AH={ah:#04x}");
     }
-    // Default to "success": clear the carry flag.
-    cpu.regs.flags.cf = false;
+    cpu.regs.flags.cf = false; // default: success
     match ah {
         // AH=0x30 Get DOS version → AL=major, AH=minor, BX:CX OEM/serial.
         0x30 => {
@@ -448,6 +433,46 @@ fn dos_int21(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
         0x19 => cpu.regs.set8(Reg8::Al, 2),
         // AH=0x25 Set interrupt vector — accept and ignore.
         0x25 => {}
+        // AH=0x1A Set DTA (DS:DX) — remember where FindFirst writes.
+        0x1A => {
+            state.dos_dta = (cpu.segment_selector(Seg::Ds), cpu.regs.get16(Reg16::Dx));
+        }
+        // AH=0x2F Get DTA → ES:BX.
+        0x2F => {
+            cpu.set_segment_reg(0 /* ES */, state.dos_dta.0);
+            cpu.regs.set16(Reg16::Bx, state.dos_dta.1);
+        }
+        // AH=0x4E FindFirst(DS:DX pathspec, CX attr) → fill the DTA with the
+        // matching file's directory entry (notably its size at +0x1A) so a
+        // copy/CRC loop reads the right number of bytes.
+        0x4E => {
+            let lin = cpu
+                .seg_base(Seg::Ds)
+                .wrapping_add(u32::from(cpu.regs.get16(Reg16::Dx)));
+            let spec = String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 260)).into_owned();
+            // Resolve a concrete match (exact path, or first VFS file whose
+            // base name matches a `*.*`-style pattern's directory).
+            let size = state
+                .context
+                .vfs
+                .as_ref()
+                .and_then(|v| dos_find_match(v, &spec));
+            match size {
+                Some((name, sz)) => {
+                    let dta = cpu.far_to_linear(state.dos_dta.0, state.dos_dta.1);
+                    let _ = mmu.store8(dta.wrapping_add(0x15), 0x20); // attr=archive
+                    for o in [0x16u32, 0x18] {
+                        let _ = mmu.store16(dta.wrapping_add(o), 0);
+                    }
+                    let _ = mmu.store16(dta.wrapping_add(0x1A), sz as u16);
+                    let _ = mmu.store16(dta.wrapping_add(0x1C), (sz >> 16) as u16);
+                    write_guest_cstr(mmu, dta.wrapping_add(0x1E), 13, name.as_bytes()).ok();
+                }
+                None => dos_error(cpu, 18), // no more files
+            }
+        }
+        // AH=0x4F FindNext — single match only; report "no more files".
+        0x4F => dos_error(cpu, 18),
         // AH=0x35 Get interrupt vector → ES:BX = 0:0.
         0x35 => {
             cpu.regs.set16(Reg16::Bx, 0);
@@ -482,6 +507,8 @@ fn dos_int21(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
         // reads into an infinite EOF-less loop, so report "file on
         // drive C" instead.
         0x44 => dos_ioctl(cpu, state),
+        // AH=0x39 MkDir / 0x3A RmDir / 0x3B ChDir — the VFS is flat; just succeed.
+        0x39 | 0x3B | 0x3A => {}
         // Anything else: report success with AX cleared. The startup
         // code stores the result but does not branch on it here.
         _ => cpu.regs.set16(Reg16::Ax, 0),
@@ -545,7 +572,7 @@ fn dos_open_or_create(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState, creat
     let vfs = state
         .context
         .vfs
-        .get_or_insert_with(crate::context::VirtualFs::new);
+        .get_or_insert_with(crate::fsmount::MountTable::new);
     if create {
         vfs.write_path(&path, Vec::new());
     }
@@ -636,7 +663,7 @@ fn dos_file_attribs(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) {
     let vfs = state
         .context
         .vfs
-        .get_or_insert_with(crate::context::VirtualFs::new);
+        .get_or_insert_with(crate::fsmount::MountTable::new);
     if !vfs.contains(&path) {
         dos_error(cpu, 0x02);
         return;
@@ -682,27 +709,43 @@ fn dos_seek(cpu: &mut Cpu, state: &mut HostState) {
         dos_error(cpu, 0x06);
         return;
     };
-    let new_pos = match origin {
-        0 => signed_off.max(0) as u64,
-        1 => {
-            let cur = vfs.tell(vh).unwrap_or(0) as i64;
-            (cur + i64::from(signed_off)).max(0) as u64
-        }
-        2 => {
-            let end = vfs.size(vh).unwrap_or(0) as i64;
-            (end + i64::from(signed_off)).max(0) as u64
-        }
-        _ => {
-            dos_error(cpu, 0x01); // invalid function
-            return;
-        }
-    };
-    vfs.seek(vh, new_pos);
+    if origin > 2 {
+        dos_error(cpu, 0x01); // invalid function
+        return;
+    }
+    let new_pos = vfs.seek_handle(vh, signed_off, origin).unwrap_or(0);
     cpu.regs.set16(Reg16::Ax, (new_pos & 0xFFFF) as u16);
     cpu.regs.set16(Reg16::Dx, ((new_pos >> 16) & 0xFFFF) as u16);
     if std::env::var("UD_NE_DOS_DEBUG").is_ok() {
         eprintln!("  DOS seek dh={dh:#06x} origin={origin} off={signed_off} -> pos={new_pos}");
     }
+}
+
+/// Resolve a DOS `FindFirst` pathspec to a `(basename, size)` match in the
+/// VFS. Handles an exact path, and a `*`/`?` pattern by matching the first
+/// file sharing the spec's directory prefix.
+fn dos_find_match(vfs: &crate::fsmount::MountTable, spec: &str) -> Option<(String, u32)> {
+    let base = |p: &str| {
+        p.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(p)
+            .to_ascii_uppercase()
+    };
+    if !spec.contains('*') && !spec.contains('?') {
+        return vfs.read(spec).map(|b| (base(spec), b.len() as u32));
+    }
+    // Wildcard: compare directory prefixes case-insensitively, treating
+    // '\' and '/' the same.
+    let norm = |s: &str| s.replace('\\', "/").to_ascii_lowercase();
+    let dir = norm(spec.rsplit_once(['\\', '/']).map_or("", |(d, _)| d));
+    for (path, len) in vfs.list() {
+        let p = norm(path);
+        let pdir = p.rsplit_once('/').map_or("", |(d, _)| d);
+        if pdir == dir.trim_start_matches(|c| c == 'c' || c == ':' || c == '/') {
+            return Some((base(path), len as u32));
+        }
+    }
+    None
 }
 
 /// `KERNEL` (KRNL286/KRNL386) ordinal stubs.
@@ -777,6 +820,33 @@ fn register_kernel(registry: &mut Registry) {
     registry.register_far_pascal("kernel", "@62", stub_lock_resource, 2);
     registry.register_far_pascal("kernel", "@63", stub_free_resource, 2);
     registry.register_far_pascal("kernel", "@65", stub_sizeof_resource, 4);
+    // KERNEL.134 GetWindowsDirectory / KERNEL.135 GetSystemDirectory.
+    registry.register_far_pascal("kernel", "@134", stub_get_windows_dir, 6);
+    registry.register_far_pascal("kernel", "@135", stub_get_system_dir, 6);
+}
+
+/// `KERNEL.134 GetWindowsDirectory(lpBuffer far, uSize)` → "C:\\WINDOWS".
+fn stub_get_windows_dir(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let n = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let buf = far_arg_linear(cpu, mmu, 6);
+    write_guest_cstr(mmu, buf, n, b"C:\\WINDOWS")
+}
+
+/// `KERNEL.135 GetSystemDirectory(lpBuffer far, uSize)` → "C:\\WINDOWS\\SYSTEM".
+fn stub_get_system_dir(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let n = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let buf = far_arg_linear(cpu, mmu, 6);
+    write_guest_cstr(mmu, buf, n, b"C:\\WINDOWS\\SYSTEM")
 }
 
 /// Generic FAR PASCAL stub returning its single word argument unchanged
@@ -1088,6 +1158,9 @@ fn stub_find_resource(
         .iter()
         .position(|r| res_id_eq(&r.type_id, &want_type) && res_id_eq(&r.name_id, &want_name))
         .map_or(0, |i| i as u32 + 1);
+    if std::env::var("UD_NE_STUB_DEBUG").is_ok() {
+        eprintln!("FindResource type={want_type:?} name={want_name:?} -> {hrsrc}");
+    }
     Ok(hrsrc)
 }
 
@@ -1465,6 +1538,59 @@ const WM_COMMAND: u16 = 0x0111;
 /// invoke the dialog procedure for `WM_INITDIALOG`, then auto-drive it by
 /// posting the default command until it calls `EndDialog`. Returns the
 /// `EndDialog` result.
+/// `USER.89 CreateDialog(hInstance, lpTemplate, hWndParent, lpDialogFunc)`
+/// → HWND of a *modeless* dialog (e.g. the install progress box). Records
+/// it, creates its controls, attaches the MFC CWnd and delivers
+/// WM_INITDIALOG, then returns the window handle (the program pumps it
+/// itself). Off the drive path it just records the dialog.
+fn stub_create_dialog(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let proc_off = cpu.stack_word(mmu, 4).unwrap_or(0);
+    let proc_sel = cpu.stack_word(mmu, 6).unwrap_or(0);
+    let tmpl_off = cpu.stack_word(mmu, 10).unwrap_or(0);
+    let tmpl_sel = cpu.stack_word(mmu, 12).unwrap_or(0);
+    let this_sel = cpu.segment_selector(crate::emulator::isa_int::Seg::Es);
+    let this_off = cpu.regs.get16(Reg16::Bx);
+    let want = if tmpl_sel == 0 {
+        ud_format::ne::ResId::Int(tmpl_off)
+    } else {
+        let lin = cpu.far_to_linear(tmpl_sel, tmpl_off);
+        ud_format::ne::ResId::Name(
+            String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 256)).into_owned(),
+        )
+    };
+    let dlg = state
+        .resources
+        .iter()
+        .find(|r| r.type_id == ud_format::ne::ResId::Int(5) && res_id_eq(&r.name_id, &want))
+        .map(|r| r.data.clone());
+    let (title, controls) = dlg
+        .as_deref()
+        .map_or_else(|| (String::new(), Vec::new()), gui::parse_dialog_template);
+    state.gui.events.push(gui::GuiEvent::DialogStart {
+        title,
+        controls: controls.clone(),
+    });
+    let hdlg = state.gui.alloc_hwnd();
+    // Record the controls so GetDlgItem on the modeless dialog resolves
+    // (the installer updates the progress text via SetDlgItemText). We
+    // don't run the dialog procedure here — a modeless dialog is pumped by
+    // the program's own message loop, and the progress UI isn't needed for
+    // the extraction to proceed.
+    for c in &controls {
+        let chwnd = state
+            .gui
+            .create_window(&c.class, &c.text, hdlg, c.id, c.style);
+        state.dialog_items.insert(c.id, chwnd);
+    }
+    let _ = (proc_sel, proc_off, this_sel, this_off, registry);
+    Ok(u32::from(hdlg))
+}
+
 fn stub_dialog_box(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -1657,51 +1783,6 @@ fn stub_end_dialog(
     state.dialog_ended = true;
     state.dialog_result = result as i16;
     Ok(1)
-}
-
-/// `USER.89 CreateDialog(hInst, lpTemplate far, hWndParent, lpDialogFunc far)`
-/// — the modeless counterpart of [`stub_dialog_box`]. Resolve the
-/// template against `state.resources`, log it as a `DialogStart` GUI
-/// event so the install-monitor transcript captures the surface the
-/// installer brings up, and return a freshly minted synthetic `HWND`.
-///
-/// Without a host-side message pump the dialog procedure never runs;
-/// the installer is expected to drive it itself via `IsDialogMessage`
-/// + `PeekMessage` or via direct `SendMessage` calls. Modeless dialogs
-/// in SITEX10 are progress / status windows the caller only treats
-/// as a non-zero handle to pass to later `ShowWindow` / `DestroyWindow`
-/// calls.
-fn stub_create_dialog(
-    cpu: &mut Cpu,
-    mmu: &mut Mmu,
-    state: &mut HostState,
-    _registry: &mut Registry,
-) -> Result<u32, Win32Error> {
-    // PASCAL (12 bytes): hInstance(SP+14), lpTemplate far(SP+10/SP+12),
-    // hWndParent(SP+8), lpDialogFunc far(SP+4/SP+6).
-    let tmpl_off = cpu.stack_word(mmu, 10).unwrap_or(0);
-    let tmpl_sel = cpu.stack_word(mmu, 12).unwrap_or(0);
-    let want = if tmpl_sel == 0 {
-        ud_format::ne::ResId::Int(tmpl_off)
-    } else {
-        let lin = cpu.far_to_linear(tmpl_sel, tmpl_off);
-        ud_format::ne::ResId::Name(
-            String::from_utf8_lossy(&read_guest_cstr(mmu, lin, 256)).into_owned(),
-        )
-    };
-    let dlg = state
-        .resources
-        .iter()
-        .find(|r| r.type_id == ud_format::ne::ResId::Int(5) && res_id_eq(&r.name_id, &want))
-        .map(|r| r.data.clone());
-    let (title, controls) = dlg
-        .as_deref()
-        .map_or_else(|| (String::new(), Vec::new()), gui::parse_dialog_template);
-    state
-        .gui
-        .events
-        .push(gui::GuiEvent::DialogStart { title, controls });
-    Ok(u32::from(state.gui.alloc_hwnd()))
 }
 
 /// First global atom value (matches Win16's `MAXINTATOM`).
@@ -2025,7 +2106,7 @@ mod tests {
         let mut state = HostState::default();
         let mut vfs = VirtualFs::new();
         vfs.insert("c:\\hello.txt", b"hi".to_vec());
-        state.context.vfs = Some(vfs);
+        state.context.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\HELLO.TXT");
         cpu.regs.set8(Reg8::Ah, 0x3D);
         cpu.regs.set8(Reg8::Al, 0); // read-only
@@ -2049,7 +2130,7 @@ mod tests {
         let mut state = HostState::default();
         let mut vfs = VirtualFs::new();
         vfs.insert("c:\\data.bin", b"ABCDEFGH".to_vec());
-        state.context.vfs = Some(vfs);
+        state.context.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         // Open
         set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\DATA.BIN");
         cpu.regs.set8(Reg8::Ah, 0x3D);
@@ -2139,7 +2220,7 @@ mod tests {
         let mut state = HostState::default();
         let mut vfs = VirtualFs::new();
         vfs.insert("c:\\sized.bin", vec![0u8; 0x1234]); // 4660 bytes
-        state.context.vfs = Some(vfs);
+        state.context.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\SIZED.BIN");
         cpu.regs.set8(Reg8::Ah, 0x3D);
         cpu.regs.set8(Reg8::Al, 0);
@@ -2164,7 +2245,7 @@ mod tests {
         let mut state = HostState::default();
         let mut vfs = VirtualFs::new();
         vfs.insert("c:\\flag.txt", vec![0u8; 1]);
-        state.context.vfs = Some(vfs);
+        state.context.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\FLAG.TXT");
         cpu.regs.set8(Reg8::Ah, 0x43);
         cpu.regs.set8(Reg8::Al, 0); // get
@@ -2194,7 +2275,7 @@ mod tests {
         let mut state = HostState::default();
         let mut vfs = VirtualFs::new();
         vfs.insert("c:\\f.bin", vec![0u8; 1]);
-        state.context.vfs = Some(vfs);
+        state.context.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\F.BIN");
         cpu.regs.set8(Reg8::Ah, 0x3D);
         cpu.regs.set8(Reg8::Al, 0);
@@ -2221,7 +2302,7 @@ mod tests {
         let mut state = HostState::default();
         let mut vfs = VirtualFs::new();
         vfs.insert("c:\\x.bin", vec![0u8]);
-        state.context.vfs = Some(vfs);
+        state.context.vfs = Some(crate::fsmount::MountTable::with_root(vfs));
         set_dos_ds_dx_to_path(&mut cpu, &mut mmu, 0x10_0000, "C:\\X.BIN");
         cpu.regs.set8(Reg8::Ah, 0x3D);
         cpu.regs.set8(Reg8::Al, 0);

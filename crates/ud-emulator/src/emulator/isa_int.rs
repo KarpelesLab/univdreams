@@ -51,6 +51,11 @@ pub enum StepOk {
 /// CPU instance — owns its own register file. The [`Mmu`] is
 /// passed by mutable reference into every step so that one MMU
 /// can be reused across multiple emulator instances.
+///
+/// `Clone` snapshots the full architectural + instrumentation state; the
+/// Linux thread scheduler uses it to spawn a child thread that shares the
+/// parent's [`Mmu`] but has its own registers / `fs_base` (TLS).
+#[derive(Clone)]
 pub struct Cpu {
     pub regs: Regs,
     pub instr_count: u64,
@@ -76,7 +81,7 @@ pub struct Cpu {
     /// [`Cpu::set_fs_base`]. References:
     /// Intel SDM Vol. 1 §3.4.4 (segment registers in 32-bit
     /// flat mode); Microsoft "TEB" documentation for FS use.
-    fs_base: u32,
+    pub(crate) fs_base: u32,
     gs_base: u32,
     /// x87 FPU control word — stored as a 16-bit shadow so a
     /// codec's `fnstcw m16 ; (modify) ; fldcw m16` boilerplate
@@ -115,7 +120,7 @@ pub struct Cpu {
     /// in host endianness; the helpers in `isa_sse` deal in
     /// 64-bit halves so we can avoid `u128` arithmetic where
     /// the architectural definition is per-lane.
-    pub xmm: [u128; 8],
+    pub xmm: [u128; 16],
     /// Upper 128 bits of the YMM register file `ymm0..ymm7`.
     /// `ymm[i]` is the 256-bit value `(ymm_high[i] << 128) |
     /// xmm[i]`; legacy SSE writes leave `ymm_high` untouched
@@ -203,6 +208,10 @@ pub struct Cpu {
     /// flat 32-bit Win32 path, where all the machinery below is inert
     /// (all bases 0, default size 32-bit) so behaviour is unchanged.
     code16: bool,
+    /// amd64 long mode: the executor decodes/runs 64-bit instructions
+    /// (`regs.gp64`/`regs.rip`, REX prefixes, RIP-relative). Mutually
+    /// exclusive with `code16`; `false` for every Windows / i386 path.
+    pub(crate) long64: bool,
     /// Current segment selectors (the 16-bit tokens loaded into the
     /// segment registers). Only meaningful in `code16` mode; used so
     /// `far call`/`push cs` can save the real selector.
@@ -259,6 +268,7 @@ impl Cpu {
             instr_limit: DEFAULT_INSTR_LIMIT,
             op_size_16: false,
             addr_size_16: false,
+            long64: false,
             rep_prefix: None,
             seg_override: None,
             fs_base: 0,
@@ -267,7 +277,7 @@ impl Cpu {
             fpu: super::isa_fpu::FpuState::new(),
             mmx: [0u64; 8],
             mmx_dispatch_count: 0,
-            xmm: [0u128; 8],
+            xmm: [0u128; 16],
             ymm_high: [0u128; 8],
             sse_dispatch_count: 0,
             avx_dispatch_count: 0,
@@ -371,6 +381,19 @@ impl Cpu {
     /// Block). The runtime calls this after mapping the TEB.
     pub fn set_fs_base(&mut self, base: u32) {
         self.fs_base = base;
+    }
+
+    /// Enter (or leave) amd64 long mode. The executor then decodes 64-bit
+    /// instructions against `regs.gp64` / `regs.rip`. The Linux loader sets
+    /// this for an `EM_X86_64` image.
+    pub fn set_long64(&mut self, on: bool) {
+        self.long64 = on;
+    }
+
+    /// True iff the CPU is in amd64 long mode.
+    #[must_use]
+    pub fn is_long64(&self) -> bool {
+        self.long64
     }
 
     /// Configure the linear base of the GS segment. Almost always
@@ -728,6 +751,11 @@ impl Cpu {
     /// [`StepOk::Halted`] when the instruction was a `ret` and
     /// the popped return address was [`RET_SENTINEL`].
     pub fn step(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+        // amd64 long mode runs a separate decode/execute path that leaves
+        // the 32-bit machinery below entirely untouched.
+        if self.long64 {
+            return self.step_long64(mmu);
+        }
         // Reset per-instruction prefix state.
         self.op_size_16 = false;
         self.addr_size_16 = false;
@@ -1626,23 +1654,18 @@ impl Cpu {
                 mnemonic: "int3",
             }),
 
-            // 0xCD — INT imm8 → trap.
+            // 0xCD — INT imm8 → surface to the run loop as a software
+            // interrupt. The Win16 loop services DOS `INT 21h`; the Linux
+            // loop services `INT 0x80` (the i386 syscall gate). `eip`
+            // already points past the 2-byte `INT n`. A loop that doesn't
+            // recognise the vector turns it into an error, matching the
+            // old 32-bit "privileged opcode" outcome for a stray `INT`.
             0xCD => {
                 let num = self.fetch_imm8(mmu)?;
-                if self.code16 {
-                    // Software interrupts (DOS INT 21h, …) are serviced
-                    // by the run loop; `eip` already points past the
-                    // 2-byte `INT n`.
-                    Err(Trap::SoftwareInterrupt {
-                        num,
-                        eip: self.regs.eip,
-                    })
-                } else {
-                    Err(Trap::PrivilegedOpcode {
-                        eip: entry_eip,
-                        mnemonic: "int imm8",
-                    })
-                }
+                Err(Trap::SoftwareInterrupt {
+                    num,
+                    eip: self.regs.eip,
+                })
             }
 
             // 0xCF — IRETD → trap.
@@ -3608,8 +3631,10 @@ impl Cpu {
         let size = self.string_size(sized_dword);
         let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
-            let src = this.regs.get32(Reg32::Esi);
-            let dst = this.regs.get32(Reg32::Edi);
+            // CMPS compares `(DS|override):SI` against `ES:DI`; both indices
+            // get their segment base applied (str_si_addr/str_di_addr).
+            let src = this.str_si_addr(true);
+            let dst = this.str_di_addr();
             match size {
                 StringSize::B8 => {
                     let a = mmu.load8(src)?;
@@ -3627,7 +3652,7 @@ impl Cpu {
                     let _ = alu_sub_32(a, b, &mut this.regs.flags);
                 }
             }
-            this.regs.set32(Reg32::Esi, src.wrapping_add(step as u32));
+            this.str_advance(Reg16::Si, Reg32::Esi, step);
             this.str_advance(Reg16::Di, Reg32::Edi, step);
             Ok(())
         };

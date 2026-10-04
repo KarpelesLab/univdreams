@@ -48,3 +48,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    # Mirror what docs.rs builds: public API only (no private items),
+    # with broken intra-doc links promoted to hard errors so the
+    # published docs never ship a dangling `[link]`.
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
+
+  script-feature:
+    name: script feature (kataan)
+    runs-on: ubuntu-latest
+    # The `script` feature pulls the `kataan` JS engine (edition 2024,
+    # Rust >= 1.88) and isn't built by the default clippy/test jobs, so
+    # lint + test it on its own.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p ud-cli --features script --all-targets -- -D warnings
+      - run: cargo test -p ud-cli --features script

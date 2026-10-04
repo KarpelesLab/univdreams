@@ -19,14 +19,14 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-ud-ast = { version = "0.2.0", path = "../ud-ast" }
-ud-format = { version = "0.2.0", path = "../ud-format" }
-ud-translate = { version = "0.2.0", path = "../ud-translate" }
-ud-arch-codec = { version = "0.2.0", path = "../ud-arch-codec" }
-ud-arch-x86 = { version = "0.2.0", path = "../ud-arch-x86" }
-ud-arch-aarch64 = { version = "0.2.0", path = "../ud-arch-aarch64" }
-ud-arch-6502 = { version = "0.2.0", path = "../ud-arch-6502" }
-ud-arch-bpf = { version = "0.2.0", path = "../ud-arch-bpf" }
+ud-ast = { version = "0.3.0", path = "../ud-ast" }
+ud-format = { version = "0.3.0", path = "../ud-format" }
+ud-translate = { version = "0.3.0", path = "../ud-translate" }
+ud-arch-codec = { version = "0.3.0", path = "../ud-arch-codec" }
+ud-arch-x86 = { version = "0.3.0", path = "../ud-arch-x86" }
+ud-arch-aarch64 = { version = "0.3.0", path = "../ud-arch-aarch64" }
+ud-arch-6502 = { version = "0.3.0", path = "../ud-arch-6502" }
+ud-arch-bpf = { version = "0.3.0", path = "../ud-arch-bpf" }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
 bs58 = "0.5"

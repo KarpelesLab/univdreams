@@ -3,12 +3,19 @@
 // Allow the cast at module level rather than peppering 14 inline
 // attrs across the VfW handlers.
 #![allow(clippy::cast_possible_wrap)]
+// Guest memory is a 32-bit address space, so `usize`/`u64` offsets
+// and lengths are cast down to `u32` throughout by design; the
+// truncation is intentional, not a latent bug.
+#![allow(clippy::cast_possible_truncation)]
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+
+#[cfg(feature = "script")]
+mod script;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -139,8 +146,10 @@ enum Command {
         /// The string is prefixed with the input PE's filename
         /// so the installer sees `argv[0] = setup.exe` and
         /// `argv[1..] = <flags>`, matching how Windows
-        /// formats the real `GetCommandLineA` output.
-        #[arg(long)]
+        /// formats the real `GetCommandLineA` output. For Linux ELFs the
+        /// tokens become the guest `argv[1..]` (quote-aware), e.g.
+        /// `--args "-c 'echo hi'"`.
+        #[arg(long, allow_hyphen_values = true)]
         args: Option<String>,
 
         /// In monitor mode, after the run finishes write every
@@ -151,6 +160,60 @@ enum Command {
         /// `ud analyze --monitor` pass.
         #[arg(long)]
         dump_vfs: Option<PathBuf>,
+
+        /// Run amd64 Linux ELFs natively under KVM (hardware
+        /// virtualization) instead of the software interpreter.
+        /// Requires a Linux x86-64 host with `/dev/kvm` and a
+        /// build with `--features kvm`; falls back to the
+        /// interpreter if KVM is unavailable or the guest can't
+        /// be run that way.
+        #[arg(long)]
+        kvm: bool,
+
+        /// Allow the guest to open real **host network** sockets
+        /// (TCP/UDP/DNS), e.g. so `apk add` can download packages.
+        /// Off by default; enabling it lets the sandboxed program
+        /// reach the host's network.
+        #[arg(long)]
+        net: bool,
+
+        /// Run interactively: wire the guest's stdin/stdout/stderr to
+        /// this terminal (raw mode), report a real tty to the guest,
+        /// and deliver Ctrl-C as SIGINT — so you can drive a shell.
+        /// Off by default (batch: stdin is EOF, output is captured).
+        #[arg(short = 'i', long)]
+        interactive: bool,
+
+        /// Back the root filesystem with a real on-disk format
+        /// (ext4 / ntfs / fat / exfat) via fstool instead of the
+        /// flat in-memory store. `auto` picks the per-OS default
+        /// (ext4 for a Linux ELF, NTFS for a PE). Requires a build
+        /// with `--features fstool`.
+        #[arg(long, value_name = "TYPE")]
+        fs_type: Option<String>,
+
+        /// Mount a filesystem at a path: `--mount <point>=<spec>`
+        /// (repeatable). `<spec>` is a type name (`ext4`, fresh
+        /// empty), `@<image>` (open a host image read-only), or
+        /// `@<image>:rw` (open writable, flush on exit). Requires
+        /// `--features fstool`. Example: `--mount /data=@disk.ext4`.
+        #[arg(long, value_name = "POINT=SPEC")]
+        mount: Vec<String>,
+
+        /// Don't auto-mount the synthetic `/proc` and `/dev` for
+        /// Linux runs.
+        #[arg(long)]
+        no_default_mounts: bool,
+
+        /// Populate the root from a filesystem image source and mount
+        /// it (writable) at `/`. SPEC is a local `*.tar.gz` / `*.tar` /
+        /// directory, or `alpine[:VERSION][/ARCH]` to fetch the Alpine
+        /// minirootfs from dl-cdn.alpinelinux.org (cached locally). The
+        /// source is repacked into a cached ext4 image on first use.
+        /// Requires `--features fstool`. Example:
+        /// `--rootfs alpine /bin/busybox`.
+        #[arg(long, value_name = "SPEC")]
+        rootfs: Option<String>,
 
         /// In monitor mode, silently ignore `DeleteFileA` and
         /// `RemoveDirectoryA` so the post-install rollback
@@ -196,6 +259,84 @@ enum Command {
         /// loads. Implies `--fail-soft`.
         #[arg(long)]
         vfs_deps: bool,
+
+        /// After `DllMain` returns, call every exported symbol
+        /// whose name matches this pattern (repeatable). A single
+        /// `*` acts as a wildcard, so `--call-export '*InitDecoder'`
+        /// drives the codec's decoder-init entry point that CRT
+        /// init alone never reaches. Each match is invoked stdcall
+        /// with the `--export-arg` values (none by default); its
+        /// return value and any trap are added to the report, and
+        /// the Win32-call / coverage totals include the calls it
+        /// makes. Non-matching patterns emit a warning.
+        #[arg(long, value_name = "PATTERN")]
+        call_export: Vec<String>,
+
+        /// 32-bit argument pushed (in order, left to right) to
+        /// each `--call-export` target. Repeatable; accepts
+        /// decimal or `0x`-prefixed hex. Applied uniformly to
+        /// every called export.
+        #[arg(long, value_name = "N")]
+        export_arg: Vec<String>,
+
+        /// Call one export with its own argument list, as an
+        /// ordered step in a persistent decode sequence. SPEC is
+        /// `NAME[:arg,arg,…]` (args decimal or `0x` hex).
+        /// Repeatable; the calls run in command-line order in the
+        /// same guest context — so a codec whose decode-time
+        /// tables are built only across a call *sequence* can be
+        /// driven end to end in one process, e.g.
+        /// `--call RAOpenCodec:0x20000000
+        ///  --call RAInitDecoder:0x20000000
+        ///  --call RADecode:0x30000000,0,0x40000000`.
+        /// Stage the descriptor / frame buffers with `--map-blob`
+        /// and capture what a call built with `--dump-mem`. Runs
+        /// after any `--call-export` matches. Unlike `--call-export`
+        /// the name is matched exactly and a repeat re-invokes it
+        /// (e.g. decode several frames).
+        #[arg(long = "call", value_name = "NAME[:args]")]
+        call: Vec<String>,
+
+        /// After the run (including any `--call-export`), dump a
+        /// region of guest memory. SPEC is `ADDR:LEN` to hex-dump
+        /// to stdout, or `ADDR:LEN=PATH` to write the raw bytes to
+        /// a host file. ADDR/LEN take decimal or `0x` hex.
+        /// Repeatable — use it to capture the tables / buffers a
+        /// decoder-init populated. Unmapped bytes render as `··`
+        /// in the hex dump and are zero-filled in file output.
+        #[arg(long, value_name = "SPEC")]
+        dump_mem: Vec<String>,
+
+        /// Before any `--call-export`, stage a host file's bytes
+        /// into guest memory at a chosen VA. SPEC is `VA=PATH`
+        /// (VA decimal or `0x` hex). Gap pages are mapped R+W;
+        /// the write bypasses page W-protection, so a blob can
+        /// land in read-only data too. Repeatable. Use it to
+        /// inject a valid init cookie / descriptor an export
+        /// expects, then point `--export-arg` at the VA and
+        /// `--dump-mem` at the tables it builds.
+        #[arg(long, value_name = "SPEC")]
+        map_blob: Vec<String>,
+
+        /// Size of the guest malloc / `HeapAlloc` arena in MiB.
+        /// Raise it when a decoder-init exhausts the default
+        /// (96 MiB) arena. Clamped to `[96, 256]`; the ceiling is
+        /// the const-arena region above the heap. Only raise it
+        /// for single-DLL codecs — the extra band is where
+        /// fixed-base QuickTime helper DLLs would load.
+        #[arg(long, value_name = "MiB", default_value_t = ud_emulator::Sandbox::DEFAULT_HEAP_MB)]
+        heap_mb: u32,
+
+        /// Watch a guest-memory region and record every store into
+        /// it as an ordered write-trace — `ADDR:LEN` (decimal or
+        /// `0x` hex), repeatable. Armed after `DllMain` + `--map-blob`
+        /// and before the `--call` / `--call-export` sequence, so it
+        /// captures exactly what those calls write. Each hit lands in
+        /// the report (text + JSON) as `#seq +off [addr] = value`
+        /// with the writing EIP — a byte-exact behavioral trace of
+        /// how the real codec fills a table.
+        #[arg(long, value_name = "ADDR:LEN")]
+        watch: Vec<String>,
     },
 
     /// Video for Windows codec tools — drive a codec DLL
@@ -249,6 +390,27 @@ enum Command {
         /// Where to write the `.ud` source. Defaults to stdout.
         #[arg(short, long)]
         out: Option<PathBuf>,
+    },
+
+    /// Drive the sandbox from a JavaScript program (feature `script`).
+    /// The script gets host globals — `load`, `dllMain`, `mapBlob`,
+    /// `callExport`, `dumpMem`, `readFile`/`writeFile`, `checkpoint`/
+    /// `restore`, `print` — over one persistent guest instance, so a
+    /// codec Open→Init→Decode sequence (or multi-frame decode) can be
+    /// orchestrated with real control flow. See `ud script --help`.
+    #[cfg(feature = "script")]
+    Script {
+        /// JavaScript program to run.
+        file: PathBuf,
+
+        /// Guest malloc / `HeapAlloc` arena size in MiB (default 96,
+        /// clamped to `[96, 256]`).
+        #[arg(long, value_name = "MiB", default_value_t = ud_emulator::Sandbox::DEFAULT_HEAP_MB)]
+        heap_mb: u32,
+
+        /// Cap each guest call at this many instructions.
+        #[arg(long, default_value_t = 100_000_000)]
+        max_instructions: u64,
     },
 }
 
@@ -470,10 +632,17 @@ enum VfwCommand {
         /// Codec DLL.
         dll: PathBuf,
 
-        /// Raw codec frame (no container — extract from any
-        /// AVI / MOV wrapper beforehand).
-        #[arg(long, value_name = "FILE")]
-        input: PathBuf,
+        /// Raw codec frame(s), bitstream only (no container —
+        /// extract from any AVI / MOV wrapper beforehand).
+        /// Repeatable: multiple `--input` frames are fed through
+        /// `ICDecompress` in order within ONE Open→Begin…End→Close
+        /// lifetime, so inter-frame decoder state (indeo5's
+        /// inheritance-MV tables, a dispatch table a P-frame
+        /// populates) persists across the sequence. An inter frame
+        /// that can't decode standalone (`ICDecompress=1` on its
+        /// own) decodes once its reference frame has run.
+        #[arg(long, value_name = "FILE", required = true)]
+        input: Vec<PathBuf>,
 
         /// Output frame width (pixels).
         #[arg(long)]
@@ -499,6 +668,43 @@ enum VfwCommand {
         /// Cap the run at this many guest instructions.
         #[arg(long, default_value_t = 100_000_000)]
         max_instructions: u64,
+
+        /// After `ICDecompress` returns (decoder tables built,
+        /// before teardown), dump a region of guest memory. SPEC
+        /// is `ADDR:LEN` to hex-dump to **stderr** (so it never
+        /// corrupts the decoded frame on stdout), or `ADDR:LEN=PATH`
+        /// to write the raw bytes to a host file. ADDR/LEN take
+        /// decimal or `0x` hex. Repeatable — capture the codec's
+        /// window / codebook / coupling tables after a real frame
+        /// decode. Unmapped bytes render as `··` / zero-fill.
+        #[arg(long, value_name = "SPEC")]
+        dump_mem: Vec<String>,
+
+        /// With multiple `--input` frames, take the `--dump-mem`
+        /// snapshots after this 1-based frame index instead of
+        /// after the last — to capture decoder state at a chosen
+        /// point in the sequence (e.g. right after the first inter
+        /// frame populates a table). Default: after the final frame.
+        #[arg(long, value_name = "N")]
+        dump_after_frame: Option<usize>,
+
+        /// Size of the guest malloc / `HeapAlloc` arena in MiB.
+        /// Raise it when a decoder exhausts the default (96 MiB)
+        /// arena mid-decode. Clamped to `[96, 256]`.
+        #[arg(long, value_name = "MiB", default_value_t = ud_emulator::Sandbox::DEFAULT_HEAP_MB)]
+        heap_mb: u32,
+
+        /// Watch a guest-memory region and record every store into
+        /// it during the decode as an ordered behavioral trace —
+        /// `ADDR:LEN` (decimal or `0x` hex), repeatable. Each hit is
+        /// printed to **stderr** as `#seq +off [addr] = value (wN)
+        /// eip=…`, so you get a byte-exact, per-write account of how
+        /// the *real* codec fills a table (window / codebook /
+        /// coupling / coefficient buffer) — ud as an instrumented
+        /// reference decoder. Watchpoints arm just before the frame
+        /// loop; use `--dump-mem` for the final contents.
+        #[arg(long, value_name = "ADDR:LEN")]
+        watch: Vec<String>,
     },
 
     /// Drive `ICCompress` on uncompressed pixel input: load
@@ -829,10 +1035,24 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             monitor,
             args,
             dump_vfs,
+            kvm,
+            net,
+            interactive,
+            fs_type,
+            mount,
+            no_default_mounts,
+            rootfs,
             preserve_deletes,
             fail_soft,
             stage_vfs,
             vfs_deps,
+            call_export,
+            export_arg,
+            call,
+            dump_mem,
+            map_blob,
+            heap_mb,
+            watch,
         } => {
             if monitor {
                 monitor_install(
@@ -842,6 +1062,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     args.as_deref(),
                     dump_vfs.as_deref(),
                     preserve_deletes,
+                    kvm,
+                    net,
+                    interactive,
+                    &FsOpts {
+                        fs_type,
+                        mounts: mount,
+                        no_default_mounts,
+                        rootfs,
+                    },
                 )
             } else {
                 analyze(
@@ -851,6 +1080,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     fail_soft || vfs_deps,
                     &stage_vfs,
                     vfs_deps,
+                    &call_export,
+                    &export_arg,
+                    &call,
+                    &dump_mem,
+                    &map_blob,
+                    heap_mb,
+                    &watch,
                 )
             }
         }
@@ -892,6 +1128,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 pix_format,
                 output,
                 max_instructions,
+                dump_mem,
+                dump_after_frame,
+                heap_mb,
+                watch,
             } => decode_cmd(
                 &dll,
                 &input,
@@ -901,6 +1141,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 pix_format,
                 output.as_deref(),
                 max_instructions,
+                &dump_mem,
+                dump_after_frame,
+                heap_mb,
+                &watch,
             ),
             VfwCommand::Encode {
                 dll,
@@ -984,6 +1228,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 max_instructions,
             ),
         },
+
+        #[cfg(feature = "script")]
+        Command::Script {
+            file,
+            heap_mb,
+            max_instructions,
+        } => script::run_script(&file, heap_mb, max_instructions),
     }
 }
 
@@ -1021,8 +1272,8 @@ const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
 
 /// Scratch address inside the heap arena, chosen so it's above
 /// any reasonable codec allocation made during DllMain. The
-/// heap allocator grows up from `HEAP_ARENA_START` (0x60000000);
-/// the slot sits just below `HEAP_ARENA_END` (0x66000000) giving
+/// heap allocator grows up from `HEAP_ARENA_START` (0x6000_0000);
+/// the slot sits just below `HEAP_ARENA_END` (0x6600_0000) giving
 /// the codec ~95 MiB before the scratch range collides.
 const QTCODEC_SCRATCH: u32 = 0x65FE_0000;
 
@@ -1236,7 +1487,7 @@ fn fourcc_be(s: &str) -> u32 {
     for (i, c) in s.bytes().take(4).enumerate() {
         b[i] = c;
     }
-    // OSType is Big-Endian — 'imdc' → 0x696d6463
+    // OSType is Big-Endian — 'imdc' → 0x696d_6463
     u32::from_be_bytes(b)
 }
 
@@ -1266,7 +1517,7 @@ fn qtcodec_register(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     for d in stage_vfs {
         let n = stage_dir_into_vfs(sandbox.context_mut(), d)
             .with_context(|| format!("stage {}", d.display()))?;
@@ -1549,7 +1800,7 @@ fn qtcodec_list(
     // context so we can carry their contents across.
     {
         let mut tmp_ctx = ud_emulator::context::Context {
-            vfs: Some(ud_emulator::context::VirtualFs::new()),
+            vfs: Some(ud_emulator::fsmount::MountTable::new()),
             ..ud_emulator::context::Context::default()
         };
         for d in stage_vfs {
@@ -1569,7 +1820,9 @@ fn qtcodec_list(
         let mut install_sb = ud_emulator::Sandbox::new();
         install_sb.host.trace_stubs = true;
         install_sb.host.instruction_budget = Some(max_instructions);
-        install_sb.context_mut().vfs = Some(staged_vfs.clone());
+        install_sb.context_mut().vfs = Some(ud_emulator::fsmount::MountTable::with_root(
+            staged_vfs.clone(),
+        ));
         install_sb.context_mut().registry = Some(staged_reg.clone());
         for msi_path in install_msi {
             let bytes =
@@ -1615,7 +1868,7 @@ fn qtcodec_list(
     let mut sandbox = ud_emulator::Sandbox::new();
     sandbox.host.trace_stubs = true;
     sandbox.host.instruction_budget = Some(max_instructions);
-    sandbox.context_mut().vfs = Some(staged_vfs);
+    sandbox.context_mut().vfs = Some(ud_emulator::fsmount::MountTable::with_root(staged_vfs));
     sandbox.context_mut().registry = Some(staged_reg);
     preload_qt_runtime(&mut sandbox);
 
@@ -1778,45 +2031,45 @@ fn qtcodec_list(
     // Diagnostic: read qts internal CM state to see what the dispatch
     // table + global state look like at runtime.
     let probe_addrs = &[
-        (0x67356240u32, "dispatch_table[cat 0..3] (32 bytes)"),
-        (0x67386860u32, "CM global state struct (32 bytes)"),
-        (0x6734a4ecu32, "[CM global ptr]"),
-        (0x6734a4e0u32, "[QT dispatcher ptr]"),
-        (0x668845b0u32, "theQuickTimeDispatcher prologue (32 bytes)"),
-        (0x67356248u32, "cat[1] entry (8 bytes raw)"),
-        (0x1004dcd0u32, "qtmlclient init flag (4 bytes)"),
+        (0x6735_6240u32, "dispatch_table[cat 0..3] (32 bytes)"),
+        (0x6738_6860u32, "CM global state struct (32 bytes)"),
+        (0x6734_a4ecu32, "[CM global ptr]"),
+        (0x6734_a4e0u32, "[QT dispatcher ptr]"),
+        (0x6688_45b0u32, "theQuickTimeDispatcher prologue (32 bytes)"),
+        (0x6735_6248u32, "cat[1] entry (8 bytes raw)"),
+        (0x1004_dcd0u32, "qtmlclient init flag (4 bytes)"),
         (
-            0x1004dcdcu32,
+            0x1004_dcdcu32,
             "qtmlclient->theQuickTimeDispatcher (4 bytes)",
         ),
-        (0x10024220u32, "qtmlclient!RegisterComponent (16 bytes)"),
-        (0x66884890u32, "cat[1].subtable stub (16 bytes)"),
-        (0x67347000u32, "qts CRT-init flag (4 bytes)"),
-        (0x67347004u32, "qts TLS slot index (4 bytes)"),
-        (0x673851e8u32, "qts thread-data lock (4 bytes)"),
-        (0x673851ecu32, "qts thread-data list head (4 bytes)"),
+        (0x1002_4220u32, "qtmlclient!RegisterComponent (16 bytes)"),
+        (0x6688_4890u32, "cat[1].subtable stub (16 bytes)"),
+        (0x6734_7000u32, "qts CRT-init flag (4 bytes)"),
+        (0x6734_7004u32, "qts TLS slot index (4 bytes)"),
+        (0x6738_51e8u32, "qts thread-data lock (4 bytes)"),
+        (0x6738_51ecu32, "qts thread-data list head (4 bytes)"),
         (0x7FFD_DFF0u32, "page below TEB (32 bytes)"),
         (0x7FFD_E000u32, "TEB start (32 bytes)"),
         (
-            0x400380a0u32,
+            0x4003_80a0u32,
             "libdispatch IAT slot range (32 bytes incl _initterm)",
         ),
         (
-            0x400380e0u32,
+            0x4003_80e0u32,
             "libdispatch IAT slot range (32 bytes incl pthread_setspecific @ +0x10)",
         ),
         (
-            0x40006750u32,
+            0x4000_6750u32,
             "pthread_setspecific impl prologue (32 bytes)",
         ),
         (
-            0x4000c160u32,
+            0x4000_c160u32,
             "pthread internal state slot [+0xc164] (16 bytes)",
         ),
-        (0x40006700u32, "pthread inner helper (32 bytes)"),
-        (0x4003a498u32, "libdispatch loaded value slot (32 bytes)"),
-        (0x4003a480u32, "libdispatch around 0xa498 (32 bytes)"),
-        (0x6000a810u32, "heap-allocated pthread_key_t (32 bytes)"),
+        (0x4000_6700u32, "pthread inner helper (32 bytes)"),
+        (0x4003_a498u32, "libdispatch loaded value slot (32 bytes)"),
+        (0x4003_a480u32, "libdispatch around 0xa498 (32 bytes)"),
+        (0x6000_a810u32, "heap-allocated pthread_key_t (32 bytes)"),
     ];
     eprintln!("--- runtime CM state ---");
     for (a, label) in probe_addrs {
@@ -1860,7 +2113,7 @@ fn qtcodec_call(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     for d in stage_vfs {
         let n = stage_dir_into_vfs(sandbox.context_mut(), d)
             .with_context(|| format!("stage {}", d.display()))?;
@@ -1944,7 +2197,7 @@ fn qtcodec_dispatch(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     for dir in stage_vfs {
         let n = stage_dir_into_vfs(sandbox.context_mut(), dir)
             .with_context(|| format!("stage {}", dir.display()))?;
@@ -2171,7 +2424,7 @@ fn vfw_probe(
     match sandbox.ic_decompress_query(hic, &in_bih, Some(&out_bih)) {
         Ok(q) => println!(
             "[probe] ICDecompressQuery({}x{} {:?} → {:?}) = {} (0 = ICERR_OK)",
-            width, height, &fcc, pix_format, q as i32
+            width, height, fcc, pix_format, q as i32
         ),
         Err(e) => println!("[probe] ICDecompressQuery failed: {e}"),
     }
@@ -2190,23 +2443,42 @@ fn vfw_probe(
 #[allow(clippy::too_many_lines)]
 fn decode_cmd(
     dll_path: &Path,
-    input: &Path,
+    inputs: &[PathBuf],
     width: u32,
     height: u32,
     fcc_handler: Option<&str>,
     pix_format: PixFormat,
     output: Option<&Path>,
     max_instructions: u64,
+    dump_mem: &[String],
+    dump_after_frame: Option<usize>,
+    heap_mb: u32,
+    watch: &[String],
 ) -> anyhow::Result<()> {
+    // Parse the `--dump-mem` / `--watch` specs up front so a typo
+    // fails before the multi-second decode run rather than after it.
+    let dump_specs: Vec<DumpSpec> = dump_mem
+        .iter()
+        .map(|s| parse_dump_spec(s).with_context(|| format!("--dump-mem {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let watch_specs: Vec<(u32, u32)> = watch
+        .iter()
+        .map(|s| parse_watch_spec(s).with_context(|| format!("--watch {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+
     let dll_bytes =
         std::fs::read(dll_path).with_context(|| format!("reading {}", dll_path.display()))?;
     let dll_name = dll_path
         .file_name()
         .map_or_else(|| "codec.dll".into(), |n| n.to_string_lossy().into_owned());
-    let frame =
-        std::fs::read(input).with_context(|| format!("reading frame {}", input.display()))?;
+    // Read every frame up front (clap guarantees ≥1). They are fed
+    // through the codec in order within one open instance.
+    let frames: Vec<Vec<u8>> = inputs
+        .iter()
+        .map(|p| std::fs::read(p).with_context(|| format!("reading frame {}", p.display())))
+        .collect::<anyhow::Result<_>>()?;
 
-    let mut sandbox = ud_emulator::Sandbox::new();
+    let mut sandbox = ud_emulator::Sandbox::new_with_heap_mb(heap_mb);
     sandbox.host.instruction_budget = Some(max_instructions);
 
     let img = sandbox
@@ -2223,6 +2495,8 @@ fn decode_cmd(
     let fcc_type = u32::from_le_bytes(*b"VIDC");
     let fcc_handler_u32 = fourcc_to_u32(&fcc);
 
+    // `in_bih` for the format-query uses the first frame's size; each
+    // decode below rebuilds it with that frame's byte length.
     let in_bih = ud_emulator::Bih {
         bi_size: 40,
         width: width as i32,
@@ -2230,7 +2504,7 @@ fn decode_cmd(
         planes: 1,
         bit_count: 24,
         compression: fcc_handler_u32.to_le_bytes(),
-        size_image: u32::try_from(frame.len()).unwrap_or(u32::MAX),
+        size_image: u32::try_from(frames[0].len()).unwrap_or(u32::MAX),
         ..ud_emulator::Bih::default()
     };
     let out_bih = ud_emulator::Bih {
@@ -2263,26 +2537,99 @@ fn decode_cmd(
 
     let _ = sandbox.ic_decompress_begin(hic, &in_bih, &out_bih);
     let out_capacity = width * height * pix_format.bytes_per_pixel();
-    let (rc, decoded) = sandbox
-        .ic_decompress(hic, 0, &in_bih, &frame, &out_bih, out_capacity)
-        .context("ICDecompress")?;
-    eprintln!(
-        "[decode] ICDecompress = {} (output {} bytes)",
-        rc as i32,
-        decoded.len()
-    );
 
+    // Arm watchpoints now — after Open/Begin — so the trace is the
+    // decode's own stores, not codec setup.
+    for &(addr, len) in &watch_specs {
+        sandbox.mmu.add_watch(addr, len);
+    }
+
+    // Which frame's decode to snapshot after (0-based). Default is
+    // the last frame; `--dump-after-frame N` (1-based) targets an
+    // earlier point in the sequence.
+    let dump_idx = match dump_after_frame {
+        Some(n) if (1..=frames.len()).contains(&n) => n - 1,
+        Some(n) => {
+            eprintln!(
+                "warning: --dump-after-frame {n} out of range 1..={}; dumping after the last frame",
+                frames.len()
+            );
+            frames.len() - 1
+        }
+        None => frames.len() - 1,
+    };
+
+    // Feed every frame through ICDecompress in order, in this one
+    // open instance — so inter-frame decoder state persists across
+    // the sequence. An inter frame that returns ICERR_UNSUPPORTED
+    // (1) standalone decodes once its reference frame has run.
+    let mut last_decoded: Vec<u8> = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let frame_bih = ud_emulator::Bih {
+            bi_size: 40,
+            width: width as i32,
+            height: height as i32,
+            planes: 1,
+            bit_count: 24,
+            compression: fcc_handler_u32.to_le_bytes(),
+            size_image: u32::try_from(frame.len()).unwrap_or(u32::MAX),
+            ..ud_emulator::Bih::default()
+        };
+        let (rc, decoded) = sandbox
+            .ic_decompress(hic, 0, &frame_bih, frame, &out_bih, out_capacity)
+            .with_context(|| format!("ICDecompress (frame {}/{})", i + 1, frames.len()))?;
+        eprintln!(
+            "[decode] frame {}/{}: ICDecompress = {} (output {} bytes)",
+            i + 1,
+            frames.len(),
+            rc as i32,
+            decoded.len()
+        );
+
+        // Snapshot requested guest-memory regions while the decoder's
+        // tables are still live (before ICDecompressEnd/Close tear
+        // them down). Hex dumps go to stderr so they never mix into
+        // the decoded frame on stdout.
+        if i == dump_idx {
+            for spec in &dump_specs {
+                let dump = capture_dump(&sandbox, spec)?;
+                if dump.file.is_none() {
+                    if let Some(hex) = &dump.hex {
+                        eprintln!(
+                            "[decode] memory dump after frame {} [0x{:x}..0x{:x}] ({} of {} bytes mapped):",
+                            i + 1,
+                            dump.addr,
+                            dump.addr.wrapping_add(dump.len as u32),
+                            dump.mapped_bytes,
+                            dump.len
+                        );
+                        eprint!("{}", render_hexdump(dump.addr, hex));
+                    }
+                }
+            }
+        }
+        last_decoded = decoded;
+    }
+
+    // Emit the watchpoint write-trace (to stderr — keeps stdout the
+    // decoded frame) before teardown.
+    if !watch_specs.is_empty() {
+        print_watch_trace(&sandbox, &watch_specs);
+    }
+
+    // Emit the final frame's pixels (with several frames the point is
+    // the persistent-state dump, not every frame's output).
     if let Some(path) = output {
-        std::fs::write(path, &decoded)
+        std::fs::write(path, &last_decoded)
             .with_context(|| format!("writing output {}", path.display()))?;
         eprintln!(
             "[decode] wrote {} bytes to {}",
-            decoded.len(),
+            last_decoded.len(),
             path.display()
         );
     } else {
         use std::io::Write as _;
-        std::io::stdout().write_all(&decoded)?;
+        std::io::stdout().write_all(&last_decoded)?;
     }
 
     let _ = sandbox.ic_decompress_end(hic);
@@ -2454,7 +2801,7 @@ fn solana_cmd(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn analyze(
     input: &Path,
     max_instructions: u64,
@@ -2462,7 +2809,37 @@ fn analyze(
     fail_soft: bool,
     stage_vfs: &[PathBuf],
     vfs_deps: bool,
+    call_export: &[String],
+    export_arg: &[String],
+    call: &[String],
+    dump_mem: &[String],
+    map_blob: &[String],
+    heap_mb: u32,
+    watch: &[String],
 ) -> anyhow::Result<()> {
+    // Parse the `--export-arg` / `--call` / `--dump-mem` / `--map-blob`
+    // / `--watch` specs up front so a typo fails before we spin up the
+    // sandbox rather than after a multi-second run.
+    let export_args: Vec<u32> = export_arg
+        .iter()
+        .map(|s| parse_u32_arg(s).with_context(|| format!("--export-arg {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let watch_specs: Vec<(u32, u32)> = watch
+        .iter()
+        .map(|s| parse_watch_spec(s).with_context(|| format!("--watch {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let call_specs: Vec<CallSpec> = call
+        .iter()
+        .map(|s| parse_call_spec(s).with_context(|| format!("--call {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let dump_specs: Vec<DumpSpec> = dump_mem
+        .iter()
+        .map(|s| parse_dump_spec(s).with_context(|| format!("--dump-mem {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let blob_specs: Vec<MapBlobSpec> = map_blob
+        .iter()
+        .map(|s| parse_map_blob_spec(s).with_context(|| format!("--map-blob {s:?}")))
+        .collect::<anyhow::Result<_>>()?;
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     if !ud_format::pe::is_pe(&bytes) {
         anyhow::bail!(
@@ -2475,13 +2852,13 @@ fn analyze(
         .and_then(|s| s.to_str())
         .unwrap_or("input");
 
-    let mut sandbox = ud_emulator::Sandbox::new();
+    let mut sandbox = ud_emulator::Sandbox::new_with_heap_mb(heap_mb);
     sandbox.host.trace_stubs = true;
     sandbox.host.instruction_budget = Some(max_instructions);
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     for dir in stage_vfs {
         let n = stage_dir_into_vfs(sandbox.context_mut(), dir)
             .with_context(|| format!("stage {}", dir.display()))?;
@@ -2511,12 +2888,15 @@ fn analyze(
                     dll_main: DllMainOutcome::LoadFailed {
                         message: e.to_string(),
                     },
+                    export_calls: Vec::new(),
                     win32_calls: Vec::new(),
                     win32_calls_by_function: Vec::new(),
                     coverage: CoverageSummary::default(),
                     indicators,
                     instructions_executed: 0,
                     instruction_budget: max_instructions,
+                    memory_dumps: Vec::new(),
+                    watch_trace: Vec::new(),
                     debug_log: std::mem::take(&mut sandbox.host.debug_log),
                 };
                 let s = serde_json::to_string_pretty(&report)?;
@@ -2527,7 +2907,47 @@ fn analyze(
         }
     };
 
+    // Stage any injected blobs (init cookies / descriptors) into
+    // guest memory now — after load so the image is mapped, before
+    // DllMain/exports so a descriptor an export dereferences is
+    // already present.
+    for spec in &blob_specs {
+        apply_map_blob(&mut sandbox, spec)?;
+    }
+
     let dll_main_result = sandbox.call_dll_main(&image, ud_emulator::DLL_PROCESS_ATTACH);
+
+    // Arm watchpoints now — after DllMain + map-blob, before the call
+    // sequence — so the write-trace is the calls' own stores.
+    for &(addr, len) in &watch_specs {
+        sandbox.mmu.add_watch(addr, len);
+    }
+
+    // With CRT init done, drive the requested codec exports
+    // (e.g. `*InitDecoder`). These run in the same guest state
+    // DllMain left behind, so the Win32-call and coverage totals
+    // taken below fold in whatever the exports touched — which is
+    // the whole point: DllMain alone never reaches the decoder.
+    let mut export_calls = drive_exports(&mut sandbox, &image, call_export, &export_args);
+
+    // Then drive the ordered `--call` sequence in command-line
+    // order, each with its own argument list. This is the
+    // persistent-instance path: Open→Init→Decode against one live
+    // guest context, so decode-time tables built only across a call
+    // sequence (cook's MDCT window / coupling coefficients, built in
+    // RADecode not RAInitDecoder) come into being before the dumps.
+    export_calls.extend(drive_call_sequence(&mut sandbox, &image, &call_specs));
+
+    // Snapshot the requested memory regions before we tear the
+    // sandbox down. Files are written here (side effect); the
+    // returned records carry the hex preview for the report.
+    let memory_dumps = dump_specs
+        .iter()
+        .map(|spec| capture_dump(&sandbox, spec))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let watch_trace = collect_watch_trace(&sandbox, &watch_specs);
+
     let stub_calls = std::mem::take(&mut sandbox.host.stub_calls);
     let _: Vec<String> = std::mem::take(&mut sandbox.host.stub_trace);
     let instructions_executed = sandbox.host.instructions_executed;
@@ -2585,12 +3005,15 @@ fn analyze(
         image_base: image.image_base,
         entry_point: image.entry_point,
         dll_main,
+        export_calls,
         win32_calls,
         win32_calls_by_function,
         coverage,
         indicators,
         instructions_executed,
         instruction_budget: max_instructions,
+        memory_dumps,
+        watch_trace,
         debug_log: std::mem::take(&mut sandbox.host.debug_log),
     };
 
@@ -2781,7 +3204,7 @@ fn monitor_msi_install(
         }
         // Also stage the MSI bytes at a path dispatch can find.
         sb_vfs.insert("c:/temp/install.msi", bytes.to_vec());
-        sandbox.context_mut().vfs = Some(sb_vfs);
+        sandbox.context_mut().vfs = Some(ud_emulator::fsmount::MountTable::with_root(sb_vfs));
         // Stage registry (clone via the all_values iter).
         let mut sb_reg = ud_emulator::context::VirtualRegistry::new();
         for (k, n, v) in registry.all_values() {
@@ -2923,7 +3346,7 @@ fn monitor_install_ne(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     sandbox
         .context_mut()
         .registry
@@ -3052,6 +3475,582 @@ fn monitor_install_ne(
     Ok(())
 }
 
+/// Run an ELF binary under the Linux syscall-emulation personality and
+/// report what it did (captured stdout/stderr, exit code, unsupported
+/// syscalls, files written to the VFS).
+/// Resolve a `--fs-type` value, mapping `auto`/`default`/empty to the per-OS
+/// default (`ext4` for Linux, `ntfs` for Windows).
+#[cfg(feature = "fstool")]
+fn resolve_fs_type(ty: &str, default_type: &str) -> String {
+    if ty.is_empty() || ty == "auto" || ty == "default" {
+        default_type.to_string()
+    } else {
+        ty.to_string()
+    }
+}
+
+/// Parse one `--mount` right-hand side into an fstool mount. Grammar:
+/// `[type]@path[:rw]` opens a host image; a bare `type` formats a fresh empty
+/// 64 MiB filesystem.
+#[cfg(feature = "fstool")]
+fn parse_mount_spec(
+    src: &str,
+    default_type: &str,
+) -> anyhow::Result<ud_emulator::fsmount::fstool::FsToolMount> {
+    use ud_emulator::fsmount::fstool::FsToolMount;
+    if let Some((lhs, rhs)) = src.split_once('@') {
+        let ty = resolve_fs_type(lhs, default_type);
+        let (path, writeback) = rhs.strip_suffix(":rw").map_or((rhs, false), |p| (p, true));
+        Ok(FsToolMount::open_image(
+            std::path::Path::new(path),
+            &ty,
+            writeback,
+        )?)
+    } else {
+        Ok(FsToolMount::format_empty(src, 256 << 20)?)
+    }
+}
+
+/// Default Alpine release fetched for `--rootfs alpine` (override with
+/// `alpine:VERSION`). The download branch is derived as `v<MAJ.MIN>`.
+#[cfg(feature = "fstool")]
+const DEFAULT_ALPINE_VERSION: &str = "3.21.0";
+
+/// Writable headroom added to a repacked `--rootfs` image, on top of the
+/// source size, so packages can be installed into the mounted root.
+#[cfg(feature = "fstool")]
+const ROOTFS_HEADROOM: u64 = 512 << 20;
+
+/// Cache directory for fetched tarballs and built rootfs images.
+#[cfg(feature = "fstool")]
+fn ud_cache_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("univdreams").join("rootfs")
+}
+
+/// Download `url` to `dest` (atomically via a temp file) unless it already
+/// exists.
+#[cfg(feature = "fstool")]
+fn fetch_cached(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+    if dest.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    eprintln!("ud: fetching {url}");
+    let resp = ureq::get(url)
+        .call()
+        .with_context(|| format!("GET {url}"))?;
+    let tmp = dest.with_extension("part");
+    {
+        let mut out = std::fs::File::create(&tmp)?;
+        std::io::copy(&mut resp.into_reader(), &mut out)?;
+    }
+    std::fs::rename(&tmp, dest)?;
+    Ok(())
+}
+
+/// Resolve a `--rootfs SPEC` to a local source path (tarball or directory).
+/// `alpine[:VERSION][/ARCH]` fetches the minirootfs; anything else is a local
+/// path used as-is.
+#[cfg(feature = "fstool")]
+fn resolve_rootfs_source(spec: &str) -> anyhow::Result<std::path::PathBuf> {
+    // alpine[:VERSION][/ARCH]
+    if spec == "alpine" || spec.starts_with("alpine:") || spec.starts_with("alpine/") {
+        let rest = &spec["alpine".len()..];
+        let (ver_part, arch) = match rest.split_once('/') {
+            Some((v, a)) => (v, a.to_string()),
+            None => (rest, "x86_64".to_string()),
+        };
+        let version = ver_part
+            .strip_prefix(':')
+            .filter(|v| !v.is_empty())
+            .unwrap_or(DEFAULT_ALPINE_VERSION);
+        // Branch v<MAJ.MIN> from the full version.
+        let branch = {
+            let mut it = version.split('.');
+            match (it.next(), it.next()) {
+                (Some(maj), Some(min)) => format!("v{maj}.{min}"),
+                _ => anyhow::bail!("invalid alpine version {version:?} (want MAJ.MIN.PATCH)"),
+            }
+        };
+        let file = format!("alpine-minirootfs-{version}-{arch}.tar.gz");
+        let url = format!("https://dl-cdn.alpinelinux.org/alpine/{branch}/releases/{arch}/{file}");
+        let dest = ud_cache_dir().join(&file);
+        fetch_cached(&url, &dest)?;
+        return Ok(dest);
+    }
+    let path = std::path::PathBuf::from(spec);
+    anyhow::ensure!(path.exists(), "--rootfs source not found: {spec}");
+    Ok(path)
+}
+
+/// Deterministic cache path for the ext4 image built from `source`, keyed on
+/// the source's path + size + mtime + headroom so it rebuilds when the source
+/// changes.
+#[cfg(feature = "fstool")]
+fn rootfs_image_path(source: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let canon = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let meta = std::fs::metadata(&canon)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    canon.hash(&mut h);
+    meta.len().hash(&mut h);
+    if let Ok(mtime) = meta.modified() {
+        if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+            dur.as_secs().hash(&mut h);
+        }
+    }
+    ROOTFS_HEADROOM.hash(&mut h);
+    let stem = canon
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("rootfs");
+    Ok(ud_cache_dir().join(format!("{stem}-{:016x}.ext4", h.finish())))
+}
+
+/// Alpine release branch (`v<MAJ.MIN>`) for an `alpine[:VERSION]` spec, or
+/// `None` for a local path / non-alpine source (we don't know its branch).
+#[cfg(feature = "fstool")]
+fn alpine_branch_for(spec: &str) -> Option<String> {
+    if spec != "alpine" && !spec.starts_with("alpine:") && !spec.starts_with("alpine/") {
+        return None;
+    }
+    let rest = &spec["alpine".len()..];
+    let ver_part = rest.split_once('/').map_or(rest, |(v, _)| v);
+    let version = ver_part
+        .strip_prefix(':')
+        .filter(|v| !v.is_empty())
+        .unwrap_or(DEFAULT_ALPINE_VERSION);
+    let mut it = version.split('.');
+    match (it.next(), it.next()) {
+        (Some(maj), Some(min)) => Some(format!("v{maj}.{min}")),
+        _ => None,
+    }
+}
+
+/// Build (if needed) and mount the `--rootfs` source as a writable ext4 root.
+#[cfg(feature = "fstool")]
+fn install_rootfs(table: &mut ud_emulator::fsmount::MountTable, spec: &str) -> anyhow::Result<()> {
+    use ud_emulator::fsmount::fstool::{build_ext_image, FsToolMount};
+    let source = resolve_rootfs_source(spec)?;
+    let image = rootfs_image_path(&source)?;
+    if !image.is_file() {
+        if let Some(parent) = image.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        eprintln!(
+            "ud: building rootfs image {} from {}",
+            image.display(),
+            source.display()
+        );
+        build_ext_image(&image, "ext4", &source, ROOTFS_HEADROOM)
+            .with_context(|| format!("repack {} -> ext4", source.display()))?;
+    }
+    // Mount writable so package installs into the root persist to the image.
+    let fm = FsToolMount::open_image(&image, "ext4", true)
+        .with_context(|| format!("mount rootfs image {}", image.display()))?;
+    table.mount("/", Box::new(fm));
+
+    // Seed a resolver so guest DNS (musl reads /etc/resolv.conf) works; without
+    // one musl defaults to 127.0.0.1, which usually goes nowhere and hangs.
+    use ud_emulator::context::FileAccess;
+    let resolv = b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
+    if let Some(h) = table.open("/etc/resolv.conf", FileAccess::ReadWrite) {
+        table.write_handle(h, resolv);
+        table.close(h);
+    }
+
+    // Point apk at `http://` mirrors. The minirootfs ships `https://` repos, but
+    // it carries no CA bundle, so TLS cert verification fails ("certificate
+    // verify failed"). apk authenticates packages with the RSA keys in
+    // `/etc/apk/keys/` (shipped in the rootfs), so plain HTTP is still secure —
+    // the index and every .apk are signature-checked regardless of transport.
+    if let Some(branch) = alpine_branch_for(spec) {
+        let repos = format!(
+            "http://dl-cdn.alpinelinux.org/alpine/{branch}/main\n\
+             http://dl-cdn.alpinelinux.org/alpine/{branch}/community\n"
+        );
+        // Truncate first: the shipped `https://` file is longer than our
+        // `http://` replacement, so a plain overwrite would leave stale bytes.
+        let _ = table.truncate_path("/etc/apk/repositories", 0);
+        if let Some(h) = table.open("/etc/apk/repositories", FileAccess::ReadWrite) {
+            table.write_handle(h, repos.as_bytes());
+            table.close(h);
+        }
+    }
+    Ok(())
+}
+
+/// Install `--rootfs` / `--fs-type` (root) and `--mount` overlays into the table.
+#[cfg(feature = "fstool")]
+fn install_fstool_mounts(
+    table: &mut ud_emulator::fsmount::MountTable,
+    fs: &FsOpts,
+    default_type: &str,
+) -> anyhow::Result<()> {
+    use ud_emulator::fsmount::fstool::FsToolMount;
+    // `--rootfs` wins for `/`; otherwise `--fs-type` formats a fresh root.
+    if let Some(spec) = &fs.rootfs {
+        install_rootfs(table, spec)?;
+    } else if let Some(ty) = &fs.fs_type {
+        let ty = resolve_fs_type(ty, default_type);
+        let fm = FsToolMount::format_empty(&ty, 256 << 20)
+            .with_context(|| format!("mkfs root --fs-type {ty}"))?;
+        table.mount("/", Box::new(fm));
+    }
+    for spec in &fs.mounts {
+        let (point, src) = spec
+            .split_once('=')
+            .with_context(|| format!("--mount expects POINT=SPEC, got {spec:?}"))?;
+        let fm =
+            parse_mount_spec(src, default_type).with_context(|| format!("--mount {spec:?}"))?;
+        table.mount(point, Box::new(fm));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "fstool"))]
+fn install_fstool_mounts(
+    _table: &mut ud_emulator::fsmount::MountTable,
+    fs: &FsOpts,
+    _default_type: &str,
+) -> anyhow::Result<()> {
+    if fs.fs_type.is_some() || !fs.mounts.is_empty() || fs.rootfs.is_some() {
+        anyhow::bail!("--fs-type / --mount / --rootfs require a build with `--features fstool`");
+    }
+    Ok(())
+}
+
+/// Split a `--args` string into argv tokens, honouring single and double
+/// quotes (so `sh -c 'echo hi'` becomes `["sh", "-c", "echo hi"]`).
+fn shell_split(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_tok = false;
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_tok = true;
+                }
+                c if c.is_whitespace() => {
+                    if in_tok {
+                        out.push(std::mem::take(&mut cur));
+                        in_tok = false;
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    in_tok = true;
+                }
+            },
+        }
+    }
+    if in_tok {
+        out.push(cur);
+    }
+    out
+}
+
+/// A minimal guest environment for the Linux personality (busybox / apk look
+/// at `PATH`, `HOME`, `TERM`).
+fn default_linux_env() -> Vec<String> {
+    [
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME=/root",
+        "TERM=dumb",
+        "PWD=/",
+        "USER=root",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Puts the host terminal (fd 0) into raw mode for the guard's lifetime and
+/// restores the saved settings on drop (including on panic). No-op if stdin is
+/// not a tty. With the host raw, every keystroke — including Ctrl-C — reaches
+/// the guest, whose line discipline does the echo/editing/signals instead.
+struct RawTerminal {
+    saved: Option<libc::termios>,
+}
+
+impl RawTerminal {
+    #[allow(unsafe_code)]
+    fn enable() -> Self {
+        let fd = libc::STDIN_FILENO;
+        // SAFETY: `termios` is plain-old-data; the ioctls act on our own stdin.
+        unsafe {
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::isatty(fd) != 1 || libc::tcgetattr(fd, &mut saved) != 0 {
+                return Self { saved: None };
+            }
+            let mut raw = saved;
+            libc::cfmakeraw(&mut raw);
+            libc::tcsetattr(fd, libc::TCSANOW, &raw);
+            Self { saved: Some(saved) }
+        }
+    }
+}
+
+impl Drop for RawTerminal {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved {
+            // SAFETY: restoring the settings we captured in `enable`.
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved);
+            }
+        }
+    }
+}
+
+/// Host terminal size `(rows, cols)` via `TIOCGWINSZ`, or `(0, 0)` if it's not a
+/// terminal (the guest's `TIOCGWINSZ` then falls back to 24×80).
+#[allow(unsafe_code)]
+fn host_term_size() -> (u16, u16) {
+    // SAFETY: `winsize` is plain-old-data; the ioctl reads our own stdin.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+            (ws.ws_row, ws.ws_col)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)]
+fn monitor_install_elf(
+    input: &Path,
+    bytes: &[u8],
+    max_instructions: u64,
+    as_json: bool,
+    extra_args: Option<&str>,
+    dump_vfs: Option<&Path>,
+    use_kvm: bool,
+    use_net: bool,
+    use_interactive: bool,
+    fs: &FsOpts,
+) -> anyhow::Result<()> {
+    let stem = input
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("a.out");
+    let argv = shell_split(extra_args.unwrap_or(""));
+    // Interactive: put the host terminal in raw mode (restored on drop) and
+    // wire the guest's std streams to it; otherwise stdin is EOF + output is
+    // captured for the report.
+    let term_size = if use_interactive {
+        host_term_size()
+    } else {
+        (0, 0)
+    };
+    let _raw_guard = if use_interactive {
+        Some(RawTerminal::enable())
+    } else {
+        None
+    };
+
+    // i386, x86-64 and aarch64 static ELFs have executors.
+    if !ud_emulator::linux::loader::is_runnable(bytes) {
+        let machine = ud_format::elf::Elf64File::parse(bytes).map_or(0, |e| e.ehdr.e_machine);
+        anyhow::bail!(
+            "ELF executor for e_machine={machine} is not implemented yet \
+             (i386 / x86-64 / aarch64 run); {} cannot be executed",
+            input.display()
+        );
+    }
+
+    let entry = ud_format::elf::Elf64File::parse(bytes).map_or(0, |e| e.ehdr.e_entry as u32);
+    #[cfg(feature = "kvm")]
+    let machine = ud_format::elf::Elf64File::parse(bytes)
+        .map(|e| e.ehdr.e_machine)
+        .unwrap_or(0);
+
+    let new_sandbox = || -> anyhow::Result<ud_emulator::Sandbox> {
+        let mut sb = ud_emulator::Sandbox::new_linux();
+        sb.host.instruction_budget = Some(max_instructions);
+        sb.linux_default_mounts = !fs.no_default_mounts;
+        sb.linux_argv.clone_from(&argv);
+        sb.linux_env = default_linux_env();
+        sb.linux.net_enabled = use_net;
+        sb.linux.interactive = use_interactive;
+        sb.linux.term_size = term_size;
+        let table = sb
+            .context_mut()
+            .vfs
+            .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
+        install_fstool_mounts(table, fs, "ext4")?;
+        Ok(sb)
+    };
+    let mut sandbox = new_sandbox()?;
+
+    // Run the guest, optionally accelerated by KVM. `run_with_interp` is the
+    // portable software path; `--kvm` (amd64 only, when built with the feature)
+    // executes natively and falls back here on any error.
+    let run_with_interp = |sandbox: &mut ud_emulator::Sandbox| -> anyhow::Result<Result<i32, _>> {
+        sandbox
+            .load_linux_elf(stem, bytes)
+            .with_context(|| format!("ELF load {}", input.display()))?;
+        Ok(sandbox.run_linux())
+    };
+
+    #[allow(unused_assignments, unused_mut)]
+    let mut used_kvm = false;
+    let run;
+    #[cfg(feature = "kvm")]
+    {
+        const EM_X86_64: u16 = 62;
+        if use_kvm && machine == EM_X86_64 {
+            match sandbox.run_linux_kvm(stem, bytes) {
+                Ok(code) => {
+                    used_kvm = true;
+                    run = Ok(code);
+                }
+                Err(e) => {
+                    eprintln!("kvm: {e} — falling back to the interpreter");
+                    sandbox = new_sandbox()?;
+                    run = run_with_interp(&mut sandbox)?;
+                }
+            }
+        } else {
+            if use_kvm {
+                eprintln!("note: --kvm accelerates amd64 only; using the interpreter");
+            }
+            run = run_with_interp(&mut sandbox)?;
+        }
+    }
+    #[cfg(not(feature = "kvm"))]
+    {
+        if use_kvm {
+            eprintln!("note: this build lacks `--features kvm`; using the interpreter");
+        }
+        run = run_with_interp(&mut sandbox)?;
+    }
+
+    let instructions = if used_kvm {
+        0
+    } else {
+        sandbox
+            .aarch64
+            .as_ref()
+            .map_or(sandbox.cpu.instr_count, |c| c.instr_count)
+    };
+
+    // Dump VFS writes if requested.
+    if let Some(dump_root) = dump_vfs {
+        if let Some(vfs) = sandbox.context().vfs.as_ref() {
+            std::fs::create_dir_all(dump_root)
+                .with_context(|| format!("create --dump-vfs root {}", dump_root.display()))?;
+            for (vpath, _) in vfs.list() {
+                if vpath.ends_with("/.dir") {
+                    continue;
+                }
+                let out = dump_root.join(sanitise_vfs_path(vpath));
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                if let Some(data) = vfs.read(vpath) {
+                    std::fs::write(&out, data).ok();
+                }
+            }
+        }
+    }
+    let vfs_writes: Vec<(String, usize)> = sandbox
+        .context()
+        .vfs
+        .as_ref()
+        .map(|v| {
+            v.list()
+                .filter(|(p, _)| !p.ends_with("/.dir"))
+                .map(|(p, n)| (p.to_string(), n))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let k = &sandbox.linux;
+    let stdout = String::from_utf8_lossy(&k.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&k.stderr).into_owned();
+    let exit = match &run {
+        Ok(code) => Some(*code),
+        Err(_) => None,
+    };
+    let trap = run.as_ref().err().map(ToString::to_string);
+    let unsupported: Vec<(String, u64)> =
+        k.unsupported.iter().map(|(s, n)| (s.clone(), *n)).collect();
+
+    if use_interactive {
+        // Output streamed straight to the terminal; no batch report to print.
+    } else if as_json {
+        let v = serde_json::json!({
+            "input": input.display().to_string(),
+            "personality": "linux-i386",
+            "entry": format!("{entry:#010x}"),
+            "instructions_executed": instructions,
+            "instruction_budget": max_instructions,
+            "exit_code": exit,
+            "trap": trap,
+            "stdout": stdout,
+            "stderr": stderr,
+            "unsupported_syscalls": unsupported.iter()
+                .map(|(s, n)| serde_json::json!({"syscall": s, "count": n}))
+                .collect::<Vec<_>>(),
+            "vfs_writes": vfs_writes.iter()
+                .map(|(p, n)| serde_json::json!({"path": p, "bytes": n}))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("ud analyze --monitor (Linux/i386): {}", input.display());
+        println!("  entry: {entry:#010x}");
+        println!("  instructions executed: {instructions} (budget {max_instructions})");
+        match (exit, &trap) {
+            (Some(c), _) => println!("  exit code: {c}"),
+            (None, Some(t)) => println!("  trapped: {t}"),
+            (None, None) => println!("  did not exit"),
+        }
+        if !unsupported.is_empty() {
+            println!("  unsupported syscalls:");
+            for (s, n) in &unsupported {
+                println!("    {s} ×{n}");
+            }
+        }
+        if !vfs_writes.is_empty() {
+            println!("  VFS files ({}):", vfs_writes.len());
+            for (p, n) in &vfs_writes {
+                println!("    {p} ({n} bytes)");
+            }
+        }
+        if !stdout.is_empty() {
+            println!("  ── stdout ──\n{stdout}");
+        }
+        if !stderr.is_empty() {
+            println!("  ── stderr ──\n{stderr}");
+        }
+    }
+    Ok(())
+}
+
 /// Render the headless GUI transcript as a readable text section.
 fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
     use ud_emulator::win16::gui::GuiEvent;
@@ -3088,7 +4087,21 @@ fn print_gui_transcript(gui: &ud_emulator::win16::gui::GuiState) {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// Filesystem options collected from `--fs-type` / `--mount` /
+/// `--no-default-mounts` / `--rootfs`.
+struct FsOpts {
+    fs_type: Option<String>,
+    mounts: Vec<String>,
+    no_default_mounts: bool,
+    /// `--rootfs SPEC`: populate `/` from a tarball/dir/`alpine:…` source.
+    rootfs: Option<String>,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)]
 fn monitor_install(
     input: &Path,
     max_instructions: u64,
@@ -3096,6 +4109,10 @@ fn monitor_install(
     extra_args: Option<&str>,
     dump_vfs: Option<&Path>,
     preserve_deletes: bool,
+    use_kvm: bool,
+    use_net: bool,
+    use_interactive: bool,
+    fs: &FsOpts,
 ) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     // MSI compound-document magic — when the input is a .msi we
@@ -3117,6 +4134,21 @@ fn monitor_install(
             dump_vfs,
         );
     }
+    // ELF binaries run under the Linux personality (syscall emulation).
+    if ud_format::elf::is_elf(&bytes) {
+        return monitor_install_elf(
+            input,
+            &bytes,
+            max_instructions,
+            as_json,
+            extra_args,
+            dump_vfs,
+            use_kvm,
+            use_net,
+            use_interactive,
+            fs,
+        );
+    }
     // NE (16-bit Windows) installers run through the Win16 loader +
     // segmented executor. Detect before PE (both carry an `MZ` header).
     if ud_format::ne::is_ne(&bytes) {
@@ -3131,7 +4163,7 @@ fn monitor_install(
     }
     if !ud_format::pe::is_pe(&bytes) {
         anyhow::bail!(
-            "ud analyze --monitor requires a PE32, NE, or MSI binary; {} is neither",
+            "ud analyze --monitor requires a PE32, NE, ELF, or MSI binary; {} is neither",
             input.display()
         );
     }
@@ -3151,7 +4183,7 @@ fn monitor_install(
     sandbox
         .context_mut()
         .vfs
-        .get_or_insert_with(ud_emulator::context::VirtualFs::new);
+        .get_or_insert_with(ud_emulator::fsmount::MountTable::new);
     sandbox
         .context_mut()
         .registry
@@ -3515,14 +4547,404 @@ struct AnalyzeReport {
     image_base: u32,
     entry_point: u32,
     dll_main: DllMainOutcome,
+    /// Exports driven after `DllMain` via `--call-export` (empty
+    /// when the flag isn't used).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    export_calls: Vec<ExportCall>,
     win32_calls: Vec<Win32Call>,
     win32_calls_by_function: Vec<Win32CallCount>,
     coverage: CoverageSummary,
     indicators: Indicators,
     instructions_executed: u64,
     instruction_budget: u64,
+    /// Guest-memory regions captured via `--dump-mem` (empty when
+    /// the flag isn't used).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memory_dumps: Vec<MemoryDump>,
+    /// Ordered write-trace of stores into any `--watch` region.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    watch_trace: Vec<WatchEventReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     debug_log: Vec<String>,
+}
+
+/// One store that hit a `--watch` region, for the analyze report.
+#[derive(serde::Serialize)]
+struct WatchEventReport {
+    seq: u64,
+    addr: u32,
+    /// Offset from the nearest watch base at or below `addr`.
+    offset: u32,
+    width: u8,
+    value: u64,
+    eip: u32,
+}
+
+/// Collect the MMU's watch log into report records (offset relative to
+/// the nearest watch base).
+fn collect_watch_trace(
+    sandbox: &ud_emulator::Sandbox,
+    watches: &[(u32, u32)],
+) -> Vec<WatchEventReport> {
+    let bases: Vec<u32> = watches.iter().map(|&(a, _)| a).collect();
+    sandbox
+        .mmu
+        .watch_log()
+        .iter()
+        .map(|ev| {
+            let base = bases
+                .iter()
+                .filter(|&&b| b <= ev.addr)
+                .max()
+                .copied()
+                .unwrap_or(ev.addr);
+            WatchEventReport {
+                seq: ev.seq,
+                addr: ev.addr,
+                offset: ev.addr - base,
+                width: ev.width,
+                value: ev.value,
+                eip: ev.eip,
+            }
+        })
+        .collect()
+}
+
+/// One `--call-export` invocation: the resolved export, the args
+/// it was handed, and how the guest call ended.
+#[derive(serde::Serialize)]
+struct ExportCall {
+    name: String,
+    /// Resolved guest VA of the export entry point.
+    va: u32,
+    args: Vec<u32>,
+    #[serde(flatten)]
+    outcome: ExportOutcome,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ExportOutcome {
+    /// The export returned; `value` is `EAX` (stdcall return).
+    Returned { value: u32 },
+    /// The export trapped (unresolved import, fault, budget).
+    Trapped { message: String },
+}
+
+/// A captured guest-memory region.
+#[derive(serde::Serialize)]
+struct MemoryDump {
+    addr: u32,
+    len: usize,
+    /// How many of the `len` bytes were actually mapped/readable.
+    mapped_bytes: usize,
+    /// Host file the raw bytes were written to, if `=PATH` was
+    /// given (unmapped bytes are zero-filled on disk).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    /// Hex string of the region (mapped bytes only, unmapped shown
+    /// as `..`). Present only when no `=PATH` was given, so JSON
+    /// consumers still get the content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hex: Option<String>,
+}
+
+/// Parse a `--watch` spec `ADDR:LEN` into a guest range.
+fn parse_watch_spec(s: &str) -> anyhow::Result<(u32, u32)> {
+    let (addr, len) = s.split_once(':').with_context(|| "expected ADDR:LEN")?;
+    Ok((parse_u32_arg(addr)?, parse_u32_arg(len)?))
+}
+
+/// Print a watchpoint write-trace to stderr: one line per store that
+/// hit a watched region, in execution order, with the offset from the
+/// nearest watch base, the value, the store width, and the writing EIP.
+fn print_watch_trace(sandbox: &ud_emulator::Sandbox, watches: &[(u32, u32)]) {
+    let log = sandbox.mmu.watch_log();
+    let bases: Vec<u32> = watches.iter().map(|&(a, _)| a).collect();
+    eprintln!("[watch] {} store(s) hit the watched region(s):", log.len());
+    for ev in log {
+        // Offset from the greatest watch base at or below this address.
+        let base = bases
+            .iter()
+            .filter(|&&b| b <= ev.addr)
+            .max()
+            .copied()
+            .unwrap_or(ev.addr);
+        eprintln!(
+            "[watch] #{:<5} +0x{:<6x} [0x{:08x}] = 0x{:0width$x} (w{}) eip=0x{:08x}",
+            ev.seq,
+            ev.addr - base,
+            ev.addr,
+            ev.value,
+            ev.width,
+            ev.eip,
+            width = (ev.width as usize) * 2,
+        );
+    }
+    let dropped = sandbox.mmu.watch_dropped();
+    if dropped > 0 {
+        eprintln!(
+            "[watch] … {dropped} further store(s) dropped after the {} cap",
+            log.len()
+        );
+    }
+}
+
+/// Parsed `--dump-mem` spec: region plus optional output file.
+struct DumpSpec {
+    addr: u32,
+    len: usize,
+    file: Option<PathBuf>,
+}
+
+/// Parse a `0x`-hex or decimal 32-bit literal (for `--export-arg`
+/// and the ADDR/LEN fields of `--dump-mem`).
+fn parse_u32_arg(s: &str) -> anyhow::Result<u32> {
+    let s = s.trim();
+    let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16)
+    } else {
+        s.parse::<u32>()
+    };
+    v.with_context(|| format!("not a 32-bit integer: {s:?}"))
+}
+
+/// Parse `ADDR:LEN` or `ADDR:LEN=PATH` into a [`DumpSpec`].
+fn parse_dump_spec(s: &str) -> anyhow::Result<DumpSpec> {
+    let (region, file) = match s.split_once('=') {
+        Some((r, p)) => (r, Some(PathBuf::from(p))),
+        None => (s, None),
+    };
+    let (addr, len) = region
+        .split_once(':')
+        .with_context(|| "expected ADDR:LEN[=PATH]")?;
+    Ok(DumpSpec {
+        addr: parse_u32_arg(addr)?,
+        len: parse_u32_arg(len)? as usize,
+        file,
+    })
+}
+
+/// Parsed `--map-blob` spec: a guest VA and the host file whose
+/// bytes get staged there.
+struct MapBlobSpec {
+    va: u32,
+    file: PathBuf,
+}
+
+/// Parse `VA=PATH` into a [`MapBlobSpec`].
+fn parse_map_blob_spec(s: &str) -> anyhow::Result<MapBlobSpec> {
+    let (va, path) = s.split_once('=').with_context(|| "expected VA=PATH")?;
+    Ok(MapBlobSpec {
+        va: parse_u32_arg(va)?,
+        file: PathBuf::from(path),
+    })
+}
+
+/// Stage a host file's bytes into guest memory at `spec.va`. Any
+/// page in the target span that isn't mapped yet is mapped fresh
+/// R+W; the write itself goes through `write_initializer`, which
+/// bypasses per-page W-protection so a blob can also overwrite a
+/// read-only data page without disturbing its permissions.
+fn apply_map_blob(sandbox: &mut ud_emulator::Sandbox, spec: &MapBlobSpec) -> anyhow::Result<()> {
+    let bytes =
+        std::fs::read(&spec.file).with_context(|| format!("read {}", spec.file.display()))?;
+    for i in 0..bytes.len() {
+        let addr = spec.va.wrapping_add(i as u32);
+        if !sandbox.mmu.is_mapped(addr) {
+            sandbox.mmu.map(
+                addr,
+                1,
+                ud_emulator::emulator::Perm::R | ud_emulator::emulator::Perm::W,
+            );
+        }
+    }
+    sandbox
+        .mmu
+        .write_initializer(spec.va, &bytes)
+        .map_err(|t| anyhow::anyhow!("stage blob at {:#010x}: {t:?}", spec.va))?;
+    eprintln!(
+        "staged {} bytes at guest {:#010x} from {}",
+        bytes.len(),
+        spec.va,
+        spec.file.display()
+    );
+    Ok(())
+}
+
+/// Match `name` against a pattern that may contain a single `*`
+/// wildcard (`*Init`, `Init*`, `Foo*Bar`, or a bare name for an
+/// exact match). Case-sensitive, matching PE export semantics.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((pre, post)) => {
+            name.len() >= pre.len() + post.len() && name.starts_with(pre) && name.ends_with(post)
+        }
+        None => pattern == name,
+    }
+}
+
+/// Parsed `--call` spec: an exact export name plus its own
+/// (ordered) argument list.
+struct CallSpec {
+    name: String,
+    args: Vec<u32>,
+}
+
+/// Parse `NAME[:arg,arg,…]` into a [`CallSpec`]. Args are
+/// comma-separated decimal / `0x` hex 32-bit values; a bare
+/// `NAME` (no `:`) is a zero-argument call.
+fn parse_call_spec(s: &str) -> anyhow::Result<CallSpec> {
+    let (name, arglist) = match s.split_once(':') {
+        Some((n, a)) => (n, a),
+        None => (s, ""),
+    };
+    if name.is_empty() {
+        anyhow::bail!("empty export name");
+    }
+    let args = if arglist.is_empty() {
+        Vec::new()
+    } else {
+        arglist
+            .split(',')
+            .map(parse_u32_arg)
+            .collect::<anyhow::Result<_>>()?
+    };
+    Ok(CallSpec {
+        name: name.to_owned(),
+        args,
+    })
+}
+
+/// Drive the ordered `--call` sequence: each spec resolves an
+/// export by exact name and invokes it stdcall with its own
+/// argument list, in order, against the same live guest context.
+/// A name that isn't exported records a `Trapped` outcome (rather
+/// than aborting the sequence) so the report shows how far the
+/// chain got.
+fn drive_call_sequence(
+    sandbox: &mut ud_emulator::Sandbox,
+    image: &ud_emulator::pe::Image,
+    specs: &[CallSpec],
+) -> Vec<ExportCall> {
+    specs
+        .iter()
+        .map(|spec| {
+            let va = image.export(&spec.name).unwrap_or(0);
+            let outcome = if va == 0 && !image.exports.contains_key(&spec.name) {
+                ExportOutcome::Trapped {
+                    message: format!("export {:?} not found in {}", spec.name, image.name),
+                }
+            } else {
+                match sandbox.call_export(image, &spec.name, &spec.args) {
+                    Ok(value) => ExportOutcome::Returned { value },
+                    Err(e) => ExportOutcome::Trapped {
+                        message: e.to_string(),
+                    },
+                }
+            };
+            ExportCall {
+                name: spec.name.clone(),
+                va,
+                args: spec.args.clone(),
+                outcome,
+            }
+        })
+        .collect()
+}
+
+/// Resolve every `--call-export` pattern against the image's
+/// export table and drive each match once (stdcall, shared
+/// `args`). Deduplicates so overlapping patterns don't call the
+/// same export twice; warns on patterns that match nothing.
+fn drive_exports(
+    sandbox: &mut ud_emulator::Sandbox,
+    image: &ud_emulator::pe::Image,
+    patterns: &[String],
+    args: &[u32],
+) -> Vec<ExportCall> {
+    let mut names: Vec<String> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for pat in patterns {
+        let mut matched = false;
+        for name in image.exports.keys() {
+            if glob_match(pat, name) {
+                matched = true;
+                if seen.insert(name.clone()) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        if !matched {
+            eprintln!(
+                "warning: --call-export {pat:?} matched no export in {}",
+                image.name
+            );
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let va = image.export(&name).unwrap_or(0);
+            let outcome = match sandbox.call_export(image, &name, args) {
+                Ok(value) => ExportOutcome::Returned { value },
+                Err(e) => ExportOutcome::Trapped {
+                    message: e.to_string(),
+                },
+            };
+            ExportCall {
+                name,
+                va,
+                args: args.to_vec(),
+                outcome,
+            }
+        })
+        .collect()
+}
+
+/// Read a `--dump-mem` region out of guest memory. Unmapped bytes
+/// come back as `None`; on file output they're zero-filled, in the
+/// report `hex` they render as `..`.
+fn capture_dump(sandbox: &ud_emulator::Sandbox, spec: &DumpSpec) -> anyhow::Result<MemoryDump> {
+    let bytes: Vec<Option<u8>> = (0..spec.len)
+        .map(|i| sandbox.mmu.load8(spec.addr.wrapping_add(i as u32)).ok())
+        .collect();
+    let mapped_bytes = bytes.iter().filter(|b| b.is_some()).count();
+
+    let (file, hex) = if let Some(path) = &spec.file {
+        let raw: Vec<u8> = bytes.iter().map(|b| b.unwrap_or(0)).collect();
+        std::fs::write(path, &raw)
+            .with_context(|| format!("write memory dump to {}", path.display()))?;
+        eprintln!(
+            "dumped {} bytes ({} mapped) of guest memory at {:#010x} to {}",
+            spec.len,
+            mapped_bytes,
+            spec.addr,
+            path.display()
+        );
+        (Some(path.display().to_string()), None)
+    } else {
+        let mut h = String::with_capacity(spec.len * 2);
+        for b in &bytes {
+            match b {
+                Some(v) => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    h.push(HEX[(v >> 4) as usize] as char);
+                    h.push(HEX[(v & 0xf) as usize] as char);
+                }
+                None => h.push_str(".."),
+            }
+        }
+        (None, Some(h))
+    };
+
+    Ok(MemoryDump {
+        addr: spec.addr,
+        len: spec.len,
+        mapped_bytes,
+        file,
+        hex,
+    })
 }
 
 #[derive(serde::Serialize, Default)]
@@ -3635,6 +5057,7 @@ fn scan_ascii_strings(buf: &[u8], out: &mut Vec<String>) {
 }
 
 impl AnalyzeReport {
+    #[allow(clippy::too_many_lines)]
     fn write_text(&self, input: &Path) {
         println!(
             "loaded: {} (image_base 0x{:x}, entry 0x{:x})",
@@ -3715,7 +5138,121 @@ impl AnalyzeReport {
                 println!("load failed: {message}");
             }
         }
+
+        if !self.export_calls.is_empty() {
+            println!();
+            println!("Export calls ({}):", self.export_calls.len());
+            for c in &self.export_calls {
+                let args: Vec<String> = c.args.iter().map(|a| format!("0x{a:x}")).collect();
+                match &c.outcome {
+                    ExportOutcome::Returned { value } => {
+                        println!(
+                            "  {}(0x{:x})({}) → 0x{value:x}",
+                            c.name,
+                            c.va,
+                            args.join(", ")
+                        );
+                    }
+                    ExportOutcome::Trapped { message } => {
+                        println!(
+                            "  {}(0x{:x})({}) trapped: {message}",
+                            c.name,
+                            c.va,
+                            args.join(", ")
+                        );
+                    }
+                }
+            }
+        }
+
+        for d in &self.memory_dumps {
+            println!();
+            if let Some(file) = &d.file {
+                println!(
+                    "Memory dump [0x{:x}..0x{:x}] ({} mapped) → {file}",
+                    d.addr,
+                    d.addr.wrapping_add(d.len as u32),
+                    d.mapped_bytes
+                );
+            } else {
+                println!(
+                    "Memory dump [0x{:x}..0x{:x}] ({} of {} bytes mapped):",
+                    d.addr,
+                    d.addr.wrapping_add(d.len as u32),
+                    d.mapped_bytes,
+                    d.len
+                );
+                if let Some(hex) = &d.hex {
+                    print_hexdump(d.addr, hex);
+                }
+            }
+        }
+
+        if !self.watch_trace.is_empty() {
+            println!();
+            println!(
+                "Watchpoint write-trace ({} stores, in order):",
+                self.watch_trace.len()
+            );
+            for ev in &self.watch_trace {
+                println!(
+                    "  #{:<5} +0x{:<6x} [0x{:08x}] = 0x{:0width$x} (w{}) eip=0x{:08x}",
+                    ev.seq,
+                    ev.offset,
+                    ev.addr,
+                    ev.value,
+                    ev.width,
+                    ev.eip,
+                    width = (ev.width as usize) * 2,
+                );
+            }
+        }
     }
+}
+
+/// Render a canonical 16-byte-per-row hex dump from an address
+/// and the report's compact hex string (two chars per byte, `..`
+/// marking an unmapped byte). Returns the multi-line text (each
+/// row newline-terminated) so the caller can route it to stdout
+/// or stderr as appropriate.
+fn render_hexdump(base: u32, hex: &str) -> String {
+    use std::fmt::Write as _;
+    let cells: Vec<&str> = hex
+        .as_bytes()
+        .chunks(2)
+        .map(|c| std::str::from_utf8(c).unwrap_or(".."))
+        .collect();
+    let mut out = String::new();
+    for (row, chunk) in cells.chunks(16).enumerate() {
+        let addr = base.wrapping_add((row * 16) as u32);
+        let mut hexpart = String::new();
+        let mut asciipart = String::new();
+        for (i, cell) in chunk.iter().enumerate() {
+            if i == 8 {
+                hexpart.push(' ');
+            }
+            hexpart.push_str(cell);
+            hexpart.push(' ');
+            match u8::from_str_radix(cell, 16) {
+                Ok(b) if (0x20..=0x7e).contains(&b) => asciipart.push(b as char),
+                Ok(_) => asciipart.push('.'),
+                Err(_) => asciipart.push(' '),
+            }
+        }
+        // Pad the hex column so the ASCII gutter lines up on short
+        // final rows.
+        let width = 16 * 3 + 1;
+        for _ in hexpart.len()..width {
+            hexpart.push(' ');
+        }
+        let _ = writeln!(out, "  {addr:08x}  {hexpart} |{asciipart}|");
+    }
+    out
+}
+
+/// Print a hex dump to stdout (used by the `analyze` text report).
+fn print_hexdump(base: u32, hex: &str) {
+    print!("{}", render_hexdump(base, hex));
 }
 
 #[derive(serde::Serialize)]

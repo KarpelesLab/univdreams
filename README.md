@@ -1,5 +1,10 @@
 # univdreams
 
+[![CI](https://github.com/KarpelesLab/univdreams/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/univdreams/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/ud-cli.svg)](https://crates.io/crates/ud-cli)
+[![docs.rs](https://img.shields.io/docsrs/ud-cli)](https://docs.rs/ud-cli)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A universal compiler **and** decompiler suite. The premise:
 
 > Given a compiled binary `B`, produce source `S` such that compiling `S` reproduces `B` **byte for byte**.

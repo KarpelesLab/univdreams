@@ -264,12 +264,14 @@ pub fn parse_dialog_template(data: &[u8]) -> (String, Vec<DialogControl>) {
 }
 
 /// Read a NUL-terminated string; returns it and the index past the NUL.
+/// Tolerates `p` past the end of `data` (a malformed template) — returns
+/// an empty string rather than panicking on the slice.
 fn read_sz(data: &[u8], p: usize) -> (String, usize) {
     let mut end = p;
     while end < data.len() && data[end] != 0 {
         end += 1;
     }
-    let s = String::from_utf8_lossy(&data[p..end]).into_owned();
+    let s = String::from_utf8_lossy(data.get(p..end).unwrap_or(&[])).into_owned();
     (s, (end + 1).min(data.len().max(p)))
 }
 

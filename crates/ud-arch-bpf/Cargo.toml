@@ -15,7 +15,7 @@ description = "Linux eBPF + Solana SBF (sBPFv1 / sBPFv2) instruction decoder + l
 workspace = true
 
 [dependencies]
-ud-core = { version = "0.2.0", path = "../ud-core" }
-ud-ir = { version = "0.2.0", path = "../ud-ir" }
-ud-arch-codec = { version = "0.2.0", path = "../ud-arch-codec" }
+ud-core = { version = "0.3.0", path = "../ud-core" }
+ud-ir = { version = "0.3.0", path = "../ud-ir" }
+ud-arch-codec = { version = "0.3.0", path = "../ud-arch-codec" }
 thiserror = "2"

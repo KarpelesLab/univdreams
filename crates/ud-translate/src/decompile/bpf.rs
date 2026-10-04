@@ -520,10 +520,8 @@ fn lift_call_stmt(
     // Parse `call <name>` or `call_local <name>` shapes.
     let (mnem_prefix, rest) = if let Some(r) = text.strip_prefix("call_local ") {
         ("call_local", r)
-    } else if let Some(r) = text.strip_prefix("call ") {
-        ("call", r)
     } else {
-        return None;
+        ("call", text.strip_prefix("call ")?)
     };
     let _ = mnem_prefix;
     let name = rest.trim();
