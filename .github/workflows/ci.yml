@@ -77,3 +77,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p ud-cli --features script --all-targets -- -D warnings
       - run: cargo test -p ud-cli --features script
+
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    # Keep this pin in sync with `rust-version` in Cargo.toml. Compile-only:
+    # guards against using a std/library or language feature newer than the
+    # declared minimum (behaviour is covered by the stable `test` job).
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --workspace --all-targets --all-features
