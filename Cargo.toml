@@ -54,6 +54,9 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 doc_markdown = "allow"
+# New in clippy 1.99: `assert!(x.is_empty())` reads better than the suggested
+# `assert_eq!(x, [] as [T; 0])` in our tests.
+assert_is_empty = "allow"
 # Binary-format spec field names are deliberately similar (e_phoff/e_phnum,
 # sh_offset/sh_size, etc.). Renaming them to please clippy makes the code
 # diverge from the spec.

@@ -46,6 +46,10 @@ pub fn register(registry: &mut Registry) {
     );
     // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deletedc
     registry.register("gdi32.dll", "DeleteDC", stub_delete_dc as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getpixel
+    // (vp6 sandbox round: On2 vp6vfw.dll / vp6dec.ax import it for
+    // their settings dialog; never reached on the decode path.)
+    registry.register("gdi32.dll", "GetPixel", stub_get_pixel as StubFn, 3);
     // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getdevicecaps
     registry.register(
         "gdi32.dll",
@@ -630,4 +634,16 @@ mod tests {
             "StretchDIBits should echo DestHeight as the scanline count"
         );
     }
+}
+
+/// `COLORREF GetPixel(HDC hdc, int x, int y)`. No raster surface
+/// exists in the sandbox; report `CLR_INVALID` (0xFFFFFFFF), the
+/// documented value for a pixel outside any clip region.
+fn stub_get_pixel(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0xFFFF_FFFF)
 }

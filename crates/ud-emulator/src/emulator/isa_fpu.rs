@@ -171,6 +171,31 @@ pub fn dispatch(cpu: &mut Cpu, mmu: &mut Mmu, opcode: u8, entry_eip: u32) -> Res
 
 /// Reg-form x87: `mode == 0b11`. The `reg` field of the
 /// ModR/M selects an FPU operation; `rm` is ST(i).
+
+/// Round `v` to an integer per the x87 control word's RC field
+/// (bits 11:10): 00 = nearest-even, 01 = down (floor), 10 = up
+/// (ceil), 11 = truncate toward zero.  `FIST`/`FISTP`/`FRNDINT`
+/// all honour RC; MSVC's `_ftol` idiom (`fnstcw; or 0xc00; fldcw;
+/// fistp; fldcw`) relies on RC = 11 for C-style integer casts, so
+/// ignoring RC silently turns truncation into round-to-nearest.
+/// (Intel SDM Vol. 1 §4.8.4 / §8.1.5.3.)
+fn x87_round(cw: u16, v: f64) -> f64 {
+    match (cw >> 10) & 3 {
+        0 => {
+            // Round half to even.
+            let r = v.round();
+            if (v - v.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
+                r - v.signum()
+            } else {
+                r
+            }
+        }
+        1 => v.floor(),
+        2 => v.ceil(),
+        _ => v.trunc(),
+    }
+}
+
 fn dispatch_reg_form(
     cpu: &mut Cpu,
     opcode: u8,
@@ -333,7 +358,7 @@ fn dispatch_reg_form(
                     // here since clippy lint coverage relies on
                     // matched sub-forms being authoritative.
                     let v = cpu.fpu.st(0);
-                    cpu.fpu.set_st(0, v.round());
+                    cpu.fpu.set_st(0, x87_round(cpu.fpu_cw, v));
                     Ok(StepOk::Continued)
                 }
                 (7, 5) => {
@@ -404,6 +429,16 @@ fn dispatch_reg_form(
             // E8 FSUB; F0 FDIVR; F8 FDIV.
             let st0 = cpu.fpu.st(0);
             let sti = cpu.fpu.st(rm);
+            // vp6 sandbox round (2026-09-12): the ST(i)-destination
+            // forms are the Intel-SDM "reversed" encodings —
+            // DC E0+i FSUBR  ST(i),ST(0): ST(i) <- ST(0) - ST(i)
+            // DC E8+i FSUB   ST(i),ST(0): ST(i) <- ST(i) - ST(0)
+            // DC F0+i FDIVR  ST(i),ST(0): ST(i) <- ST(0) / ST(i)
+            // DC F8+i FDIV   ST(i),ST(0): ST(i) <- ST(i) / ST(0)
+            // (SDM Vol. 2A, FSUB/FSUBR/FDIV/FDIVR opcode tables).
+            // They were implemented with the operands swapped, which
+            // made On2's `fdivp st(1), st` CPU-MHz calibration return
+            // ~0 and every frame decode trap on divide-by-zero.
             let r = match reg {
                 0 => sti + st0,
                 1 => sti * st0,
@@ -416,10 +451,10 @@ fn dispatch_reg_form(
                     cpu.fpu.pop();
                     return Ok(StepOk::Continued);
                 }
-                4 => sti - st0,
-                5 => st0 - sti,
-                6 => sti / st0,
-                7 => st0 / sti,
+                4 => st0 - sti, // FSUBR ST(i),ST(0)
+                5 => sti - st0, // FSUB  ST(i),ST(0)
+                6 => st0 / sti, // FDIVR ST(i),ST(0)
+                7 => sti / st0, // FDIV  ST(i),ST(0)
                 _ => unreachable!(),
             };
             cpu.fpu.set_st(rm, r);
@@ -487,13 +522,16 @@ fn dispatch_reg_form(
                 _ => {
                     let st0 = cpu.fpu.st(0);
                     let sti = cpu.fpu.st(rm);
+                    // Same SDM "reversed" operand order as the DC
+                    // forms above (DE E0+i FSUBRP, E8+i FSUBP,
+                    // F0+i FDIVRP, F8+i FDIVP; destination ST(i)).
                     let r = match reg {
                         0 => sti + st0, // FADDP ST(i)
                         1 => sti * st0, // FMULP
-                        4 => sti - st0, // FSUBRP
-                        5 => st0 - sti, // FSUBP
-                        6 => sti / st0, // FDIVRP
-                        7 => st0 / sti, // FDIVP
+                        4 => st0 - sti, // FSUBRP ST(i),ST(0): ST(0)-ST(i)
+                        5 => sti - st0, // FSUBP  ST(i),ST(0): ST(i)-ST(0)
+                        6 => st0 / sti, // FDIVRP ST(i),ST(0): ST(0)/ST(i)
+                        7 => sti / st0, // FDIVP  ST(i),ST(0): ST(i)/ST(0)
                         _ => {
                             return Err(Trap::PrivilegedOpcode {
                                 eip: entry_eip,
@@ -688,13 +726,13 @@ fn fpu_db_mem(
         }
         2 => {
             // FIST m32
-            let v = cpu.fpu.st(0).round() as i32;
+            let v = x87_round(cpu.fpu_cw, cpu.fpu.st(0)) as i32;
             mmu.store32(addr, v as u32)?;
             Ok(StepOk::Continued)
         }
         3 => {
             // FISTP m32
-            let v = cpu.fpu.st(0).round() as i32;
+            let v = x87_round(cpu.fpu_cw, cpu.fpu.st(0)) as i32;
             mmu.store32(addr, v as u32)?;
             cpu.fpu.pop();
             Ok(StepOk::Continued)
@@ -892,13 +930,13 @@ fn fpu_df_mem(
         }
         2 => {
             // FIST m16
-            let v = cpu.fpu.st(0).round() as i16;
+            let v = x87_round(cpu.fpu_cw, cpu.fpu.st(0)) as i16;
             mmu.store16(addr, v as u16)?;
             Ok(StepOk::Continued)
         }
         3 => {
             // FISTP m16
-            let v = cpu.fpu.st(0).round() as i16;
+            let v = x87_round(cpu.fpu_cw, cpu.fpu.st(0)) as i16;
             mmu.store16(addr, v as u16)?;
             cpu.fpu.pop();
             Ok(StepOk::Continued)
@@ -913,7 +951,7 @@ fn fpu_df_mem(
         }
         7 => {
             // FISTP m64
-            let v = cpu.fpu.st(0).round() as i64;
+            let v = x87_round(cpu.fpu_cw, cpu.fpu.st(0)) as i64;
             mmu.store32(addr, (v as u64 & 0xFFFF_FFFF) as u32)?;
             mmu.store32(addr.wrapping_add(4), ((v as u64) >> 32) as u32)?;
             cpu.fpu.pop();

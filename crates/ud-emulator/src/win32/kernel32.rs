@@ -142,6 +142,15 @@ pub fn register(registry: &mut Registry) {
         stub_get_environment_strings as StubFn,
         0,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getenvironmentvariablea
+    // (vp6 sandbox round: On2 vp6vfw.dll / vp6dec.ax import it; the
+    // MSVC CRT probes for `__MSVCRT_HEAP_SELECT` and similar.)
+    registry.register(
+        "kernel32.dll",
+        "GetEnvironmentVariableA",
+        stub_get_environment_variable_a as StubFn,
+        3,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfiletype
     registry.register(
         "kernel32.dll",
@@ -7529,4 +7538,57 @@ mod tests {
         .unwrap();
         assert_eq!(cpu.regs.get32(Reg32::Eax), 0x1234);
     }
+}
+
+/// `DWORD GetEnvironmentVariableA(LPCSTR lpName, LPSTR lpBuffer,
+/// DWORD nSize)`. The synthesised env block is consulted; a
+/// variable that is not in [`SYNTH_ENV_VARS`] reports
+/// `ERROR_ENVVAR_NOT_FOUND` (203) and returns 0, which is the
+/// documented "not found" contract and what the MSVC CRT's
+/// heap-select / locale probes expect.
+fn stub_get_environment_variable_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &mut Registry,
+) -> Result<u32, Win32Error> {
+    let name_ptr =
+        arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
+    let buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
+    let n_size = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
+    let mut name = Vec::new();
+    let mut p = name_ptr;
+    while name.len() < 256 {
+        let b = mmu
+            .load8(p)
+            .map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
+        if b == 0 {
+            break;
+        }
+        name.push(b);
+        p = p.wrapping_add(1);
+    }
+    let name = String::from_utf8_lossy(&name).to_ascii_uppercase();
+    for kv in SYNTH_ENV_VARS {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        if k.to_ascii_uppercase() == name {
+            let bytes = v.as_bytes();
+            let need = bytes.len() as u32 + 1;
+            if buf == 0 || n_size < need {
+                return Ok(need);
+            }
+            let mut out = bytes.to_vec();
+            out.push(0);
+            mmu.write_initializer(buf, &out)
+                .map_err(|t| trap_to_win32("GetEnvironmentVariableA", t))?;
+            return Ok(bytes.len() as u32);
+        }
+    }
+    // ERROR_ENVVAR_NOT_FOUND
+    state.last_error = 203;
+    let tib = state.cur_thread().tib_addr;
+    if tib != 0 {
+        let _ = mmu.store32(tib + 0x34, 203);
+    }
+    Ok(0)
 }

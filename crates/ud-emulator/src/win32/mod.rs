@@ -26,6 +26,7 @@ use crate::emulator::{Cpu, Mmu};
 
 pub mod advapi32;
 pub mod comctl32;
+pub mod comdlg32;
 pub mod corefoundation;
 pub mod gdi32;
 pub mod kernel32;
@@ -1364,6 +1365,7 @@ impl Registry {
         comctl32::register(self);
         shell32::register(self);
         shlwapi::register(self);
+        comdlg32::register(self);
         self.by_name.len() - before
     }
 
@@ -2154,6 +2156,9 @@ fn emit_trap_event(cpu: &Cpu, mmu: &Mmu, err: &crate::Error) {
             crate::emulator::Trap::UnimplementedMmx { eip, opcode, .. } => {
                 ("UnimplementedMmx", *eip, Some(*opcode))
             }
+            // 64-bit syscall gate (Linux personality); truncated to the
+            // 32-bit eip slot this i386 trace record carries.
+            crate::emulator::Trap::Syscall { pc } => ("Syscall", *pc as u32, None),
         },
         crate::Error::PeLoader(_) => ("PeLoader", cpu.regs.eip, None),
         crate::Error::Win32(_) => ("Win32", cpu.regs.eip, None),

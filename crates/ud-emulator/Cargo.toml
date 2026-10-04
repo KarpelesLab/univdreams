@@ -90,3 +90,60 @@ fstool = { version = "0.4.18", optional = true, default-features = false, featur
 ureq = { version = "2", default-features = false, features = ["tls"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+
+# OxideAV docs-round harnesses that drive the trace/watchpoint surface.
+
+[[example]]
+name = "cook_r12"
+path = "examples/cook_r12.rs"
+required-features = ["trace"]
+
+[[example]]
+name = "cook_r13"
+path = "examples/cook_r13.rs"
+required-features = ["trace"]
+
+[[example]]
+name = "round27_msmpeg4_watch"
+path = "examples/round27_msmpeg4_watch.rs"
+required-features = ["trace"]
+
+[[example]]
+name = "vp6_sbx"
+path = "examples/vp6_sbx.rs"
+required-features = ["trace"]
+
+[[example]]
+name = "lagarith_r56"
+path = "examples/lagarith_r56.rs"
+required-features = ["trace"]
+
+[[example]]
+name = "msmpeg4_r30_encode_seq"
+path = "examples/msmpeg4_r30_encode_seq.rs"
+required-features = ["trace"]
+
+[[example]]
+name = "wma_r10_lsp"
+path = "examples/wma_r10_lsp.rs"
+required-features = ["trace"]
+
+[[test]]
+name = "re2_indeo5_dequant"
+path = "tests/re2_indeo5_dequant.rs"
+required-features = ["trace"]
+
+[[test]]
+name = "re2_indeo5_r18"
+path = "tests/re2_indeo5_r18.rs"
+required-features = ["trace"]
+
+[[test]]
+name = "re2_indeo3_r21"
+path = "tests/re2_indeo3_r21.rs"
+required-features = ["trace"]
+
+[[test]]
+name = "round8_svq3_qtx_filter"
+path = "tests/round8_svq3_qtx_filter.rs"
+required-features = ["trace"]
