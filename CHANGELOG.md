@@ -8,6 +8,23 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/KarpelesLab/univdreams/compare/v0.4.0...v0.5.0) - 2026-10-30
+
+### Documentation
+
+- *(evm)* don't intra-link private evm_cfg / evm_lift modules from public docs
+
+### Evm
+
+- compile edited lifted statements, relocating the contract
+- decompile creation code with its runtime as a nested section
+- Vyper dispatch and calling conventions, EIP-1167 clones, proxy fixtures
+- EVM bytecode arch, decompiler with statement lifting, `ud evm`
+
+### Playground
+
+- keep the chosen EVM form, load creation code by tx hash
+
 ## [0.4.0](https://github.com/KarpelesLab/univdreams/compare/v0.3.0...v0.4.0) - 2026-10-05
 
 ### Changed
