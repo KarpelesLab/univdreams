@@ -74,6 +74,10 @@ pub enum TokenKind {
     Caret,
     /// `~` — bitwise NOT in lifted `not` (`eax = ~eax`).
     Tilde,
+    /// `.` after a closing delimiter — member access on a call result
+    /// in lifted EVM calls (`IERC20(t).transfer(a, n)`). Inside a
+    /// name, `.` stays part of the identifier.
+    Dot,
     /// `!` — leading char of the `!=` operator in C-style cond text.
     /// The parser uses raw-source snipping inside `if (…)` so `!` is
     /// only lexed for the lexer's benefit, not consumed structurally.
@@ -233,6 +237,7 @@ impl<'a> Lexer<'a> {
             '|' => TokenKind::Pipe,
             '^' => TokenKind::Caret,
             '~' => TokenKind::Tilde,
+            '.' => TokenKind::Dot,
             '!' => TokenKind::Bang,
             '/' if self.peek_char() == Some('/') => {
                 self.bump(); // consume the second '/'

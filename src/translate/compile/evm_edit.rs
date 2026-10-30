@@ -1036,6 +1036,17 @@ impl Sim {
 
 /// Opcodes whose result depends only on operands and fixed call
 /// context, so recomputing them is safe.
+/// Whether a lifted assignment's right-hand side is an external call
+/// with its ABI encoding folded in — member syntax on a call result
+/// (`IERC20(t).transfer(a, n)`) or a `.call` / `.staticcall` member
+/// (`t.call(IERC20.transfer(a, n))`).
+fn is_folded_call(src: &str) -> bool {
+    src.contains(").")
+        || src
+            .split(|c: char| !(c == '.' || c == '_' || c.is_ascii_alphanumeric()))
+            .any(|w| w.contains(".call") || w.contains(".staticcall"))
+}
+
 fn is_pure(op: u8) -> bool {
     matches!(
         op,
@@ -1472,7 +1483,19 @@ impl<'a> Ctx<'a> {
         let last = self.opcode_at(b - 1).unwrap_or(STOP);
 
         match (&r.stmt, &r.canon) {
-            (Stmt::Move { dst, src, .. }, Stmt::Move { dst: cdst, .. }) => {
+            (
+                Stmt::Move { dst, src, .. },
+                Stmt::Move {
+                    dst: cdst,
+                    src: csrc,
+                    ..
+                },
+            ) => {
+                // `IERC20(t).transfer(a, n)` / `t.call(IERC20.transfer(…))`:
+                // a call with its ABI encoding folded in.
+                if is_folded_call(csrc) {
+                    return Err("editing external calls (`Iface(t).f(…)`) isn't supported".into());
+                }
                 self.assign(r, Some((dst, src)), cdst, a, b, fresh)
             }
             (Stmt::Call { name, args, .. }, Stmt::Call { .. }) if self.call_site(b).is_some() => {
@@ -3198,11 +3221,15 @@ mod tests {
     use crate::translate::decompile::decompile_evm_to_text;
 
     fn weth() -> Vec<u8> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/weth9-mainnet.evm");
-        let code = std::fs::read(path).expect("read weth9 fixture");
+        fixture("weth9-mainnet.evm")
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = format!("{}/testdata/{name}", env!("CARGO_MANIFEST_DIR"));
+        let code = std::fs::read(path).expect("read fixture");
         assert!(
             !code.starts_with(b"version https://git-lfs"),
-            "weth9-mainnet.evm is an LFS pointer; run `git lfs pull`"
+            "{name} is an LFS pointer; run `git lfs pull`"
         );
         code
     }
@@ -3746,6 +3773,26 @@ mod tests {
         }
     }
 
+    /// Calls with their ABI encoding folded in lower unedited, and an
+    /// edit to one is rejected naming the statement.
+    #[test]
+    fn folded_external_calls_reject_edits() {
+        let code = fixture("uniswap-v2-router02-mainnet.evm");
+        let text = decompile_evm_to_text(&code);
+        assert_eq!(compile(&text).unwrap(), code);
+        let line = text
+            .lines()
+            .find(|l| l.contains(" = IWETH(") && l.contains(").withdraw("))
+            .expect("folded withdraw call");
+        let edited = text.replacen(
+            line,
+            &line.replacen(").withdraw(", ").withdraw(0x1 + ", 1),
+            1,
+        );
+        let e = compile(&edited).expect_err("edit should be rejected");
+        assert!(e.contains("external calls") && e.contains("IWETH("), "{e}");
+    }
+
     #[test]
     fn unsupported_edits_fail_clearly() {
         let code = weth();
@@ -3849,11 +3896,6 @@ mod tests {
         assert_eq!(balance_of(&mut m, ALICE), u(1000));
         let out = send(&mut m, ALICE, 0, "withdraw(uint256)", &[u(1001)]);
         assert!(matches!(out, Outcome::Revert(_)), "{out:?}");
-    }
-
-    fn fixture(name: &str) -> Vec<u8> {
-        let path = format!("{}/testdata/{name}", env!("CARGO_MANIFEST_DIR"));
-        std::fs::read(path).expect("fixture")
     }
 
     /// The router's `quote()` without its non-zero-amount check.
@@ -3965,33 +4007,34 @@ mod tests {
     fn edited_raw_external_call() {
         let code = fixture("uniswap-v2-router02-mainnet.evm");
         let text = decompile_evm_to_text(&code);
-        let call = "v13 = call(gasleft(), v18, 0x0, v16, v15, v14, 0x0)";
-        let edited = in_fn(&text, "sub_0de4", |t| {
+        // `pair.swap(…, data)`: dynamic arguments keep the raw form.
+        let call = "v15 = call(gasleft(), v12, 0x0, v16, v20 - v16, v16, 0x0)";
+        let edited = in_fn(&text, "sub_4381", |t| {
             retext(
                 t,
                 "0x5b, 0x50, 0x5a, 0xf1]",
                 call,
-                "v13 = call(gasleft(), v18, 0x7, v16, v15, v14, 0x20)",
+                "v15 = call(gasleft(), v12, 0x7, v16, v20 - v16, v16, 0x20)",
             )
         });
         let new = compile(&edited).unwrap();
         let relifted = decompile_evm_to_text(&new);
         assert!(
-            relifted.contains("call(gasleft(), v18, 0x7, v16, v15, v14, 0x20)"),
+            relifted.contains("call(gasleft(), v12, 0x7, v16, v20 - v16, v16, 0x20)"),
             "{relifted}"
         );
         assert_eq!(compile(&relifted).unwrap(), new);
-        let edited = in_fn(&text, "sub_0de4", |t| {
+        let edited = in_fn(&text, "sub_4381", |t| {
             retext(
                 t,
                 "0x5b, 0x50, 0x5a, 0xf1]",
                 call,
-                "v13 = staticcall(gasleft(), v18, v16, v15, v14, 0x0)",
+                "v15 = staticcall(gasleft(), v12, v16, v20 - v16, v16, 0x0)",
             )
         });
         let relifted = decompile_evm_to_text(&compile(&edited).unwrap());
         assert!(
-            relifted.contains("staticcall(gasleft(), v18, v16, v15, v14, 0x0)"),
+            relifted.contains("staticcall(gasleft(), v12, v16, v20 - v16, v16, 0x0)"),
             "{relifted}"
         );
     }

@@ -835,6 +835,16 @@ fn abi_head(sig: &str) -> Option<AbiHead<'_>> {
     Some(AbiHead { types, words })
 }
 
+/// How many head words a call to `sig` encodes when all its
+/// parameters are static (so the head is the whole encoding).
+pub(crate) fn static_head_words(sig: &str) -> Option<usize> {
+    let head = abi_head(sig)?;
+    head.types.iter().try_fold(0, |n, t| match head_words(t)? {
+        HeadWords::Static(w) => Some(n + w),
+        HeadWords::Dynamic => None,
+    })
+}
+
 /// Split a comma-separated type list at its top level.
 fn split_types(list: &str) -> Option<Vec<&str>> {
     if list.is_empty() {

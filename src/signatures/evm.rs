@@ -126,6 +126,8 @@ const FUNCTIONS: &[&str] = &[
     "swap(uint256,uint256,address,bytes)",
     "sync()",
     "skim(address)",
+    "mint(address)",
+    "burn(address)",
     "getPair(address,address)",
     "createPair(address,address)",
     // Uniswap V4 pool manager
@@ -150,8 +152,18 @@ const FUNCTIONS: &[&str] = &[
     "updateDynamicLPFee((address,address,uint24,int24,address),uint24)",
     "setProtocolFee((address,address,uint24,int24,address),uint24)",
     "collectProtocolFees(address,address,uint256)",
-    // Uniswap v4 callbacks
+    // Uniswap v4 callbacks and hooks
     "unlockCallback(bytes)",
+    "beforeInitialize(address,(address,address,uint24,int24,address),uint160)",
+    "afterInitialize(address,(address,address,uint24,int24,address),uint160,int24)",
+    "beforeAddLiquidity(address,(address,address,uint24,int24,address),(int24,int24,int256,bytes32),bytes)",
+    "afterAddLiquidity(address,(address,address,uint24,int24,address),(int24,int24,int256,bytes32),int256,int256,bytes)",
+    "beforeRemoveLiquidity(address,(address,address,uint24,int24,address),(int24,int24,int256,bytes32),bytes)",
+    "afterRemoveLiquidity(address,(address,address,uint24,int24,address),(int24,int24,int256,bytes32),int256,int256,bytes)",
+    "beforeSwap(address,(address,address,uint24,int24,address),(bool,int256,uint160),bytes)",
+    "afterSwap(address,(address,address,uint24,int24,address),(bool,int256,uint160),int256,bytes)",
+    "beforeDonate(address,(address,address,uint24,int24,address),uint256,uint256,bytes)",
+    "afterDonate(address,(address,address,uint24,int24,address),uint256,uint256,bytes)",
     "protocolFeeController()",
     "setProtocolFeeController(address)",
     // Curve StableSwap (Vyper; the 3pool's ABI, shared by most
@@ -300,6 +312,127 @@ const EVENTS: &[&str] = &[
     "ProtocolFeeUpdated(bytes32,uint24)",
 ];
 
+/// The interfaces that declare known functions, for naming external
+/// calls (`IERC20(token).transfer(to, amount)`). The first interface
+/// listing a signature names it.
+const INTERFACES: &[(&str, &[&str])] = &[
+    (
+        "IERC20",
+        &[
+            "name()",
+            "symbol()",
+            "decimals()",
+            "totalSupply()",
+            "balanceOf(address)",
+            "transfer(address,uint256)",
+            "transferFrom(address,address,uint256)",
+            "approve(address,uint256)",
+            "allowance(address,address)",
+            "increaseAllowance(address,uint256)",
+            "decreaseAllowance(address,uint256)",
+            "mint(address,uint256)",
+            "burn(uint256)",
+            "burnFrom(address,uint256)",
+            "burn(address,uint256)",
+            "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+            "nonces(address)",
+            "DOMAIN_SEPARATOR()",
+        ],
+    ),
+    ("IWETH", &["deposit()", "withdraw(uint256)"]),
+    (
+        "IERC721",
+        &[
+            "ownerOf(uint256)",
+            "safeTransferFrom(address,address,uint256)",
+            "safeTransferFrom(address,address,uint256,bytes)",
+            "setApprovalForAll(address,bool)",
+            "getApproved(uint256)",
+            "isApprovedForAll(address,address)",
+            "tokenURI(uint256)",
+        ],
+    ),
+    (
+        "IERC721Receiver",
+        &["onERC721Received(address,address,uint256,bytes)"],
+    ),
+    (
+        "IERC1155",
+        &[
+            "balanceOfBatch(address[],uint256[])",
+            "safeTransferFrom(address,address,uint256,uint256,bytes)",
+            "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)",
+            "uri(uint256)",
+        ],
+    ),
+    ("IERC165", &["supportsInterface(bytes4)"]),
+    (
+        "IERC4626",
+        &[
+            "asset()",
+            "totalAssets()",
+            "convertToShares(uint256)",
+            "convertToAssets(uint256)",
+            "deposit(uint256,address)",
+            "mint(uint256,address)",
+            "withdraw(uint256,address,address)",
+            "redeem(uint256,address,address)",
+        ],
+    ),
+    (
+        "IUniswapV2Pair",
+        &[
+            "getReserves()",
+            "token0()",
+            "token1()",
+            "swap(uint256,uint256,address,bytes)",
+            "sync()",
+            "skim(address)",
+            "mint(address)",
+            "burn(address)",
+        ],
+    ),
+    (
+        "IUniswapV2Factory",
+        &["getPair(address,address)", "createPair(address,address)"],
+    ),
+    ("IUnlockCallback", &["unlockCallback(bytes)"]),
+    (
+        "IHooks",
+        &[
+            "beforeInitialize(address,(address,address,uint24,int24,address),uint160)",
+            "afterInitialize(address,(address,address,uint24,int24,address),uint160,int24)",
+            "beforeAddLiquidity(address,(address,address,uint24,int24,address),(int24,int24,int256,bytes32),bytes)",
+            "afterAddLiquidity(address,(address,address,uint24,int24,address),(int24,int24,int256,bytes32),int256,int256,bytes)",
+            "beforeRemoveLiquidity(address,(address,address,uint24,int24,address),(int24,int24,int256,bytes32),bytes)",
+            "afterRemoveLiquidity(address,(address,address,uint24,int24,address),(int24,int24,int256,bytes32),int256,int256,bytes)",
+            "beforeSwap(address,(address,address,uint24,int24,address),(bool,int256,uint160),bytes)",
+            "afterSwap(address,(address,address,uint24,int24,address),(bool,int256,uint160),int256,bytes)",
+            "beforeDonate(address,(address,address,uint24,int24,address),uint256,uint256,bytes)",
+            "afterDonate(address,(address,address,uint24,int24,address),uint256,uint256,bytes)",
+        ],
+    ),
+];
+
+/// Well-known ABI tuples: canonical type, struct name, member names.
+const STRUCTS: &[(&str, &str, &[&str])] = &[
+    (
+        "(address,address,uint24,int24,address)",
+        "PoolKey",
+        &["currency0", "currency1", "fee", "tickSpacing", "hooks"],
+    ),
+    (
+        "(bool,int256,uint160)",
+        "SwapParams",
+        &["zeroForOne", "amountSpecified", "sqrtPriceLimitX96"],
+    ),
+    (
+        "(int24,int24,int256,bytes32)",
+        "ModifyLiquidityParams",
+        &["tickLower", "tickUpper", "liquidityDelta", "salt"],
+    ),
+];
+
 /// ERC-1967 slots, defined as `keccak256(label) - 1`.
 const ERC1967_SLOTS: &[(&str, &str)] = &[
     (
@@ -384,6 +517,27 @@ pub fn selectors_named(name: &str) -> Vec<u32> {
         .collect()
 }
 
+/// The interface declaring the known function `sig` (`IERC20` for
+/// `transfer(address,uint256)`).
+#[must_use]
+pub fn interface_of(sig: &str) -> Option<&'static str> {
+    INTERFACES
+        .iter()
+        .find(|(_, sigs)| sigs.contains(&sig))
+        .map(|(name, _)| *name)
+}
+
+/// Struct name and member names of a well-known ABI tuple type, given
+/// in canonical form (`(address,address,uint24,int24,address)` is
+/// Uniswap v4's `PoolKey`).
+#[must_use]
+pub fn struct_fields(tuple: &str) -> Option<(&'static str, &'static [&'static str])> {
+    STRUCTS
+        .iter()
+        .find(|(t, _, _)| *t == tuple)
+        .map(|&(_, name, fields)| (name, fields))
+}
+
 /// Event signature for a `LOGn` topic-0 value.
 #[must_use]
 pub fn event_by_topic(topic: &[u8; 32]) -> Option<&'static str> {
@@ -410,6 +564,27 @@ mod tests {
         assert_eq!(function_by_selector(0x4e48_7b71), Some("Panic(uint256)"));
         assert_eq!(function_by_selector(0xd0e3_0db0), Some("deposit()"));
         assert_eq!(function_by_selector(0xdead_beef), None);
+    }
+
+    #[test]
+    fn interfaces_and_structs() {
+        assert_eq!(interface_of("transfer(address,uint256)"), Some("IERC20"));
+        assert_eq!(interface_of("withdraw(uint256)"), Some("IWETH"));
+        assert_eq!(interface_of("getReserves()"), Some("IUniswapV2Pair"));
+        assert_eq!(interface_of("A()"), None);
+        // Every interface member is a known function.
+        for (_, sigs) in INTERFACES {
+            for sig in *sigs {
+                assert_eq!(function_by_selector(selector(sig)), Some(*sig), "{sig}");
+            }
+        }
+        let (name, fields) = struct_fields("(address,address,uint24,int24,address)").unwrap();
+        assert_eq!(name, "PoolKey");
+        assert_eq!(fields[4], "hooks");
+        for (t, _, fields) in STRUCTS {
+            assert_eq!(t.matches(',').count() + 1, fields.len(), "{t}");
+        }
+        assert_eq!(struct_fields("(uint256)"), None);
     }
 
     #[test]

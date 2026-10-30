@@ -26,6 +26,15 @@
 //! pass) says — via-IR's ABI-decoder helpers return parameters, and a
 //! public getter's accessor returns the storage it names.
 //!
+//! External calls fold the ABI encoding of their input — a selector
+//! and static words stored at the free-memory pointer (or Vyper's
+//! fixed buffers) — into `t.call(IERC20.transfer(a, n))`, and into the
+//! high-level `IERC20(t).transfer(a, n)` once the check that re-raises
+//! a failure is folded in too. A block ending in a guard that falls
+//! into a failure block, when its continuation (next in the slice)
+//! makes a call, is lifted together with that continuation, so solc's
+//! setup / `extcodesize` check / call read as one statement.
+//!
 //! A forward `JUMPI` whose fall-through run of blocks is entered only
 //! from that `JUMPI` becomes `if (!cond) { … }`; any other jump stays
 //! explicit as `jump(L_xxxx)`.
@@ -61,6 +70,13 @@ const UNKNOWN: &str = "?";
 /// summary: analysis sees through it, but the text keeps naming the
 /// variable the call assigned.
 const RESULT: &str = "result";
+
+/// A free-memory-pointer value in resolved form, `mptr(id)`: reads of
+/// `mload(0x40)` with no `mstore(0x40, …)` between them share an id,
+/// so buffers built at the pointer can be followed across statements
+/// (and blocks, through the stack values blocks hand on). Never
+/// rendered.
+const MPTR: &str = "mptr";
 
 /// Resolved values larger than this are treated as [`UNKNOWN`].
 const RESOLVE_MAX_NODES: usize = 48;
@@ -192,8 +208,14 @@ fn simplify(e: Expr) -> Expr {
     let Expr::Op(op, args) = e else { return e };
     let args: Vec<Expr> = args.into_iter().map(simplify).collect();
     let is_calldata0 = |x: &Expr| matches!(x, Expr::Op("calldataload", a) if a.len() == 1 && a[0].const_value() == Some(0));
+    // A low-bytes mask, also as solc ≥0.8 computes it: `(1 << n) - 1`.
     let is_mask = |x: &Expr, bytes: usize| {
         x.is_const_bytes(|b| b.len() == bytes && b.iter().all(|&v| v == 0xff))
+            || matches!(x, Expr::Op("sub", ab) if ab.len() == 2
+                && ab[1].const_value() == Some(1)
+                && matches!(&ab[0], Expr::Op("shl", sh) if sh.len() == 2
+                    && sh[0].const_value() == Some(8 * bytes as u64)
+                    && sh[1].const_value() == Some(1)))
     };
     match (op, args.as_slice()) {
         // Selector extraction: `shr(224, calldataload(0))`, or the
@@ -506,6 +528,121 @@ fn lin(e: &Expr, bindings: &HashMap<String, Expr>, depth: u8) -> Option<(String,
             Some((base, o1.checked_add(o2)?))
         }
         Expr::Op(..) => None,
+    }
+}
+
+/// `e` (a resolved value) as a base plus a constant offset: `(None,
+/// c)` for a constant, `(Some(base), c)` for `base + c`, where `base`
+/// is any other value analysis can follow. `(b + x) - (b + y)` is the
+/// constant `x - y`.
+fn rlin(e: &Expr) -> Option<(Option<Expr>, u64)> {
+    match e {
+        Expr::Const(_) => Some((None, e.const_value()?)),
+        Expr::Op(RESULT, a) if a.len() == 1 => rlin(&a[0]),
+        Expr::Op("add", ab) if ab.len() == 2 => {
+            let (b1, o1) = rlin(&ab[0])?;
+            let (b2, o2) = rlin(&ab[1])?;
+            let ((base, None) | (None, base)) = (b1, b2) else {
+                return None;
+            };
+            Some((base, o1.checked_add(o2)?))
+        }
+        Expr::Op("sub", ab) if ab.len() == 2 => {
+            let (b1, o1) = rlin(&ab[0])?;
+            let (b2, o2) = rlin(&ab[1])?;
+            match (b1, b2) {
+                (b, None) => Some((b, o1.checked_sub(o2)?)),
+                (Some(x), Some(y)) if x == y => Some((None, o1.checked_sub(o2)?)),
+                _ => None,
+            }
+        }
+        _ if mentions_op(e, UNKNOWN) => None,
+        _ => Some((Some(e.clone()), 0)),
+    }
+}
+
+/// `e` with its free-memory-pointer reads of epoch `epoch` (`fmp(k)`
+/// bindings) as `mload(0x40)`; `None` if it reads an older pointer.
+fn replace_fmp(e: &Expr, epoch: &Expr) -> Option<Expr> {
+    Some(match e {
+        Expr::Op("fmp", k) => {
+            if k.first() != Some(epoch) {
+                return None;
+            }
+            Expr::Op("mload", vec![Expr::Const(vec![0x40])])
+        }
+        Expr::Op(op, args) => Expr::Op(
+            op,
+            args.iter()
+                .map(|a| replace_fmp(a, epoch))
+                .collect::<Option<_>>()?,
+        ),
+        other => other.clone(),
+    })
+}
+
+/// The 4 bytes at byte `rel` of a resolved 32-byte word.
+fn word_bytes4(e: &Expr, rel: u64) -> Option<u32> {
+    let rel = usize::try_from(rel).ok()?;
+    match e {
+        Expr::Const(b) => {
+            let b = strip(b);
+            if b.len() > 32 || rel + 4 > 32 {
+                return None;
+            }
+            let mut w = [0u8; 32];
+            w[32 - b.len()..].copy_from_slice(b);
+            Some(u32::from_be_bytes(w[rel..rel + 4].try_into().ok()?))
+        }
+        Expr::Op("shl", a) if rel == 0 && a.len() == 2 && a[0].const_value() == Some(224) => {
+            u32::try_from(a[1].const_value()?).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Reads whose binding can't be dropped from the text: calls and
+/// contract creation.
+fn read_name_has_effects(op: &str) -> bool {
+    matches!(
+        op,
+        "call" | "callcode" | "delegatecall" | "staticcall" | "create" | "create2" | FOLDED_CALL
+    )
+}
+
+/// Binding of the variable a folded external call assigns (wrapping
+/// the raw call): never inlined into later statements.
+const FOLDED_CALL: &str = "xcall";
+
+/// Whether `e` mentions a variable `pred` accepts.
+fn mentions_var(e: &Expr, pred: &dyn Fn(&str) -> bool) -> bool {
+    match e {
+        Expr::Var(v) => pred(v),
+        Expr::Op(_, args) => args.iter().any(|a| mentions_var(a, pred)),
+        Expr::Const(_) => false,
+    }
+}
+
+/// A resolved value that reads the same wherever it is shown:
+/// constants, ABI parameters, call-wide environment values, and pure
+/// operations on them.
+fn stable_value(e: &Expr) -> bool {
+    match e {
+        Expr::Const(_) => true,
+        Expr::Var(_) => is_param(e),
+        Expr::Op(op, args) if args.is_empty() => shows_inline(e) || *op == "address(this)",
+        Expr::Op(op, args) => {
+            ((0..=0xff).any(|o| pure_name(o) == Some(op)) || matches!(*op, "address" | "bool"))
+                && *op != "calldataload"
+                && args.iter().all(stable_value)
+        }
+    }
+}
+
+fn mentions_op(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Op(op, args) => *op == name || args.iter().any(|a| mentions_op(a, name)),
+        _ => false,
     }
 }
 
@@ -841,7 +978,7 @@ fn summary_safe(e: &Expr) -> bool {
     match e {
         Expr::Const(_) => true,
         Expr::Var(v) => v.starts_with("L_") || v.strip_prefix("arg").is_some_and(is_digits),
-        Expr::Op(op, args) => *op != UNKNOWN && args.iter().all(summary_safe),
+        Expr::Op(op, args) => *op != UNKNOWN && *op != MPTR && args.iter().all(summary_safe),
     }
 }
 
@@ -1282,20 +1419,27 @@ impl FnBuilder<'_, '_> {
                 i += 1;
                 continue;
             }
-            let (stmts, end) = self.lift_block(b);
+            let (stmts, end, last) = self.lift_block(b, &blocks[i + 1..]);
+            // A chain of blocks lifted as one ends where its last block
+            // does, and is planned as that block.
+            let label_b = b;
+            let b = last;
+            if let Some(k) = blocks[i..].iter().position(|&x| x == last) {
+                i += k;
+            }
             let BlockEnd::Cond {
                 cond,
                 target,
                 bytes,
             } = end
             else {
-                out.extend(self.label(b));
+                out.extend(self.label(label_b));
                 out.extend(stmts);
                 i += 1;
                 continue;
             };
             let Some(&shape) = self.plan.ifs.get(&b) else {
-                out.extend(self.label(b));
+                out.extend(self.label(label_b));
                 out.extend(stmts);
                 // A jump to a block that only fails (via-IR shares one
                 // per error) reads as that failure, inline.
@@ -1338,7 +1482,7 @@ impl FnBuilder<'_, '_> {
                 else {
                     unreachable!("checked above")
                 };
-                out.extend(self.label(b));
+                out.extend(self.label(label_b));
                 out.push(Stmt::WhileBlock {
                     cond_text: render(&negate(cond)),
                     entry_bytes: bytes,
@@ -1354,7 +1498,7 @@ impl FnBuilder<'_, '_> {
             if shape.is_loop && start != self.range_start && !self.labels.contains(&start) {
                 out.push(Stmt::Comment(format!("L_{start:04x}:")));
             }
-            out.extend(self.label(b));
+            out.extend(self.label(label_b));
             out.extend(stmts);
             if shape.else_end.is_none()
                 && let Some(guard) = as_guard(&cond, &bytes, &then_body)
@@ -1388,7 +1532,7 @@ impl FnBuilder<'_, '_> {
             return None;
         }
         let saved = self.temps;
-        let (stmts, _) = self.lift_block(b);
+        let (stmts, _, _) = self.lift_block(b, &[]);
         self.temps = saved;
         let mut real = stmts.into_iter().filter(|s| !matches!(s, Stmt::Comment(_)));
         match (real.next(), real.next()) {
@@ -1414,7 +1558,7 @@ impl FnBuilder<'_, '_> {
         if body_blocks.is_empty() {
             body.extend(self.label(tail));
         }
-        let (stmts, end) = self.lift_block(tail);
+        let (stmts, end, _) = self.lift_block(tail, &[]);
         body.extend(stmts);
         let BlockEnd::Cond { cond, bytes, .. } = end else {
             unreachable!("do-while tail ends in JUMPI")
@@ -1438,7 +1582,11 @@ impl FnBuilder<'_, '_> {
         });
     }
 
-    fn lift_block(&mut self, b: usize) -> (Vec<Stmt>, BlockEnd) {
+    /// Lift block `b` — and, where it ends in a guard whose failure
+    /// path and continuation are the next blocks of `rest`, those too
+    /// (see [`BlockLift::try_chain`]). Returns the statements, how the
+    /// last block lifted ends, and that block.
+    fn lift_block(&mut self, b: usize, rest: &[usize]) -> (Vec<Stmt>, BlockEnd, usize) {
         let depth = self.ctx.cfg.depth[b];
         let entry = self.entry_values(b);
         let mut bl = BlockLift {
@@ -1451,7 +1599,9 @@ impl FnBuilder<'_, '_> {
             temps: &mut self.temps,
             mstores: Vec::new(),
             bindings: HashMap::new(),
+            flat: HashMap::new(),
             fmp_epoch: 0,
+            fmp_id: None,
             params: self
                 .ctx
                 .params
@@ -1463,6 +1613,10 @@ impl FnBuilder<'_, '_> {
             exit: None,
             returned: None,
             encoded: None,
+            rest,
+            last: b,
+            code_checks: HashSet::new(),
+            folded: None,
         };
         let end = bl.run(b);
         let BlockLift {
@@ -1470,10 +1624,11 @@ impl FnBuilder<'_, '_> {
             exit,
             returned,
             encoded,
+            last,
             ..
         } = bl;
         if let (Some(exit), Some(d)) = (exit, depth) {
-            self.exits.insert(b, (self.range_start, d.frame, exit));
+            self.exits.insert(last, (self.range_start, d.frame, exit));
         }
         if let (Some(vals), Some(frame)) = (returned, depth.and_then(|d| d.frame)) {
             self.facts.returns.entry(frame).or_default().push(vals);
@@ -1485,7 +1640,7 @@ impl FnBuilder<'_, '_> {
                 .or_default()
                 .push(words);
         }
-        (out, end)
+        (out, end, last)
     }
 
     /// Known values of `b`'s entry stack, by frame position: the
@@ -1558,6 +1713,48 @@ fn subst_args(e: &Expr, args: &[Expr]) -> Expr {
     }
 }
 
+/// The one `revert(…)` / `panic(…)` / `invalid()` a failure block's
+/// statements come down to.
+fn single_failure(stmts: Vec<Stmt>) -> Option<Stmt> {
+    let mut real = stmts.into_iter().filter(|s| !matches!(s, Stmt::Comment(_)));
+    match (real.next(), real.next()) {
+        (Some(st @ Stmt::Call { .. }), None)
+            if matches!(&st, Stmt::Call { name, .. }
+                if matches!(name.as_str(), "revert" | "panic" | "invalid")) =>
+        {
+            Some(st)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a failure block's statements re-raise the return data of
+/// the call that failed: `returndatacopy(p, 0x0, returndatasize())`,
+/// then `revert(p, returndatasize())`.
+fn is_bubble(stmts: &[Stmt]) -> bool {
+    let calls: Vec<(&str, &[String])> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Call { name, args, .. } => Some((name.as_str(), args.as_slice())),
+            _ => None,
+        })
+        .collect();
+    let moves_ok = stmts.iter().all(|s| match s {
+        Stmt::Move { src, .. } => src == "returndatasize()",
+        _ => true,
+    });
+    matches!(calls.as_slice(), [("returndatacopy", [p, z, n]), ("revert", [q, _])]
+        if p == q && z == "0x0" && n == "returndatasize()")
+        && moves_ok
+}
+
+/// Whether a failure block's statements are a bare `revert(0x0, 0x0)`.
+fn is_plain_revert(stmts: &[Stmt]) -> bool {
+    let mut real = stmts.iter().filter(|s| !matches!(s, Stmt::Comment(_)));
+    matches!((real.next(), real.next()), (Some(Stmt::Call { name, args, .. }), None)
+        if name == "revert" && args.len() == 2 && args.iter().all(|a| a == "0x0"))
+}
+
 /// `if (!ok) { revert(…) }` as `require(ok, …)`, and `if (!ok) {
 /// invalid() }` (solc ≤0.7 `assert` and bounds checks) as `assert(ok)`.
 /// `ok` is the `JUMPI` condition: the jump skips the failure path.
@@ -1616,6 +1813,7 @@ fn jump_stmt(dest: String, bytes: Vec<u8>) -> Stmt {
 // ---------------------------------------------------------------------
 
 /// An `mstore` emitted by the block being lifted.
+#[derive(Clone)]
 struct MStore {
     /// Index of its statement in `BlockLift::out`.
     at: usize,
@@ -1627,6 +1825,8 @@ struct MStore {
     /// `value` resolved when the store happened (see
     /// [`BlockLift::resolve`]), for the same reason.
     resolved: Expr,
+    /// `offset` resolved, as a base plus a constant (see [`rlin`]).
+    rplace: Option<(Option<Expr>, u64)>,
 }
 
 struct BlockLift<'a, 'c> {
@@ -1646,9 +1846,16 @@ struct BlockLift<'a, 'c> {
     /// What each variable bound in this block was bound to. A
     /// free-memory-pointer read is recorded as `fmp(epoch)`.
     bindings: HashMap<String, Expr>,
+    /// Variables bound in this block whose values mention no variable
+    /// (but parameters and labels), as those values: free-memory
+    /// pointer reads stay `fmp(epoch)`.
+    flat: HashMap<String, Expr>,
     /// Bumped by every `mstore(0x40, …)`: free-memory-pointer reads in
     /// the same epoch see the same value.
     fmp_epoch: u64,
+    /// The id of the current epoch's free-memory pointer once read
+    /// (see [`MPTR`]).
+    fmp_id: Option<u64>,
     /// Names of the ABI head words of the external function being
     /// lifted (see [`LiftCtx::params`]).
     params: &'a [String],
@@ -1667,6 +1874,76 @@ struct BlockLift<'a, 'c> {
     returned: Option<Vec<Expr>>,
     /// Set by `return abi.encode(…)`: the words returned, resolved.
     encoded: Option<Vec<Expr>>,
+    /// The blocks after the current one in the slice being built, for
+    /// lifting a guarded continuation in the same pass.
+    rest: &'a [usize],
+    /// The block being lifted (the last of a chain).
+    last: usize,
+    /// Indices in `out` of `require`s that only check that a call's
+    /// target has code (solc's `extcodesize` check).
+    code_checks: HashSet<usize>,
+    /// The external call [`Self::fold_external_call`] folded last.
+    folded: Option<FoldedCall>,
+}
+
+/// An external call folded into one statement, kept so the checks
+/// that follow it can be taken in.
+struct FoldedCall {
+    /// Index of its statement in `BlockLift::out`.
+    at: usize,
+    /// The variable holding its success flag.
+    var: String,
+    kind: &'static str,
+    sel: u32,
+    gas: Expr,
+    to: Expr,
+    value: Option<Expr>,
+    args: Vec<Expr>,
+}
+
+impl FoldedCall {
+    /// The statement's right-hand side: the low-level call that
+    /// returns the success flag — `t.call(IERC20.transfer(a, n))` —
+    /// or, once a failure re-raises its revert data (`checked`), the
+    /// high-level call Solidity compiles that way —
+    /// `IERC20(t).transfer(a, n)`. A non-zero value and an explicit
+    /// gas limit show as `.value(v)` / `.gas(g)` modifiers, as Solidity
+    /// 0.6 wrote them; an unknown selector as `t.call(0xsel, a, …)`.
+    fn text(&self, checked: bool) -> String {
+        let to = match &self.to {
+            Expr::Op("address", x) if x.len() == 1 => &x[0],
+            other => other,
+        };
+        let mut mods = String::new();
+        if let Some(v) = self.value.as_ref().filter(|v| v.const_value() != Some(0)) {
+            let _ = write!(mods, ".value({})", render_arg(v));
+        }
+        if !matches!(&self.gas, Expr::Op("gasleft", a) if a.is_empty()) {
+            let _ = write!(mods, ".gas({})", render_arg(&self.gas));
+        }
+        let mut parts: Vec<String> = self.args.iter().map(render_arg).collect();
+        let Some(sig) = crate::signatures::evm::function_by_selector(self.sel) else {
+            parts.insert(0, format!("0x{:08x}", self.sel));
+            return format!(
+                "{}.{}{mods}({})",
+                render_arg(to),
+                self.kind,
+                parts.join(", ")
+            );
+        };
+        let name = sig.split('(').next().unwrap_or(sig);
+        let iface = crate::signatures::evm::interface_of(sig).unwrap_or("Iface");
+        if checked {
+            format!("{iface}({}).{name}{mods}({})", render(to), parts.join(", "))
+        } else {
+            format!(
+                "{}.{}{mods}({iface}.{name}({}))",
+                render_arg(to),
+                self.kind,
+                parts.join(", ")
+            )
+        }
+    }
 }
 
 impl BlockLift<'_, '_> {
@@ -1750,6 +2027,21 @@ impl BlockLift<'_, '_> {
     }
 
     fn bind_resolved(&mut self, name: &str, val: Expr, resolved: Expr) {
+        // The value in terms of no variable at all, where it is one
+        // (pointer arithmetic over free-memory-pointer reads, mostly).
+        let mut flat = val.clone();
+        for (v, f) in &self.flat {
+            if flat.mentions(v) {
+                flat = flat.substitute(v, f);
+            }
+        }
+        if mentions_var(&flat, &|v| !v.starts_with("param") && !v.starts_with("L_"))
+            || flat.nodes() > RESOLVE_MAX_NODES
+        {
+            self.flat.remove(name);
+        } else {
+            self.flat.insert(name.to_string(), flat);
+        }
         self.resolved.insert(name.to_string(), resolved);
         self.bindings.insert(name.to_string(), val);
     }
@@ -2007,6 +2299,7 @@ impl BlockLift<'_, '_> {
     #[allow(clippy::too_many_lines)]
     fn run(&mut self, b: usize) -> BlockEnd {
         let cfg = self.ctx.cfg;
+        self.last = b;
         let blk = cfg.blocks[b].clone();
         let last = blk.insns.end - 1;
         // Vyper 0.2 returns with `mload(slot); JUMP`, its return address
@@ -2170,6 +2463,7 @@ impl BlockLift<'_, '_> {
                     if op == 0x52 {
                         if args[0].const_value() == Some(0x40) {
                             self.fmp_epoch += 1;
+                            self.fmp_id = None;
                         }
                         self.mstores.push(MStore {
                             at: self.out.len(),
@@ -2177,6 +2471,7 @@ impl BlockLift<'_, '_> {
                             value: args[1].clone(),
                             place: lin(&args[0], &self.bindings, 0),
                             resolved: self.resolve(&args[1]),
+                            rplace: rlin(&self.resolve(&args[0])),
                         });
                     }
                     // A store to named storage reads as an assignment.
@@ -2245,6 +2540,9 @@ impl BlockLift<'_, '_> {
                         Expr::Op("xor", ab) => simplify(Expr::Op("ne", ab)),
                         c => c,
                     };
+                    if let Some(next) = self.try_chain(b, i, &cond) {
+                        return self.run(next);
+                    }
                     self.exit = self.exit_values();
                     let bytes = self.jump_bytes(i);
                     let target = target.const_value().or_else(|| {
@@ -2281,6 +2579,124 @@ impl BlockLift<'_, '_> {
             self.pending = blk.insns.end;
         }
         BlockEnd::Other
+    }
+
+    /// Lift on through a guard: when block `b` ends in a `JUMPI` (at
+    /// instruction `i`, on `cond`) that falls through into a block that
+    /// only fails and otherwise jumps to the block right after it, and
+    /// both are entered only from here and come next in the slice,
+    /// emit `require(cond, …)` and return the continuation, to be
+    /// lifted with the stack and memory as this block left them. Only
+    /// done where the continuation makes an external call, so a call's
+    /// setup and the call itself (solc ≤0.8 checks `extcodesize` in
+    /// between) are seen together.
+    fn try_chain(&mut self, b: usize, i: usize, cond: &Expr) -> Option<usize> {
+        let cfg = self.ctx.cfg;
+        let [fail_b, cont, ..] = *self.rest else {
+            return None;
+        };
+        let blk = &cfg.blocks[b];
+        let d = self.depth?;
+        let at_t = BlockDepth {
+            frame: d.frame,
+            depth: self.pos_of(self.stack.len())?,
+        };
+        let calls = cfg.blocks[cont]
+            .insns
+            .clone()
+            .any(|k| matches!(self.ctx.insns[k].opcode, 0xf1 | 0xf2 | 0xf4 | 0xfa));
+        let after_call = self.folded.as_ref().is_some_and(|fc| {
+            self.out.len() == fc.at + 1
+                && strip_cleanup(&negate(negate(cond.clone()))) == &Expr::Var(fc.var.clone())
+        });
+        let ok = (calls || after_call)
+            && cfg.blocks[fail_b].start == blk.end
+            && cfg.blocks[cont].start == cfg.blocks[fail_b].end
+            && cfg.blocks[fail_b].term == Term::Halt
+            && cfg.targets[b].len() == 1
+            && cfg.targets[b].contains(&cont)
+            && cfg.preds[fail_b] == [b]
+            && cfg.preds[cont] == [b]
+            && cfg.reached[fail_b]
+            && cfg.reached[cont]
+            && cfg.depth[cont] == Some(at_t)
+            && !cfg.functions.contains_key(&cont);
+        if !ok || self.pending > i {
+            return None;
+        }
+        let pending = self.pending;
+        let mut jumpi = self.take(i);
+        let fail = self.inline_failure(fail_b);
+        // `if (!success) { returndatacopy(…); revert(…) }` right after a
+        // folded call is how Solidity's high-level call bubbles a
+        // failure up, and `if (!success) { revert(0, 0) }` how Vyper's
+        // fails: the call statement takes the check in and reads as one.
+        if after_call
+            && fail
+                .as_deref()
+                .is_some_and(|s| is_bubble(s) || is_plain_revert(s))
+        {
+            let fc = self.folded.take().expect("checked");
+            for st in fail.unwrap_or_default() {
+                if let Stmt::Move { bytes, .. } | Stmt::Call { bytes, .. } = st {
+                    jumpi.extend(bytes);
+                }
+            }
+            if let Some(Stmt::Move { src, bytes, .. }) = self.out.get_mut(fc.at) {
+                bytes.extend(jumpi);
+                *src = fc.text(true);
+            }
+            self.rest = &self.rest[2..];
+            return Some(cont);
+        }
+        let Some(guard) = fail
+            .and_then(single_failure)
+            .and_then(|fail| as_guard(cond, &jumpi, std::slice::from_ref(&fail)))
+        else {
+            self.pending = pending;
+            return None;
+        };
+        if mentions_op(&self.resolve(cond), "extcodesize") {
+            self.code_checks.insert(self.out.len());
+        }
+        self.out.push(guard);
+        self.rest = &self.rest[2..];
+        Some(cont)
+    }
+
+    /// Lift failure block `f` from the current state, which is left
+    /// as it was (but for the instructions consumed), to the
+    /// statements it ends in.
+    fn inline_failure(&mut self, f: usize) -> Option<Vec<Stmt>> {
+        let saved = (
+            self.stack.clone(),
+            self.pulled,
+            std::mem::take(&mut self.out),
+            std::mem::take(&mut self.mstores),
+            (self.bindings.clone(), self.flat.clone()),
+            self.resolved.clone(),
+            *self.temps,
+            (self.fmp_epoch, self.fmp_id),
+            (self.rest, self.last),
+        );
+        let start = self.pending;
+        self.rest = &[];
+        self.run(f);
+        let stmts = std::mem::take(&mut self.out);
+        let (stack, pulled, out, mstores, bindings, resolved, temps, fmp, rest) = saved;
+        self.out = out;
+        self.stack = stack;
+        self.pulled = pulled;
+        self.mstores = mstores;
+        (self.bindings, self.flat) = bindings;
+        self.resolved = resolved;
+        *self.temps = temps;
+        (self.fmp_epoch, self.fmp_id) = fmp;
+        (self.rest, self.last) = rest;
+        self.exit = None;
+        self.returned = None;
+        self.encoded = None;
+        (self.pending == self.ctx.cfg.blocks[f].insns.end && start <= self.pending).then_some(stmts)
     }
 
     /// Fold an ABI-encoded `Error(string)` / `Panic(uint256)` revert
@@ -2388,10 +2804,14 @@ impl BlockLift<'_, '_> {
         // Before inlining: inlined values may name variables since
         // rebound.
         let resolved = if is_fmp {
-            Expr::Op(UNKNOWN, Vec::new())
+            let id = *self.fmp_id.get_or_insert(i as u64);
+            Expr::Op(MPTR, vec![Expr::Const(id.to_be_bytes().to_vec())])
         } else {
             self.resolve(val)
         };
+        if self.fold_external_call(val, &resolved, i) {
+            return;
+        }
         let (val, mut bytes) = if is_fmp {
             (val.clone(), Vec::new())
         } else {
@@ -2466,6 +2886,215 @@ impl BlockLift<'_, '_> {
         )
     }
 
+    /// The most recent store covering bytes `[start, start + n)` of
+    /// memory at `base`, if one stored them all and no store after it
+    /// (or at a place analysis can't follow) touched them.
+    fn store_covering(&self, base: Option<&Expr>, start: u64, n: u64) -> Option<&MStore> {
+        for m in self.mstores.iter().rev() {
+            let (b, q) = m.rplace.as_ref()?;
+            if b.as_ref() != base || q + 32 <= start || start + n <= *q {
+                continue;
+            }
+            return (*q <= start && start + n <= q + 32).then_some(m);
+        }
+        None
+    }
+
+    /// A `CALL` / `STATICCALL` whose input is a selector and static ABI
+    /// words stored in memory just before it — `mstore(p, sel << 224);
+    /// mstore(p + 4, a); …; call(g, t, v, p, 4 + 32n, …)`, or Vyper's
+    /// selector right-aligned in the word before the input — reads as
+    /// `Iface(t).name(a, …)`, and `t.call(0x…, a, …)` for an unknown
+    /// selector. The encoding statements fold into the call's, which
+    /// assigns the call's success flag. `resolved` is `val` resolved.
+    /// Returns whether it emitted the statement.
+    fn fold_external_call(&mut self, val: &Expr, resolved: &Expr, i: usize) -> bool {
+        let (Expr::Op(kind @ ("call" | "staticcall"), a), Expr::Op(_, r)) = (val, resolved) else {
+            return false;
+        };
+        let Some((mut fc, first)) = self.external_call_text(kind, a, r) else {
+            return false;
+        };
+        let text = fc.text(false);
+        let mut bytes = Vec::new();
+        for st in self.out.drain(first..) {
+            match st {
+                Stmt::Move { bytes: b, .. } | Stmt::Call { bytes: b, .. } => bytes.extend(b),
+                _ => {}
+            }
+        }
+        self.mstores.retain(|m| m.at < first);
+        bytes.extend(self.take(i));
+        let idx = self.stack.len();
+        let name = self.bind_name(idx);
+        self.out.push(Stmt::Move {
+            dst: name.clone(),
+            src: text,
+            bytes,
+        });
+        // The raw call must not be inlined back into a later statement.
+        self.bind_resolved(
+            &name,
+            Expr::Op(FOLDED_CALL, vec![val.clone()]),
+            resolved.clone(),
+        );
+        fc.at = self.out.len() - 1;
+        fc.var.clone_from(&name);
+        self.folded = Some(fc);
+        self.stack.push(Expr::Var(name));
+        true
+    }
+
+    /// The text of an external call folded by
+    /// [`Self::fold_external_call`] and the index of the first
+    /// statement it absorbs. Rewrites stack items that name variables
+    /// bound in the absorbed statements to their values.
+    #[allow(clippy::too_many_lines)]
+    fn external_call_text(
+        &mut self,
+        kind: &'static str,
+        a: &[Expr],
+        r: &[Expr],
+    ) -> Option<(FoldedCall, usize)> {
+        let (value, at) = if kind == "call" {
+            (Some(&a[2]), 3)
+        } else {
+            (None, 2)
+        };
+        let (base, off) = rlin(&r[at])?;
+        let (None, len) = rlin(&r[at + 1])? else {
+            return None;
+        };
+        if len < 4 || (len - 4) % 32 != 0 || len > 4 + 32 * 16 {
+            return None;
+        }
+        let nargs = usize::try_from((len - 4) / 32).ok()?;
+        let base = base.as_ref();
+        let sel_store = self.store_covering(base, off, 4)?;
+        let rel = off - sel_store.rplace.as_ref()?.1;
+        let sel = word_bytes4(&sel_store.resolved, rel)?;
+        if let Some(sig) = crate::signatures::evm::function_by_selector(sel)
+            && super::evm::static_head_words(sig) != Some(nargs)
+        {
+            return None;
+        }
+        let mut first = sel_store.at;
+        let mut used = vec![sel_store.at];
+        let mut words = Vec::new();
+        for k in 0..nargs as u64 {
+            let m = self.store_covering(base, off + 4 + 32 * k, 32)?;
+            if m.rplace.as_ref()?.1 != off + 4 + 32 * k {
+                return None;
+            }
+            first = first.min(m.at);
+            used.push(m.at);
+            words.push((m.at, m.value.clone(), m.resolved.clone()));
+        }
+        // Take in the pointer reads that located the buffer.
+        while first > 0
+            && matches!(&self.out[first - 1], Stmt::Move { src, .. } if src == "mload(0x40)")
+        {
+            first -= 1;
+        }
+        // A buffer pointer the code goes on using (the output, often)
+        // keeps its assignment.
+        while let Some(Stmt::Move { dst, .. }) = self.out.get(first)
+            && matches!(self.bindings.get(dst), Some(Expr::Op("fmp", _)))
+            && self.stack.iter().any(|e| e.mentions(dst))
+        {
+            first += 1;
+        }
+        // Only encoding work may be folded away: the stores, and
+        // single assignments that compute pointers or read state.
+        let mut dropped: Vec<String> = Vec::new();
+        for (k, st) in self.out.iter().enumerate().skip(first) {
+            match st {
+                Stmt::Comment(_) => {}
+                Stmt::Call { name, .. } if name == "mstore" && used.contains(&k) => {}
+                Stmt::Call { name, .. } if name == "require" && self.code_checks.contains(&k) => {}
+                Stmt::Move { dst, .. }
+                    if !dst.contains(',')
+                        && !matches!(self.bindings.get(dst), Some(Expr::Op(op, _))
+                            if read_name_has_effects(op)) =>
+                {
+                    dropped.push(dst.clone());
+                }
+                _ => return None,
+            }
+        }
+        // Words name the variables they were stored from; those must
+        // still hold the same values at the call.
+        for (at, value, _) in &words {
+            let reassigned = self.out[at + 1..]
+                .iter()
+                .any(|st| matches!(st, Stmt::Move { dst, .. } if value.mentions(dst)));
+            if reassigned {
+                return None;
+            }
+        }
+        // Values bound in the dropped statements are put in: free-memory
+        // pointer reads as `mload(0x40)`, which still reads the same at
+        // the call (any `mstore(0x40, …)` would have stopped the fold).
+        let epoch = Expr::Const(self.fmp_epoch.to_be_bytes().to_vec());
+        //
+        // Going back through the dropped assignments, each one a value
+        // mentions is replaced by what it assigned, in names as they
+        // were just before it — so what is left names values as they
+        // were before the folded statements, where the call statement
+        // now starts. Only a variable's last assignment is known.
+        let unfold = |e: &Expr, bindings: &HashMap<String, Expr>| -> Option<Expr> {
+            let mut e = e.clone();
+            let mut seen: HashSet<&str> = HashSet::new();
+            for d in dropped.iter().rev() {
+                let latest = seen.insert(d.as_str());
+                if !e.mentions(d) {
+                    continue;
+                }
+                match (latest, self.flat.get(d), bindings.get(d)) {
+                    (true, Some(f), _) => e = e.substitute(d, f),
+                    (true, None, Some(b)) if !matches!(b, Expr::Op("fmp", _)) => {
+                        e = e.substitute(d, b);
+                    }
+                    _ => return None,
+                }
+            }
+            replace_fmp(&e, &epoch)
+        };
+        // A word whose text can't be recovered may still be a value
+        // that reads the same anywhere (a parameter, a constant).
+        let mut args = Vec::new();
+        for (_, value, res) in &words {
+            match unfold(value, &self.bindings) {
+                Some(v) => args.push(v),
+                None if stable_value(res) => args.push(res.clone()),
+                None => return None,
+            }
+        }
+        let to = unfold(&a[1], &self.bindings)?;
+        let gas = unfold(&a[0], &self.bindings)?;
+        let value = match value {
+            Some(v) => Some(unfold(v, &self.bindings)?),
+            None => None,
+        };
+        // What stays on the stack must not name a dropped variable.
+        let mut stack = self.stack.clone();
+        for e in &mut stack {
+            *e = unfold(e, &self.bindings)?;
+        }
+        self.stack = stack;
+        let fc = FoldedCall {
+            at: 0,
+            var: String::new(),
+            kind,
+            sel,
+            gas,
+            to,
+            value,
+            args,
+        };
+        Some((fc, first))
+    }
+
     /// Fold the statement just emitted into `args` when it bound a
     /// variable that `args` use exactly once and nothing else still
     /// holds: `v3 = mapping(…); v3 = sload(v3)` reads as
@@ -2479,7 +3108,7 @@ impl BlockLift<'_, '_> {
                 break;
             };
             let uses: usize = args.iter().map(|a| a.count(&dst)).sum();
-            if matches!(bound, Expr::Op("fmp", _))
+            if matches!(bound, Expr::Op("fmp" | FOLDED_CALL, _))
                 || uses != 1
                 || self.stack.iter().any(|e| e.mentions(&dst))
             {
@@ -2489,6 +3118,7 @@ impl BlockLift<'_, '_> {
                 unreachable!("checked above")
             };
             self.bindings.remove(&dst);
+            self.flat.remove(&dst);
             for a in &mut args {
                 *a = a.substitute(&dst, &bound);
             }
@@ -2880,6 +3510,69 @@ mod tests {
         assert!(shows_inline(&op("msg.sender", vec![])));
         assert!(!shows_inline(&op("returndatasize", vec![])));
         assert!(!shows_inline(&op(RESULT, vec![c(1)])));
+    }
+
+    #[test]
+    fn external_call_pieces() {
+        let p = op(MPTR, vec![c(0x92c)]);
+        // `(p + 0x24) - p` is a length; `p + 0x4` a place.
+        let end = op("add", vec![c(0x20), op("add", vec![c(4), p.clone()])]);
+        assert_eq!(rlin(&op("sub", vec![end, p.clone()])), Some((None, 0x24)));
+        assert_eq!(
+            rlin(&op("add", vec![c(4), p.clone()])),
+            Some((Some(p.clone()), 4))
+        );
+        assert_eq!(rlin(&op("add", vec![p.clone(), p.clone()])), None);
+        assert_eq!(rlin(&op(UNKNOWN, vec![])), None);
+        // Solidity's left-aligned selector, Vyper's right-aligned one.
+        let shifted = op("shl", vec![c(224), c(0xa905_9cbb)]);
+        assert_eq!(word_bytes4(&shifted, 0), Some(0xa905_9cbb));
+        assert_eq!(word_bytes4(&c(0x1816_0ddd), 28), Some(0x1816_0ddd));
+        assert_eq!(word_bytes4(&c(0x1816_0ddd), 0), Some(0));
+        assert_eq!(word_bytes4(&var("v1"), 0), None);
+
+        let fc = FoldedCall {
+            at: 0,
+            var: "v3".into(),
+            kind: "call",
+            sel: 0xa905_9cbb,
+            gas: op("gasleft", vec![]),
+            to: op("address", vec![var("v1")]),
+            value: Some(c(0)),
+            args: vec![var("param0"), c(5)],
+        };
+        assert_eq!(fc.text(false), "v1.call(IERC20.transfer(param0, 0x5))");
+        assert_eq!(fc.text(true), "IERC20(v1).transfer(param0, 0x5)");
+        let fc = FoldedCall {
+            sel: 0xdead_beef,
+            value: Some(var("v2")),
+            gas: c(2300),
+            ..fc
+        };
+        assert_eq!(
+            fc.text(true),
+            "v1.call.value(v2).gas(0x8fc)(0xdeadbeef, param0, 0x5)"
+        );
+        // A failed call's revert data re-raised.
+        let call = |name: &str, args: &[&str]| Stmt::Call {
+            name: name.into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            bytes: vec![0],
+            direct_target: None,
+        };
+        let bubble = [
+            call("returndatacopy", &["0x0", "0x0", "returndatasize()"]),
+            Stmt::Move {
+                dst: "v4".into(),
+                src: "returndatasize()".into(),
+                bytes: vec![0],
+            },
+            call("revert", &["0x0", "v4"]),
+        ];
+        assert!(is_bubble(&bubble));
+        assert!(!is_bubble(&bubble[1..]));
+        assert!(is_plain_revert(&[call("revert", &["0x0", "0x0"])]));
+        assert!(!is_plain_revert(&bubble));
     }
 
     #[test]

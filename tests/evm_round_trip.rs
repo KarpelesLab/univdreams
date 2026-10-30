@@ -240,6 +240,60 @@ fn router_selectors_resolve_to_names() {
     assert!(text.matches("@asm(").count() <= 8);
 }
 
+/// External calls read as the Solidity that made them: the selector
+/// and argument stores, solc's `extcodesize` check (a block of its
+/// own) and the re-raise of a failed call's revert data fold into
+/// `Iface(target).name(args)`.
+#[test]
+fn router_external_calls_fold() {
+    let code = read(&testdata().join("uniswap-v2-router02-mainnet.evm"));
+    let text = decompile_evm_to_text(&code);
+    for call in [
+        "v13 = IWETH(0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2).withdraw(v8)",
+        "= IWETH(0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2).deposit.value(msg.value)()",
+        "= IUniswapV2Factory(0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f).getPair(address(arg0), address(arg1))",
+        "= IERC20(v12).transferFrom(msg.sender, address(v12), arg2)",
+        "= IUniswapV2Pair(v8).getReserves()",
+        // `IERC20(path[i]).balanceOf(…)`, the target read from calldata.
+        "v13 = IERC20(calldataload((0x20 * v12) + v10)).balanceOf(address(v6))",
+        "= IERC20(v15).permit(msg.sender, address(this), v17, v8, (v10 & 0xff), v11, v12)",
+    ] {
+        assert!(text.contains(call), "missing `{call}`");
+    }
+    assert!(text.contains("= IUniswapV2Pair(v11).burn(address(arg5))"));
+    // Left: calls with dynamic arguments, and checks in shared tails.
+    assert!(text.matches("extcodesize(").count() <= 9);
+}
+
+/// Calls whose failure the code handles itself keep the success flag:
+/// `t.staticcall(IERC20.balanceOf(a))`. Vyper's selector sits in the
+/// low bytes of the word before the call data.
+#[test]
+fn low_level_external_calls_fold() {
+    let code = read(&testdata().join("uniswap-v4-poolmanager-mainnet.evm"));
+    let text = decompile_evm_to_text(&code);
+    assert!(text.contains("v2 = arg0.staticcall(IERC20.balanceOf(address(this)))"));
+    assert!(text.contains("= s0.call(IERC20.transfer(address(s3), s2))"));
+    assert!(text.contains("mstore((v11 + 0x20), beforeInitialize.selector)"));
+    let code = read(&testdata().join("curve-3pool-mainnet.evm"));
+    let text = decompile_evm_to_text(&code);
+    // Vyper reverts when a call fails: `ERC20(coin).balanceOf(self)`.
+    assert!(text.contains("v0 = IERC20(sload(0x5)).totalSupply()"));
+    assert!(text.contains("v2 = IERC20(mload(0x500)).balanceOf(address(this))"));
+    assert!(text.contains("v0 = IERC20(sload(0x5)).burnFrom(msg.sender, param0)"));
+    let code = read(&testdata().join("initcode-immutable-mainnet.evm"));
+    let text = decompile_evm_to_text(&code);
+    assert!(text.contains("v4 = v2.call(IERC20.transfer(v3, v5))"));
+    // solc ≥0.8's computed address mask reads as `address(x)`.
+    let code = read(&testdata().join("initcode-ctor-args-mainnet.evm"));
+    let text = decompile_evm_to_text(&code);
+    assert!(
+        text.contains("= IERC20(v17).approve(address(v13), arg4)"),
+        "{text}"
+    );
+    assert!(text.contains("if (msg.sender != address(v2))"));
+}
+
 #[test]
 fn usdc_proxy_reads_like_its_source() {
     let code = read(&testdata().join("usdc-proxy-mainnet.evm"));

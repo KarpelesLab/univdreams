@@ -2588,6 +2588,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Pipe => "`|`".into(),
         TokenKind::Caret => "`^`".into(),
         TokenKind::Tilde => "`~`".into(),
+        TokenKind::Dot => "`.`".into(),
         TokenKind::Bang => "`!`".into(),
         TokenKind::Minus => "`-`".into(),
         TokenKind::Slash => "`/`".into(),
