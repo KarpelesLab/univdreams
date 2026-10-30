@@ -53,7 +53,8 @@
 //! `staticcall(…)` / `delegatecall(…)` (6) and `to.send(v)` /
 //! `send(to, v)` (`call(!v * 2300, to, v, 0, 0, 0, 0)`) are compiled
 //! in place of the call opcode. Either kind can be edited, added or
-//! deleted. Vyper's `PUSH d; PC; ADD` return addresses become label
+//! deleted. An EIP-1167 clone's `delegatecall` can be pointed at
+//! another implementation. Vyper's `PUSH d; PC; ADD` return addresses become label
 //! pushes inside edited code, and wherever an edit changes the size of
 //! the code between one and its target.
 //!
@@ -164,6 +165,9 @@ pub(crate) fn apply_edits(
             return Ok(Some(splice()));
         }
     }
+    if let Some(proxy) = crate::format::evm::minimal_proxy(code) {
+        return proxy_edit(&jobs, &proxy, code).map(|code| Some(Edited { code, moved: None }));
+    }
 
     let cfg = evm_cfg::build(&rl.insns);
     let data_spans: Vec<(u64, u64)> = file
@@ -218,6 +222,54 @@ pub(crate) fn apply_edits(
     }
     let moved = (marks.iter().any(|(a, b)| a != b) || out.len() != code.len()).then_some(marks);
     Ok(Some(Edited { code: out, moved }))
+}
+
+/// An EIP-1167 clone pointed at another implementation: its one
+/// statement, `return delegatecall(<implementation>, msg.data);`, with
+/// a new address. Data appended after the proxy code stays.
+fn proxy_edit(
+    jobs: &[Job],
+    proxy: &crate::format::evm::MinimalProxy,
+    code: &[u8],
+) -> Result<Vec<u8>, EvmEditError> {
+    let [Job::Replace(r)] = jobs else {
+        return Err(whole_file(
+            "a minimal proxy's only edit is the implementation its `delegatecall` forwards to",
+        ));
+    };
+    let fail = |m: &str| EvmEditError {
+        place: jobs[0].place(),
+        message: m.into(),
+    };
+    let Stmt::ReturnExpr { text, .. } = &r.stmt else {
+        return Err(fail(
+            "expected `return delegatecall(<implementation>, msg.data);`",
+        ));
+    };
+    let target = match parse_expr(text) {
+        Ok(EExpr::Call(n, args)) if n == "delegatecall" => match args.as_slice() {
+            [EExpr::Num(a), EExpr::Name(d)] if d == "msg.data" && a.len() <= 20 => a.clone(),
+            _ => return Err(fail("expected `delegatecall(<20-byte address>, msg.data)`")),
+        },
+        _ => {
+            return Err(fail(
+                "expected `return delegatecall(<implementation>, msg.data);`",
+            ));
+        }
+    };
+    // Keep a vanity address's short `PUSHn` while the new one fits.
+    let old_n = 20 - proxy.target.iter().take_while(|&&b| b == 0).count();
+    let n = target.len().max(old_n);
+    let mut addr = vec![0u8; n - target.len()];
+    addr.extend(&target);
+    let mut out = vec![0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d];
+    out.push(0x5f + n as u8);
+    out.extend(&addr);
+    out.extend([0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91]);
+    out.extend([0x60, (out.len() + 2 + 2) as u8]);
+    out.extend([0x57, 0xfd, 0x5b, 0xf3]);
+    out.extend(&code[proxy.code_len..]);
+    Ok(out)
 }
 
 pub(crate) fn has_lifted_statements(file: &UdFile) -> bool {
@@ -1034,8 +1086,6 @@ impl Sim {
     }
 }
 
-/// Opcodes whose result depends only on operands and fixed call
-/// context, so recomputing them is safe.
 /// Whether a lifted assignment's right-hand side is an external call
 /// with its ABI encoding folded in — member syntax on a call result
 /// (`IERC20(t).transfer(a, n)`) or a `.call` / `.staticcall` member
@@ -1047,6 +1097,8 @@ fn is_folded_call(src: &str) -> bool {
             .any(|w| w.contains(".call") || w.contains(".staticcall"))
 }
 
+/// Opcodes whose result depends only on operands and fixed call
+/// context, so recomputing them is safe.
 fn is_pure(op: u8) -> bool {
     matches!(
         op,
@@ -2016,6 +2068,9 @@ impl<'a> Ctx<'a> {
         let b = self.idx(r.end)?;
         let last = self.opcode_at(b - 1).unwrap_or(STOP);
         match &r.canon {
+            Stmt::Move { src, .. } if is_folded_call(src) => {
+                Err("deleting external calls (`Iface(t).f(…)`) isn't supported".into())
+            }
             Stmt::Move { dst, .. } => self.assign(r, None, dst, a, b, fresh),
             Stmt::Call { name, .. } if matches!(name.as_str(), "require" | "assert") => {
                 self.delete_guard(a, b, fresh)
@@ -4044,6 +4099,39 @@ mod tests {
         let start = text.find(&format!("fn {name}() {{")).expect("function");
         let end = start + text[start..].find("\n}\n").expect("end") + 3;
         format!("{}{}{}", &text[..start], f(&text[start..end]), &text[end..])
+    }
+
+    /// Deleting a folded external call is refused too.
+    #[test]
+    fn folded_external_calls_refuse_deletion() {
+        let code = fixture("uniswap-v2-router02-mainnet.evm");
+        let text = decompile_evm_to_text(&code);
+        let line = text
+            .lines()
+            .find(|l| l.contains(" = IWETH(") && l.contains(").withdraw("))
+            .expect("folded withdraw call");
+        let gone = format!("    // {}", line.trim_start());
+        let e = compile(&text.replacen(line, &gone, 1)).expect_err("deletion should be rejected");
+        assert!(
+            e.contains("deleting external calls") && e.contains("IWETH("),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn edited_clone_target() {
+        let code = fixture("eip1167-clone-mainnet.evm");
+        let text = decompile_evm_to_text(&code);
+        let start = text.find("return delegatecall(").expect("clone") + 20;
+        let end = start + text[start..].find(',').expect("address");
+        let other = "0x1111111111111111111111111111111111111111";
+        let edited = format!("{}{other}{}", &text[..start], &text[end..]);
+        let new = compile(&edited).unwrap();
+        assert_eq!(new.len(), code.len());
+        let proxy = crate::format::evm::minimal_proxy(&new).expect("still a clone");
+        assert_eq!(proxy.target, [0x11; 20]);
+        let e = compile(&edited.replace("msg.data", "0x0")).expect_err("not a forward");
+        assert!(e.contains("msg.data"), "{e}");
     }
 
     /// Vyper calls push their return address as `PC + d`; an edited or
