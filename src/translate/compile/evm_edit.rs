@@ -1386,6 +1386,18 @@ impl<'a> Ctx<'a> {
                 for (i, v) in vals.iter().enumerate() {
                     *sim.at_mut(n - i) = lower(v, pre)?;
                 }
+                // Vyper 0.2 loads its spilled return address in the
+                // `return` itself: load it again, after the new values
+                // (which write at most the scratch words below 0x40).
+                if let Sym::Opaque(j) = *sim.at_mut(0)
+                    && self.insns[j].opcode == 0x51
+                    && let Some(slot) = j
+                        .checked_sub(1)
+                        .and_then(|p| self.insns[p].push_value())
+                        .filter(|&s| s >= 0x40 && j > k)
+                {
+                    *sim.at_mut(0) = Sym::Op(0x51, vec![Sym::konst(slot)]);
+                }
                 let mut em = self.emitter(k, sim.consumed, fresh);
                 em.materialize(sim.consumed, &sim.items).map_err(|e| e.0)?;
                 em.op(JUMP, None).map_err(|e| e.0)?;
@@ -2526,6 +2538,34 @@ mod tests {
             assert_eq!(
                 send(&mut m, BOB, 0, "totalSupply()", &[]),
                 Outcome::Return(word(supply))
+            );
+        }
+    }
+
+    /// Vyper 0.2's private returns load the spilled return address as
+    /// part of `return v;`; an edited value still returns there.
+    #[test]
+    fn edited_vyper02_internal_return() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/curve-3pool-mainnet.evm"
+        );
+        let code = std::fs::read(path).expect("read 3pool fixture");
+        let text = decompile_evm_to_text(&code);
+        // `_A()` (every path), behind `A()`.
+        let ret = "return mload(0x0); [0x60, 0x00, 0x51, 0x61, 0x01, 0x40, 0x51, 0x56]";
+        assert_eq!(text.matches(ret).count(), 3, "{text}");
+        let edited = text.replace(
+            ret,
+            "return mload(0x0) + 0x7; [0x60, 0x00, 0x51, 0x61, 0x01, 0x40, 0x51, 0x56]",
+        );
+        let new = compile(&edited).unwrap();
+        assert_ne!(new, code);
+        for (bin, extra) in [(&code, 0), (&new, 7)] {
+            let mut m = Machine::new(bin);
+            assert_eq!(
+                send(&mut m, ALICE, 0, "A()", &[]),
+                Outcome::Return(word(extra))
             );
         }
     }

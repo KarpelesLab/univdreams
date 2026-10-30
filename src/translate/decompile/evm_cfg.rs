@@ -296,6 +296,243 @@ fn step_item_stack(stack: &mut Vec<Item>, ins: &DecodedInsn, jumpdests: &HashSet
     }
 }
 
+/// Most iterations a counted loop is simulated for.
+const MAX_LOOP_TRIPS: usize = MAX_STACK + 1;
+/// Most blocks in a counted loop's body.
+const MAX_LOOP_BLOCKS: usize = 4;
+
+/// A loop whose stack effect is known: Vyper 0.2 saves its memory
+/// frame on the stack around private calls (and returns arrays) with
+/// loops that push or pop one word per iteration, over a pointer kept
+/// in memory (`mstore(p, start)` right before the loop, then
+/// `mload(mload(p))` / `mstore(mload(p), …)` and `p ± 0x20` until it
+/// passes a constant bound). Abstract interpretation can't count the
+/// trips, so without a summary the blocks after the loop would lose
+/// their depth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CountedLoop {
+    /// Blocks visited before the first return to the loop's entry,
+    /// entry included.
+    body: BTreeSet<usize>,
+    /// First block outside the body, where the loop ends.
+    exit: usize,
+    /// Net stack items the whole loop pushes (negative: pops).
+    delta: i64,
+}
+
+/// Counted loops keyed by the block that initialises their pointer
+/// and falls into them.
+#[derive(Default)]
+struct CountedLoops {
+    by_init: HashMap<usize, CountedLoop>,
+    /// `(body block, exit)` edges, which only a loop's summary takes.
+    exits: HashSet<(usize, usize)>,
+}
+
+impl CountedLoops {
+    fn find(blocks: &[Block], insns: &[DecodedInsn], by_start: &HashMap<u64, usize>) -> Self {
+        let mut out = Self::default();
+        for (b, blk) in blocks.iter().enumerate() {
+            if blk.term != Term::Fall {
+                continue;
+            }
+            let Some(&header) = by_start.get(&blk.end) else {
+                continue;
+            };
+            let code = &insns[blk.insns.clone()];
+            let [.., ptr, store] = code else {
+                continue;
+            };
+            let Some(ptr) = ptr.push_value().filter(|_| store.opcode == 0x52) else {
+                continue;
+            };
+            // The pointer's initial value, as the block computes it
+            // (`mstore(p, start)`, or `mstore(p, mload(q))` after a
+            // constant store to `q`).
+            let mut init = Concrete::new(HashMap::new());
+            if code.iter().any(|ins| init.step(ins, false).is_none()) {
+                continue;
+            }
+            let Some(&start) = init.mem.get(&ptr) else {
+                continue;
+            };
+            if let Some(l) = simulate_loop(blocks, insns, by_start, header, ptr, start) {
+                for &x in &l.body {
+                    out.exits.insert((x, l.exit));
+                }
+                out.by_init.insert(b, l);
+            }
+        }
+        out
+    }
+
+    /// Whether the abstract walk may take the edge `from → to`.
+    fn walks(&self, from: usize, to: usize) -> bool {
+        !self.exits.contains(&(from, to))
+    }
+}
+
+/// A concrete run over small constants: values that don't fit in a
+/// `u64`, or come from outside, are unknown. The stack starts with
+/// [`MAX_STACK`] unknown items, so its length tracks the net effect.
+struct Concrete {
+    stack: Vec<Option<u64>>,
+    /// Memory words at known offsets.
+    mem: HashMap<u64, u64>,
+}
+
+impl Concrete {
+    fn new(mem: HashMap<u64, u64>) -> Self {
+        Self {
+            stack: vec![None; MAX_STACK],
+            mem,
+        }
+    }
+
+    /// The top item (`None` inside: unknown), or `None` on underflow.
+    #[allow(clippy::option_option)]
+    fn pop(&mut self) -> Option<Option<u64>> {
+        self.stack.pop()
+    }
+
+    /// Execute one non-jump instruction. `None` gives up: a stack
+    /// underflow, or (when `strict`) a memory write that could change a
+    /// tracked word to an unknown value. Otherwise such writes forget
+    /// the words they might touch.
+    fn step(&mut self, ins: &DecodedInsn, strict: bool) -> Option<()> {
+        match ins.opcode {
+            0x5b => {}
+            0x5f..=0x7f => self.stack.push(ins.push_value()),
+            0x51 => {
+                let a = self.pop()?;
+                self.stack.push(a.and_then(|a| self.mem.get(&a).copied()));
+            }
+            0x52 => {
+                let a = self.pop()?;
+                let v = self.pop()?;
+                match (a, v) {
+                    (Some(a), Some(v)) => {
+                        let clobbers = self.mem.keys().any(|&k| k != a && k.abs_diff(a) < 0x20);
+                        if strict && clobbers {
+                            return None;
+                        }
+                        self.mem.retain(|&k, _| k.abs_diff(a) >= 0x20);
+                        self.mem.insert(a, v);
+                    }
+                    (Some(a), None) => {
+                        let clobbers = self.mem.keys().any(|&k| k.abs_diff(a) < 0x20);
+                        if strict && clobbers {
+                            return None;
+                        }
+                        self.mem.retain(|&k, _| k.abs_diff(a) >= 0x20);
+                    }
+                    (None, _) if strict => return None,
+                    (None, _) => self.mem.clear(),
+                }
+            }
+            0x01 | 0x03 | 0x10 | 0x11 | 0x14 => {
+                let a = self.pop()?;
+                let c = self.pop()?;
+                self.stack
+                    .push(a.zip(c).and_then(|(a, c)| match ins.opcode {
+                        0x01 => a.checked_add(c),
+                        0x03 => a.checked_sub(c),
+                        0x10 => Some(u64::from(a < c)),
+                        0x11 => Some(u64::from(a > c)),
+                        _ => Some(u64::from(a == c)),
+                    }));
+            }
+            0x15 => {
+                let a = self.pop()?;
+                self.stack.push(a.map(|a| u64::from(a == 0)));
+            }
+            0x80..=0x8f => {
+                let n = usize::from(ins.opcode - 0x80) + 1;
+                let v = self.stack[self.stack.len().checked_sub(n)?];
+                self.stack.push(v);
+            }
+            0x90..=0x9f => {
+                let n = usize::from(ins.opcode - 0x90) + 1;
+                let len = self.stack.len();
+                self.stack.swap(len - 1, len.checked_sub(n + 1)?);
+            }
+            op => {
+                // Other memory writes, and anything that calls out.
+                if matches!(op, 0x37 | 0x39 | 0x3c | 0x3e | 0x53 | 0x5e | 0xf0..=0xff) {
+                    if strict {
+                        return None;
+                    }
+                    self.mem.clear();
+                }
+                let info = &OPCODE_TABLE[op as usize];
+                for _ in 0..info.pops {
+                    self.pop()?;
+                }
+                for _ in 0..info.pushes {
+                    self.stack.push(None);
+                }
+            }
+        }
+        Some(())
+    }
+}
+
+/// Run the loop entered at `header` concretely, with memory word `ptr`
+/// holding `start` and every other value unknown. Gives up unless each
+/// branch is decided by known values, the loop stays within a few
+/// blocks, and nothing in it could change `ptr` behind its back.
+fn simulate_loop(
+    blocks: &[Block],
+    insns: &[DecodedInsn],
+    by_start: &HashMap<u64, usize>,
+    header: usize,
+    ptr: u64,
+    start: u64,
+) -> Option<CountedLoop> {
+    let mut m = Concrete::new(HashMap::from([(ptr, start)]));
+    let mut body: BTreeSet<usize> = BTreeSet::new();
+    let mut looped = false;
+    let mut b = header;
+    for _ in 0..MAX_LOOP_TRIPS * MAX_LOOP_BLOCKS {
+        if looped && !body.contains(&b) {
+            return Some(CountedLoop {
+                body,
+                exit: b,
+                delta: m.stack.len() as i64 - MAX_STACK as i64,
+            });
+        }
+        if !looped {
+            body.insert(b);
+            if body.len() > MAX_LOOP_BLOCKS {
+                return None;
+            }
+        }
+        let blk = &blocks[b];
+        let body_end = match blk.term {
+            Term::Jump | Term::JumpI => blk.insns.end - 1,
+            Term::Halt => return None,
+            Term::Fall => blk.insns.end,
+        };
+        for ins in &insns[blk.insns.start..body_end] {
+            m.step(ins, true)?;
+        }
+        // The pointer must stay known, or the trip count isn't.
+        m.mem.get(&ptr)?;
+        let next = by_start.get(&blk.end).copied();
+        b = match blk.term {
+            Term::Fall => next?,
+            Term::JumpI => {
+                let t = m.pop()??;
+                let c = m.pop()??;
+                if c == 0 { next? } else { *by_start.get(&t)? }
+            }
+            _ => *by_start.get(&m.pop()??)?,
+        };
+        looped |= b == header;
+    }
+    None
+}
+
 /// Which constants can be return addresses.
 struct RetCandidates {
     /// `JUMPDEST`s that nothing falls through into (they follow a
@@ -433,6 +670,7 @@ fn analyze_frame(
     entry: usize,
     shape: FrameShape,
     calls: &HashMap<usize, CallSite>,
+    loops: &CountedLoops,
     functions: &BTreeMap<usize, FuncInfo>,
 ) -> FrameFacts {
     let mut facts = FrameFacts::default();
@@ -506,7 +744,18 @@ fn analyze_frame(
         let next = by_start.get(&blk.end).copied();
         match blk.term {
             Term::Fall => {
-                if let Some(nb) = next {
+                if let Some(l) = loops.by_init.get(&b) {
+                    // Past the counted loop, with its pushes or pops.
+                    let mut after = stack.clone();
+                    let keep = after.len() as i64 + l.delta.min(0);
+                    if let Ok(keep) = usize::try_from(keep) {
+                        after.truncate(keep);
+                        let pushed = usize::try_from(l.delta).unwrap_or(0);
+                        after.extend(std::iter::repeat_n(None, pushed));
+                        enqueue(&mut work, &mut seen, l.exit, after);
+                    }
+                }
+                if let Some(nb) = next.filter(|&nb| loops.walks(b, nb)) {
                     enqueue(&mut work, &mut seen, nb, stack);
                 }
             }
@@ -518,11 +767,13 @@ fn analyze_frame(
                 if let Some(Tag::Const(v)) = t {
                     let tb = by_start[&v];
                     facts.targets.push((b, tb));
-                    enqueue(&mut work, &mut seen, tb, stack.clone());
+                    if loops.walks(b, tb) {
+                        enqueue(&mut work, &mut seen, tb, stack.clone());
+                    }
                 } else {
                     facts.unresolved = true;
                 }
-                if falls && let Some(nb) = next {
+                if falls && let Some(nb) = next.filter(|&nb| loops.walks(b, nb)) {
                     enqueue(&mut work, &mut seen, nb, stack);
                 }
             }
@@ -603,7 +854,9 @@ fn analyze_frame(
                         let tb = by_start[&v];
                         facts.locals.insert(b);
                         facts.targets.push((b, tb));
-                        enqueue(&mut work, &mut seen, tb, stack);
+                        if loops.walks(b, tb) {
+                            enqueue(&mut work, &mut seen, tb, stack);
+                        }
                     }
                     (Some(Tag::Arg(k)), None) => {
                         facts.ret_via_arg.get_or_insert(k);
@@ -700,6 +953,7 @@ pub(crate) fn build(insns: &[DecodedInsn]) -> Cfg {
     // only exists once one of its call sites is reached, so bytes that
     // never execute can't invent functions.
     let rets = RetCandidates::new(&blocks, insns, &jumpdests);
+    let loops = CountedLoops::find(&blocks, insns, &by_start);
     let mut calls = seed_calls(&blocks, insns, &by_start, &jumpdests, &rets);
     let mut functions: BTreeMap<usize, FuncInfo> = BTreeMap::new();
     let mut facts: Vec<(FrameId, FrameFacts)> = Vec::new();
@@ -717,7 +971,8 @@ pub(crate) fn build(insns: &[DecodedInsn]) -> Cfg {
             .iter()
             .map(|&(id, entry, shape)| {
                 let f = analyze_frame(
-                    &blocks, insns, &by_start, &jumpdests, &rets, entry, shape, &calls, &functions,
+                    &blocks, insns, &by_start, &jumpdests, &rets, entry, shape, &calls, &loops,
+                    &functions,
                 );
                 (id, f)
             })
@@ -980,6 +1235,45 @@ mod tests {
                 depth: 1
             })
         );
+    }
+
+    /// Vyper 0.2's frame save / restore: push memory words
+    /// `0x40..0xa0` with a pointer kept at 0, then pop them back from
+    /// `0x80` down to `0x40`. Each loop's trip count is known, so the
+    /// blocks after them keep their depth.
+    #[test]
+    fn counted_stack_loops() {
+        let code = vec![
+            0x60, 0x40, 0x60, 0x00, 0x52, // 00 mstore(0, 0x40)
+            0x5b, 0x60, 0x00, 0x51, 0x51, // 05 push mload(mload(0))
+            0x60, 0x20, 0x60, 0x00, 0x51, 0x01, 0x60, 0x00, 0x52, // 0a p += 0x20
+            0x60, 0xa0, 0x60, 0x00, 0x51, 0x10, 0x15, 0x60, 0x20, 0x57, // 13 out: p >= 0xa0
+            0x60, 0x05, 0x56, // 1d loop
+            0x5b, 0x60, 0x80, 0x60, 0x00, 0x52, // 20 mstore(0, 0x80)
+            0x5b, 0x60, 0x00, 0x51, 0x52, // 26 mstore(mload(0), pop)
+            0x60, 0x20, 0x60, 0x00, 0x51, 0x03, 0x60, 0x00, 0x52, // 2b p -= 0x20
+            0x60, 0x40, 0x60, 0x00, 0x51, 0x10, 0x15, 0x15, 0x60, 0x42,
+            0x57, // 34 out: p < 0x40
+            0x60, 0x26, 0x56, // 3f loop
+            0x5b, 0x00, // 42
+        ];
+        let insns = decode_range(&code, 0);
+        let cfg = build(&insns);
+        let at = |a: u64| cfg.depth[cfg.block_at(a).unwrap()];
+        let root = |depth| Some(BlockDepth { frame: None, depth });
+        assert_eq!(at(0x20), root(3));
+        assert_eq!(at(0x42), root(0));
+        // The loop bodies themselves run at several depths.
+        assert_eq!(at(0x05), None);
+        assert_eq!(at(0x26), None);
+        assert!(cfg.reached[cfg.block_at(0x1d).unwrap()]);
+        assert_eq!(cfg.role[cfg.block_at(0x1d).unwrap()], JumpRole::Local);
+        // A loop whose bound isn't a constant stays uncounted.
+        let mut unknown = code.clone();
+        unknown[0x14] = 0x35; // CALLDATALOAD in place of the bound
+        unknown[0x13] = 0x5f; // (PUSH0)
+        let cfg = build(&decode_range(&unknown, 0));
+        assert_eq!(cfg.depth[cfg.block_at(0x20).unwrap()], None);
     }
 
     #[test]

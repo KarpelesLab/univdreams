@@ -777,6 +777,9 @@ pub(crate) fn lift_ranges(ctx: &LiftCtx<'_>, ranges: &[(u64, u64)]) -> Vec<Vec<S
     }
     let labels = collect_labels(ctx, &plan);
     let pass = |summaries: &Summaries, facts: &mut Facts| -> Vec<Vec<Stmt>> {
+        // Shared by every range, so known values (Vyper's `msg.sig`
+        // kept in a stack slot) reach each dispatcher case.
+        let mut exits = Exits::new();
         slices
             .iter()
             .zip(ranges)
@@ -788,7 +791,7 @@ pub(crate) fn lift_ranges(ctx: &LiftCtx<'_>, ranges: &[(u64, u64)]) -> Vec<Vec<S
                     range_start: start,
                     temps: 0,
                     summaries,
-                    exits: HashMap::new(),
+                    exits: &mut exits,
                     facts: &mut *facts,
                 };
                 let mut body = fb.build(slice, None);
@@ -854,6 +857,11 @@ fn shows_inline(e: &Expr) -> bool {
             args.is_empty() && (*op == "msg.sig" || (0x30..=0x4a).any(|o| env_name(o) == Some(op)))
         }
     }
+}
+
+/// `msg.sig`, `msg.sender`, `block.number`, …
+fn is_env(e: &Expr) -> bool {
+    matches!(e, Expr::Op(..)) && shows_inline(e)
 }
 
 fn is_param(e: &Expr) -> bool {
@@ -1222,11 +1230,14 @@ struct FnBuilder<'a, 'c> {
     range_start: u64,
     temps: usize,
     summaries: &'a Summaries,
-    /// What each block lifted so far leaves on the stack for its
-    /// successors: its frame, and known values by frame position.
-    exits: HashMap<usize, (FrameId, HashMap<i64, Expr>)>,
+    exits: &'a mut Exits,
     facts: &'a mut Facts,
 }
+
+/// What each block lifted so far leaves on the stack for its
+/// successors: the range it was lifted in, its frame, and known values
+/// by frame position.
+type Exits = HashMap<usize, (u64, FrameId, HashMap<i64, Expr>)>;
 
 /// How a lifted block hands control on.
 enum BlockEnd {
@@ -1462,7 +1473,7 @@ impl FnBuilder<'_, '_> {
             ..
         } = bl;
         if let (Some(exit), Some(d)) = (exit, depth) {
-            self.exits.insert(b, (d.frame, exit));
+            self.exits.insert(b, (self.range_start, d.frame, exit));
         }
         if let (Some(vals), Some(frame)) = (returned, depth.and_then(|d| d.frame)) {
             self.facts.returns.entry(frame).or_default().push(vals);
@@ -1492,22 +1503,32 @@ impl FnBuilder<'_, '_> {
         }
         let mut known: Option<HashMap<i64, Expr>> = None;
         for p in &cfg.preds[b] {
-            let Some((frame, exit)) = self.exits.get(p) else {
+            let Some((range, frame, exit)) = self.exits.get(p) else {
                 return HashMap::new();
             };
             if *frame != d.frame {
                 return HashMap::new();
             }
+            // Into another range only call-wide environment values
+            // flow (`msg.sig` kept in a slot by Vyper's dispatcher):
+            // `paramN` would name the other range's parameters, and
+            // constants left behind there would change how this range
+            // reads (an ABI encoding into memory it set up itself).
+            let exit = exit
+                .iter()
+                .filter(|&(_, e)| *range == self.range_start || is_env(e));
             match &mut known {
                 None => {
                     known = Some(
-                        exit.iter()
-                            .filter(|&(&pos, _)| pos < d.depth)
+                        exit.filter(|&(&pos, _)| pos < d.depth)
                             .map(|(&pos, e)| (pos, e.clone()))
                             .collect(),
                     );
                 }
-                Some(k) => k.retain(|pos, e| exit.get(pos) == Some(e)),
+                Some(k) => {
+                    let exit: HashMap<&i64, &Expr> = exit.collect();
+                    k.retain(|pos, e| exit.get(pos) == Some(&&*e));
+                }
             }
         }
         known.unwrap_or_default()
@@ -1988,6 +2009,25 @@ impl BlockLift<'_, '_> {
         let cfg = self.ctx.cfg;
         let blk = cfg.blocks[b].clone();
         let last = blk.insns.end - 1;
+        // Vyper 0.2 returns with `mload(slot); JUMP`, its return address
+        // spilled to memory on entry: reads that only feed the return
+        // (that load and the values below it) stay in the `return`.
+        let spilled_return = blk.term == Term::Jump
+            && cfg.role[b] == JumpRole::Return
+            && self
+                .depth
+                .and_then(|d| d.frame)
+                .is_some_and(|f| cfg.functions[&f].ret_spilled);
+        let quiet_tail = if spilled_return {
+            let quiet = self.ctx.insns[blk.insns.start..last]
+                .iter()
+                .rev()
+                .take_while(|n| matches!(n.opcode, 0x51 | 0x5f..=0x9f))
+                .count();
+            last - quiet
+        } else {
+            usize::MAX
+        };
         for i in blk.insns.clone() {
             self.record(i, false);
             let ins = &self.ctx.insns[i];
@@ -1995,7 +2035,7 @@ impl BlockLift<'_, '_> {
             // A statement on the last instruction of a fall-through
             // block would leave the slot write-back with no bytes, so
             // value-producing statements defer to it there.
-            let defer = blk.term == Term::Fall && i == last;
+            let defer = (blk.term == Term::Fall && i == last) || (op == 0x51 && i >= quiet_tail);
             match op {
                 0x5b => {}
                 0x5f..=0x7f => {

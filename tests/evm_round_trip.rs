@@ -279,7 +279,33 @@ fn vyper02_curve_3pool() {
     // Private functions keep their return address in memory.
     assert!(text.matches("// internal function:").count() >= 8);
     assert!(text.contains("v0 = sub_00a9()"));
-    assert!(text.matches("@asm(").count() <= 110);
+    // Memory frames saved to the stack around private calls, and
+    // arrays returned on it, are counted loops: the blocks after them
+    // keep frame-relative names, and `_xp_mem()` returns three values.
+    assert!(
+        text.contains("v38, v39, v40 = sub_03a1(v38, v39, v40)"),
+        "{text}"
+    );
+    assert!(text.contains("mstore(0x3c0, v40)"));
+    let entry_relative = text
+        .lines()
+        .filter(|l| {
+            l.split(|c: char| !c.is_alphanumeric() && c != '-')
+                .any(|w| {
+                    w.strip_prefix('s').is_some_and(|n| {
+                        !n.is_empty()
+                            && n.trim_start_matches('-')
+                                .bytes()
+                                .all(|b| b.is_ascii_digit())
+                    })
+                })
+        })
+        .count();
+    // What's left are the loop bodies themselves.
+    assert!(entry_relative <= 45, "{entry_relative}");
+    // Returns load the spilled return address as part of the `return`.
+    assert!(text.contains("return mload(0x0); [0x60, 0x00, 0x51, 0x61, 0x01, 0x40, 0x51, 0x56]"));
+    assert!(text.matches("@asm(").count() <= 100);
 }
 
 #[test]
@@ -295,7 +321,11 @@ fn vyper03_crvusd() {
     assert!(text.contains("appended after the metadata"));
     assert!(text.contains("fn transferFrom()"));
     assert!(text.contains("fn set_minter()"));
-    assert!(text.contains("if (v0 != 0x23b872dd)"), "{text}");
+    // The selector the dispatcher keeps in a stack slot is known in
+    // every case.
+    assert!(text.contains("if (msg.sig != 0x23b872dd)"), "{text}");
+    assert!(text.contains("if (msg.sig != 0xa9059cbb)"));
+    assert!(!text.contains("v0 != 0x"));
     // `self.allowance[_from][msg.sender]`: vyper hashes slot ‖ key.
     assert!(text.contains("sload(mapping(mapping(0x0, mload(0xc0)), msg.sender))"));
     assert!(!text.contains("fn fn_"));
