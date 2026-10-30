@@ -57,6 +57,14 @@
 //! pushes inside edited code, and wherever an edit changes the size of
 //! the code between one and its target.
 //!
+//! Embedded contracts (`@section`s) are compiled first; when an edit
+//! moves code inside one, the enclosing code is laid out again with
+//! the constants its deploying code uses adjusted ([`deploy_fixups`]):
+//! the length it copies and returns, and the immutables it writes into
+//! the copy. `codesize() - n` (constructor arguments appended to the
+//! code) follows the move too; any other `CODESIZE` refuses a size
+//! change.
+//!
 //! Everything else — calls in other forms or inside expressions,
 //! statements that end a block, names no longer on the stack — is an
 //! error naming the statement.
@@ -92,18 +100,69 @@ fn whole_file(message: impl Into<String>) -> EvmEditError {
     }
 }
 
-/// Lower `file`'s edits, given `code` from its pinned bytes. `None`
-/// when nothing was edited (or the file isn't lifted output).
-pub(crate) fn apply_edits(file: &UdFile, code: &[u8]) -> Result<Option<Vec<u8>>, EvmEditError> {
+/// An embedded contract (`@section`) whose code an edit changed.
+#[derive(Debug)]
+pub(crate) struct SectionChange {
+    /// Its offset in the enclosing code.
+    pub addr: u64,
+    pub old: Vec<u8>,
+    pub new: Vec<u8>,
+    /// Where its original instructions start now, by original offset;
+    /// `None` when none moved.
+    pub moved: Option<HashMap<u64, u64>>,
+}
+
+/// Code with its edits compiled.
+#[derive(Debug)]
+pub(crate) struct Edited {
+    pub code: Vec<u8>,
+    /// See [`SectionChange::moved`].
+    pub moved: Option<HashMap<u64, u64>>,
+}
+
+/// Lower `file`'s edits, given `code` from its pinned bytes and the
+/// embedded contracts in it that changed. `None` when nothing was
+/// edited (or the file isn't lifted output).
+pub(crate) fn apply_edits(
+    file: &UdFile,
+    code: &[u8],
+    sections: &[SectionChange],
+) -> Result<Option<Edited>, EvmEditError> {
+    // Embedded contracts that kept their layout drop in as they are.
+    let in_place = sections
+        .iter()
+        .all(|s| s.new.len() == s.old.len() && s.moved.is_none());
+    let splice = || {
+        let mut out = code.to_vec();
+        for s in sections {
+            let at = s.addr as usize;
+            out[at..at + s.new.len()].copy_from_slice(&s.new);
+        }
+        Edited {
+            code: out,
+            moved: None,
+        }
+    };
     if !has_lifted_statements(file) {
-        return Ok(None);
+        return match (sections.is_empty(), in_place) {
+            (true, _) => Ok(None),
+            (false, true) => Ok(Some(splice())),
+            (false, false) => Err(whole_file(
+                "an embedded contract's code moved, and the code deploying it isn't in lifted form, so it can't be adjusted",
+            )),
+        };
     }
     let rl = relift(code);
     let canonical = crate::translate::compile::parse(&crate::ast::emit(&rl.file))
         .map_err(|e| whole_file(format!("re-lifted text doesn't parse: {e}")))?;
     let jobs = align_file(file, &canonical)?;
     if jobs.is_empty() {
-        return Ok(None);
+        if sections.is_empty() {
+            return Ok(None);
+        }
+        if in_place {
+            return Ok(Some(splice()));
+        }
     }
 
     let cfg = evm_cfg::build(&rl.insns);
@@ -137,13 +196,28 @@ pub(crate) fn apply_edits(file: &UdFile, code: &[u8]) -> Result<Option<Vec<u8>>,
         patches.push(patch);
     }
     let rewrites = pc_rewrites(&ctx, &patches)?;
-    let out = layout(file, &rl.insns, &reloc, patches, &rewrites)?;
-    if out.len() != code.len() && rl.insns.iter().any(|i| i.opcode == 0x38) {
-        return Err(whole_file(
-            "the contract reads `CODESIZE` and the edit changes its size",
-        ));
+    let data_starts: Vec<u64> = data_spans.iter().map(|d| d.0).collect();
+    let fix = deploy_fixups(&rl.insns, &cfg, sections, code.len() as u64, &data_starts)?;
+    let (out, marks) = layout(
+        file,
+        &rl.insns,
+        &reloc,
+        patches,
+        &Adjust {
+            pc_rewrites: &rewrites,
+            fixups: &fix.fixups,
+            sections,
+        },
+    )?;
+    if out.len() != code.len()
+        && let Some(at) = fix.codesize
+    {
+        return Err(whole_file(format!(
+            "the contract reads `CODESIZE` at 0x{at:x}, other than as `codesize() - n` past its own end, and the edit changes its size"
+        )));
     }
-    Ok(Some(out))
+    let moved = (marks.iter().any(|(a, b)| a != b) || out.len() != code.len()).then_some(marks);
+    Ok(Some(Edited { code: out, moved }))
 }
 
 pub(crate) fn has_lifted_statements(file: &UdFile) -> bool {
@@ -2563,7 +2637,7 @@ fn pieces_len(pieces: &[Piece]) -> u64 {
         .iter()
         .map(|p| match p {
             Piece::Bytes(b) | Piece::Data { bytes: b, .. } => b.len() as u64,
-            Piece::Label(_) => 0,
+            Piece::Label(_) | Piece::Mark(_) => 0,
             Piece::Push { width, .. } => 1 + u64::from(*width),
         })
         .sum()
@@ -2640,20 +2714,287 @@ fn pc_rewrites(ctx: &Ctx<'_>, patches: &[Patch]) -> Result<Vec<(usize, usize, u6
 }
 
 // ---------------------------------------------------------------------
+// Deploying code: embedded contracts' lengths, immutables, CODESIZE
+// ---------------------------------------------------------------------
+
+/// A new value for a `PUSH` the layout writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fixup {
+    Const(u64),
+    /// The size of the laid-out code.
+    End,
+    /// Where a data region now starts, by its original offset.
+    Data(u64),
+}
+
+/// What [`deploy_fixups`] found.
+#[derive(Debug, Default)]
+struct DeployFixups {
+    fixups: HashMap<usize, Fixup>,
+    /// A `CODESIZE` used other than as `codesize() - n` with `n` the
+    /// code's own size (constructor arguments appended after it).
+    codesize: Option<u64>,
+}
+
+/// Offsets (from the contract's start) of the `PUSH32 0` placeholders
+/// solc leaves for immutables in a runtime, by `PUSH32` offset.
+fn immutable_slots(code: &[u8]) -> Vec<u64> {
+    crate::arch::evm::decode_range(code, 0)
+        .iter()
+        .filter(|i| i.opcode == 0x7f && i.immediate().iter().all(|&b| b == 0))
+        .filter(|i| !i.is_truncated())
+        .map(|i| i.addr.0)
+        .collect()
+}
+
+/// The constants deploying code needs changed when an embedded
+/// contract it copies out changes: the length its `CODECOPY` copies
+/// and the `RETURN` / `CREATE` that follow use, and the offsets of the
+/// immutables it writes into the copy afterwards (`mstore(dest + off,
+/// v)` in the same block). Also the `n` of `codesize() - n` — the
+/// size of constructor arguments appended to the code, `n` its end or
+/// the start of the data region holding them — which follows the move.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn deploy_fixups(
+    insns: &[DecodedInsn],
+    cfg: &Cfg,
+    sections: &[SectionChange],
+    size: u64,
+    data_starts: &[u64],
+) -> Result<DeployFixups, EvmEditError> {
+    #[derive(Debug, Clone)]
+    enum Val {
+        Push(usize),
+        /// A sum with these pushes among its operands.
+        Plus(Vec<usize>),
+        CodeSize,
+    }
+    let value = |i: usize| insns[i].push_value();
+    let mut out = DeployFixups::default();
+    // Old → new offset of each immutable's immediate, per section.
+    let mut slots: Vec<HashMap<u64, u64>> = Vec::new();
+    for s in sections {
+        let mut m = HashMap::new();
+        if let Some(moved) = &s.moved {
+            for p in immutable_slots(&s.old) {
+                let Some(&n) = moved.get(&p) else {
+                    return Err(whole_file(format!(
+                        "an immutable's placeholder at 0x{p:x} in the embedded contract at 0x{:x} was inside edited code",
+                        s.addr
+                    )));
+                };
+                m.insert(p + 1, n + 1);
+            }
+        }
+        slots.push(m);
+    }
+    let resized = |s: &SectionChange| s.new.len() != s.old.len();
+    let mut copied: Vec<bool> = vec![false; sections.len()];
+    let fix = |out: &mut DeployFixups, i: usize, f: Fixup| -> Result<(), EvmEditError> {
+        if out.fixups.insert(i, f).is_some_and(|g| g != f) {
+            return Err(whole_file(format!(
+                "the constant at 0x{:x} is used for two embedded contracts",
+                insns[i].addr.0
+            )));
+        }
+        Ok(())
+    };
+    for blk in &cfg.blocks {
+        let mut st: Vec<Option<Val>> = Vec::new();
+        // Sections this block copied out so far.
+        let mut here: Vec<usize> = Vec::new();
+        let pop = |st: &mut Vec<Option<Val>>| st.pop().flatten();
+        let codesize_used = |out: &mut DeployFixups, v: &Option<Val>, at: usize| {
+            if matches!(v, Some(Val::CodeSize)) && out.codesize.is_none() {
+                out.codesize = Some(insns[at].addr.0);
+            }
+        };
+        for i in blk.insns.clone() {
+            let op = insns[i].opcode;
+            match op {
+                0x5f..=0x7f => st.push(Some(Val::Push(i))),
+                0x38 => st.push(Some(Val::CodeSize)),
+                0x80..=0x8f => {
+                    let n = usize::from(op - 0x80) + 1;
+                    let v = st.len().checked_sub(n).and_then(|k| st[k].clone());
+                    st.push(v);
+                }
+                0x90..=0x9f => {
+                    let n = usize::from(op - 0x90) + 1;
+                    while st.len() <= n {
+                        st.insert(0, None);
+                    }
+                    let len = st.len();
+                    st.swap(len - 1, len - 1 - n);
+                }
+                0x50 => {
+                    st.pop();
+                }
+                0x01 => {
+                    let (a, b) = (pop(&mut st), pop(&mut st));
+                    let mut v = Vec::new();
+                    for x in [&a, &b] {
+                        codesize_used(&mut out, x, i);
+                        match x {
+                            Some(Val::Push(j)) => v.push(*j),
+                            Some(Val::Plus(js)) => v.extend(js),
+                            _ => {}
+                        }
+                    }
+                    st.push(Some(Val::Plus(v)));
+                }
+                0x03 => {
+                    let (a, b) = (pop(&mut st), pop(&mut st));
+                    match (&a, &b) {
+                        // `codesize() - n`: the constructor arguments.
+                        (Some(Val::CodeSize), Some(Val::Push(j)))
+                            if value(*j) == Some(size)
+                                || value(*j).is_some_and(|v| data_starts.contains(&v)) =>
+                        {
+                            let v = value(*j).unwrap_or_default();
+                            let f = if v == size {
+                                Fixup::End
+                            } else {
+                                Fixup::Data(v)
+                            };
+                            fix(&mut out, *j, f)?;
+                        }
+                        _ => {
+                            codesize_used(&mut out, &a, i);
+                            codesize_used(&mut out, &b, i);
+                        }
+                    }
+                    st.push(None);
+                }
+                0x39 => {
+                    let (dest, off, len) = (pop(&mut st), pop(&mut st), pop(&mut st));
+                    for x in [&dest, &off, &len] {
+                        codesize_used(&mut out, x, i);
+                    }
+                    let Some(Val::Push(o)) = off else { continue };
+                    for (n, s) in sections.iter().enumerate() {
+                        if value(o) != Some(s.addr) {
+                            continue;
+                        }
+                        here.push(n);
+                        copied[n] = true;
+                        if !resized(s) {
+                            continue;
+                        }
+                        match &len {
+                            Some(Val::Push(z)) if value(*z) == Some(s.old.len() as u64) => {
+                                fix(&mut out, *z, Fixup::Const(s.new.len() as u64))?;
+                            }
+                            _ => {
+                                return Err(whole_file(format!(
+                                    "the `CODECOPY` at 0x{:x} doesn't copy the embedded contract at 0x{:x} with a constant length, which its new size would change",
+                                    insns[i].addr.0, s.addr
+                                )));
+                            }
+                        }
+                    }
+                }
+                // `RETURN` / `CREATE` / `CREATE2` of the copy.
+                0xf3 | 0xf0 | 0xf5 => {
+                    let info = &OPCODE_TABLE[op as usize];
+                    let args: Vec<Option<Val>> = (0..info.pops).map(|_| pop(&mut st)).collect();
+                    for x in &args {
+                        codesize_used(&mut out, x, i);
+                    }
+                    let len = if op == 0xf3 { &args[1] } else { &args[2] };
+                    if let Some(Val::Push(z)) = len {
+                        for &n in &here {
+                            let s = &sections[n];
+                            if resized(s) && value(*z) == Some(s.old.len() as u64) {
+                                fix(&mut out, *z, Fixup::Const(s.new.len() as u64))?;
+                            }
+                        }
+                    }
+                    if info.pushes == 1 {
+                        st.push(None);
+                    }
+                }
+                // Immutables written into the copy.
+                MSTORE => {
+                    let (off, v) = (pop(&mut st), pop(&mut st));
+                    codesize_used(&mut out, &off, i);
+                    codesize_used(&mut out, &v, i);
+                    let cands = match off {
+                        Some(Val::Push(j)) => vec![j],
+                        Some(Val::Plus(js)) => js,
+                        _ => Vec::new(),
+                    };
+                    for j in cands {
+                        for &n in &here {
+                            if let Some(&new) = value(j).and_then(|x| slots[n].get(&x)) {
+                                fix(&mut out, j, Fixup::Const(new))?;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let info = &OPCODE_TABLE[op as usize];
+                    for _ in 0..info.pops {
+                        let x = st.pop().flatten();
+                        codesize_used(&mut out, &x, i);
+                    }
+                    for _ in 0..info.pushes {
+                        st.push(None);
+                    }
+                }
+            }
+        }
+        for x in &st {
+            let at = blk.insns.end.saturating_sub(1);
+            codesize_used(&mut out, x, at);
+        }
+    }
+    if let Some(n) = (0..sections.len()).find(|&n| !copied[n] && sections[n].moved.is_some()) {
+        return Err(whole_file(format!(
+            "no constant `CODECOPY` deploys the embedded contract at 0x{:x}, whose code the edit moved",
+            sections[n].addr
+        )));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------
 
+/// Changes the layout makes besides the patches.
+struct Adjust<'a> {
+    /// See [`pc_rewrites`].
+    pc_rewrites: &'a [(usize, usize, u64)],
+    /// See [`deploy_fixups`].
+    fixups: &'a HashMap<usize, Fixup>,
+    sections: &'a [SectionChange],
+}
+
+/// Lay out the contract: the code and its patches, the data regions
+/// (with changed embedded contracts' new bytes). Also returns where
+/// each instruction kept as it was now starts.
+#[allow(clippy::too_many_lines)]
 fn layout(
     file: &UdFile,
     insns: &[DecodedInsn],
     reloc: &Reloc,
     patches: Vec<Patch>,
-    pc_rewrites: &[(usize, usize, u64)],
-) -> Result<Vec<u8>, EvmEditError> {
-    let rewrites: HashMap<usize, (usize, u64)> = pc_rewrites
+    adjust: &Adjust<'_>,
+) -> Result<(Vec<u8>, HashMap<u64, u64>), EvmEditError> {
+    let rewrites: HashMap<usize, (usize, u64)> = adjust
+        .pc_rewrites
         .iter()
         .map(|&(first, end, target)| (first, (end, target)))
         .collect();
+    let data_piece = |addr: u64, bytes: &[u8]| {
+        let new = adjust.sections.iter().find(|s| s.addr == addr);
+        Piece::Data {
+            orig: addr,
+            orig_len: bytes.len() as u64,
+            bytes: new.map_or_else(|| bytes.to_vec(), |s| s.new.clone()),
+        }
+    };
     // Patches by start; check they don't overlap.
     let mut by_start: BTreeMap<usize, Vec<Patch>> = BTreeMap::new();
     for p in patches {
@@ -2686,10 +3027,7 @@ fn layout(
     while k < insns.len() {
         let ins = &insns[k];
         while let Some((addr, bytes)) = data.next_if(|d| d.0 <= ins.addr.0) {
-            pieces.push(Piece::Data {
-                orig: addr,
-                bytes: bytes.to_vec(),
-            });
+            pieces.push(data_piece(addr, bytes));
         }
         if let Some(ps) = by_start.remove(&k) {
             let mut next = k;
@@ -2718,10 +3056,35 @@ fn layout(
             k = end;
             continue;
         }
+        pieces.push(Piece::Mark(ins.addr.0));
         if ins.opcode == JUMPDEST {
             pieces.push(Piece::Label(Target::Orig(ins.addr.0)));
         }
-        if reloc.is_ref(k) && !ins.is_truncated() {
+        let width = ins.info().imm_len;
+        if let Some(fix) = adjust.fixups.get(&k) {
+            match *fix {
+                Fixup::End | Fixup::Data(_) => pieces.push(Piece::Push {
+                    width,
+                    target: match *fix {
+                        Fixup::Data(v) => Target::Orig(v),
+                        _ => Target::End,
+                    },
+                    fixed: false,
+                }),
+                Fixup::Const(v) => {
+                    let w = usize::from(width);
+                    if w < 8 && v >> (8 * w) != 0 {
+                        return Err(whole_file(format!(
+                            "the deploying code's constant 0x{v:x} no longer fits its PUSH{w}"
+                        )));
+                    }
+                    let be = v.to_be_bytes();
+                    let mut b = vec![ins.opcode];
+                    b.extend((0..w).map(|i| (i + 8).checked_sub(w).map_or(0, |j| be[j])));
+                    pieces.push(Piece::Bytes(b));
+                }
+            }
+        } else if reloc.is_ref(k) && !ins.is_truncated() {
             pieces.push(Piece::Push {
                 width: ins.info().imm_len,
                 target: Target::Orig(ins.push_value().unwrap_or_default()),
@@ -2739,18 +3102,18 @@ fn layout(
         }
     }
     for (addr, bytes) in data {
-        pieces.push(Piece::Data {
-            orig: addr,
-            bytes: bytes.to_vec(),
-        });
+        pieces.push(data_piece(addr, bytes));
     }
     resolve(&pieces)
 }
 
-/// Assign offsets and emit bytes.
-fn resolve(pieces: &[Piece]) -> Result<Vec<u8>, EvmEditError> {
+/// Assign offsets and emit bytes; also returns where each
+/// [`Piece::Mark`]ed instruction starts.
+fn resolve(pieces: &[Piece]) -> Result<(Vec<u8>, HashMap<u64, u64>), EvmEditError> {
     let mut labels: HashMap<Target, u64> = HashMap::new();
-    let mut spans: Vec<(u64, u64, u64)> = Vec::new();
+    let mut marks: HashMap<u64, u64> = HashMap::new();
+    // `(orig, new offset, orig len, new len)`.
+    let mut spans: Vec<(u64, u64, u64, u64)> = Vec::new();
     let mut pc = 0u64;
     for p in pieces {
         match p {
@@ -2758,28 +3121,43 @@ fn resolve(pieces: &[Piece]) -> Result<Vec<u8>, EvmEditError> {
             Piece::Label(t) => {
                 labels.insert(*t, pc);
             }
+            Piece::Mark(a) => {
+                marks.insert(*a, pc);
+            }
             Piece::Push { width, .. } => pc += 1 + u64::from(*width),
-            Piece::Data { orig, bytes } => {
-                spans.push((*orig, pc, bytes.len() as u64));
+            Piece::Data {
+                orig,
+                orig_len,
+                bytes,
+            } => {
+                spans.push((*orig, pc, *orig_len, bytes.len() as u64));
                 pc += bytes.len() as u64;
             }
         }
     }
+    labels.insert(Target::End, pc);
     let find = |t: &Target| -> Option<u64> {
         if let Some(&v) = labels.get(t) {
             return Some(v);
         }
-        let Target::Orig(x) = t else { return None };
-        spans
-            .iter()
-            .find(|&&(o, _, len)| *x >= o && *x <= o + len)
-            .map(|&(o, n, _)| n + (x - o))
+        let Target::Orig(x) = *t else { return None };
+        // A region's start, then its end, then inside one that kept
+        // its size.
+        let start = spans.iter().find(|s| s.0 == x).map(|s| s.1);
+        let end = || spans.iter().find(|s| s.0 + s.2 == x).map(|s| s.1 + s.3);
+        let inside = || {
+            spans
+                .iter()
+                .find(|s| x > s.0 && x < s.0 + s.2 && s.2 == s.3)
+                .map(|s| s.1 + (x - s.0))
+        };
+        start.or_else(end).or_else(inside)
     };
     let mut out = Vec::with_capacity(pc as usize);
     for p in pieces {
         match p {
             Piece::Bytes(b) | Piece::Data { bytes: b, .. } => out.extend(b),
-            Piece::Label(_) => {}
+            Piece::Label(_) | Piece::Mark(_) => {}
             Piece::Push {
                 width,
                 target,
@@ -2810,7 +3188,7 @@ fn resolve(pieces: &[Piece]) -> Result<Vec<u8>, EvmEditError> {
             }
         }
     }
-    Ok(out)
+    Ok((out, marks))
 }
 
 #[cfg(test)]
@@ -3220,8 +3598,66 @@ mod tests {
             "mstore(0x40, 0x80)",
             "mstore(0x40, (0x80 + msg.value))",
         );
-        let e = compile(&grown).expect_err("runtime grew");
-        assert!(e.contains("changed size"), "{e}");
+        let new = compile(&grown).unwrap();
+        assert_eq!(new.len(), code.len() + 2);
+        assert!(decompile_evm_to_text(&new).contains("mstore(0x40, (0x80 + msg.value))"));
+    }
+
+    /// The runtime deployed by running `initcode` from ALICE.
+    fn deploy(initcode: &[u8]) -> Vec<u8> {
+        let mut m = Machine::new(initcode);
+        match send(&mut m, ALICE, 0, "", &[]) {
+            Outcome::Return(runtime) => runtime,
+            other => panic!("deploy: {other:?}"),
+        }
+    }
+
+    /// Growing the runtime a constructor deploys: the deploying code's
+    /// copy length, returned size, immutables' offsets and constructor
+    /// arguments' offset follow.
+    #[test]
+    fn resized_embedded_runtime() {
+        for name in [
+            "initcode-immutable-mainnet.evm",
+            "initcode-ctor-args-mainnet.evm",
+        ] {
+            let code = fixture(name);
+            let text = decompile_evm_to_text(&code);
+            let at = text.find("@section(\"runtime\"").expect("runtime");
+            let body = at + text[at..].find("fn entry() {\n").expect("entry") + 13;
+            let edited = format!(
+                "{}        sstore(0xdead, 0x1)\n{}",
+                &text[..body],
+                &text[body..]
+            );
+            let new = compile(&edited).unwrap();
+            assert!(new.len() > code.len(), "{name}");
+            let (old_rt, new_rt) = (deploy(&code), deploy(&new));
+            assert_eq!(new_rt.len(), old_rt.len() + 6, "{name}");
+            // The immutables were written into the moved placeholders:
+            // the deployed code reads the same, plus the store.
+            let (old_t, new_t) = (
+                decompile_evm_to_text(&old_rt),
+                decompile_evm_to_text(&new_rt),
+            );
+            assert!(new_t.contains("sstore(0xdead, 0x1)"), "{name}");
+            let words = |rt: &[u8]| -> Vec<Vec<u8>> {
+                crate::arch::evm::decode_range(rt, 0)
+                    .iter()
+                    .filter(|i| i.opcode == 0x7f)
+                    .map(|i| i.immediate().to_vec())
+                    .collect()
+            };
+            assert_eq!(words(&old_rt), words(&new_rt), "{name}");
+            assert!(
+                words(&new_rt)
+                    .iter()
+                    .all(|w| w.iter().any(|&b| b != 0) || words(&code).is_empty()),
+                "{name}: an immutable placeholder was left unwritten"
+            );
+            let (old_s, new_s) = (shape(&old_t), shape(&new_t));
+            assert_eq!(old_s.len() + 1, new_s.len(), "{name}");
+        }
     }
 
     /// Replace every `0x…` number, `L_xxxx` / `sub_xxxx` label and byte
@@ -3291,9 +3727,6 @@ mod tests {
             let edited = format!("{}    sstore(0xdead, 0x1)\n{}", &text[..at], &text[at..]);
             let new = match compile(&edited) {
                 Ok(new) => new,
-                // Initcode that finds its constructor arguments past
-                // its own end can't grow.
-                Err(e) if e.contains("CODESIZE") => continue,
                 Err(e) => panic!("{}: {e}", path.display()),
             };
             assert!(new.len() > code.len());

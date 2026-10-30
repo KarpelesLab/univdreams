@@ -63,6 +63,8 @@ pub(crate) enum Target {
     Orig(u64),
     /// A label made for generated code.
     Fresh(u32),
+    /// The end of the laid-out code: its size.
+    End,
 }
 
 /// One unit of laid-out code.
@@ -79,8 +81,15 @@ pub(crate) enum Piece {
         target: Target,
         fixed: bool,
     },
-    /// A data region copied verbatim; `orig` is its original offset.
-    Data { orig: u64, bytes: Vec<u8> },
+    /// A data region; `orig` is its original offset and `orig_len` its
+    /// original size (an embedded contract an edit resized differs).
+    Data {
+        orig: u64,
+        orig_len: u64,
+        bytes: Vec<u8>,
+    },
+    /// The original instruction at this offset starts here.
+    Mark(u64),
 }
 
 /// A symbolic stack value.
