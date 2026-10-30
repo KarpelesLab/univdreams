@@ -899,6 +899,10 @@ struct Facts {
     /// Words each `return abi.encode(…)` of an external function
     /// returns, keyed by entry address.
     encoded: HashMap<u64, Vec<Vec<Expr>>>,
+    /// Internal functions lifted, by entry block.
+    frames: HashSet<usize>,
+    /// Internal functions that write memory their caller can see.
+    clobbers: HashSet<usize>,
 }
 
 /// Per internal function (by entry block), each return value that is
@@ -913,36 +917,41 @@ pub(crate) fn lift_ranges(ctx: &LiftCtx<'_>, ranges: &[(u64, u64)]) -> Vec<Vec<S
         plan_slice(ctx, slice, None, &mut plan);
     }
     let labels = collect_labels(ctx, &plan);
-    let pass = |summaries: &Summaries, facts: &mut Facts| -> Vec<Vec<Stmt>> {
-        // Shared by every range, so known values (Vyper's `msg.sig`
-        // kept in a stack slot) reach each dispatcher case.
-        let mut exits = Exits::new();
-        slices
-            .iter()
-            .zip(ranges)
-            .map(|(slice, &(start, _))| {
-                let mut fb = FnBuilder {
-                    ctx,
-                    plan: &plan,
-                    labels: &labels,
-                    range_start: start,
-                    temps: 0,
-                    summaries,
-                    exits: &mut exits,
-                    facts: &mut *facts,
-                };
-                let mut body = fb.build(slice, None);
-                fold_short_circuits(&mut body);
-                body
-            })
-            .collect()
-    };
+    let pass =
+        |summaries: &Summaries, quiet: &HashSet<usize>, facts: &mut Facts| -> Vec<Vec<Stmt>> {
+            // Shared by every range, so known values (Vyper's `msg.sig`
+            // kept in a stack slot) reach each dispatcher case.
+            let mut exits = Exits::new();
+            slices
+                .iter()
+                .zip(ranges)
+                .map(|(slice, &(start, _))| {
+                    let mut fb = FnBuilder {
+                        ctx,
+                        plan: &plan,
+                        labels: &labels,
+                        range_start: start,
+                        temps: 0,
+                        summaries,
+                        quiet,
+                        exits: &mut exits,
+                        mem_exits: HashMap::new(),
+                        facts: &mut *facts,
+                    };
+                    let mut body = fb.build(slice, None);
+                    fold_short_circuits(&mut body);
+                    body
+                })
+                .collect()
+        };
     let mut summaries = Summaries::new();
+    let mut quiet = HashSet::new();
     let mut facts = Facts::default();
     for _ in 0..ANALYSIS_PASSES {
         facts = Facts::default();
-        pass(&summaries, &mut facts);
+        pass(&summaries, &quiet, &mut facts);
         summaries = summarize(&facts);
+        quiet = facts.frames.difference(&facts.clobbers).copied().collect();
     }
     let names = storage_names(ctx, &facts);
     if let Some(trace) = ctx.trace {
@@ -951,7 +960,7 @@ pub(crate) fn lift_ranges(ctx: &LiftCtx<'_>, ranges: &[(u64, u64)]) -> Vec<Vec<S
         t.params.clone_from(&ctx.params);
     }
     let _scope = StorageScope::enter(names);
-    pass(&summaries, &mut Facts::default())
+    pass(&summaries, &quiet, &mut Facts::default())
 }
 
 fn summarize(facts: &Facts) -> Summaries {
@@ -1367,7 +1376,12 @@ struct FnBuilder<'a, 'c> {
     range_start: u64,
     temps: usize,
     summaries: &'a Summaries,
+    /// Internal functions known (from an earlier pass) to leave the
+    /// caller's memory alone.
+    quiet: &'a HashSet<usize>,
     exits: &'a mut Exits,
+    /// What each block lifted so far knows about memory as it leaves.
+    mem_exits: HashMap<usize, Vec<MemWord>>,
     facts: &'a mut Facts,
 }
 
@@ -1589,6 +1603,7 @@ impl FnBuilder<'_, '_> {
     fn lift_block(&mut self, b: usize, rest: &[usize]) -> (Vec<Stmt>, BlockEnd, usize) {
         let depth = self.ctx.cfg.depth[b];
         let entry = self.entry_values(b);
+        let mem = self.entry_mem(b);
         let mut bl = BlockLift {
             ctx: self.ctx,
             depth,
@@ -1610,6 +1625,9 @@ impl FnBuilder<'_, '_> {
             entry,
             resolved: HashMap::new(),
             summaries: self.summaries,
+            quiet: self.quiet,
+            mem,
+            clobbered: false,
             exit: None,
             returned: None,
             encoded: None,
@@ -1625,10 +1643,19 @@ impl FnBuilder<'_, '_> {
             returned,
             encoded,
             last,
+            mem,
+            clobbered,
             ..
         } = bl;
         if let (Some(exit), Some(d)) = (exit, depth) {
             self.exits.insert(last, (self.range_start, d.frame, exit));
+            self.mem_exits.insert(last, mem);
+        }
+        if let Some(frame) = depth.and_then(|d| d.frame) {
+            self.facts.frames.insert(frame);
+            if clobbered {
+                self.facts.clobbers.insert(frame);
+            }
         }
         if let (Some(vals), Some(frame)) = (returned, depth.and_then(|d| d.frame)) {
             self.facts.returns.entry(frame).or_default().push(vals);
@@ -1641,6 +1668,29 @@ impl FnBuilder<'_, '_> {
                 .push(words);
         }
         (out, end, last)
+    }
+
+    /// What memory holds as `b` starts, as far as every predecessor
+    /// (all lifted already, in this range) agrees.
+    fn entry_mem(&self, b: usize) -> Vec<MemWord> {
+        let cfg = self.ctx.cfg;
+        if cfg.functions.contains_key(&b) || cfg.preds[b].is_empty() {
+            return Vec::new();
+        }
+        let mut known: Option<Vec<MemWord>> = None;
+        for p in &cfg.preds[b] {
+            let (Some(mem), Some((range, ..))) = (self.mem_exits.get(p), self.exits.get(p)) else {
+                return Vec::new();
+            };
+            if *range != self.range_start {
+                return Vec::new();
+            }
+            match &mut known {
+                None => known = Some(mem.clone()),
+                Some(k) => k.retain(|w| mem.contains(w)),
+            }
+        }
+        known.unwrap_or_default()
     }
 
     /// Known values of `b`'s entry stack, by frame position: the
@@ -1866,6 +1916,13 @@ struct BlockLift<'a, 'c> {
     /// entry values ([`Self::resolve`]).
     resolved: HashMap<String, Expr>,
     summaries: &'a Summaries,
+    /// See [`FnBuilder::quiet`].
+    quiet: &'a HashSet<usize>,
+    /// Words known to be in memory (see [`MemWord`]).
+    mem: Vec<MemWord>,
+    /// Set when the block writes memory its function's caller can
+    /// see (anything but scratch space and memory it allocated).
+    clobbered: bool,
     /// Set when control leaves for successor blocks: the stack it
     /// leaves, resolved, by frame position.
     exit: Option<HashMap<i64, Expr>>,
@@ -1885,6 +1942,44 @@ struct BlockLift<'a, 'c> {
     /// The external call [`Self::fold_external_call`] folded last.
     folded: Option<FoldedCall>,
 }
+
+/// A word known to be in memory: what was stored at `base + off`,
+/// both resolved. Only heap words are tracked (bases built on
+/// [`MPTR`] values or passed in), and only values that stay the same
+/// for the rest of the function (see [`trackable`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemWord {
+    base: Expr,
+    off: u64,
+    value: Expr,
+}
+
+/// A resolved value that can be followed through memory: it names no
+/// unknown or block-local value, only constants, the call's inputs
+/// and the function's arguments as it was entered.
+fn trackable(e: &Expr) -> bool {
+    match e {
+        Expr::Const(_) => true,
+        Expr::Var(v) => {
+            v.starts_with("param")
+                || v.starts_with("L_")
+                || v.strip_prefix("arg").is_some_and(is_digits)
+        }
+        Expr::Op(op, args) => {
+            *op != UNKNOWN && *op != MPTR && *op != RESULT && args.iter().all(trackable)
+        }
+    }
+}
+
+/// Whether a memory base is memory the current function allocated:
+/// built on a free-memory-pointer read and nothing passed in.
+fn fresh_base(base: &Expr) -> bool {
+    mentions_op(base, MPTR) && !mentions_var(base, &|_| true)
+}
+
+/// A summarised return value standing for memory the callee allocated
+/// and filled: `alloc(w0, w1, …)`, word `k` at offset `32k`.
+const ALLOC: &str = "alloc";
 
 /// An external call folded into one statement, kept so the checks
 /// that follow it can be taken in.
@@ -2424,6 +2519,18 @@ impl BlockLift<'_, '_> {
                 }
                 _ if effect_name(op).is_some() => {
                     let args = self.pop_n(OPCODE_TABLE[op as usize].pops.into());
+                    // Memory writes other than `mstore`.
+                    match op {
+                        0x37 | 0x39 | 0x3e | 0x53 | 0x5e => {
+                            let dest = self.resolve(&args[0]);
+                            self.mem_clobber(&dest);
+                        }
+                        0x3c => {
+                            let dest = self.resolve(&args[1]);
+                            self.mem_clobber(&dest);
+                        }
+                        _ => {}
+                    }
                     let event = (0xa1..=0xa4)
                         .contains(&op)
                         .then(|| match &args[2] {
@@ -2465,14 +2572,16 @@ impl BlockLift<'_, '_> {
                             self.fmp_epoch += 1;
                             self.fmp_id = None;
                         }
-                        self.mstores.push(MStore {
+                        let m = MStore {
                             at: self.out.len(),
                             offset: args[0].clone(),
                             value: args[1].clone(),
                             place: lin(&args[0], &self.bindings, 0),
                             resolved: self.resolve(&args[1]),
                             rplace: rlin(&self.resolve(&args[0])),
-                        });
+                        };
+                        self.mem_store(m.rplace.clone(), &m.resolved);
+                        self.mstores.push(m);
                     }
                     // A store to named storage reads as an assignment.
                     // Not on a fall-through block's last instruction,
@@ -2677,7 +2786,7 @@ impl BlockLift<'_, '_> {
             self.resolved.clone(),
             *self.temps,
             (self.fmp_epoch, self.fmp_id),
-            (self.rest, self.last),
+            (self.rest, self.last, self.mem.clone(), self.clobbered),
         );
         let start = self.pending;
         self.rest = &[];
@@ -2692,7 +2801,7 @@ impl BlockLift<'_, '_> {
         self.resolved = resolved;
         *self.temps = temps;
         (self.fmp_epoch, self.fmp_id) = fmp;
-        (self.rest, self.last) = rest;
+        (self.rest, self.last, self.mem, self.clobbered) = rest;
         self.exit = None;
         self.returned = None;
         self.encoded = None;
@@ -2809,9 +2918,40 @@ impl BlockLift<'_, '_> {
         } else {
             self.resolve(val)
         };
+        // A call's output lands in memory.
+        if let Expr::Op(op @ ("call" | "callcode" | "staticcall" | "delegatecall"), a) = val {
+            let out = if matches!(*op, "call" | "callcode") {
+                5
+            } else {
+                4
+            };
+            if a[out + 1].const_value() != Some(0) {
+                let dest = self.resolve(&a[out]);
+                self.mem_clobber(&dest);
+            }
+        }
         if self.fold_external_call(val, &resolved, i) {
             return;
         }
+        // Memory known to hold a parameter (a struct decoded into
+        // memory, field by field) reads as that parameter.
+        let (resolved, shown) = match val {
+            Expr::Op("mload", a) if !is_fmp => {
+                let at = self.resolve(&a[0]);
+                match self.mem_word(&at).filter(|w| is_param(strip_cleanup(w))) {
+                    Some(w) => (w.clone(), Some(w.clone())),
+                    None => (resolved, None),
+                }
+            }
+            Expr::Op("keccak256", a) => {
+                let (p, n) = (self.resolve(&a[0]), self.resolve(&a[1]));
+                let hashed = self
+                    .hashed_words(&p, &n)
+                    .map(|e| Expr::Op("keccak256", vec![e]));
+                (resolved, hashed)
+            }
+            _ => (resolved, None),
+        };
         let (val, mut bytes) = if is_fmp {
             (val.clone(), Vec::new())
         } else {
@@ -2821,9 +2961,12 @@ impl BlockLift<'_, '_> {
             let (args, prefix) = self.inline_last(args);
             (Expr::Op(op, args), prefix)
         };
-        let src = self
-            .stipend_send(&val, &resolved)
-            .unwrap_or_else(|| render_rhs(&val));
+        let src = match &shown {
+            Some(e) => render_rhs(e),
+            None => self
+                .stipend_send(&val, &resolved)
+                .unwrap_or_else(|| render_rhs(&val)),
+        };
         let idx = self.stack.len();
         let name = self.bind_name(idx);
         bytes.extend(self.take(i));
@@ -2838,7 +2981,7 @@ impl BlockLift<'_, '_> {
                 vec![Expr::Const(self.fmp_epoch.to_be_bytes().to_vec())],
             )
         } else {
-            val
+            shown.unwrap_or(val)
         };
         self.bind_resolved(&name, bound, resolved);
         self.stack.push(Expr::Var(name));
@@ -2884,6 +3027,130 @@ impl BlockLift<'_, '_> {
                 format!("send({}, {value})", render_arg(&a[1]))
             },
         )
+    }
+
+    /// Track an `mstore` of `value` (resolved) at `place` (see
+    /// [`rlin`]) in [`Self::mem`].
+    fn mem_store(&mut self, place: Option<(Option<Expr>, u64)>, value: &Expr) {
+        match place {
+            Some((Some(base), off)) => {
+                self.mem
+                    .retain(|w| !(w.base == base && w.off < off + 32 && off < w.off + 32));
+                if !fresh_base(&base) {
+                    self.clobbered = true;
+                }
+                if trackable(value) {
+                    self.mem.push(MemWord {
+                        base,
+                        off,
+                        value: value.clone(),
+                    });
+                }
+            }
+            // Scratch space and the free-memory pointer.
+            Some((None, off)) if off < 0x80 => {}
+            _ => {
+                self.mem.clear();
+                self.clobbered = true;
+            }
+        }
+    }
+
+    /// Forget what memory held where a copy (or call output) of unknown
+    /// length lands: `dest` resolved.
+    fn mem_clobber(&mut self, dest: &Expr) {
+        match rlin(dest) {
+            Some((Some(base), _)) => {
+                self.mem.retain(|w| w.base != base);
+                if !fresh_base(&base) {
+                    self.clobbered = true;
+                }
+            }
+            Some((None, off)) if off < 0x40 => {}
+            _ => {
+                self.mem.clear();
+                self.clobbered = true;
+            }
+        }
+    }
+
+    /// A returned pointer `r` (resolved) to memory this function
+    /// allocated, with the words known there from offset 0 on, as
+    /// `alloc(w0, w1, …)` for the callers' summary.
+    fn allocated(&self, r: &Expr) -> Option<Expr> {
+        let (Some(base), 0) = rlin(r)? else {
+            return None;
+        };
+        if !fresh_base(&base) {
+            return None;
+        }
+        let words: Vec<Expr> = (0u64..)
+            .map_while(|k| {
+                self.mem
+                    .iter()
+                    .find(|w| w.base == base && w.off == 32 * k)
+                    .map(|w| w.value.clone())
+            })
+            .collect();
+        (!words.is_empty()).then_some(Expr::Op(ALLOC, words))
+    }
+
+    /// The value (resolved) known to be stored at `addr` (resolved).
+    fn mem_word(&self, addr: &Expr) -> Option<&Expr> {
+        let (Some(base), off) = rlin(addr)? else {
+            return None;
+        };
+        self.mem
+            .iter()
+            .find(|w| w.base == base && w.off == off)
+            .map(|w| &w.value)
+    }
+
+    /// `keccak256(p, n)` over words all known: `abi.encode(w0, …)`, and
+    /// `abi.encode(paramK)` when they are a struct parameter's head
+    /// words in order (via-IR's `PoolId` is `keccak256(abi.encode(key))`).
+    fn hashed_words(&self, p: &Expr, n: &Expr) -> Option<Expr> {
+        let (Some(base), off) = rlin(p)? else {
+            return None;
+        };
+        let n = n.const_value()?;
+        if n == 0 || n % 32 != 0 || n > 32 * 16 {
+            return None;
+        }
+        let words: Vec<Expr> = (0..n / 32)
+            .map(|k| {
+                self.mem
+                    .iter()
+                    .find(|w| w.base == base && w.off == off + 32 * k)
+                    .map(|w| w.value.clone())
+                    .filter(stable_value)
+            })
+            .collect::<Option<_>>()?;
+        let names: Vec<&str> = words
+            .iter()
+            .map(|w| match strip_cleanup(w) {
+                Expr::Var(v) => Some(v.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()
+            .unwrap_or_default();
+        let whole = names
+            .first()
+            .and_then(|n| n.split_once('.'))
+            .map(|(k, _)| k);
+        let args = match whole {
+            Some(k)
+                if self
+                    .params
+                    .iter()
+                    .filter(|w| w.split_once('.').is_some_and(|(x, _)| x == k))
+                    .eq(names.iter()) =>
+            {
+                vec![Expr::Var(k.to_string())]
+            }
+            _ => words,
+        };
+        Some(Expr::Op("abi.encode", args))
     }
 
     /// The most recent store covering bytes `[start, start + n)` of
@@ -3292,6 +3559,44 @@ impl BlockLift<'_, '_> {
                     }
                     exit
                 });
+                // The callee may write memory we know about; memory it
+                // allocates and returns is fresh, filled as its summary
+                // says.
+                if !self.quiet.contains(&c.callee) {
+                    self.mem.clear();
+                    self.clobbered = true;
+                }
+                let base = self.pos_of(self.stack.len()).unwrap_or_default();
+                for k in 0..nrets.unwrap_or(0) {
+                    let pos = base + k as i64;
+                    let Some(Expr::Op(RESULT, r)) = self.exit.as_ref().and_then(|e| e.get(&pos))
+                    else {
+                        continue;
+                    };
+                    let Expr::Op(ALLOC, words) = &r[0] else {
+                        continue;
+                    };
+                    let ptr = Expr::Op(
+                        MPTR,
+                        vec![Expr::Const(
+                            ((1u64 << 40) + (i as u64) * 8 + k as u64)
+                                .to_be_bytes()
+                                .to_vec(),
+                        )],
+                    );
+                    for (j, w) in words.iter().enumerate() {
+                        if trackable(w) {
+                            self.mem.push(MemWord {
+                                base: ptr.clone(),
+                                off: 32 * j as u64,
+                                value: w.clone(),
+                            });
+                        }
+                    }
+                    if let Some(e) = self.exit.as_mut() {
+                        e.insert(pos, Expr::Op(RESULT, vec![ptr]));
+                    }
+                }
                 let ret_names: Vec<String> = (0..nrets.unwrap_or(0))
                     .map(|k| {
                         if k == 0 && info.keeps_ret {
@@ -3369,7 +3674,14 @@ impl BlockLift<'_, '_> {
                     .unwrap_or(0);
                 let mut vals = self.pop_n(nrets);
                 vals.reverse();
-                self.returned = Some(vals.iter().map(|v| self.resolve(v)).collect());
+                self.returned = Some(
+                    vals.iter()
+                        .map(|v| {
+                            let r = self.resolve(v);
+                            self.allocated(&r).unwrap_or(r)
+                        })
+                        .collect(),
+                );
                 let keeps_ret = self
                     .depth
                     .and_then(|d| d.frame)
@@ -3573,6 +3885,27 @@ mod tests {
         assert!(!is_bubble(&bubble[1..]));
         assert!(is_plain_revert(&[call("revert", &["0x0", "0x0"])]));
         assert!(!is_plain_revert(&bubble));
+    }
+
+    #[test]
+    fn memory_words_are_followed() {
+        let p = op(MPTR, vec![c(7)]);
+        assert!(fresh_base(&p));
+        assert!(!fresh_base(&op("add", vec![var("arg0"), p.clone()])));
+        assert!(!fresh_base(&var("arg0")));
+        // Only values that read the same for the rest of the function.
+        assert!(trackable(&op("calldataload", vec![c(4)])));
+        assert!(trackable(&var("param0.hooks")) && trackable(&var("arg1")));
+        assert!(!trackable(&var("v3")));
+        assert!(!trackable(&op(RESULT, vec![c(1)])));
+        assert!(!trackable(&p));
+        // An allocated struct survives summarising and substitution.
+        let alloc = op(ALLOC, vec![op("calldataload", vec![c(4)]), var("arg0")]);
+        assert!(summary_safe(&alloc));
+        assert_eq!(
+            subst_args(&alloc, &[c(9)]),
+            op(ALLOC, vec![op("calldataload", vec![c(4)]), c(9)])
+        );
     }
 
     #[test]

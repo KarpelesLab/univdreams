@@ -3924,6 +3924,40 @@ mod tests {
         }
     }
 
+    /// A struct field read back from memory (`param0.hooks`) edits like
+    /// any parameter; a hash of the whole struct isn't editable.
+    #[test]
+    fn struct_fields_in_memory() {
+        let code = fixture("uniswap-v4-poolmanager-mainnet.evm");
+        let text = decompile_evm_to_text(&code);
+        assert_eq!(compile(&text).unwrap(), code);
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("v13 = param0.hooks ["))
+            .expect("field read");
+        let edited = text.replacen(
+            line,
+            &line.replacen("param0.hooks", "param0.currency1", 1),
+            1,
+        );
+        let new = compile(&edited).unwrap();
+        assert_ne!(new, code);
+        let relifted = decompile_evm_to_text(&new);
+        // The calldata read now folds into its one use.
+        assert!(
+            relifted.contains("v4, address(param0.currency1))"),
+            "{relifted}"
+        );
+        assert_eq!(compile(&relifted).unwrap(), new);
+        let line = text
+            .lines()
+            .find(|l| l.contains("= keccak256(abi.encode(param0)) ["))
+            .expect("struct hash");
+        let edited = text.replacen(line, &line.replacen("(param0)", "(param1)", 1), 1);
+        let e = compile(&edited).expect_err("edit should be rejected");
+        assert!(e.contains("keccak256(abi.encode(param1))"), "{e}");
+    }
+
     /// Calls with their ABI encoding folded in lower unedited, and an
     /// edit to one is rejected naming the statement.
     #[test]

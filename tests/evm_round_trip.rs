@@ -216,7 +216,15 @@ fn poolmanager_uses_transient_storage_and_carries_solc_version() {
     assert!(text.contains(
         "swap((address,address,uint24,int24,address) param0, (bool,int256,uint160) param1, bytes param2)"
     ));
-    assert!(text.contains("require(!(param1.f0 - bool(param1.f0)))"));
+    // Well-known structs name their members (`SwapParams`).
+    assert!(text.contains("require(!(param1.zeroForOne - bool(param1.zeroForOne)))"));
+    // via-IR decodes the `PoolKey` into memory in a helper; its fields
+    // read back by name, and `key.toId()` hashes the whole struct.
+    assert!(text.contains("v13 = param0.hooks"), "{text}");
+    assert!(text.contains("v6 = keccak256(abi.encode(param0))"));
+    assert!(text.contains("mstore((v13 + 0x60), signextend(0x2, param0.tickSpacing))"));
+    // `SwapParams` copied into memory field by field, then read back.
+    assert!(text.contains("v6 = param1.amountSpecified"));
     assert!(!text.contains("unknown return value"));
     assert!(text.matches("@asm(").count() <= 8);
 }

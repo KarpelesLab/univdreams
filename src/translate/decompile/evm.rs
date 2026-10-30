@@ -935,6 +935,13 @@ fn abi_head(sig: &str) -> Option<AbiHead<'_>> {
     let mut words = Vec::new();
     for (k, t) in types.iter().enumerate() {
         match head_words(t)? {
+            // A well-known struct names its members (`param0.hooks`).
+            HeadWords::Static(n)
+                if let Some((_, fields)) = crate::signatures::evm::struct_fields(t)
+                    && fields.len() == n =>
+            {
+                words.extend(fields.iter().map(|f| format!("param{k}.{f}")));
+            }
             HeadWords::Static(n) if n > 1 => {
                 words.extend((0..n).map(|j| format!("param{k}.f{j}")));
             }
@@ -1238,6 +1245,11 @@ mod tests {
         want.push("param3".into());
         assert_eq!(head.words, want);
         assert_eq!(abi_head("name()").unwrap().words, Vec::<String>::new());
+        // Uniswap v4's `PoolKey` by its member names.
+        let head = abi_head("initialize((address,address,uint24,int24,address),uint160)").unwrap();
+        assert_eq!(head.words[0], "param0.currency0");
+        assert_eq!(head.words[4], "param0.hooks");
+        assert_eq!(head.words[5], "param1");
         assert_eq!(abi_head("bad((uint256)"), None);
     }
 
