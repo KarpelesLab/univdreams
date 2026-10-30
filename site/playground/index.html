@@ -17,7 +17,7 @@
 
 <main class="wide">
 <p class="playground-intro">
-Upload an ELF, PE, Mach-O, or 6502 raw image — or paste a URL — and it decompiles to <code>.ud</code> source in the editor.
+Upload an ELF, PE, Mach-O, EVM bytecode, or 6502 raw image — or paste a URL — and it decompiles to <code>.ud</code> source in the editor.
 Edit the source, click <strong>Compile</strong>, and the rebuilt binary downloads.
 The whole pipeline runs in this tab via WebAssembly; nothing leaves your browser.
 </p>
@@ -31,6 +31,8 @@ Or load a live Solana program by its address — the browser fetches the on-chai
 <a href="#" id="example-solana">3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr</a>
 (the Chief Pussy staking dApp, ~365 KB).
 Append <code>?program=&lt;id&gt;</code> to this page's URL to deep-link a program.
+EVM contracts work the same way from the <em>EVM chain</em> tab (any chain's JSON-RPC endpoint) — try
+<a href="#" id="example-evm">WETH9</a>, or deep-link with <code>?contract=0x…</code>.
 </p>
 
 <div class="playground">
@@ -38,6 +40,7 @@ Append <code>?program=&lt;id&gt;</code> to this page's URL to deep-link a progra
     <button type="button" class="tab active" data-tab="upload" role="tab" aria-selected="true">Upload binary</button>
     <button type="button" class="tab" data-tab="url" role="tab" aria-selected="false">From URL</button>
     <button type="button" class="tab" data-tab="chain" role="tab" aria-selected="false">Solana chain</button>
+    <button type="button" class="tab" data-tab="evm" role="tab" aria-selected="false">EVM chain</button>
   </div>
 
   <div class="toolbar">
@@ -64,6 +67,17 @@ Append <code>?program=&lt;id&gt;</code> to this page's URL to deep-link a progra
                autocomplete="off">
         <button id="btn-load-program" class="file-btn">Load</button>
       </div>
+      <div class="tab-panel hidden" data-panel="evm">
+        <input id="evm-address" type="text"
+               placeholder="Contract address (0x…)"
+               size="44"
+               autocomplete="off">
+        <input id="evm-rpc-url" type="text"
+               placeholder="RPC URL"
+               size="36"
+               autocomplete="off">
+        <button id="btn-load-contract" class="file-btn">Load</button>
+      </div>
     </div>
 
     <span id="filename" class="filename"></span>
@@ -71,11 +85,13 @@ Append <code>?program=&lt;id&gt;</code> to this page's URL to deep-link a progra
 
     <label for="format-select" class="format-label">Format:</label>
     <select id="format-select">
-      <option value="auto" selected>auto (ELF / PE / Mach-O / WASM header)</option>
+      <option value="auto" selected>auto (ELF / PE / Mach-O / WASM header, EVM)</option>
       <option value="elf">ELF (force)</option>
       <option value="pe">PE / COFF (force)</option>
       <option value="macho">Mach-O (force)</option>
       <option value="wasm">WebAssembly (force)</option>
+      <option value="evm">EVM bytecode (raw or hex)</option>
+      <option value="evm-listing">EVM bytecode, instruction listing (editable)</option>
       <option value="raw-6502">raw 6502 image</option>
     </select>
 

@@ -30,9 +30,15 @@ use crate::translate::compile::AsmWarning;
 /// * `"pe"` — force PE/COFF.
 /// * `"macho"` — force thin 64-bit Mach-O.
 /// * `"wasm"` — force a WebAssembly module.
+/// * `"evm"` — EVM contract bytecode, raw bytes or hex text, lifted
+///   to statements.
+/// * `"evm-listing"` — the same as an editable instruction listing.
 /// * `"raw-6502"` — interpret as a raw 6502 image whose load address
 ///   is derived from the file length (top of the 16-bit address
 ///   space).
+///
+/// `"auto"` also picks EVM bytecode when it carries a compiler
+/// metadata trailer or solc's prologue, or arrives as hex text.
 #[wasm_bindgen]
 pub fn decompile(bytes: &[u8], format: &str) -> Result<String, JsError> {
     set_panic_hook();
@@ -42,9 +48,11 @@ pub fn decompile(bytes: &[u8], format: &str) -> Result<String, JsError> {
         "pe" => decompile_as_pe(bytes),
         "macho" => decompile_as_macho(bytes),
         "wasm" => decompile_as_wasm(bytes),
+        "evm" => Ok(decompile_as_evm(bytes, false)),
+        "evm-listing" => Ok(decompile_as_evm(bytes, true)),
         "raw-6502" => decompile_as_raw_6502(bytes),
         other => Err(JsError::new(&format!(
-            "unsupported format hint {other:?} (expected \"auto\", \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw-6502\")"
+            "unsupported format hint {other:?} (expected \"auto\", \"elf\", \"pe\", \"macho\", \"wasm\", \"evm\", \"evm-listing\", or \"raw-6502\")"
         ))),
     }
 }
@@ -62,9 +70,24 @@ fn decompile_auto(bytes: &[u8]) -> Result<String, JsError> {
     if crate::format::wasm::is_wasm(bytes) {
         return decompile_as_wasm(bytes);
     }
+    if crate::format::evm::looks_like_evm(bytes)
+        || crate::format::evm::decode_hex_text(bytes).is_some()
+    {
+        return Ok(decompile_as_evm(bytes, false));
+    }
     Err(JsError::new(
-        "auto-detect found no ELF / PE / Mach-O / WASM header. Pick an explicit format if this is a raw image (e.g. 6502).",
+        "auto-detect found no ELF / PE / Mach-O / WASM header or EVM bytecode. Pick an explicit format if this is a raw image (e.g. 6502).",
     ))
+}
+
+/// Hex text is decoded first; anything else is taken as raw code.
+fn decompile_as_evm(bytes: &[u8], listing: bool) -> String {
+    let code = crate::format::evm::decode_hex_text(bytes).unwrap_or_else(|| bytes.to_vec());
+    if listing {
+        crate::translate::decompile::evm::decompile_evm_listing_to_text(&code)
+    } else {
+        crate::translate::decompile::decompile_evm_to_text(&code)
+    }
 }
 
 fn decompile_as_elf(bytes: &[u8]) -> Result<String, JsError> {
@@ -117,7 +140,7 @@ pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
         .map_err(|e| JsError::new(&format!("parse .ud: {e}")))?;
     let format = read_string(&ast.module, "format").ok_or_else(|| {
         JsError::new(
-            "missing `@module.format` (expected \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw\")",
+            "missing `@module.format` (expected \"elf\", \"pe\", \"macho\", \"wasm\", \"evm\", or \"raw\")",
         )
     })?;
     let warnings = crate::translate::compile::verify_asm(&ast);
@@ -130,10 +153,12 @@ pub fn compile(source: &str) -> Result<Vec<u8>, JsError> {
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to Mach-O: {e}"), &warnings))),
         "wasm" => crate::translate::compile::lower_to_wasm(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to WASM: {e}"), &warnings))),
+        "evm" => crate::translate::compile::lower_to_evm(&ast)
+            .map_err(|e| JsError::new(&with_warnings(&format!("lower to EVM: {e}"), &warnings))),
         "raw" => crate::translate::compile::lower_to_raw(&ast)
             .map_err(|e| JsError::new(&with_warnings(&format!("lower to raw: {e}"), &warnings))),
         other => Err(JsError::new(&format!(
-            "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", \"wasm\", or \"raw\")"
+            "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"macho\", \"wasm\", \"evm\", or \"raw\")"
         ))),
     }?;
     Ok(bytes)

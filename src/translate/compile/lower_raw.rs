@@ -67,6 +67,18 @@ pub fn lower_to_raw(file: &UdFile) -> Result<Vec<u8>, RawLowerError> {
     let load_addr = read_int_at(&file.module, "load_addr")?;
     let build = build_block(&file.module)?;
     let file_size = read_int(build, "file_size")?;
+    lower_flat_image(file, load_addr, file_size)
+}
+
+/// Lower every `@raw` block and `@addr` function in `file` into one
+/// contiguous image of `file_size` bytes starting at `load_addr`.
+/// Every byte must be covered exactly once. Shared by the headerless
+/// formats (`"raw"`, `"evm"`).
+pub(crate) fn lower_flat_image(
+    file: &UdFile,
+    load_addr: u64,
+    file_size: u64,
+) -> Result<Vec<u8>, RawLowerError> {
     let end = load_addr + file_size;
 
     let arch = resolve_arch_codec(&file.module)?;
@@ -131,7 +143,7 @@ pub fn lower_to_raw(file: &UdFile) -> Result<Vec<u8>, RawLowerError> {
     Ok(out)
 }
 
-fn build_block(module: &Module) -> Result<&[Field], RawLowerError> {
+pub(crate) fn build_block(module: &Module) -> Result<&[Field], RawLowerError> {
     for f in &module.fields {
         if f.name == "build" {
             if let Value::Block(fields) = &f.value {
@@ -148,7 +160,7 @@ fn build_block(module: &Module) -> Result<&[Field], RawLowerError> {
     })
 }
 
-fn read_int(fields: &[Field], name: &str) -> Result<u64, RawLowerError> {
+pub(crate) fn read_int(fields: &[Field], name: &str) -> Result<u64, RawLowerError> {
     for f in fields {
         if f.name == name {
             if let Value::Int(n) = &f.value {
@@ -167,7 +179,7 @@ fn read_int_at(module: &Module, name: &str) -> Result<u64, RawLowerError> {
     read_int(&module.fields, name)
 }
 
-fn read_string(module: &Module, name: &str) -> Option<String> {
+pub(crate) fn read_string(module: &Module, name: &str) -> Option<String> {
     module.fields.iter().find_map(|f| match &f.value {
         Value::String(s) if f.name == name => Some(s.clone()),
         _ => None,

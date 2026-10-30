@@ -50,4 +50,5 @@ pub fn register_all_arches() {
     crate::arch::aarch64::register();
     crate::arch::mos6502::register();
     crate::arch::bpf::register();
+    crate::arch::evm::register();
 }

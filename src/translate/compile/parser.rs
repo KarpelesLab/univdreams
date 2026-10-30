@@ -2588,6 +2588,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::String(_) => "a string literal".into(),
         TokenKind::Int(n) => format!("integer 0x{n:x}"),
+        TokenKind::BigInt(t) => format!("integer {t} (wider than 64 bits)"),
         TokenKind::Comment(_) => "a comment".into(),
         TokenKind::Eof => "end of input".into(),
     }

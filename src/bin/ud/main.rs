@@ -68,6 +68,13 @@ enum Command {
         /// Where to write the `.ud` source. Defaults to stdout.
         #[arg(short, long)]
         out: Option<PathBuf>,
+
+        /// EVM bytecode: emit one `@asm` line per instruction instead
+        /// of lifted statements. The listing is the form to edit:
+        /// changed mnemonics and immediates recompile, while lifted
+        /// statements are a read-only view over pinned bytes.
+        #[arg(long)]
+        listing: bool,
     },
 
     /// Verify a `.ud` source file: parse, then check every `@asm`
@@ -81,7 +88,7 @@ enum Command {
 
     /// Compile a `.ud` source file back to a binary. Dispatches on
     /// the `@module.format` field — `"elf"` → ELF, `"pe"` → PE,
-    /// `"macho"` → Mach-O, `"raw"` → raw image.
+    /// `"macho"` → Mach-O, `"evm"` → EVM bytecode, `"raw"` → raw image.
     ///
     /// Editing the source between decompile and compile is the
     /// supported workflow: PC-relative encoders (jmp, jcc, call,
@@ -386,6 +393,41 @@ enum Command {
         /// hand-inspecting with another tool.
         #[arg(long)]
         save_elf: Option<PathBuf>,
+
+        /// Where to write the `.ud` source. Defaults to stdout.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Fetch an EVM contract's runtime bytecode by address and
+    /// decompile it. Works against any EVM chain's JSON-RPC
+    /// endpoint (`eth_getCode`); the default is a public Ethereum
+    /// mainnet node.
+    ///
+    /// Code is cached under `~/.cache/univdreams/evm/<chain-id>/`.
+    /// Pass `--no-cache` to force a fresh fetch (e.g. after an
+    /// EIP-7702 re-delegation).
+    Evm {
+        /// Contract address (`0x` + 40 hex digits).
+        address: String,
+
+        /// RPC endpoint URL. Defaults to a public Ethereum
+        /// mainnet endpoint.
+        #[arg(long, default_value = univdreams::cli::evm::DEFAULT_RPC)]
+        rpc: String,
+
+        /// Skip the local cache and force a fresh fetch.
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Save the raw bytecode to this path before decompiling.
+        #[arg(long)]
+        save_code: Option<PathBuf>,
+
+        /// Emit the instruction listing instead of lifted statements
+        /// (see `ud decompile --listing`).
+        #[arg(long)]
+        listing: bool,
 
         /// Where to write the `.ud` source. Defaults to stdout.
         #[arg(short, long)]
@@ -912,7 +954,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 Ok(())
             }
         }
-        Command::Decompile { input, out } => {
+        Command::Decompile {
+            input,
+            out,
+            listing,
+        } => {
+            let evm = |code: &[u8]| {
+                if listing {
+                    univdreams::translate::decompile::evm::decompile_evm_listing_to_text(code)
+                } else {
+                    univdreams::translate::decompile::decompile_evm_to_text(code)
+                }
+            };
             let bytes =
                 std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
             let source = if univdreams::format::elf::is_elf64_le(&bytes) {
@@ -938,13 +991,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let wasm = univdreams::format::wasm::WasmFile::parse(&bytes)
                     .with_context(|| format!("parse {} as WASM", input.display()))?;
                 univdreams::translate::decompile::decompile_wasm_to_text(&wasm)
+            } else if univdreams::format::evm::looks_like_evm(&bytes) {
+                // Headerless: after the magic-number formats, before
+                // the permissive 6502 heuristic.
+                evm(&bytes)
+            } else if let Some(code) = univdreams::format::evm::decode_hex_text(&bytes) {
+                // Hex text (`solc --bin`, explorers, RPC dumps) is how
+                // bytecode usually travels; decompile the decoded bytes.
+                evm(&code)
             } else if let Some(load_addr) = univdreams::cli::raw_6502_load_addr(&bytes) {
                 let image = univdreams::format::raw::RawImage::new(bytes, load_addr);
                 univdreams::translate::decompile::decompile_raw_6502_to_text(&image)
                     .with_context(|| format!("decompile {} as 6502 raw", input.display()))?
             } else {
                 anyhow::bail!(
-                    "unrecognised binary format: {} (expected ELF, PE, NE, Mach-O, WASM, or 6502 raw image)",
+                    "unrecognised binary format: {} (expected ELF, PE, NE, Mach-O, WASM, EVM bytecode, or 6502 raw image)",
                     input.display()
                 );
             };
@@ -998,7 +1059,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     _ => None,
                 })
                 .ok_or_else(|| {
-                    anyhow::anyhow!("`@module.format` is missing — expected \"elf\", \"pe\", \"ne\", \"macho\", \"wasm\", or \"raw\"")
+                    anyhow::anyhow!("`@module.format` is missing — expected \"elf\", \"pe\", \"ne\", \"macho\", \"wasm\", \"evm\", or \"raw\"")
                 })?;
             let bytes = match format.as_str() {
                 "elf" => univdreams::translate::compile::lower_to_elf(&ast)
@@ -1011,10 +1072,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     .with_context(|| format!("lower {} to Mach-O", input.display()))?,
                 "wasm" => univdreams::translate::compile::lower_to_wasm(&ast)
                     .with_context(|| format!("lower {} to WASM", input.display()))?,
+                "evm" => univdreams::translate::compile::lower_to_evm(&ast)
+                    .with_context(|| format!("lower {} to EVM bytecode", input.display()))?,
                 "raw" => univdreams::translate::compile::lower_to_raw(&ast)
                     .with_context(|| format!("lower {} to raw", input.display()))?,
                 other => anyhow::bail!(
-                    "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"ne\", \"macho\", \"wasm\", or \"raw\")"
+                    "unsupported `@module.format` value {other:?} (expected \"elf\", \"pe\", \"ne\", \"macho\", \"wasm\", \"evm\", or \"raw\")"
                 ),
             };
             std::fs::write(&output, &bytes)
@@ -1101,6 +1164,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             &rpc,
             !no_cache,
             save_elf.as_deref(),
+            out.as_deref(),
+        ),
+        Command::Evm {
+            address,
+            rpc,
+            no_cache,
+            save_code,
+            listing,
+            out,
+        } => evm_cmd(
+            &address,
+            &rpc,
+            !no_cache,
+            save_code.as_deref(),
+            listing,
             out.as_deref(),
         ),
         Command::Vfw { command } => match command {
@@ -2794,6 +2872,36 @@ fn solana_cmd(
         .with_context(|| format!("parse stripped ELF from {program_id}"))?;
     let source = univdreams::translate::decompile::decompile_to_text(&elf)
         .with_context(|| format!("decompile {program_id}"))?;
+    if let Some(path) = out {
+        std::fs::write(path, source).with_context(|| format!("write {}", path.display()))?;
+    } else {
+        use std::io::Write as _;
+        std::io::stdout().write_all(source.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// `ud evm <address>` — fetch + decompile an EVM contract's
+/// runtime bytecode. Writes the `.ud` text to `out` (or stdout)
+/// and optionally saves the raw code to `save_code`.
+fn evm_cmd(
+    address: &str,
+    rpc_url: &str,
+    use_cache: bool,
+    save_code: Option<&Path>,
+    listing: bool,
+    out: Option<&Path>,
+) -> anyhow::Result<()> {
+    let code = univdreams::cli::evm::fetch_code(address, rpc_url, use_cache)
+        .with_context(|| format!("fetch {address} from {rpc_url}"))?;
+    if let Some(path) = save_code {
+        std::fs::write(path, &code).with_context(|| format!("write {}", path.display()))?;
+    }
+    let source = if listing {
+        univdreams::translate::decompile::evm::decompile_evm_listing_to_text(&code)
+    } else {
+        univdreams::translate::decompile::decompile_evm_to_text(&code)
+    };
     if let Some(path) = out {
         std::fs::write(path, source).with_context(|| format!("write {}", path.display()))?;
     } else {

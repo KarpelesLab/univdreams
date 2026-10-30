@@ -25,8 +25,8 @@ For every committed fixture, the entire file — headers, segment / section tabl
 
 What's working today:
 
-- **Byte-identical round-trip** across ELF64, PE/COFF, thin Mach-O (x86-64 + arm64), and 16-bit Windows NE, plus 6502 raw images.
-- **Architectures**: x86-64 + i386 via `iced-x86`, AArch64 (decode + lift), 6502 (full assembler + disassembler).
+- **Byte-identical round-trip** across ELF64, PE/COFF, thin Mach-O (x86-64 + arm64), and 16-bit Windows NE, plus 6502 raw images and EVM contract bytecode.
+- **Architectures**: x86-64 + i386 via `iced-x86`, AArch64 (decode + lift), 6502 (full assembler + disassembler), eBPF / Solana SBF, EVM (decoder + assembler through Fusaka: `PUSH0`, transient storage, `MCOPY`, `CLZ`).
 - **Structured statement lifting**, not just `@asm()` dumps: `if`/`switch`/`goto`, register-named locals, `dword ptr [global] = expr` stores, `lea`-as-`&` address-of, `sub_foo(arg_8, arg_c)` calls with stdcall/cdecl push-chain folding, `tail_F(args)` for tail-jmps, prologue/epilogue auto-generation, SSA expression composition.
 - **PE / Mach-O readability** comparable to Ghidra's Headers + Memory Map + Symbol Table + Listing panes: structural decode of load commands (`LC_SEGMENT_64`, `LC_SYMTAB`, `LC_MAIN`, `LC_BUILD_VERSION`, `LC_LOAD_DYLIB`, etc.), inline disassembly comments, IAT-resolved imports (`GetDriverModuleHandle(arg_c)`).
 - **DWARF reader** for typed function signatures (parameters and return type from `.debug_info`).
@@ -143,6 +143,36 @@ $ ud roundtrip --through-source testdata/external/wmpcdcs8-mpg4c32.dll \
 source round-trip ok: testdata/external/wmpcdcs8-mpg4c32.dll == /tmp/mpg4c32.rebuilt (420240 bytes)
 ```
 
+EVM contracts lift to functions over named stack slots — internal calls, storage mappings, `require`, events. Here is mainnet WETH9's `withdraw`, fetched by address (each statement's pinned byte list elided):
+
+```bash
+$ ud evm 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+…
+// selector 0x2e1a7d4d: withdraw(uint256)
+fn withdraw() {
+    require(!msg.value)
+    sub_09d9(calldataload(0x4))
+    stop()
+}
+// internal function: 1 argument(s), 0 return value(s); called from withdraw
+fn sub_09d9() {
+    v3 = mapping(0x3, address(msg.sender))
+    v3 = sload(v3)
+    require((v3 >= arg0))
+    …
+    sstore(v3, v2)
+    …
+    v6 = call(v3, address(msg.sender), arg0, v7, v5 - v7, v7, 0x0)
+    require(bool(v6))
+    …
+    // event Withdrawal(address,uint256)
+    log2(t1, ((0x20 + v5) - t1), 0x7fcf…1b65, address(msg.sender))
+    return;
+}
+```
+
+`--listing` gives the editable instruction-level form instead; both recompile byte-identically.
+
 ## Targets
 
 | Tier | Format | Architectures | Status |
@@ -152,6 +182,7 @@ source round-trip ok: testdata/external/wmpcdcs8-mpg4c32.dll == /tmp/mpg4c32.reb
 | **v1 (working)** | Mach-O (thin) | x86-64, arm64 (macOS) | ✅ whole-binary source round-trip; Ghidra-style listing |
 | **v1 (working)** | NE | x86-16 (Windows 1.x–3.x) | ✅ whole-binary source round-trip; Ghidra-style listing (imports, exports, 16-bit disasm) — structured lifting pending |
 | **v1 (working)** | raw / flat | 6502 (Apple I / WozMon) | ✅ round-trip + lift |
+| **v1 (working)** | EVM bytecode | EVM (solc / vyper output, any chain) | ✅ whole-contract source round-trip; lifted to functions / expressions / `if`-`while` / `require` (internal calls and frames recovered); selector-dispatcher functions named from an ABI signature table; CODECOPY data + CBOR metadata split out |
 | 2 | Mach-O fat | universal binaries | demux to thin first |
 | 2 | ARM / Thumb | 32-bit ARM | not yet |
 | 3 | High-level lifting | loops, types, struct fields | partial — see roadmap |
@@ -187,16 +218,17 @@ Rust. Reasoning, briefly:
 │   └── installers.md           # running Win32 installers under `ud analyze --monitor`
 └── src/                        # one crate, one module per subsystem
     ├── common/                 # shared types: VAddr, Result, byte helpers
-    ├── format/                 # ELF64 + PE/COFF + thin Mach-O + NE + raw readers + writers (byte-identical)
+    ├── format/                 # ELF64 + PE/COFF + thin Mach-O + NE + raw + EVM readers + writers (byte-identical)
     ├── arch/
     │   ├── codec/              # the arch-codec trait + registry every backend implements
     │   ├── x86/                # x86 decode + lift + Intel formatter + assembler
     │   ├── aarch64/            # AArch64 decode + lift
     │   ├── mos6502/            # 6502 decode + lift + assembler
-    │   └── bpf/                # eBPF / Solana SBF decode + lift
+    │   ├── bpf/                # eBPF / Solana SBF decode + lift
+    │   └── evm/                # EVM decode + assembler + keccak-256
     ├── ir/                     # Function, BasicBlock, Terminator (generic over arch)
     ├── analysis/               # function discovery (symtab / eh_frame / signatures)
-    ├── signatures/             # byte-pattern DB (CRT helpers)
+    ├── signatures/             # byte-pattern DB (CRT helpers) + EVM ABI selector / event / slot names
     ├── debug/                  # DWARF reader → typed signatures
     ├── ast/                    # .ud AST + canonical pretty-printer
     ├── translate/              # .ud → binary lowering + binary → .ud decompile (all formats)
@@ -215,8 +247,13 @@ cargo build
 # Run end-to-end byte-identical round-trip on the test corpus
 cargo test
 
-# Decompile any supported binary to .ud (auto-detects ELF / PE / Mach-O / 6502)
+# Decompile any supported binary to .ud (auto-detects ELF / PE / Mach-O / EVM / 6502)
 cargo run --bin ud -- decompile path/to/binary
+
+# Fetch + decompile an on-chain program: Solana by program ID, EVM by address
+# (any EVM chain via --rpc; Ethereum mainnet by default)
+cargo run --bin ud -- solana <program-id>
+cargo run --bin ud -- evm 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
 
 # Source round-trip: decompile → emit → parse → lower → check byte-equality
 cargo run --bin ud -- roundtrip --through-source path/to/binary

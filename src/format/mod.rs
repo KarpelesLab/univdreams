@@ -10,6 +10,8 @@
 //! * [`pe`] — PE / COFF, PE32 and PE32+ (`PeFile`).
 //! * [`macho`] — thin 64-bit Mach-O (`MachoFile`).
 //! * [`ne`] — 16-bit Windows New Executable (`NeFile`).
+//! * [`evm`] — headerless EVM contract bytecode: compiler metadata
+//!   trailer, EIP-7702 delegation, hex-text input.
 //! * [`raw`] — headerless flat images, e.g. 6502 ROMs
 //!   (`RawImage`).
 //! * [`wasm`] — WebAssembly modules (`WasmFile`).
@@ -21,6 +23,7 @@
 //! project's scope warranted.
 
 pub mod elf;
+pub mod evm;
 pub mod macho;
 pub mod ne;
 pub mod pe;

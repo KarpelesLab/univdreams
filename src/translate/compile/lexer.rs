@@ -88,6 +88,12 @@ pub enum TokenKind {
     String(String),
     /// An integer literal (always parsed as u64).
     Int(u64),
+    /// A non-negative integer literal too wide for `u64` (EVM's
+    /// 256-bit constants), kept as its source text. Valid only where
+    /// the parser captures raw text — conditions, call arguments,
+    /// assignment sides; anywhere a number is required it is
+    /// rejected like any other unexpected token.
+    BigInt(String),
     /// A `// …` line comment, with the leading `//` and any leading
     /// whitespace inside stripped — `// hello` becomes `Comment("hello")`.
     Comment(String),
@@ -402,6 +408,13 @@ impl<'a> Lexer<'a> {
                 };
                 Ok(TokenKind::Int(value))
             }
+            Err(e)
+                if !negative
+                    && matches!(e.kind(), std::num::IntErrorKind::PosOverflow)
+                    && body.len() <= if radix == 16 { 64 } else { 78 } =>
+            {
+                Ok(TokenKind::BigInt(text.to_string()))
+            }
             Err(e) => Err(LexError::InvalidNumber {
                 text: text.to_string(),
                 line,
@@ -467,6 +480,22 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn wide_literals_lex_as_big_ints() {
+        let wide = "0xffffffffffffffffffffffffffffffffffffffff";
+        assert_eq!(
+            kinds(&format!("{wide} 0x10")),
+            vec![
+                TokenKind::BigInt(wide.to_string()),
+                TokenKind::Int(0x10),
+                TokenKind::Eof
+            ]
+        );
+        // Wider than 256 bits, or negative and too wide: still errors.
+        assert!(tokenize(&format!("0x1{}", "0".repeat(64))).is_err());
+        assert!(tokenize("-0x10000000000000000").is_err());
     }
 
     #[test]

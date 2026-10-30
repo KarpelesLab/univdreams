@@ -151,6 +151,25 @@ fail-soft-thunk / monitor-report machinery.
 - [ ] **Phase 3** — drive the installer's silent path + capture the extracted
   `EXPANDER.EXE` via `--dump-vfs`.
 
+### EVM bytecode — round-trip + readable listing ✅
+
+- [x] `arch::evm`: opcode table through Fusaka (`PUSH0`, `TLOAD`/`TSTORE`/`MCOPY`/`BLOBHASH`/`BLOBBASEFEE`, `CLZ`), linear decoder that keeps truncated trailing `PUSH`es byte-exact, and a text assembler — `@asm` lines carry no pinned bytes, so edited mnemonics and immediates recompile.
+- [x] `format::evm`: CBOR metadata trailer (solc / vyper), EIP-7702 delegation designators, hex-text input.
+- [x] `translate::decompile::evm` / `compile::lower_to_evm`: data regions from constant-offset `CODECOPY`s (initcode → embedded runtime) and the metadata trailer become `@raw`; the Solidity / Vyper selector dispatcher yields one function per entry point, named from `signatures::evm` (ABI signatures hashed with an in-tree keccak-256) or `fn_<selector>`; `JUMPDEST` labels and jump-target / selector / event-topic / ERC-1967-slot annotations.
+- [x] `ud evm <address> [--rpc URL]` fetches runtime code via `eth_getCode` (cached per chain ID); playground "EVM chain" tab.
+- [x] Whole-contract round-trip defended on mainnet WETH9 (solc 0.4), Uniswap V2 Router02 (solc 0.6.6) and Uniswap v4 PoolManager (solc 0.8.26 via-IR), for both output forms below.
+
+**Lifted output (the default)** — `translate::decompile::evm_cfg` + `evm_lift`:
+
+- [x] Internal functions: call sites seeded from `PUSH ret … PUSH f; JUMP`, then a per-function abstract interpretation (entry stack `[ret, args…]`, call sites summarised so cost doesn't multiply along call chains) resolves returns, argument / return counts, cross-block calls, masked targets (`PUSH4 0xffffffff; …; AND`), reused continuations, tail calls, and optimizer-shared tails that return to each caller's own continuation. A function that returns through an "argument" has its frame size corrected.
+- [x] Stack slots named per frame (`ret`, `arg0…`, `vN`) so blocks read as code over variables; pure ops fold into infix expressions with constant folding; state reads bind to variables; side effects as `sstore`/`mstore`/`log`/`call` statements.
+- [x] Structure: `if` / `else` over single-entry regions, `while` (top-tested) and `do … while` (bottom-tested) loops, `&&` / `||` short-circuits.
+- [x] Idioms: `msg.sig`, `msg.sender` & co., `address(x)` masks, `mapping(slot, key)` slots, `require(cond[, "reason"])`, `assert(cond)`, `revert("reason")`, `revert(CustomError(args))`, `panic(code)`, `Name.selector`, `codecopy`'d revert strings, event names, ERC-1967 slots.
+- [x] The listing form (`--listing`) remains for editing; lifted statements are a read-only view over pinned bytes.
+- [ ] Editable lifted statements: an EVM expression compiler so canonical statements can drop their pinned bytes (as the listing does per instruction).
+- [ ] Symbolic jump targets (`PUSH2 L_01a3`) resolved at lower time, so edits that change code length keep jumps valid.
+- [ ] Typed ABI decoding of external-function arguments (`calldataload(0x4)` → `arg0: address`), storage-variable naming across functions, and recursive decompile of runtime code embedded in initcode.
+
 ## Beyond v1
 
 In open consideration once Phases 5–9 stabilize:
@@ -160,4 +179,4 @@ In open consideration once Phases 5–9 stabilize:
 - LTO/PGO output.
 - Packed/obfuscated binaries.
 - GUI / IDE integration.
-- Decompiling non-CPU bytecode (Java, Wasm, Python `.pyc`, JVM, MSIL) — same architecture, new backends.
+- Decompiling more non-CPU bytecode (Java, Python `.pyc`, MSIL) — same architecture, new backends.

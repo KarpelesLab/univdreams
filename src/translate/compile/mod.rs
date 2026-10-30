@@ -15,6 +15,7 @@
 mod lexer;
 mod lower;
 mod lower_elf;
+mod lower_evm;
 mod lower_macho;
 mod lower_ne;
 mod lower_pe;
@@ -31,6 +32,7 @@ pub use lower::{
     lower_functions, lower_section_bytes, lower_sections,
 };
 pub use lower_elf::{ElfLowerError, build_elf64, lower_to_elf};
+pub use lower_evm::{EvmLowerError, lower_to_evm};
 pub use lower_macho::{MachoLowerError, lower_to_macho};
 pub use lower_ne::{NeLowerError, lower_to_ne};
 pub use lower_pe::{PeLowerError, lower_to_pe};

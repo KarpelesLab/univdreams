@@ -36,6 +36,9 @@ mod bpf_ssa;
 mod build_function;
 mod build_module;
 mod data_lookup;
+pub mod evm;
+mod evm_cfg;
+mod evm_lift;
 mod expr;
 mod idioms;
 pub mod macho;
@@ -49,6 +52,7 @@ pub mod wasm;
 mod wasm_disasm;
 
 pub use data_lookup::DataLookup;
+pub use evm::{decompile_evm, decompile_evm_to_text};
 pub use macho::{decompile_macho, decompile_macho_to_text};
 pub use ne::{decompile_ne, decompile_ne_to_text};
 pub use pe::{decompile_pe, decompile_pe_to_text};

@@ -366,7 +366,11 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
         Stmt::ReturnExpr { text, bytes } => {
             // C-style `return EXPR; [bytes]` form — same shape the
             // `if (cond) return EXPR; [bytes]` early-return uses.
-            write!(out, "{indent}return {text};").unwrap();
+            if text.is_empty() {
+                write!(out, "{indent}return;").unwrap();
+            } else {
+                write!(out, "{indent}return {text};").unwrap();
+            }
             out.push_str(" [");
             emit_byte_list(out, bytes);
             writeln!(out, "]").unwrap();

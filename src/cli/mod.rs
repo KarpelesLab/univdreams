@@ -4,6 +4,7 @@
 //! split lets integration tests call the same code path as the binary
 //! without spawning a subprocess.
 
+pub mod evm;
 pub mod solana;
 
 use std::path::Path;
@@ -153,6 +154,8 @@ pub enum SourceRoundTripError {
     RawLower(#[from] crate::translate::compile::RawLowerError),
     #[error(transparent)]
     WasmLower(#[from] crate::translate::compile::WasmLowerError),
+    #[error(transparent)]
+    EvmLower(#[from] crate::translate::compile::EvmLowerError),
 }
 
 /// Run `input` through the full source pipeline:
@@ -214,6 +217,16 @@ pub fn roundtrip_through_source(
             .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
         let warnings = crate::translate::compile::verify_asm(&parsed);
         let rebuilt = crate::translate::compile::lower_to_wasm(&parsed)?;
+        (text, warnings, rebuilt)
+    } else if crate::format::evm::looks_like_evm(&input_bytes) {
+        // Headerless, so after every format with a magic number and
+        // before the 6502 heuristic (which accepts almost anything).
+        let ast = crate::translate::decompile::decompile_evm(&input_bytes);
+        let text = crate::ast::emit(&ast);
+        let parsed = crate::translate::compile::parse(&text)
+            .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = crate::translate::compile::verify_asm(&parsed);
+        let rebuilt = crate::translate::compile::lower_to_evm(&parsed)?;
         (text, warnings, rebuilt)
     } else if let Some(load_addr) = raw_6502_load_addr(&input_bytes) {
         let image = crate::format::raw::RawImage::new(input_bytes.clone(), load_addr);

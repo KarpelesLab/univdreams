@@ -18,6 +18,7 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+pub mod evm;
 mod x86_64;
 
 pub use x86_64::CRT_HELPERS_X86_64;

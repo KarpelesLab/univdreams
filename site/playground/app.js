@@ -35,6 +35,10 @@ const $format        = document.getElementById("format-select");
 const $programId     = document.getElementById("program-id");
 const $rpcUrl        = document.getElementById("rpc-url");
 const $loadProgram   = document.getElementById("btn-load-program");
+const $exampleEvm    = document.getElementById("example-evm");
+const $evmAddress    = document.getElementById("evm-address");
+const $evmRpcUrl     = document.getElementById("evm-rpc-url");
+const $loadContract  = document.getElementById("btn-load-contract");
 const $tabs          = document.querySelectorAll(".tabs .tab");
 const $tabPanels     = document.querySelectorAll(".tab-panel");
 
@@ -49,6 +53,12 @@ const MSMPEG4_URL =
 const SOLANA_RPC_DEFAULT =
   "https://kristi-cykm4t-fast-mainnet.helius-rpc.com";
 const SOLANA_EXAMPLE = "3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr";
+
+// Default EVM RPC: publicnode's keyless Ethereum mainnet endpoint,
+// which allows browser-origin requests. Any chain's endpoint works
+// (override in the RPC input or via ?evm_rpc=<url>).
+const EVM_RPC_DEFAULT = "https://ethereum-rpc.publicnode.com";
+const EVM_EXAMPLE = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"; // WETH9
 
 // Base58 alphabet — Bitcoin / Solana convention. Used to
 // decode the user-supplied program ID and the RPC's `owner`
@@ -112,7 +122,7 @@ function base64Decode(str) {
   return out;
 }
 
-async function solanaRpc(rpcUrl, method, params) {
+async function jsonRpc(rpcUrl, method, params) {
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
   const resp = await fetch(rpcUrl, {
     method: "POST",
@@ -131,7 +141,7 @@ async function solanaRpc(rpcUrl, method, params) {
 
 async function fetchSolanaProgram(programId, rpcUrl) {
   setStatus(`Fetching ${programId} from ${new URL(rpcUrl).host}…`, "");
-  const account = await solanaRpc(rpcUrl, "getAccountInfo", [
+  const account = await jsonRpc(rpcUrl, "getAccountInfo", [
     programId,
     { encoding: "base64" },
   ]);
@@ -155,7 +165,7 @@ async function fetchSolanaProgram(programId, rpcUrl) {
   if (kind === "upgradeable") {
     const pdAddr = solana_programdata_pubkey_base58(programAccountData);
     setStatus(`Fetching ProgramData ${pdAddr.slice(0, 8)}…`, "");
-    const pd = await solanaRpc(rpcUrl, "getAccountInfo", [
+    const pd = await jsonRpc(rpcUrl, "getAccountInfo", [
       pdAddr,
       { encoding: "base64" },
     ]);
@@ -194,6 +204,35 @@ function onLoadProgram() {
   const rpc = ($rpcUrl.value || "").trim() || SOLANA_RPC_DEFAULT;
   void fetchSolanaProgram(id, rpc).catch((e) => {
     setStatus(`Solana fetch failed: ${e.message || e}`, "error");
+  });
+}
+
+async function fetchEvmContract(address, rpcUrl) {
+  setStatus(`Fetching ${address} from ${new URL(rpcUrl).host}…`, "");
+  const chainId = parseInt(await jsonRpc(rpcUrl, "eth_chainId", []), 16);
+  const hex = await jsonRpc(rpcUrl, "eth_getCode", [address, "latest"]);
+  if (typeof hex !== "string" || hex.length <= 2) {
+    throw new Error(`no code at ${address} on chain ${chainId} (externally-owned account or destroyed contract)`);
+  }
+  const code = new Uint8Array((hex.length - 2) / 2);
+  for (let i = 0; i < code.length; i++) {
+    code[i] = parseInt(hex.substr(2 + 2 * i, 2), 16);
+  }
+  uploadName = `${address}.evm`;
+  $filename.textContent = `${address} (${code.length} bytes, chain ${chainId})`;
+  $format.value = "evm";
+  await decompileBytes(code, address);
+}
+
+function onLoadContract() {
+  const address = $evmAddress.value.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    setStatus("Enter a contract address: 0x followed by 40 hex digits.", "warn");
+    return;
+  }
+  const rpc = ($evmRpcUrl.value || "").trim() || EVM_RPC_DEFAULT;
+  void fetchEvmContract(address, rpc).catch((e) => {
+    setStatus(`EVM fetch failed: ${e.message || e}`, "error");
   });
 }
 
@@ -259,6 +298,10 @@ async function start() {
   $programId.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") onLoadProgram();
   });
+  $loadContract.addEventListener("click", onLoadContract);
+  $evmAddress.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") onLoadContract();
+  });
   for (const tab of $tabs) {
     tab.addEventListener("click", () => selectTab(tab.dataset.tab));
   }
@@ -279,11 +322,21 @@ async function start() {
     });
   }
 
+  if ($exampleEvm) {
+    $exampleEvm.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      selectTab("evm");
+      $evmAddress.value = EVM_EXAMPLE;
+      onLoadContract();
+    });
+  }
+
   // Populate the RPC input with the default (and any
   // `?rpc=<url>` override) so the user can see / edit it
   // before triggering a fetch.
   const params = new URLSearchParams(window.location.search);
   $rpcUrl.value = params.get("rpc") || SOLANA_RPC_DEFAULT;
+  $evmRpcUrl.value = params.get("evm_rpc") || EVM_RPC_DEFAULT;
 
   // Deep-link: ?program=<id> auto-loads on page load and
   // switches the toolbar to the Solana-chain tab.
@@ -292,6 +345,14 @@ async function start() {
     selectTab("chain");
     $programId.value = queryProgram;
     onLoadProgram();
+    return;
+  }
+  // ?contract=<0x address> does the same for the EVM tab.
+  const queryContract = params.get("contract");
+  if (queryContract) {
+    selectTab("evm");
+    $evmAddress.value = queryContract;
+    onLoadContract();
     return;
   }
   // Same for ?url=<binary-url>: pre-load the URL tab.
@@ -303,7 +364,7 @@ async function start() {
     return;
   }
 
-  setStatus("Ready. Upload a binary, paste a URL or Solana program ID, or edit the sample and click Compile.", "ok");
+  setStatus("Ready. Upload a binary, paste a URL, Solana program ID or EVM contract address, or edit the sample and click Compile.", "ok");
 }
 
 function selectTab(name) {
