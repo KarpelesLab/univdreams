@@ -1328,13 +1328,22 @@ impl<'a> Ctx<'a> {
                 return self.storage.get(var).map(|slot| Sym::Const(slot.clone()));
             }
             vars(n).or_else(|| {
-                let k = self
-                    .trace
-                    .params
-                    .get(&fn_addr)?
-                    .iter()
-                    .position(|w| w == n)?;
-                Some(Sym::Op(0x35, vec![Sym::konst(4 + 32 * k as u64)]))
+                let params = self.trace.params.get(&fn_addr)?;
+                let head = |w: &str| {
+                    let k = params.iter().position(|p| p == w)?;
+                    Some(Sym::Op(0x35, vec![Sym::konst(4 + 32 * k as u64)]))
+                };
+                // A dynamic parameter's length word and data offset.
+                match n.rsplit_once('.') {
+                    Some((p, "length")) if head(n).is_none() => Some(Sym::Op(
+                        0x35,
+                        vec![Sym::Op(0x01, vec![Sym::konst(4), head(p)?])],
+                    )),
+                    Some((p, "offset")) if head(n).is_none() => {
+                        Some(Sym::Op(0x01, vec![Sym::konst(0x24), head(p)?]))
+                    }
+                    _ => head(n),
+                }
             })
         }
     }
@@ -1352,8 +1361,17 @@ impl<'a> Ctx<'a> {
             stack_names(e, &mut v);
         }
         let params = self.trace.params.get(&fn_addr);
+        let base = |n: &str| {
+            n.strip_suffix(".length")
+                .or_else(|| n.strip_suffix(".offset"))
+                .map(str::to_string)
+        };
         v.retain(|n| {
-            !self.storage.contains_key(n) && !params.is_some_and(|p| p.iter().any(|w| w == n))
+            !self.storage.contains_key(n)
+                && !params.is_some_and(|p| {
+                    p.iter()
+                        .any(|w| w == n || base(n).as_deref() == Some(w.as_str()))
+                })
         });
         v
     }
@@ -3922,6 +3940,30 @@ mod tests {
             }
             assert_eq!(old.len() + 1, new.len(), "{}", path.display());
         }
+    }
+
+    /// A dynamic parameter's `paramK.length` / `paramK.offset` compile
+    /// back to the calldata reads they stand for.
+    #[test]
+    fn dynamic_parameter_parts() {
+        let code = fixture("uniswap-v2-router02-mainnet.evm");
+        let text = decompile_evm_to_text(&code);
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("mstore(v10, param1.length) ["))
+            .expect("length store");
+        let edited = text.replacen(
+            line,
+            &line.replacen("param1.length)", "(param1.length + param1.offset))", 1),
+            1,
+        );
+        let new = compile(&edited).unwrap();
+        let relifted = decompile_evm_to_text(&new);
+        assert!(
+            relifted.contains("mstore(v10, (param1.length + param1.offset))"),
+            "{relifted}"
+        );
+        assert_eq!(compile(&relifted).unwrap(), new);
     }
 
     /// A struct field read back from memory (`param0.hooks`) edits like

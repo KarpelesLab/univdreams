@@ -853,6 +853,10 @@ pub(crate) struct LiftCtx<'a> {
     /// 32-byte word of their ABI-encoded parameters' head: word `k` is
     /// `calldataload(4 + 32k)`.
     pub params: HashMap<u64, Vec<String>>,
+    /// The head words of each external function's dynamic parameters
+    /// (`bytes`, `string`, `T[]`): offsets of their encodings, whose
+    /// length (`paramK.length`) and data (`paramK.offset`) are named.
+    pub dynamic: HashMap<u64, Vec<String>>,
     /// External functions that may be public-variable getters: the
     /// name their known signature gives them and how many (static)
     /// parameters it takes.
@@ -1622,6 +1626,11 @@ impl FnBuilder<'_, '_> {
                 .params
                 .get(&self.range_start)
                 .map_or(&[], Vec::as_slice),
+            dynamic: self
+                .ctx
+                .dynamic
+                .get(&self.range_start)
+                .map_or(&[], Vec::as_slice),
             entry,
             resolved: HashMap::new(),
             summaries: self.summaries,
@@ -1909,6 +1918,8 @@ struct BlockLift<'a, 'c> {
     /// Names of the ABI head words of the external function being
     /// lifted (see [`LiftCtx::params`]).
     params: &'a [String],
+    /// Its dynamic parameters (see [`LiftCtx::dynamic`]).
+    dynamic: &'a [String],
     /// Known entry-stack values by frame position (see
     /// [`FnBuilder::entry_values`]).
     entry: HashMap<i64, Expr>,
@@ -2185,15 +2196,38 @@ impl BlockLift<'_, '_> {
         self.params.get(k).map(|name| Expr::Var(name.clone()))
     }
 
-    /// `e` with its calldata reads at parameter offsets named.
+    /// `e` with its calldata reads at parameter offsets named, and a
+    /// dynamic parameter's length and data offset as such.
     fn paramize(&self, e: Expr) -> Expr {
-        match e {
+        let e = match e {
             Expr::Op("calldataload", a) if a.len() == 1 && self.param_at(&a[0]).is_some() => {
                 self.param_at(&a[0]).expect("checked")
             }
             Expr::Op(op, a) => Expr::Op(op, a.into_iter().map(|x| self.paramize(x)).collect()),
             other => other,
-        }
+        };
+        self.dynamic_part(&e).unwrap_or(e)
+    }
+
+    /// `paramK.length` for `calldataload(4 + paramK)` and `paramK.offset`
+    /// for `4 + paramK + 0x20`, where `paramK` (resolved in `e`) is the
+    /// head word of a dynamic parameter: its encoding's length word
+    /// and the calldata offset of its data, as Solidity names them.
+    fn dynamic_part(&self, e: &Expr) -> Option<Expr> {
+        let (name, part) = match e {
+            Expr::Op("calldataload", a) if a.len() == 1 => match rlin(&a[0])? {
+                (Some(Expr::Var(p)), 4) => (p, "length"),
+                _ => return None,
+            },
+            Expr::Op("add", _) => match rlin(e)? {
+                (Some(Expr::Var(p)), 0x24) => (p, "offset"),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        self.dynamic
+            .contains(&name)
+            .then(|| Expr::Var(format!("{name}.{part}")))
     }
 
     fn slot_name(&self, pos: i64) -> Option<String> {
@@ -2467,10 +2501,15 @@ impl BlockLift<'_, '_> {
                 _ if pure_name(op).is_some() => {
                     let args = self.pop_n(OPCODE_TABLE[op as usize].pops.into());
                     let param = (op == 0x35).then(|| self.param_at(&args[0])).flatten();
-                    self.stack.push(match param {
-                        Some(p) => p,
-                        None => simplify(Expr::Op(pure_name(op).unwrap(), args)),
+                    let value = param.unwrap_or_else(|| {
+                        let e = simplify(Expr::Op(pure_name(op).unwrap(), args));
+                        // A dynamic parameter's length or data offset.
+                        let part = (matches!(op, 0x01 | 0x35) && !self.dynamic.is_empty())
+                            .then(|| self.dynamic_part(&self.resolve(&e)))
+                            .flatten();
+                        part.unwrap_or(e)
                     });
+                    self.stack.push(value);
                 }
                 0x20 if !defer && self.mapping_ready() => {
                     let args = self.pop_n(2);
@@ -2630,7 +2669,8 @@ impl BlockLift<'_, '_> {
                 }
                 0xfd => {
                     let args = self.pop_n(2);
-                    if !self.collapse_revert(i) {
+                    let at = rlin(&self.resolve(&args[0]));
+                    if !self.collapse_revert(i, at.as_ref()) {
                         self.emit_call("revert", &args, i);
                     }
                     return BlockEnd::Other;
@@ -2814,17 +2854,27 @@ impl BlockLift<'_, '_> {
     /// `codecopy` for long strings) right before the `REVERT`; those
     /// statements carry no other effect worth showing, since a revert
     /// discards everything.
-    fn collapse_revert(&mut self, i: usize) -> bool {
+    fn collapse_revert(&mut self, i: usize, payload: Option<&(Option<Expr>, u64)>) -> bool {
         const ERROR: u32 = 0x08c3_79a0;
         const PANIC: u32 = 0x4e48_7b71;
+        // The selector stored where the payload starts, when that is
+        // known: a selector-like word inside its data (a nested error
+        // in `bytes`) is not the error being raised.
         let Some(start) = self
             .mstores
             .iter()
             .rev()
+            .filter(|m| payload.is_none() || m.rplace.as_ref() == payload)
             .find_map(|m| Some((m.at, shifted_selector(&m.value)?)))
         else {
             return false;
         };
+        // Dynamic arguments' encodings aren't shown as plain words.
+        if crate::signatures::evm::function_by_selector(start.1).is_some_and(|sig| {
+            sig != "Error(string)" && super::evm::static_head_words(sig).is_none()
+        }) {
+            return false;
+        }
         let (mut at, sel) = start;
         // The free-memory-pointer read that located the payload.
         if at > 0 && matches!(&self.out[at - 1], Stmt::Move { src, .. } if src == "mload(0x40)") {

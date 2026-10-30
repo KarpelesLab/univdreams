@@ -178,7 +178,7 @@ v13 = IWETH(0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2).withdraw(v8)
 v13 = IERC20(calldataload((0x20 * v12) + v10)).balanceOf(address(v6))
 ```
 
-and, where the code checks the success flag itself, `v2 = arg0.staticcall(IERC20.balanceOf(address(this)))`. Structs decoded into memory read back by field — Uniswap v4's `swap(PoolKey key, …)` shows `v13 = param0.hooks` and `keccak256(abi.encode(param0))` for `key.toId()`.
+and, where the code checks the success flag itself, `v2 = arg0.staticcall(IERC20.balanceOf(address(this)))`. Structs decoded into memory read back by field — Uniswap v4's `swap(PoolKey key, …)` shows `v13 = param0.hooks` and `keccak256(abi.encode(param0))` for `key.toId()` — and dynamic parameters by their parts, `param2.length` / `param2.offset`.
 
 Lifted statements are editable: change `require((v3 >= arg0))` to `require((v3 >= (arg0 + 0x64)))`, add `require(param1 != 0x0, "zero amount")` or `balanceOf[msg.sender] = 0x2a` (no byte list) to a function, or edit an `sstore`, assignment (including its target), `return abi.encode(…)`, `emit` or `if` condition, edit, add or delete an internal call (`sub_09d9(param0 / 0x2)`) or an external `call(…)` / `staticcall(…)` / `delegatecall(…)` / `to.send(v)`, or comment a statement out (keeping its byte list) to delete it, and `ud compile` generates EVM code for it and relocates every jump in the contract (and, for creation code, adjusts the length and immutables the constructor deploys). Unedited files still recompile byte-identically. Unreachable code and higher-level external-call forms aren't editable yet and are reported as errors. `--listing` gives the instruction-level form instead, where mnemonics and immediates are edited directly.
 

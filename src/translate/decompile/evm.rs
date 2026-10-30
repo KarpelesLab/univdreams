@@ -261,6 +261,20 @@ fn decompile_evm_impl(
                     (addr, words)
                 })
                 .collect(),
+            dynamic: selectors
+                .iter()
+                .filter_map(|(&addr, &sel)| {
+                    let head = abi_head(function_by_selector(sel)?)?;
+                    let names = head
+                        .types
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| head_words(t) == Some(HeadWords::Dynamic))
+                        .map(|(k, _)| format!("param{k}"))
+                        .collect();
+                    Some((addr, names))
+                })
+                .collect(),
             getters: selectors
                 .iter()
                 .filter_map(|(&addr, &sel)| {

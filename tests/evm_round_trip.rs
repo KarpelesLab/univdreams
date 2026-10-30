@@ -289,6 +289,31 @@ fn router_external_calls_fold() {
     assert!(text.matches("extcodesize(").count() <= 9);
 }
 
+/// Dynamic parameters (`bytes`, `T[]`) name their length word and data
+/// offset, `paramK.length` / `paramK.offset`, whichever compiler
+/// decodes them; a revert whose data nests another error's selector
+/// isn't mistaken for that error.
+#[test]
+fn dynamic_parameters_are_named() {
+    let code = read(&testdata().join("uniswap-v2-router02-mainnet.evm"));
+    let text = decompile_evm_to_text(&code);
+    assert!(text.contains(
+        "v1 = sub_0f4c(param0, param1, param2.offset, param2.length, address(param3), param4)"
+    ));
+    assert!(
+        text.contains("calldatacopy(t1, param1.offset, v12)"),
+        "{text}"
+    );
+    let code = read(&testdata().join("uniswap-v4-poolmanager-mainnet.evm"));
+    let text = decompile_evm_to_text(&code);
+    // via-IR's decoder helper returns both.
+    assert!(
+        text.contains("param2.offset, param2.length = sub_2f4d(msg.data.length, (0x4 + param2))")
+    );
+    assert!(text.contains("mstore((t13 + 0xc4), NativeTransferFailed.selector)"));
+    assert!(!text.contains("revert(NativeTransferFailed())"));
+}
+
 /// Calls whose failure the code handles itself keep the success flag:
 /// `t.staticcall(IERC20.balanceOf(a))`. Vyper's selector sits in the
 /// low bytes of the word before the call data.
