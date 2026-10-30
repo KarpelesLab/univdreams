@@ -171,7 +171,7 @@ fn sub_09d9() {
 }
 ```
 
-Lifted statements are editable: change `require((v3 >= arg0))` to `require((v3 >= (arg0 + 0x64)))`, add `require(param1 != 0x0, "zero amount")` or `balanceOf[msg.sender] = 0x2a` (no byte list) to a function, or edit an `sstore`, assignment, `return abi.encode(…)`, `emit` or `if` condition, and `ud compile` generates EVM code for it and relocates every jump in the contract. Unedited files still recompile byte-identically. Internal and external calls, deleted statements and unreachable code aren't editable yet and are reported as errors. `--listing` gives the instruction-level form instead, where mnemonics and immediates are edited directly.
+Lifted statements are editable: change `require((v3 >= arg0))` to `require((v3 >= (arg0 + 0x64)))`, add `require(param1 != 0x0, "zero amount")` or `balanceOf[msg.sender] = 0x2a` (no byte list) to a function, or edit an `sstore`, assignment (including its target), `return abi.encode(…)`, `emit` or `if` condition, or comment a statement out (keeping its byte list) to delete it, and `ud compile` generates EVM code for it and relocates every jump in the contract. Unedited files still recompile byte-identically. Internal and external calls and unreachable code aren't editable yet and are reported as errors. `--listing` gives the instruction-level form instead, where mnemonics and immediates are edited directly.
 
 ## Targets
 

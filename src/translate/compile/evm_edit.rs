@@ -36,12 +36,18 @@
 //! arguments (same event and arity), and the conditions of `if`,
 //! `while` and `do … while`. New statements of those kinds (plus `if`
 //! blocks around them; not `emit`) can be added without bytes.
-//! Everything else — internal and external calls, renamed assignment
-//! targets, deleted statements, names no longer on the stack — is an
-//! error naming the statement.
+//! An assignment may also change its target — another stack variable
+//! or a storage variable — and the variables it no longer writes keep
+//! their previous values. A statement commented out in place (`// …`,
+//! keeping its byte list) is deleted: its effects go, and the stack
+//! it left is rebuilt for the code after it (`require` / `assert`
+//! continue where the check passes). Everything else — internal and
+//! external calls, statements that end a block, names no longer on
+//! the stack — is an error naming the statement.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use super::evm_emit::{
     Emitter, INVALID, JUMP, JUMPDEST, JUMPI, MSTORE, Opts, Piece, STOP, Sym, Target, lower_expr,
@@ -105,6 +111,7 @@ pub(crate) fn apply_edits(file: &UdFile, code: &[u8]) -> Result<Option<Vec<u8>>,
     for job in &jobs {
         let patch = match job {
             Job::Replace(r) => ctx.replace(r, &mut fresh),
+            Job::Delete(r) => ctx.delete(r, &mut fresh),
             Job::Insert(ins) => ctx.insert(ins, &mut fresh),
         }
         .map_err(|message| EvmEditError {
@@ -134,15 +141,23 @@ pub(crate) fn has_lifted_statements(file: &UdFile) -> bool {
 }
 
 /// Drop statements added without bytes that the generic lowerer can't
-/// pass over (assignments, numeric returns), so the pinned bytes alone
-/// can be lowered.
+/// pass over (assignments, numeric returns), and restore commented-out
+/// (deleted) ones, so the pinned bytes alone can be lowered.
 pub(crate) fn strip_added(file: &UdFile) -> UdFile {
+    let lifted = has_lifted_statements(file);
     let items = file
         .items
         .iter()
         .map(|it| match it {
             Item::Function(f) => Item::Function(FnDecl {
                 body: rebuild(&f.body, &|s| {
+                    if let Stmt::Comment(text) = s
+                        && lifted
+                        && let Some(gone) = commented_out(text)
+                    {
+                        // Deleted: its bytes are still the original code.
+                        return Some(gone);
+                    }
                     let added = matches!(
                         s,
                         Stmt::Move { bytes, .. } | Stmt::Return { bytes, .. } if bytes.is_empty()
@@ -158,6 +173,31 @@ pub(crate) fn strip_added(file: &UdFile) -> UdFile {
         module: file.module.clone(),
         items,
     }
+}
+
+/// A lifted statement commented out to delete it: `// text [bytes]`,
+/// a single-line statement keeping its byte list.
+fn commented_out(text: &str) -> Option<Stmt> {
+    let t = text.trim();
+    if !t.ends_with(']') || t.starts_with('@') {
+        return None;
+    }
+    let src = format!("@module {{\n    arch: \"evm\",\n}}\n\nfn f() {{\n    {t}\n}}\n");
+    let file = crate::translate::compile::parse(&src).ok()?;
+    let [Item::Function(f)] = file.items.as_slice() else {
+        return None;
+    };
+    let [s] = f.body.as_slice() else {
+        return None;
+    };
+    let carries = match s {
+        Stmt::Move { bytes, .. }
+        | Stmt::Call { bytes, .. }
+        | Stmt::ReturnExpr { bytes, .. }
+        | Stmt::Return { bytes, .. } => !bytes.is_empty(),
+        _ => false,
+    };
+    carries.then(|| s.clone())
 }
 
 /// `stmts` with `f` applied to every statement (nested ones first);
@@ -253,6 +293,8 @@ struct Replace {
     end: u64,
     /// Contiguous earlier siblings, nearest last.
     prev: Vec<Sib>,
+    /// Identifiers the function's statements use, as written.
+    used: Rc<HashSet<String>>,
 }
 
 #[derive(Debug)]
@@ -270,12 +312,20 @@ struct Insert {
 #[derive(Debug)]
 enum Job {
     Replace(Box<Replace>),
+    /// A statement commented out; `stmt` is what it said.
+    Delete(Box<Replace>),
     Insert(Insert),
 }
 
 impl Job {
     fn place(&self) -> String {
         match self {
+            Job::Delete(r) => format!(
+                "fn {}, offset 0x{:x}: deleted `{}`",
+                r.function,
+                r.start,
+                stmt_text(&r.stmt).unwrap_or_default()
+            ),
             Job::Replace(r) => format!(
                 "fn {}, offset 0x{:x}: `{}`",
                 r.function,
@@ -317,15 +367,45 @@ fn align_file(file: &UdFile, canonical: &UdFile) -> Result<Vec<Job>, EvmEditErro
         if p.name != c.name || p.addr != c.addr {
             return Err(mismatch());
         }
+        let mut used = HashSet::new();
+        used_names(&p.body, &mut used);
         let mut al = Aligner {
             function: &p.name,
             fn_addr: c.addr.unwrap_or(0),
             cursor: c.addr.unwrap_or(0),
             jobs: &mut jobs,
+            used: Rc::new(used),
         };
         al.list(&normalize(&p.body), &normalize(&c.body))?;
     }
     Ok(jobs)
+}
+
+/// Every identifier the live statements of `stmts` mention.
+fn used_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        if let Some(t) = stmt_text(s) {
+            out.extend(
+                t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .filter(|w| w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+                    .map(str::to_string),
+            );
+        }
+        match s {
+            Stmt::IfBranch {
+                pre_body,
+                then_body,
+                else_body,
+                ..
+            } => {
+                used_names(pre_body, out);
+                used_names(then_body, out);
+                used_names(else_body.as_deref().unwrap_or_default(), out);
+            }
+            Stmt::WhileBlock { body, .. } | Stmt::Loop { body, .. } => used_names(body, out),
+            _ => {}
+        }
+    }
 }
 
 /// Text a statement's edit is detected by.
@@ -480,6 +560,13 @@ struct Aligner<'j> {
     fn_addr: u64,
     cursor: u64,
     jobs: &'j mut Vec<Job>,
+    used: Rc<HashSet<String>>,
+}
+
+/// A statement as written: live, or commented out to delete it.
+enum Written<'s> {
+    Live(&'s Stmt),
+    Deleted(Stmt),
 }
 
 impl Aligner<'_> {
@@ -495,10 +582,27 @@ impl Aligner<'_> {
         }
     }
 
+    fn flush_added(&mut self, added: &mut Vec<Stmt>, end_of_list: bool) {
+        if !added.is_empty() {
+            self.jobs.push(Job::Insert(Insert {
+                function: self.function.to_string(),
+                fn_addr: self.fn_addr,
+                stmts: std::mem::take(added),
+                at: self.cursor,
+                end_of_list,
+            }));
+        }
+    }
+
     fn list(&mut self, p: &[Stmt], c: &[Stmt]) -> Result<(), EvmEditError> {
-        let p: Vec<&Stmt> = p
+        let p: Vec<Written<'_>> = p
             .iter()
-            .filter(|s| !matches!(s, Stmt::Comment(_)))
+            .filter_map(|s| match s {
+                Stmt::Comment(t) => {
+                    commented_out(t).map(|gone| Written::Deleted(normalize(&[gone]).remove(0)))
+                }
+                s => Some(Written::Live(s)),
+            })
             .collect();
         let c: Vec<&Stmt> = c
             .iter()
@@ -508,15 +612,43 @@ impl Aligner<'_> {
         let mut added: Vec<Stmt> = Vec::new();
         let mut sibs: Vec<Sib> = Vec::new();
         for ps in p {
-            if j < c.len() && same_shape(ps, c[j]) {
-                if !added.is_empty() {
-                    self.jobs.push(Job::Insert(Insert {
+            let ps = match ps {
+                Written::Deleted(gone) => {
+                    if j >= c.len() || !same_shape(&gone, c[j]) {
+                        return Err(self.err(
+                            &gone,
+                            "this commented-out statement doesn't match the re-lifted code here (comment a statement out in place, keeping its byte list, to delete it)",
+                        ));
+                    }
+                    self.flush_added(&mut added, false);
+                    let start = self.cursor;
+                    let len = own_len(c[j]) as u64;
+                    if is_structured(c[j]) || len == 0 {
+                        return Err(self.err(
+                            &gone,
+                            "only statements with bytes of their own can be deleted",
+                        ));
+                    }
+                    self.jobs.push(Job::Delete(Box::new(Replace {
                         function: self.function.to_string(),
                         fn_addr: self.fn_addr,
-                        stmts: std::mem::take(&mut added),
-                        at: self.cursor,
-                        end_of_list: false,
-                    }));
+                        stmt: gone,
+                        canon: c[j].clone(),
+                        start,
+                        end: start + len,
+                        prev: sibs.clone(),
+                        used: self.used.clone(),
+                    })));
+                    self.cursor += len;
+                    sibs.clear();
+                    j += 1;
+                    continue;
+                }
+                Written::Live(ps) => ps,
+            };
+            if j < c.len() && same_shape(ps, c[j]) {
+                if !added.is_empty() {
+                    self.flush_added(&mut added, false);
                     sibs.clear();
                 }
                 let start = self.cursor;
@@ -540,25 +672,17 @@ impl Aligner<'_> {
             } else {
                 return Err(self.err(
                     ps,
-                    "doesn't match the re-lifted code (statements can be edited in place or added without bytes, not moved or given new bytes); decompile again with this version if the file came from another one",
+                    "doesn't match the re-lifted code (statements can be edited in place, added without bytes, or commented out to delete them, not moved or given new bytes); decompile again with this version if the file came from another one",
                 ));
             }
         }
         if let Some(missing) = c.get(j) {
             return Err(self.err(
                 missing,
-                "this statement is missing; deleting lifted statements isn't supported",
+                "this statement is missing; to delete a statement, comment it out keeping its byte list",
             ));
         }
-        if !added.is_empty() {
-            self.jobs.push(Job::Insert(Insert {
-                function: self.function.to_string(),
-                fn_addr: self.fn_addr,
-                stmts: added,
-                at: self.cursor,
-                end_of_list: true,
-            }));
-        }
+        self.flush_added(&mut added, true);
         Ok(())
     }
 
@@ -632,6 +756,7 @@ impl Aligner<'_> {
                 start,
                 end: start + len,
                 prev: sibs.to_vec(),
+                used: self.used.clone(),
             })));
         }
         self.cursor += len;
@@ -1178,60 +1303,7 @@ impl<'a> Ctx<'a> {
 
         match (&r.stmt, &r.canon) {
             (Stmt::Move { dst, src, .. }, Stmt::Move { dst: cdst, .. }) => {
-                if dst != cdst {
-                    return Err("changing which variables an assignment writes isn't supported; edit the right-hand side".into());
-                }
-                // `owner = v` / `balanceOf[k] = v` store to named storage.
-                if let Ok(place) = parse_expr(dst)
-                    && self.is_place(&place)
-                {
-                    return self.replace_store(r, 0x55, &place, true, &parse(src)?, b, fresh);
-                }
-                let dsts: Vec<&str> = dst.split(", ").collect();
-                let srcs = parse_many(src)?;
-                if srcs.len() != dsts.len() {
-                    return Err(format!(
-                        "{} target(s) but {} value(s)",
-                        dsts.len(),
-                        srcs.len()
-                    ));
-                }
-                if self.insns[a..b]
-                    .iter()
-                    .any(|i| matches!(i.opcode, 0x56 | 0x57))
-                {
-                    return Err("assignments from internal calls can't be edited".into());
-                }
-                let k = self.pick_start(r, &names_of(&srcs))?;
-                let mut sim = self.simulate(k, b)?;
-                if let Some((op, _)) = sim.effects.iter().find(|(op, _)| *op != MSTORE) {
-                    return Err(format!(
-                        "the statement's code also runs `{}`, which its text doesn't show",
-                        OPCODE_TABLE[*op as usize].name
-                    ));
-                }
-                let pre = self.before(k)?;
-                let post = self.after(b)?;
-                for (d, s) in dsts.iter().zip(&srcs) {
-                    if *d == "_" {
-                        continue;
-                    }
-                    let v = lower(s, pre)?;
-                    let at = dst_positions(post, d);
-                    if at.is_empty() {
-                        return Err(format!("can't locate `{d}` on the stack"));
-                    }
-                    for t in at {
-                        *sim.at_mut(t) = v.clone();
-                    }
-                }
-                let mut em = self.emitter(k, sim.consumed, fresh);
-                em.materialize(sim.consumed, &sim.items).map_err(|e| e.0)?;
-                Ok(Patch {
-                    from: k,
-                    to: b,
-                    pieces: em.pieces,
-                })
+                self.assign(r, Some((dst, src)), cdst, a, b, fresh)
             }
             (Stmt::Call { name, args, .. }, Stmt::Call { name: cname, .. }) => {
                 if name != cname
@@ -1336,6 +1408,207 @@ impl<'a> Ctx<'a> {
             (Stmt::Loop { cond_text, .. }, _) => self.replace_cond(r, cond_text, true, b, fresh),
             _ => Err("editing this kind of statement isn't supported".into()),
         }
+    }
+
+    /// Rewrite the assignment `old = …` spanning `a..b` to `new` (`None`
+    /// deletes it). Stack variables it no longer writes keep the values
+    /// they had before it; one that had none is left as zero when no
+    /// other statement mentions it.
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    fn assign(
+        &self,
+        r: &Replace,
+        new: Option<(&str, &str)>,
+        old: &str,
+        a: usize,
+        b: usize,
+        fresh: &mut u32,
+    ) -> Res<Patch> {
+        let opts = self.opts;
+        let parse = |t: &str| parse_expr(t).map_err(|e| format!("can't parse `{t}`: {e}"));
+        let as_place = |d: &str| parse_expr(d).ok().filter(|e| self.is_place(e));
+        let old_place = as_place(old);
+        let new_place = new.and_then(|(d, _)| as_place(d));
+        // `owner = v` / `balanceOf[k] = v` store to named storage.
+        if let (Some(_), Some(place), Some((_, src))) = (&old_place, &new_place, new) {
+            return self.replace_store(r, 0x55, place, true, &parse(src)?, b, fresh);
+        }
+        if self.insns[a..b]
+            .iter()
+            .any(|i| matches!(i.opcode, 0x56 | 0x57))
+        {
+            return Err("assignments from internal calls can't be edited".into());
+        }
+        let (new_dsts, srcs): (Vec<&str>, Vec<EExpr>) = match new {
+            None => (Vec::new(), Vec::new()),
+            Some((_, src)) if new_place.is_some() => (Vec::new(), vec![parse(src)?]),
+            Some((dst, src)) => {
+                let dsts: Vec<&str> = dst.split(", ").collect();
+                let srcs = parse_list(src).map_err(|e| format!("can't parse `{src}`: {e}"))?;
+                if srcs.len() != dsts.len() {
+                    return Err(format!(
+                        "{} target(s) but {} value(s)",
+                        dsts.len(),
+                        srcs.len()
+                    ));
+                }
+                (dsts, srcs)
+            }
+        };
+        let mut exprs: Vec<&EExpr> = srcs.iter().collect();
+        exprs.extend(&new_place);
+        let k = self.pick_start(r, &self.needed(r.fn_addr, &exprs))?;
+        let mut sim = self.simulate(k, b)?;
+        let stores = sim.effects.iter().filter(|(o, _)| *o == 0x55).count();
+        if let Some((op, _)) = sim.effects.iter().find(|(o, _)| *o != MSTORE && *o != 0x55) {
+            return Err(format!(
+                "the statement's code also runs `{}`, which its text doesn't show",
+                OPCODE_TABLE[*op as usize].name
+            ));
+        }
+        if stores != usize::from(old_place.is_some()) {
+            return Err(
+                "the statement's code also runs `SSTORE`, which its text doesn't show".into(),
+            );
+        }
+        let pre = self.before(k)?;
+        let post = self.after(b)?;
+        let names = self.at(r.fn_addr, pre);
+        for (d, e) in new_dsts.iter().zip(&srcs) {
+            if *d == "_" {
+                continue;
+            }
+            let v = lower_expr(e, &names, opts).map_err(|e| e.0)?;
+            let at = dst_positions(post, d);
+            if at.is_empty() {
+                return Err(format!(
+                    "`{d}` isn't on the stack after this statement; assign a variable the code after it holds"
+                ));
+            }
+            for t in at {
+                *sim.at_mut(t) = v.clone();
+            }
+        }
+        if old_place.is_none() {
+            for d in old.split(", ") {
+                if d == "_" || new_dsts.contains(&d) {
+                    continue;
+                }
+                // Siblings the replacement extends over mustn't write it.
+                if r.prev.iter().any(|sib| {
+                    self.index.get(&sib.start).is_some_and(|&s| s >= k)
+                        && sib.dsts.iter().any(|x| x == d)
+                }) {
+                    return Err(format!(
+                        "`{d}` is also assigned just before; edit that statement instead"
+                    ));
+                }
+                let kept = match pre.iter().position(|s| s.var.as_deref() == Some(d)) {
+                    Some(t) => Sym::Slot(t),
+                    None if !r.used.contains(d) => Sym::konst(0),
+                    None => {
+                        return Err(format!(
+                            "`{d}` has no value without this assignment, but other statements use it"
+                        ));
+                    }
+                };
+                for t in dst_positions(post, d) {
+                    *sim.at_mut(t) = kept.clone();
+                }
+            }
+        }
+        let mut em = self.emitter(k, sim.consumed, fresh);
+        if let Some(place) = &new_place {
+            let slot = lower_place(place, &names, opts)
+                .map_err(|e| e.0)?
+                .ok_or("not a storage location")?;
+            let v = lower_expr(&srcs[0], &names, opts).map_err(|e| e.0)?;
+            em.value(&v).map_err(|e| e.0)?;
+            em.value(&slot).map_err(|e| e.0)?;
+            em.op(0x55, None).map_err(|e| e.0)?;
+        }
+        em.materialize(sim.consumed, &sim.items).map_err(|e| e.0)?;
+        Ok(Patch {
+            from: k,
+            to: b,
+            pieces: em.pieces,
+        })
+    }
+
+    /// Code for a commented-out statement: what it left on the stack
+    /// for the code after it, without its effects.
+    fn delete(&self, r: &Replace, fresh: &mut u32) -> Res<Patch> {
+        let a = self.idx(r.start)?;
+        let b = self.idx(r.end)?;
+        let last = self.opcode_at(b - 1).unwrap_or(STOP);
+        match &r.canon {
+            Stmt::Move { dst, .. } => self.assign(r, None, dst, a, b, fresh),
+            Stmt::Call { name, .. } if matches!(name.as_str(), "require" | "assert") => {
+                self.delete_guard(a, b, fresh)
+            }
+            _ if matches!(last, 0x00 | 0xf3 | 0xfd | 0xfe | 0xff | JUMP | JUMPI) => Err(
+                "a statement that ends its block (a halt, return or jump) can't be deleted; edit it instead".into(),
+            ),
+            Stmt::Call { .. } => {
+                let sim = self.simulate(a, b)?;
+                let mut em = self.emitter(a, sim.consumed, fresh);
+                em.materialize(sim.consumed, &sim.items).map_err(|e| e.0)?;
+                Ok(Patch {
+                    from: a,
+                    to: b,
+                    pieces: em.pieces,
+                })
+            }
+            _ => Err("deleting this kind of statement isn't supported".into()),
+        }
+    }
+
+    /// A deleted `require` / `assert`: continue where its check passes.
+    fn delete_guard(&self, a: usize, b: usize, fresh: &mut u32) -> Res<Patch> {
+        let j = (a..b)
+            .find(|&k| matches!(self.insns[k].opcode, 0x56 | 0x57))
+            .filter(|&k| self.insns[k].opcode == JUMPI)
+            .ok_or("the statement's code has no conditional jump")?;
+        let mut sim = self.simulate(a, j)?;
+        if !sim.effects.iter().all(|(o, _)| *o == MSTORE) {
+            return Err("the condition's code has effects its text doesn't show".into());
+        }
+        let target = sim.pop();
+        sim.pop();
+        let dest = match &target {
+            Sym::Label(Target::Orig(t), _) => Some(*t),
+            // Pushed by an earlier statement: as the CFG resolved it.
+            _ => self
+                .cfg
+                .blocks
+                .iter()
+                .position(|blk| blk.insns.contains(&j))
+                .and_then(
+                    |blk| match self.cfg.targets[blk].iter().collect::<Vec<_>>()[..] {
+                        [&t] => Some(self.cfg.blocks[t].start),
+                        _ => None,
+                    },
+                ),
+        };
+        let dest = dest.ok_or("the jump target isn't known")?;
+        let mut em = self.emitter(a, sim.consumed, fresh);
+        let falls_in = self
+            .insns
+            .get(b)
+            .is_some_and(|i| i.opcode == JUMPDEST && i.addr.0 == dest);
+        if falls_in {
+            em.materialize(sim.consumed, &sim.items).map_err(|e| e.0)?;
+        } else {
+            let mut goal = sim.items.clone();
+            goal.push(target);
+            em.materialize(sim.consumed, &goal).map_err(|e| e.0)?;
+            em.op(JUMP, None).map_err(|e| e.0)?;
+        }
+        Ok(Patch {
+            from: a,
+            to: b,
+            pieces: em.pieces,
+        })
     }
 
     /// A store (`op`) of `val` at `key` — an address, or with `place`
@@ -2068,6 +2341,22 @@ mod tests {
         out
     }
 
+    /// Comment that statement out, deleting it.
+    fn comment_out(text: &str, bytes: &str, hint: &str) -> String {
+        let n = find_line(text, bytes, hint);
+        text.lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == n {
+                    let indent = line.len() - line.trim_start().len();
+                    format!("{}// {}\n", &line[..indent], line.trim_start())
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect()
+    }
+
     fn compile(text: &str) -> Result<Vec<u8>, String> {
         let ast = parse(text).map_err(|e| e.to_string())?;
         lower_to_evm(&ast).map_err(|e| e.to_string())
@@ -2477,7 +2766,7 @@ mod tests {
             "require((v3 >= nosuch))",
         ));
         assert!(e.contains("`nosuch`"), "{e}");
-        // A deleted statement.
+        // A statement removed outright, rather than commented out.
         let n = find_line(&text, WITHDRAW_REQUIRE, "");
         let gone: Vec<&str> = text
             .lines()
@@ -2487,6 +2776,157 @@ mod tests {
             .collect();
         let gone = gone.join("\n");
         let e = err(&gone);
-        assert!(e.contains("deleting"), "{e}");
+        assert!(e.contains("comment"), "{e}");
+        // Deleting an assignment whose variable is still read.
+        let e = err(&comment_out(&text, "0x03, 0x92, 0x50, 0x50, 0x81]", "arg0"));
+        assert!(e.contains("`v2` has no value"), "{e}");
+        // Renaming to a variable that isn't on the stack.
+        let e = err(&retext(
+            &text,
+            "0x03, 0x92, 0x50, 0x50, 0x81]",
+            "arg0",
+            "nosuch = v6 - arg0",
+        ));
+        assert!(e.contains("`nosuch`"), "{e}");
+    }
+
+    #[test]
+    fn deleted_statements_compile() {
+        let code = weth();
+        let text = decompile_evm_to_text(&code);
+        // withdraw() without its balance check, and deposit() without
+        // its event.
+        let edited = comment_out(&text, WITHDRAW_REQUIRE, "");
+        let edited = comment_out(&edited, "0x50, 0x33, 0x73", "Deposit");
+        let new = compile(&edited).unwrap();
+        let relifted = decompile_evm_to_text(&new);
+        assert!(!relifted.contains("require((v3 >= arg0))"), "{relifted}");
+        assert!(!relifted.contains("emit(Deposit"), "{relifted}");
+        assert_eq!(compile(&relifted).unwrap(), new);
+        let mut m = Machine::new(&new);
+        assert_eq!(send(&mut m, ALICE, 1000, "deposit()", &[]), Outcome::Stop);
+        assert!(m.logs.is_empty());
+        assert_eq!(balance_of(&mut m, ALICE), u(1000));
+        assert_eq!(
+            send(&mut m, ALICE, 0, "withdraw(uint256)", &[u(1500)]),
+            Outcome::Stop
+        );
+        assert_eq!(m.calls.last(), Some(&(u(ALICE), u(1500))));
+        assert_eq!(
+            balance_of(&mut m, ALICE),
+            U256([!499, u64::MAX, u64::MAX, u64::MAX])
+        );
+
+        // withdraw() that doesn't debit: its `sstore` deleted.
+        let edited = comment_out(&text, "0x90, 0x55]", "sstore(v3, v2)");
+        let new = compile(&edited).unwrap();
+        let mut m = Machine::new(&new);
+        send(&mut m, ALICE, 1000, "deposit()", &[]);
+        assert_eq!(
+            send(&mut m, ALICE, 0, "withdraw(uint256)", &[u(400)]),
+            Outcome::Stop
+        );
+        assert_eq!(m.calls.last(), Some(&(u(ALICE), u(400))));
+        assert_eq!(balance_of(&mut m, ALICE), u(1000));
+        let out = send(&mut m, ALICE, 0, "withdraw(uint256)", &[u(1001)]);
+        assert!(matches!(out, Outcome::Revert(_)), "{out:?}");
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = format!("{}/testdata/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read(path).expect("fixture")
+    }
+
+    /// The router's `quote()` without its non-zero-amount check.
+    #[test]
+    fn deleted_require_in_router() {
+        let code = fixture("uniswap-v2-router02-mainnet.evm");
+        let text = decompile_evm_to_text(&code);
+        let edited = comment_out(&text, "0x57, 0x60, 0x40", "INSUFFICIENT_AMOUNT\")");
+        let new = compile(&edited).unwrap();
+        let relifted = decompile_evm_to_text(&new);
+        assert!(!relifted.contains("INSUFFICIENT_AMOUNT\")"), "{relifted}");
+        let quote = "quote(uint256,uint256,uint256)";
+        for (bin, edited) in [(&code, false), (&new, true)] {
+            let mut m = Machine::new(bin);
+            let out = send(&mut m, ALICE, 0, quote, &[u(0), u(5), u(7)]);
+            if edited {
+                assert_eq!(out, Outcome::Return(word(0)));
+            } else {
+                assert!(matches!(out, Outcome::Revert(_)), "{out:?}");
+            }
+            let out = send(&mut m, ALICE, 0, quote, &[u(10), u(5), u(7)]);
+            assert_eq!(out, Outcome::Return(word(14)));
+            let out = send(&mut m, ALICE, 0, quote, &[u(10), u(0), u(7)]);
+            assert!(matches!(out, Outcome::Revert(_)), "{out:?}");
+        }
+    }
+
+    /// Vyper: the 3pool's `A()` made payable.
+    #[test]
+    fn deleted_require_in_vyper() {
+        let code = fixture("curve-3pool-mainnet.evm");
+        let text = decompile_evm_to_text(&code);
+        let edited = comment_out(&text, "0x34, 0x15, 0x61, 0x02, 0x5d", "require(!msg.value)");
+        let new = compile(&edited).unwrap();
+        assert!(new.len() < code.len());
+        let mut m = Machine::new(&code);
+        let free = send(&mut m, ALICE, 0, "A()", &[]);
+        assert!(matches!(free, Outcome::Return(_)), "{free:?}");
+        let paid = send(&mut m, ALICE, 1, "A()", &[]);
+        assert!(matches!(paid, Outcome::Revert(_)), "{paid:?}");
+        let mut m = Machine::new(&new);
+        assert_eq!(send(&mut m, ALICE, 0, "A()", &[]), free);
+        assert_eq!(send(&mut m, ALICE, 1, "A()", &[]), free);
+    }
+
+    #[test]
+    fn renamed_assignment_targets() {
+        let code = weth();
+        let text = decompile_evm_to_text(&code);
+        // approve() records the allowance the other way round.
+        let edited = retext(
+            &text,
+            "",
+            "allowance[address(msg.sender)][address(arg0)] = arg1",
+            "allowance[address(arg0)][address(msg.sender)] = arg1",
+        );
+        // withdraw() writes what remains to BOB's balance instead of
+        // the caller's: the assignment to `v2` becomes a store, and the
+        // `sstore` of `v2` goes.
+        let edited = retext(
+            &edited,
+            "0x03, 0x92, 0x50, 0x50, 0x81]",
+            "arg0",
+            "balanceOf[address(0xb0b)] = v6 - arg0",
+        );
+        let edited = comment_out(&edited, "0x90, 0x55]", "sstore(v3, v2)");
+        let new = compile(&edited).unwrap();
+        let relifted = decompile_evm_to_text(&new);
+        assert!(
+            relifted.contains("allowance[address(arg0)][address(msg.sender)] = arg1"),
+            "{relifted}"
+        );
+        assert_eq!(compile(&relifted).unwrap(), new);
+        let mut m = Machine::new(&new);
+        send(&mut m, ALICE, 1000, "deposit()", &[]);
+        send(
+            &mut m,
+            ALICE,
+            0,
+            "approve(address,uint256)",
+            &[u(BOB), u(5)],
+        );
+        let allowance = |m: &mut Machine, a: u64, b: u64| {
+            send(m, a, 0, "allowance(address,address)", &[u(a), u(b)])
+        };
+        assert_eq!(allowance(&mut m, BOB, ALICE), Outcome::Return(word(5)));
+        assert_eq!(allowance(&mut m, ALICE, BOB), Outcome::Return(word(0)));
+        assert_eq!(
+            send(&mut m, ALICE, 0, "withdraw(uint256)", &[u(300)]),
+            Outcome::Stop
+        );
+        assert_eq!(balance_of(&mut m, ALICE), u(1000));
+        assert_eq!(balance_of(&mut m, BOB), u(700));
     }
 }

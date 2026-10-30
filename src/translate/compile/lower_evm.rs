@@ -44,7 +44,7 @@ pub enum EvmLowerError {
     #[error(transparent)]
     Edit(#[from] EvmEditError),
     #[error(
-        "{0}: the pinned bytes no longer cover the code; lifted statements can be edited or added, but deleting them (or editing their byte lists) isn't supported"
+        "{0}: the pinned bytes no longer cover the code; lifted statements can be edited, added without bytes, or deleted by commenting them out (keeping their byte lists), but not removed outright or given new byte lists"
     )]
     PinnedBytes(RawLowerError),
     #[error(
