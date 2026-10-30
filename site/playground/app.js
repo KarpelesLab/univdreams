@@ -207,31 +207,81 @@ function onLoadProgram() {
   });
 }
 
-async function fetchEvmContract(address, rpcUrl) {
-  setStatus(`Fetching ${address} from ${new URL(rpcUrl).host}…`, "");
+const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const EVM_TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
+// Arachnid's deterministic-deployment proxy (same address on most
+// chains): its calldata is a 32-byte salt followed by the initcode.
+const CREATE2_FACTORY = "0x4e59b44847b379578588920ca78fbf26c0b4956c";
+
+// `0x`-prefixed hex from JSON-RPC to bytes; rejects anything else
+// rather than silently decoding garbage as zeros.
+function hexToBytes(hex, what) {
+  if (typeof hex !== "string" || !/^0x([0-9a-fA-F]{2})*$/.test(hex)) {
+    throw new Error(`${what}: malformed hex from the RPC`);
+  }
+  const out = new Uint8Array((hex.length - 2) / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(2 + 2 * i, 4 + 2 * i), 16);
+  }
+  return out;
+}
+
+// `target` is a contract address (runtime code, `eth_getCode`) or a
+// deployment transaction hash (its initcode: the constructor plus the
+// runtime it deploys, decompiled as a nested section).
+async function fetchEvmContract(target, rpcUrl) {
+  setStatus(`Fetching ${target} from ${new URL(rpcUrl).host}…`, "");
   const chainId = parseInt(await jsonRpc(rpcUrl, "eth_chainId", []), 16);
-  const hex = await jsonRpc(rpcUrl, "eth_getCode", [address, "latest"]);
-  if (typeof hex !== "string" || hex.length <= 2) {
-    throw new Error(`no code at ${address} on chain ${chainId} (externally-owned account or destroyed contract)`);
+  let code;
+  let what;
+  if (EVM_TX_HASH_RE.test(target)) {
+    const tx = await jsonRpc(rpcUrl, "eth_getTransactionByHash", [target]);
+    if (!tx) {
+      throw new Error(`no transaction ${target} on chain ${chainId}`);
+    }
+    code = hexToBytes(tx.input, "transaction input");
+    const to = tx.to ? tx.to.toLowerCase() : null;
+    if (to === CREATE2_FACTORY && code.length > 32) {
+      code = code.slice(32);
+    } else if (to !== null) {
+      throw new Error(
+        `transaction ${target} calls ${tx.to}, so it isn't a contract creation (contracts deployed by a factory have no initcode of their own)`,
+      );
+    }
+    if (code.length === 0) {
+      throw new Error(`transaction ${target} creates a contract with empty initcode`);
+    }
+    what = "creation code";
+  } else {
+    code = hexToBytes(
+      await jsonRpc(rpcUrl, "eth_getCode", [target, "latest"]),
+      "eth_getCode",
+    );
+    if (code.length === 0) {
+      throw new Error(`no code at ${target} on chain ${chainId} (externally-owned account or destroyed contract)`);
+    }
+    what = "runtime code";
   }
-  const code = new Uint8Array((hex.length - 2) / 2);
-  for (let i = 0; i < code.length; i++) {
-    code[i] = parseInt(hex.substr(2 + 2 * i, 2), 16);
+  uploadName = `${target}.evm`;
+  $filename.textContent = `${target} (${code.length} bytes of ${what}, chain ${chainId})`;
+  // Keep the EVM form the user picked (lifted or listing).
+  if ($format.value !== "evm" && $format.value !== "evm-listing") {
+    $format.value = "evm";
   }
-  uploadName = `${address}.evm`;
-  $filename.textContent = `${address} (${code.length} bytes, chain ${chainId})`;
-  $format.value = "evm";
-  await decompileBytes(code, address);
+  await decompileBytes(code, target);
 }
 
 function onLoadContract() {
-  const address = $evmAddress.value.trim();
-  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
-    setStatus("Enter a contract address: 0x followed by 40 hex digits.", "warn");
+  const target = $evmAddress.value.trim();
+  if (!EVM_ADDRESS_RE.test(target) && !EVM_TX_HASH_RE.test(target)) {
+    setStatus(
+      "Enter a contract address (0x + 40 hex digits) or a deployment transaction hash (0x + 64 hex digits).",
+      "warn",
+    );
     return;
   }
   const rpc = ($evmRpcUrl.value || "").trim() || EVM_RPC_DEFAULT;
-  void fetchEvmContract(address, rpc).catch((e) => {
+  void fetchEvmContract(target, rpc).catch((e) => {
     setStatus(`EVM fetch failed: ${e.message || e}`, "error");
   });
 }
@@ -347,7 +397,8 @@ async function start() {
     onLoadProgram();
     return;
   }
-  // ?contract=<0x address> does the same for the EVM tab.
+  // ?contract=<0x address or deployment tx hash> does the same for
+  // the EVM tab.
   const queryContract = params.get("contract");
   if (queryContract) {
     selectTab("evm");

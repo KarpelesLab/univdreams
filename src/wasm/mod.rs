@@ -37,8 +37,11 @@ use crate::translate::compile::AsmWarning;
 ///   is derived from the file length (top of the 16-bit address
 ///   space).
 ///
-/// `"auto"` also picks EVM bytecode when it carries a compiler
-/// metadata trailer or solc's prologue, or arrives as hex text.
+/// `"auto"` also picks EVM bytecode when
+/// [`looks_like_evm`](crate::format::evm::looks_like_evm) accepts it
+/// (metadata trailer, solc / Vyper entry sequence, EIP-1167 clone,
+/// EIP-7702 designator) or it arrives as hex text. Creation code
+/// decompiles with the runtime it deploys as a nested section.
 #[wasm_bindgen]
 pub fn decompile(bytes: &[u8], format: &str) -> Result<String, JsError> {
     set_panic_hook();
@@ -336,6 +339,32 @@ mod tests {
             bytes.len(),
             rebuilt.len()
         );
+    }
+
+    /// The playground's EVM path: creation code as `0x` hex text (how
+    /// JSON-RPC and explorers hand it out), auto-detected, in both
+    /// forms, compiles back to the same bytes.
+    #[test]
+    fn evm_hex_text_round_trips() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/initcode-immutable-mainnet.evm"
+        );
+        let Ok(bytes) = std::fs::read(path) else {
+            return; // fixture missing; skip
+        };
+        if bytes.starts_with(b"version https://") {
+            return; // LFS pointer; skip
+        }
+        let mut hex = String::from("0x");
+        for b in &bytes {
+            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+        }
+        for format in ["auto", "evm", "evm-listing"] {
+            let text = decompile(hex.as_bytes(), format).expect("decompile");
+            assert!(text.contains("@section(\"runtime\""), "{format}");
+            assert_eq!(compile(&text).expect("compile"), bytes, "{format}");
+        }
     }
 
     // Error-path tests can't run natively: `JsError::new` is a

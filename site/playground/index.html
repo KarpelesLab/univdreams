@@ -33,6 +33,7 @@ Or load a live Solana program by its address — the browser fetches the on-chai
 Append <code>?program=&lt;id&gt;</code> to this page's URL to deep-link a program.
 EVM contracts work the same way from the <em>EVM chain</em> tab (any chain's JSON-RPC endpoint) — try
 <a href="#" id="example-evm">WETH9</a>, or deep-link with <code>?contract=0x…</code>.
+A deployment's transaction hash loads its creation code instead: the constructor, with the runtime it deploys decompiled as a nested section.
 </p>
 
 <div class="playground">
@@ -69,7 +70,7 @@ EVM contracts work the same way from the <em>EVM chain</em> tab (any chain's JSO
       </div>
       <div class="tab-panel hidden" data-panel="evm">
         <input id="evm-address" type="text"
-               placeholder="Contract address (0x…)"
+               placeholder="Contract address or deployment tx hash (0x…)"
                size="44"
                autocomplete="off">
         <input id="evm-rpc-url" type="text"
