@@ -2454,9 +2454,10 @@ impl BlockLift<'_, '_> {
         let name = render_arg(to);
         let value = render_arg(&a[2]);
         Some(
-            if name
-                .chars()
-                .all(|c| c == '_' || c == '.' || c.is_ascii_alphanumeric())
+            if name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+                && name
+                    .chars()
+                    .all(|c| c == '_' || c == '.' || c.is_ascii_alphanumeric())
             {
                 format!("{name}.send({value})")
             } else {

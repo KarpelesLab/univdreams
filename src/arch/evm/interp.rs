@@ -57,7 +57,7 @@ impl U256 {
         std::cmp::Ordering::Equal
     }
 
-    fn add(self, o: Self) -> Self {
+    pub(crate) fn add(self, o: Self) -> Self {
         let mut r = [0u64; 4];
         let mut carry = false;
         for (i, limb) in r.iter_mut().enumerate() {

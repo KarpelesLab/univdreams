@@ -430,6 +430,23 @@ impl<'f> Emitter<'f> {
         free(s) || self.model.contains(s)
     }
 
+    /// After a `JUMP` into an internal function: it took the top
+    /// `consumed` items (its frame) and left `results` (bottom first).
+    pub(crate) fn returned(&mut self, consumed: usize, results: &[Sym]) -> Result<(), EmitError> {
+        let Some(start) = self.model.len().checked_sub(consumed) else {
+            return fail("stack underflow in generated code");
+        };
+        self.model.truncate(start);
+        self.model.extend_from_slice(results);
+        Ok(())
+    }
+
+    /// A value distinct from every other.
+    pub(crate) fn fresh_opaque(&mut self) -> Sym {
+        self.opaque += 1;
+        Sym::Opaque(self.opaque)
+    }
+
     /// The top `n` modelled items, bottom first.
     pub(crate) fn top(&self, n: usize) -> Result<Vec<Sym>, EmitError> {
         let Some(start) = self.model.len().checked_sub(n) else {

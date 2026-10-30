@@ -41,9 +41,25 @@
 //! their previous values. A statement commented out in place (`// …`,
 //! keeping its byte list) is deleted: its effects go, and the stack
 //! it left is rebuilt for the code after it (`require` / `assert`
-//! continue where the check passes). Everything else — internal and
-//! external calls, statements that end a block, names no longer on
-//! the stack — is an error naming the statement.
+//! continue where the check passes).
+//!
+//! Calls: an internal call (`sub_xxxx(args)`, alone or as the last
+//! value of an assignment whose last targets take its results) is
+//! compiled from the callee's CFG summary — the arguments it takes
+//! below and above the return address, how many values it returns —
+//! as `PUSH ret; args…; PUSH sub_xxxx; JUMP`, returning straight to
+//! the old continuation when the results land where it expects them.
+//! External calls spelt as `call(…)` / `callcode(…)` (7 arguments),
+//! `staticcall(…)` / `delegatecall(…)` (6) and `to.send(v)` /
+//! `send(to, v)` (`call(!v * 2300, to, v, 0, 0, 0, 0)`) are compiled
+//! in place of the call opcode. Either kind can be edited, added or
+//! deleted. Vyper's `PUSH d; PC; ADD` return addresses become label
+//! pushes inside edited code, and wherever an edit changes the size of
+//! the code between one and its target.
+//!
+//! Everything else — calls in other forms or inside expressions,
+//! statements that end a block, names no longer on the stack — is an
+//! error naming the statement.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -53,11 +69,11 @@ use super::evm_emit::{
     Emitter, INVALID, JUMP, JUMPDEST, JUMPI, MSTORE, Opts, Piece, STOP, Sym, Target, lower_expr,
     lower_place, negate,
 };
-use super::evm_expr::{EExpr, parse_expr, parse_list};
+use super::evm_expr::{BinOp, EExpr, UnOp, parse_expr, parse_list};
 use crate::arch::evm::{DecodedInsn, OPCODE_TABLE, assemble_one};
 use crate::ast::{FnDecl, Item, Stmt, UdFile};
 use crate::translate::decompile::evm::{Relift, relift};
-use crate::translate::decompile::evm_cfg::{self, Cfg, JumpRole};
+use crate::translate::decompile::evm_cfg::{self, Cfg, FuncInfo, JumpRole};
 use crate::translate::decompile::evm_lift::SlotNames;
 
 /// An edit that can't be compiled.
@@ -120,8 +136,8 @@ pub(crate) fn apply_edits(file: &UdFile, code: &[u8]) -> Result<Option<Vec<u8>>,
         })?;
         patches.push(patch);
     }
-    check_pc(&ctx, &patches)?;
-    let out = layout(file, &rl.insns, &reloc, patches)?;
+    let rewrites = pc_rewrites(&ctx, &patches)?;
+    let out = layout(file, &rl.insns, &reloc, patches, &rewrites)?;
     if out.len() != code.len() && rl.insns.iter().any(|i| i.opcode == 0x38) {
         return Err(whole_file(
             "the contract reads `CODESIZE` and the edit changes its size",
@@ -953,6 +969,68 @@ fn is_pure(op: u8) -> bool {
     )
 }
 
+/// An assignment [`Ctx::rewrite`] generates.
+struct Rewrite<'w> {
+    /// Stack targets (none for a store).
+    dsts: &'w [&'w str],
+    srcs: &'w [EExpr],
+    /// The storage variable written instead.
+    place: Option<&'w EExpr>,
+    /// Stack targets of the original statement.
+    old: &'w [&'w str],
+    /// The original stored to a storage variable.
+    old_place: bool,
+}
+
+impl<'w> Rewrite<'w> {
+    /// A call statement assigning nothing: `srcs` is the call, or
+    /// empty to drop it.
+    fn call(srcs: &'w [EExpr]) -> Self {
+        Self {
+            dsts: &[],
+            srcs,
+            place: None,
+            old: &[],
+            old_place: false,
+        }
+    }
+}
+
+/// `sub_xxxx(…)`.
+fn is_internal_call(e: &EExpr) -> bool {
+    matches!(e, EExpr::Call(n, _) if n.starts_with("sub_"))
+}
+
+/// An external call the text can spell: its opcode and stack
+/// arguments, top first. `to.send(v)` / `send(to, v)` are
+/// `call(!v * 2300, to, v, 0, 0, 0, 0)`.
+fn ext_call(e: &EExpr) -> Option<(u8, Vec<EExpr>)> {
+    let EExpr::Call(name, args) = e else {
+        return None;
+    };
+    let send = |to: EExpr, v: &EExpr| {
+        let gas = EExpr::Binary(
+            BinOp::Mul,
+            Box::new(EExpr::Unary(UnOp::Not, Box::new(v.clone()))),
+            Box::new(EExpr::Num(vec![0x08, 0xfc])),
+        );
+        let zero = || EExpr::Num(Vec::new());
+        Some((
+            0xf1,
+            vec![gas, to, v.clone(), zero(), zero(), zero(), zero()],
+        ))
+    };
+    match (name.as_str(), args.as_slice()) {
+        ("call", [..]) if args.len() == 7 => Some((0xf1, args.clone())),
+        ("callcode", [..]) if args.len() == 7 => Some((0xf2, args.clone())),
+        ("delegatecall", [..]) if args.len() == 6 => Some((0xf4, args.clone())),
+        ("staticcall", [..]) if args.len() == 6 => Some((0xfa, args.clone())),
+        ("send", [to, v]) => send(to.clone(), v),
+        (n, [v]) => send(EExpr::Name(n.strip_suffix(".send")?.to_string()), v),
+        _ => None,
+    }
+}
+
 struct Ctx<'a> {
     insns: &'a [DecodedInsn],
     trace: &'a crate::translate::decompile::evm_lift::LiftTrace,
@@ -1155,13 +1233,31 @@ impl<'a> Ctx<'a> {
     /// Symbolically run instructions `from..to`, which mustn't jump or
     /// halt; a `JUMPDEST` inside them must not be a jump target.
     fn simulate(&self, from: usize, to: usize) -> Res<Sim> {
-        let mut s = Sim::default();
+        self.simulate_from(Sim::default(), from, from, to)
+    }
+
+    /// [`Self::simulate`] of `from..to` continuing from state `s`;
+    /// `first` is where the statement's code starts.
+    fn simulate_from(&self, mut s: Sim, first: usize, from: usize, to: usize) -> Res<Sim> {
         for k in from..to {
             let ins = &self.insns[k];
             let op = ins.opcode;
+            // A Vyper return address `PC + d`: the label it computes.
+            if op == 0x58
+                && let Some((lo, end, target)) = pc_return(self.insns, &self.index, k)
+                && lo >= first
+                && end <= to
+            {
+                if lo < k {
+                    s.pop();
+                }
+                s.items.push(Sym::Label(Target::Orig(target), 2));
+                // Continue after the `ADD`.
+                return self.simulate_from(s, first, end, to);
+            }
             match op {
                 JUMPDEST => {
-                    if k != from && self.referenced.contains(&ins.addr.0) {
+                    if k != first && self.referenced.contains(&ins.addr.0) {
                         return Err(format!(
                             "the statement's code spans the jump target 0x{:x}",
                             ins.addr.0
@@ -1305,6 +1401,15 @@ impl<'a> Ctx<'a> {
             (Stmt::Move { dst, src, .. }, Stmt::Move { dst: cdst, .. }) => {
                 self.assign(r, Some((dst, src)), cdst, a, b, fresh)
             }
+            (Stmt::Call { name, args, .. }, Stmt::Call { .. }) if self.call_site(b).is_some() => {
+                if !name.starts_with("sub_") {
+                    return Err(format!(
+                        "turning an internal call into `{name}(…)` isn't supported"
+                    ));
+                }
+                let call = parse(&format!("{name}({})", args.join(", ")))?;
+                self.rewrite(r, &Rewrite::call(std::slice::from_ref(&call)), a, b, fresh)
+            }
             (Stmt::Call { name, args, .. }, Stmt::Call { name: cname, .. }) => {
                 if name != cname
                     && !(matches!(name.as_str(), "require" | "assert")
@@ -1426,7 +1531,7 @@ impl<'a> Ctx<'a> {
     /// deletes it). Stack variables it no longer writes keep the values
     /// they had before it; one that had none is left as zero when no
     /// other statement mentions it.
-    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    #[allow(clippy::many_single_char_names)]
     fn assign(
         &self,
         r: &Replace,
@@ -1436,115 +1541,375 @@ impl<'a> Ctx<'a> {
         b: usize,
         fresh: &mut u32,
     ) -> Res<Patch> {
-        let opts = self.opts;
         let parse = |t: &str| parse_expr(t).map_err(|e| format!("can't parse `{t}`: {e}"));
         let as_place = |d: &str| parse_expr(d).ok().filter(|e| self.is_place(e));
         let old_place = as_place(old);
         let new_place = new.and_then(|(d, _)| as_place(d));
-        // `owner = v` / `balanceOf[k] = v` store to named storage.
-        if let (Some(_), Some(place), Some((_, src))) = (&old_place, &new_place, new) {
-            return self.replace_store(r, 0x55, place, true, &parse(src)?, b, fresh);
-        }
-        if self.insns[a..b]
-            .iter()
-            .any(|i| matches!(i.opcode, 0x56 | 0x57))
-        {
-            return Err("assignments from internal calls can't be edited".into());
-        }
-        let (new_dsts, srcs): (Vec<&str>, Vec<EExpr>) = match new {
+        let (dsts, srcs): (Vec<&str>, Vec<EExpr>) = match new {
             None => (Vec::new(), Vec::new()),
             Some((_, src)) if new_place.is_some() => (Vec::new(), vec![parse(src)?]),
-            Some((dst, src)) => {
-                let dsts: Vec<&str> = dst.split(", ").collect();
-                let srcs = parse_list(src).map_err(|e| format!("can't parse `{src}`: {e}"))?;
-                if srcs.len() != dsts.len() {
-                    return Err(format!(
-                        "{} target(s) but {} value(s)",
-                        dsts.len(),
-                        srcs.len()
-                    ));
+            Some((dst, src)) => (
+                dst.split(", ").collect(),
+                parse_list(src).map_err(|e| format!("can't parse `{src}`: {e}"))?,
+            ),
+        };
+        let calls = |e: &EExpr| is_internal_call(e) || ext_call(e).is_some();
+        // `owner = v` / `balanceOf[k] = v` store to named storage.
+        if let (Some(_), Some(place), [src]) = (&old_place, &new_place, srcs.as_slice())
+            && self.call_site(b).is_none()
+            && !calls(src)
+        {
+            return self.replace_store(r, 0x55, place, true, src, b, fresh);
+        }
+        let old_dsts: Vec<&str> = if old_place.is_some() {
+            Vec::new()
+        } else {
+            old.split(", ").collect()
+        };
+        self.rewrite(
+            r,
+            &Rewrite {
+                dsts: &dsts,
+                srcs: &srcs,
+                place: new_place.as_ref(),
+                old: &old_dsts,
+                old_place: old_place.is_some(),
+            },
+            a,
+            b,
+            fresh,
+        )
+    }
+
+    /// The internal call whose `JUMP` ends just before `b`: its call
+    /// site's block.
+    fn call_site(&self, b: usize) -> Option<usize> {
+        if b == 0 || self.opcode_at(b - 1) != Some(JUMP) {
+            return None;
+        }
+        let blk = self
+            .cfg
+            .blocks
+            .iter()
+            .position(|blk| blk.insns.contains(&(b - 1)))?;
+        (self.cfg.role[blk] == JumpRole::Call && !self.cfg.tail_calls.contains(&blk)).then_some(blk)
+    }
+
+    /// The internal function `sub_xxxx` names: entry offset and summary.
+    fn callee(&self, name: &str) -> Res<(u64, FuncInfo)> {
+        name.strip_prefix("sub_")
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .and_then(|addr| {
+                let blk = self.cfg.block_at(addr)?;
+                Some((addr, *self.cfg.functions.get(&blk)?))
+            })
+            .ok_or_else(|| format!("`{name}` isn't an internal function"))
+    }
+
+    /// Generate `w.dsts = w.srcs` (or `w.place = w.srcs[0]`) in place of
+    /// the statement spanning `a..b`, which assigned `w.old`. The last
+    /// value may be an internal call (`sub_xxxx(args)`, its results
+    /// filling the last targets) and one value an external call; the
+    /// original statement may itself be an internal call, whose frame
+    /// the new code no longer builds unless it calls again.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::many_single_char_names,
+        clippy::single_match_else
+    )]
+    fn rewrite(
+        &self,
+        r: &Replace,
+        w: &Rewrite<'_>,
+        a: usize,
+        b: usize,
+        fresh: &mut u32,
+    ) -> Res<Patch> {
+        // Ids of values that don't exist before the new code runs.
+        const OLD_RESULT: usize = usize::MAX - 0x100;
+        const NEW_RESULT: usize = usize::MAX - 0x200;
+        const NEW_EXT: usize = usize::MAX - 0x300;
+        let opts = self.opts;
+        // The original call.
+        let site = self.call_site(b);
+        let orig = match site {
+            Some(blk) => {
+                let info = self.cfg.functions[&self.cfg.calls[&blk].callee];
+                if info.noreturn {
+                    return Err("calls to functions that never return can't be edited".into());
                 }
-                (dsts, srcs)
+                let n = info
+                    .nrets
+                    .ok_or("the called function's return-value count is unknown")?;
+                let cont = self.insns.get(b).map(|i| i.addr.0);
+                let here =
+                    self.cfg.conts.get(&blk).is_some_and(|cs| {
+                        cs.iter().all(|&c| Some(self.cfg.blocks[c].start) == cont)
+                    });
+                if !here || self.opcode_at(b) != Some(JUMPDEST) {
+                    return Err("the call returns elsewhere than to the code after it".into());
+                }
+                Some((info, n))
+            }
+            None => {
+                if self.insns[a..b]
+                    .iter()
+                    .any(|i| matches!(i.opcode, 0x56 | 0x57))
+                {
+                    return Err("the statement's code jumps, which its text doesn't show".into());
+                }
+                None
             }
         };
-        let mut exprs: Vec<&EExpr> = srcs.iter().collect();
-        exprs.extend(&new_place);
-        let k = self.pick_start(r, &self.needed(r.fn_addr, &exprs))?;
-        let mut sim = self.simulate(k, b)?;
-        let stores = sim.effects.iter().filter(|(o, _)| *o == 0x55).count();
-        if let Some((op, _)) = sim.effects.iter().find(|(o, _)| *o != MSTORE && *o != 0x55) {
+        let onrets = orig.map_or(0, |(_, n)| n);
+        // The new internal call: the last value.
+        let icall = match w.srcs.last() {
+            Some(EExpr::Call(n, args)) if n.starts_with("sub_") => {
+                let (addr, info) = self.callee(n)?;
+                if args.len() != info.total_args() {
+                    return Err(format!("`{n}` takes {} argument(s)", info.total_args()));
+                }
+                let nn = if info.noreturn {
+                    0
+                } else {
+                    info.nrets
+                        .ok_or_else(|| format!("`{n}`'s return-value count is unknown"))?
+                };
+                Some((addr, info, nn, args.as_slice()))
+            }
+            _ => None,
+        };
+        let plain = &w.srcs[..w.srcs.len() - usize::from(icall.is_some())];
+        if plain.iter().any(is_internal_call) {
+            return Err("an internal call must be the whole of the last value".into());
+        }
+        let ext_at: Vec<usize> = (0..plain.len())
+            .filter(|&i| ext_call(&plain[i]).is_some())
+            .collect();
+        if ext_at.len() + usize::from(icall.is_some()) > 1 {
+            return Err("one call per statement".into());
+        }
+        let ext_at = ext_at.first().copied();
+        let nn = icall.map_or(0, |c| c.2);
+        if icall.is_some_and(|c| c.1.noreturn) && !w.dsts.is_empty() {
+            return Err("the called function never returns".into());
+        }
+        if w.place.is_some() && (icall.is_some() || ext_at.is_some()) {
+            return Err("a call's result can only be assigned to stack variables".into());
+        }
+        if w.place.is_none() && w.dsts.len() != plain.len() + nn {
             return Err(format!(
-                "the statement's code also runs `{}`, which its text doesn't show",
-                OPCODE_TABLE[*op as usize].name
+                "{} target(s) but {} value(s)",
+                w.dsts.len(),
+                plain.len() + nn
             ));
         }
-        if stores != usize::from(old_place.is_some()) {
+        let mut exprs: Vec<&EExpr> = w.srcs.iter().collect();
+        exprs.extend(w.place);
+        let k = self.pick_start(r, &self.needed(r.fn_addr, &exprs))?;
+        let end = if orig.is_some() { b - 1 } else { b };
+        let mut sim = self.simulate(k, end)?;
+        // Effects: scratch `mstore`s, the store the text shows, and an
+        // external call it shows.
+        let canon_calls = stmt_text(&r.canon).is_some_and(|t| {
+            parse_list(t.split_once(" = ").map_or(t.as_str(), |x| x.1))
+                .is_ok_and(|es| es.iter().any(|e| ext_call(e).is_some()))
+        });
+        let mut old_ext = None;
+        let mut stores = 0;
+        for (op, _) in &sim.effects {
+            match op {
+                &MSTORE => {}
+                0x55 => stores += 1,
+                0xf1 | 0xf2 | 0xf4 | 0xfa if canon_calls && old_ext.is_none() => {
+                    old_ext = (k..end).find(|&i| self.insns[i].opcode == *op);
+                }
+                0xf1 | 0xf2 | 0xf4 | 0xfa => {
+                    return Err(
+                        "this form of external call can't be edited; only `call(…)`, `staticcall(…)`, `delegatecall(…)`, `callcode(…)` and `to.send(v)`".into(),
+                    );
+                }
+                op => {
+                    return Err(format!(
+                        "the statement's code also runs `{}`, which its text doesn't show",
+                        OPCODE_TABLE[*op as usize].name
+                    ));
+                }
+            }
+        }
+        if stores != usize::from(w.old_place) {
             return Err(
                 "the statement's code also runs `SSTORE`, which its text doesn't show".into(),
             );
         }
-        let pre = self.before(k)?;
-        let post = self.after(b)?;
-        let names = self.at(r.fn_addr, pre);
-        for (d, e) in new_dsts.iter().zip(&srcs) {
-            if *d == "_" {
-                continue;
+        if let Some((info, _)) = orig {
+            sim.pop(); // the callee
+            for _ in 0..info.nargs {
+                sim.pop();
             }
-            let v = lower_expr(e, &names, opts).map_err(|e| e.0)?;
-            let at = dst_positions(post, d);
-            if at.is_empty() {
-                return Err(format!(
-                    "`{d}` isn't on the stack after this statement; assign a variable the code after it holds"
-                ));
+            sim.pop(); // the return address
+            for _ in 0..info.nbelow {
+                sim.pop();
             }
-            for t in at {
-                *sim.at_mut(t) = v.clone();
+            for i in 0..onrets {
+                sim.items.push(Sym::Opaque(OLD_RESULT + i));
             }
         }
-        if old_place.is_none() {
-            for d in old.split(", ") {
-                if d == "_" || new_dsts.contains(&d) {
+        let pre = self.before(k)?;
+        let post = if orig.is_some() {
+            self.before(b)?
+        } else {
+            self.after(b)?
+        };
+        let names = self.at(r.fn_addr, pre);
+        let ext_id = Sym::Opaque(old_ext.unwrap_or(NEW_EXT));
+        let mut vals: Vec<Sym> = Vec::new();
+        for (i, e) in plain.iter().enumerate() {
+            vals.push(if Some(i) == ext_at {
+                ext_id.clone()
+            } else {
+                lower_expr(e, &names, opts).map_err(|e| e.0)?
+            });
+        }
+        let results: Vec<Sym> = (0..nn).map(|i| Sym::Opaque(NEW_RESULT + i)).collect();
+        vals.extend(results.iter().cloned());
+        if w.place.is_none() {
+            for (i, (d, v)) in w.dsts.iter().zip(&vals).enumerate() {
+                if *d == "_" {
+                    // A kept return address: where the old call's was.
+                    if let Some(j) = i.checked_sub(plain.len()).filter(|&j| j < onrets) {
+                        *sim.at_mut(onrets - 1 - j) = v.clone();
+                    }
                     continue;
                 }
-                // Siblings the replacement extends over mustn't write it.
-                if r.prev.iter().any(|sib| {
-                    self.index.get(&sib.start).is_some_and(|&s| s >= k)
-                        && sib.dsts.iter().any(|x| x == d)
-                }) {
+                let at = dst_positions(post, d);
+                if at.is_empty() {
                     return Err(format!(
-                        "`{d}` is also assigned just before; edit that statement instead"
+                        "`{d}` isn't on the stack after this statement; assign a variable the code after it holds"
                     ));
                 }
-                let kept = match pre.iter().position(|s| s.var.as_deref() == Some(d)) {
-                    Some(t) => Sym::Slot(t),
-                    None if !r.used.contains(d) => Sym::konst(0),
-                    None => {
-                        return Err(format!(
-                            "`{d}` has no value without this assignment, but other statements use it"
-                        ));
-                    }
-                };
-                for t in dst_positions(post, d) {
-                    *sim.at_mut(t) = kept.clone();
+                for t in at {
+                    *sim.at_mut(t) = v.clone();
                 }
             }
         }
-        let mut em = self.emitter(k, sim.consumed, fresh);
-        if let Some(place) = &new_place {
-            let slot = lower_place(place, &names, opts)
-                .map_err(|e| e.0)?
-                .ok_or("not a storage location")?;
-            let v = lower_expr(&srcs[0], &names, opts).map_err(|e| e.0)?;
-            em.value(&v).map_err(|e| e.0)?;
-            em.value(&slot).map_err(|e| e.0)?;
-            em.op(0x55, None).map_err(|e| e.0)?;
+        for d in w.old {
+            if *d == "_" || w.dsts.contains(d) {
+                continue;
+            }
+            // Siblings the replacement extends over mustn't write it.
+            if r.prev.iter().any(|sib| {
+                self.index.get(&sib.start).is_some_and(|&s| s >= k)
+                    && sib.dsts.iter().any(|x| x == d)
+            }) {
+                return Err(format!(
+                    "`{d}` is also assigned just before; edit that statement instead"
+                ));
+            }
+            let kept = match pre.iter().position(|s| s.var.as_deref() == Some(*d)) {
+                Some(t) => Sym::Slot(t),
+                None if !r.used.contains(*d) => Sym::konst(0),
+                None => {
+                    return Err(format!(
+                        "`{d}` has no value without this assignment, but other statements use it"
+                    ));
+                }
+            };
+            for t in dst_positions(post, d) {
+                *sim.at_mut(t) = kept.clone();
+            }
         }
-        em.materialize(sim.consumed, &sim.items).map_err(|e| e.0)?;
+        // Results of the old call nothing names (a kept return address).
+        for item in &mut sim.items {
+            if matches!(item, Sym::Opaque(x) if (OLD_RESULT..OLD_RESULT + 0x100).contains(x)) {
+                *item = Sym::konst(0);
+            }
+        }
+        let ext = match ext_at {
+            Some(i) => Some(self.lower_ext(&plain[i], &names)?),
+            None => None,
+        };
+
+        let emit = |ret: Target, fresh: &mut u32| -> Res<(Vec<Piece>, bool)> {
+            let mut em = self.emitter(k, sim.consumed, fresh);
+            let Some((addr, info, nn, args)) = icall else {
+                let mut extra = 0;
+                if let Some((op, args)) = &ext {
+                    for x in args.iter().rev() {
+                        em.value(x).map_err(|e| e.0)?;
+                    }
+                    em.op(*op, Some(ext_id.clone())).map_err(|e| e.0)?;
+                    extra = 1;
+                }
+                if let Some(place) = w.place {
+                    let slot = lower_place(place, &names, opts)
+                        .map_err(|e| e.0)?
+                        .ok_or("not a storage location")?;
+                    em.value(&vals[0]).map_err(|e| e.0)?;
+                    em.value(&slot).map_err(|e| e.0)?;
+                    em.op(0x55, None).map_err(|e| e.0)?;
+                }
+                em.materialize(sim.consumed + extra, &sim.items)
+                    .map_err(|e| e.0)?;
+                return Ok((em.pieces, false));
+            };
+            let argv: Vec<Sym> = args
+                .iter()
+                .map(|x| lower_expr(x, &names, opts).map_err(|e| e.0))
+                .collect::<Res<_>>()?;
+            let below_n = sim.items.len() - onrets;
+            let is_new = |x: &Sym| matches!(x, Sym::Opaque(i) if (NEW_RESULT..NEW_RESULT + 0x100).contains(i));
+            let mut goal: Vec<Sym> = sim.items[..below_n]
+                .iter()
+                .map(|x| if is_new(x) { Sym::konst(0) } else { x.clone() })
+                .collect();
+            goal.extend(argv[..info.nbelow].iter().cloned());
+            goal.push(Sym::Label(ret, 2));
+            goal.extend(argv[info.nbelow..].iter().cloned());
+            goal.push(Sym::Label(Target::Orig(addr), 2));
+            em.materialize(sim.consumed, &goal).map_err(|e| e.0)?;
+            em.op(JUMP, None).map_err(|e| e.0)?;
+            if info.noreturn {
+                return Ok((em.pieces, false));
+            }
+            if matches!(ret, Target::Fresh(_)) {
+                em.place(ret);
+            }
+            em.returned(info.total_args() + 1, &results[..nn])
+                .map_err(|e| e.0)?;
+            let before = em.pieces.clone();
+            em.materialize(below_n + nn, &sim.items).map_err(|e| e.0)?;
+            let trivial = em.pieces == before;
+            Ok((em.pieces, trivial))
+        };
+        // Return straight to the old continuation when the results
+        // land where it expects them.
+        let cont = match (orig, self.insns.get(b)) {
+            (Some(_), Some(c)) if icall.is_some() => Some(Target::Orig(c.addr.0)),
+            _ => None,
+        };
+        let pieces = match cont.map(|t| emit(t, fresh)).transpose()? {
+            Some((pieces, true)) => pieces,
+            _ => {
+                *fresh += 1;
+                emit(Target::Fresh(*fresh), fresh)?.0
+            }
+        };
         Ok(Patch {
             from: k,
             to: b,
-            pieces: em.pieces,
+            pieces,
         })
+    }
+
+    /// An external call's opcode and its stack arguments, top first.
+    fn lower_ext(&self, e: &EExpr, names: &dyn Fn(&str) -> Option<Sym>) -> Res<(u8, Vec<Sym>)> {
+        let (op, args) = ext_call(e).ok_or("not an external call")?;
+        let args: Vec<Sym> = args
+            .iter()
+            .map(|x| lower_expr(x, names, self.opts).map_err(|e| e.0))
+            .collect::<Res<_>>()?;
+        Ok((op, args))
     }
 
     /// Code for a commented-out statement: what it left on the stack
@@ -1557,6 +1922,9 @@ impl<'a> Ctx<'a> {
             Stmt::Move { dst, .. } => self.assign(r, None, dst, a, b, fresh),
             Stmt::Call { name, .. } if matches!(name.as_str(), "require" | "assert") => {
                 self.delete_guard(a, b, fresh)
+            }
+            Stmt::Call { .. } if self.call_site(b).is_some() => {
+                self.rewrite(r, &Rewrite::call(&[]), a, b, fresh)
             }
             _ if matches!(last, 0x00 | 0xf3 | 0xfd | 0xfe | 0xff | JUMP | JUMPI) => Err(
                 "a statement that ends its block (a halt, return or jump) can't be deleted; edit it instead".into(),
@@ -1955,22 +2323,37 @@ impl<'a> Ctx<'a> {
                 }
                 let dsts: Vec<&str> = dst.split(", ").collect();
                 let srcs = parse_list(src).map_err(|e| format!("can't parse `{src}`: {e}"))?;
-                if srcs.len() != dsts.len() {
+                let calls = srcs
+                    .iter()
+                    .filter(|e| is_internal_call(e) || ext_call(e).is_some())
+                    .count();
+                if calls > 1 {
+                    return Err("one call per statement".into());
+                }
+                // The call runs first; its results stay on top.
+                let mut results = Vec::new();
+                let mut vals: Vec<Sym> = Vec::new();
+                for e in &srcs {
+                    let res = self.names(fn_addr, |n| scope.get(n).cloned());
+                    if is_internal_call(e) || ext_call(e).is_some() {
+                        results = self.added_call(em, e, &res)?;
+                        vals.extend(results.iter().cloned());
+                    } else {
+                        vals.push(lower_expr(e, &res, opts).map_err(|e| e.0)?);
+                    }
+                }
+                if vals.len() != dsts.len() {
                     return Err(format!(
                         "{} target(s) but {} value(s)",
                         dsts.len(),
-                        srcs.len()
+                        vals.len()
                     ));
                 }
-                let vals: Vec<Sym> = srcs
-                    .iter()
-                    .map(|e| {
-                        lower_expr(e, &self.names(fn_addr, |n| scope.get(n).cloned()), opts)
-                            .map_err(|e| e.0)
-                    })
-                    .collect::<Res<_>>()?;
                 let mut repl: Vec<(usize, Sym)> = Vec::new();
                 for (d, v) in dsts.iter().zip(&vals) {
+                    if *d == "_" {
+                        continue;
+                    }
                     let at = dst_positions(&pre, d);
                     if at.is_empty() {
                         return Err(format!("`{d}` isn't a stack variable here"));
@@ -1978,12 +2361,14 @@ impl<'a> Ctx<'a> {
                     repl.extend(at.into_iter().map(|t| (t, v.clone())));
                 }
                 let depth = repl.iter().map(|(t, _)| t + 1).max().unwrap_or(0);
-                let mut goal = em.top(depth).map_err(|e| e.0)?;
+                let n = results.len();
+                let mut goal = em.top(depth + n).map_err(|e| e.0)?;
+                goal.truncate(depth);
                 for (t, v) in &repl {
                     let len = goal.len();
                     goal[len - 1 - t] = v.clone();
                 }
-                em.materialize(depth, &goal).map_err(|e| e.0)?;
+                em.materialize(depth + n, &goal).map_err(|e| e.0)?;
                 for (d, v) in dsts.iter().zip(vals) {
                     scope.insert((*d).to_string(), v);
                 }
@@ -2024,7 +2409,17 @@ impl<'a> Ctx<'a> {
                     args,
                     &self.names(fn_addr, |n| scope.get(n).cloned()),
                 ),
-                _ => Err(format!("adding `{name}(…)` statements isn't supported")),
+                _ => {
+                    let call = parse_expr(&format!("{name}({})", args.join(", ")))
+                        .map_err(|e| format!("can't parse the call: {e}"))?;
+                    if !is_internal_call(&call) && ext_call(&call).is_none() {
+                        return Err(format!("adding `{name}(…)` statements isn't supported"));
+                    }
+                    let res = self.names(fn_addr, |n| scope.get(n).cloned());
+                    let results = self.added_call(em, &call, &res)?;
+                    // Results nothing names are dropped.
+                    em.materialize(results.len(), &[]).map_err(|e| e.0)
+                }
             },
             Stmt::ReturnExpr { text, .. } => {
                 let e = parse_expr(text).map_err(|e| format!("can't parse `{text}`: {e}"))?;
@@ -2072,6 +2467,62 @@ impl<'a> Ctx<'a> {
     }
 }
 
+impl Ctx<'_> {
+    /// Emit an internal call (returning to a fresh label) or an
+    /// external one; its results are left on the stack, bottom first.
+    fn added_call(
+        &self,
+        em: &mut Emitter<'_>,
+        e: &EExpr,
+        names: &dyn Fn(&str) -> Option<Sym>,
+    ) -> Res<Vec<Sym>> {
+        if let Some((op, args)) = ext_call(e) {
+            let args: Vec<Sym> = args
+                .iter()
+                .map(|x| lower_expr(x, names, self.opts).map_err(|e| e.0))
+                .collect::<Res<_>>()?;
+            for x in args.iter().rev() {
+                em.value(x).map_err(|e| e.0)?;
+            }
+            let r = em.fresh_opaque();
+            em.op(op, Some(r.clone())).map_err(|e| e.0)?;
+            return Ok(vec![r]);
+        }
+        let EExpr::Call(name, args) = e else {
+            return Err("not a call".into());
+        };
+        let (addr, info) = self.callee(name)?;
+        if info.noreturn {
+            return Err(format!("`{name}` never returns; it can't be called here"));
+        }
+        let nrets = info
+            .nrets
+            .ok_or_else(|| format!("`{name}`'s return-value count is unknown"))?;
+        if args.len() != info.total_args() {
+            return Err(format!("`{name}` takes {} argument(s)", info.total_args()));
+        }
+        let args: Vec<Sym> = args
+            .iter()
+            .map(|x| lower_expr(x, names, self.opts).map_err(|e| e.0))
+            .collect::<Res<_>>()?;
+        let ret = em.fresh_label();
+        for x in &args[..info.nbelow] {
+            em.value(x).map_err(|e| e.0)?;
+        }
+        em.push_label(ret, 2);
+        for x in &args[info.nbelow..] {
+            em.value(x).map_err(|e| e.0)?;
+        }
+        em.push_label(Target::Orig(addr), 2);
+        em.op(JUMP, None).map_err(|e| e.0)?;
+        em.place(ret);
+        let results: Vec<Sym> = (0..nrets).map(|_| em.fresh_opaque()).collect();
+        em.returned(info.total_args() + 1, &results)
+            .map_err(|e| e.0)?;
+        Ok(results)
+    }
+}
+
 /// The expressions a halting statement's text uses.
 fn halt_exprs(s: &Stmt) -> Vec<EExpr> {
     let texts: Vec<String> = match s {
@@ -2083,47 +2534,109 @@ fn halt_exprs(s: &Stmt) -> Vec<EExpr> {
     texts.iter().filter_map(|t| parse_expr(t).ok()).collect()
 }
 
+/// `PUSH d; PC; ADD` or `PC; PUSH d; ADD` around the `PC` at `p`, a
+/// Vyper return address: `(first, end, target)` — instructions
+/// `first..end` compute `target`, a `JUMPDEST`.
+fn pc_return(
+    insns: &[DecodedInsn],
+    index: &HashMap<u64, usize>,
+    p: usize,
+) -> Option<(usize, usize, u64)> {
+    let at = |k: usize| insns.get(k);
+    let is_push = |k: usize| at(k).is_some_and(|i| (0x60..=0x7f).contains(&i.opcode));
+    let is_add = |k: usize| at(k).is_some_and(|i| i.opcode == 0x01);
+    let (first, push, end) = if p > 0 && is_push(p - 1) && is_add(p + 1) {
+        (p - 1, p - 1, p + 2)
+    } else if is_push(p + 1) && is_add(p + 2) {
+        (p, p + 1, p + 3)
+    } else {
+        return None;
+    };
+    let target = insns[p].addr.0.checked_add(insns[push].push_value()?)?;
+    let q = *index.get(&target)?;
+    (at(q)?.opcode == JUMPDEST).then_some((first, end, target))
+}
+
+/// Bytes a patch's pieces take (labels at their widest).
+fn pieces_len(pieces: &[Piece]) -> u64 {
+    pieces
+        .iter()
+        .map(|p| match p {
+            Piece::Bytes(b) | Piece::Data { bytes: b, .. } => b.len() as u64,
+            Piece::Label(_) => 0,
+            Piece::Push { width, .. } => 1 + u64::from(*width),
+        })
+        .sum()
+}
+
 /// `PC` values move with the code. Vyper 0.2 only uses them for
 /// return addresses, `PUSHn d; PC; ADD`, which stay right as long as
-/// nothing between the `PC` and `PC + d` changes size.
-fn check_pc(ctx: &Ctx<'_>, patches: &[Patch]) -> Result<(), EvmEditError> {
+/// nothing between the `PC` and `PC + d` changes size; those an edit
+/// does change are rewritten to push their target's label (returned
+/// as `(first, end, target)`, see [`pc_return`]), and so are those a
+/// rewrite shrinks in turn. Any other `PC` mustn't move.
+fn pc_rewrites(ctx: &Ctx<'_>, patches: &[Patch]) -> Result<Vec<(usize, usize, u64)>, EvmEditError> {
+    let orig_len = |from: usize, to: usize| -> u64 {
+        ctx.insns[from..to]
+            .iter()
+            .map(|i| i.original_bytes.len() as u64)
+            .sum()
+    };
+    let mut resized: Vec<(usize, usize)> = patches
+        .iter()
+        .filter(|p| pieces_len(&p.pieces) != orig_len(p.from, p.to))
+        .map(|p| (p.from, p.to))
+        .collect();
+    let in_patch = |k: usize| patches.iter().any(|e| e.from <= k && k < e.to);
+    // `(pc, first, end, target)`.
+    let mut triples: Vec<(usize, usize, usize, u64)> = Vec::new();
     for (p, ins) in ctx
         .insns
         .iter()
         .enumerate()
         .filter(|(_, i)| i.opcode == 0x58)
     {
-        let at = |k: usize| ctx.insns.get(k);
-        let is_push = |k: usize| at(k).is_some_and(|i| (0x60..=0x7f).contains(&i.opcode));
-        let is_add = |k: usize| at(k).is_some_and(|i| i.opcode == 0x01);
-        // `PUSH d; PC; ADD` or `PC; PUSH d; ADD`.
-        let push = if p > 0 && is_push(p - 1) && is_add(p + 1) {
-            at(p - 1)
-        } else if is_push(p + 1) && is_add(p + 2) {
-            at(p + 1)
-        } else {
-            None
-        };
-        let target = push
-            .and_then(DecodedInsn::push_value)
-            .and_then(|d| ctx.index.get(&(ins.addr.0 + d)));
-        let Some(&q) = target else {
-            return Err(whole_file(format!(
-                "`PC` at 0x{:x} isn't a return address, and its value would move",
-                ins.addr.0
-            )));
-        };
-        if patches
-            .iter()
-            .any(|e| (e.from > p && e.from <= q) || (e.from < q && e.to > p))
-        {
-            return Err(whole_file(format!(
-                "an edit lies between the `PC` at 0x{:x} and the return address it computes",
-                ins.addr.0
-            )));
+        if in_patch(p) {
+            continue;
+        }
+        match pc_return(ctx.insns, &ctx.index, p) {
+            Some((first, end, target)) if !(first..end).any(in_patch) => {
+                triples.push((p, first, end, target));
+            }
+            Some(_) => {
+                return Err(whole_file(format!(
+                    "an edit splits the return address the `PC` at 0x{:x} computes",
+                    ins.addr.0
+                )));
+            }
+            None if resized.iter().any(|&(f, _)| f <= p) => {
+                return Err(whole_file(format!(
+                    "`PC` at 0x{:x} isn't a return address, and the edit moves it",
+                    ins.addr.0
+                )));
+            }
+            None => {}
         }
     }
-    Ok(())
+    let mut out = Vec::new();
+    let mut todo = triples;
+    loop {
+        let (hit, keep): (Vec<_>, Vec<_>) = todo.into_iter().partition(|&(p, _, _, target)| {
+            let q = ctx.index[&target];
+            resized
+                .iter()
+                .any(|&(from, to)| (from > p && from <= q) || (from < q && to > p))
+        });
+        todo = keep;
+        if hit.is_empty() {
+            break;
+        }
+        for (_, first, end, target) in hit {
+            resized.push((first, end));
+            out.push((first, end, target));
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------
@@ -2135,7 +2648,12 @@ fn layout(
     insns: &[DecodedInsn],
     reloc: &Reloc,
     patches: Vec<Patch>,
+    pc_rewrites: &[(usize, usize, u64)],
 ) -> Result<Vec<u8>, EvmEditError> {
+    let rewrites: HashMap<usize, (usize, u64)> = pc_rewrites
+        .iter()
+        .map(|&(first, end, target)| (first, (end, target)))
+        .collect();
     // Patches by start; check they don't overlap.
     let mut by_start: BTreeMap<usize, Vec<Patch>> = BTreeMap::new();
     for p in patches {
@@ -2189,6 +2707,16 @@ fn layout(
                 k = next;
                 continue;
             }
+        }
+        if let Some(&(end, target)) = rewrites.get(&k) {
+            // `PUSH d; PC; ADD` → `PUSH2 target`.
+            pieces.push(Piece::Push {
+                width: 2,
+                target: Target::Orig(target),
+                fixed: false,
+            });
+            k = end;
+            continue;
         }
         if ins.opcode == JUMPDEST {
             pieces.push(Piece::Label(Target::Orig(ins.addr.0)));
@@ -2790,14 +3318,32 @@ mod tests {
         let code = weth();
         let text = decompile_evm_to_text(&code);
         let err = |t: &str| compile(t).expect_err("edit should be rejected");
-        // An internal call.
+        // Internal calls with the wrong arguments, or to no function.
         let e = err(&retext(
             &text,
             "0x5b, 0x61, 0x02, 0x64",
             "",
-            "sub_09d9(0x1)",
+            "sub_09d9(0x1, 0x2)",
         ));
-        assert!(e.contains("isn't supported"), "{e}");
+        assert!(e.contains("takes 1 argument"), "{e}");
+        let e = err(&retext(
+            &text,
+            "0x5b, 0x61, 0x02, 0x64",
+            "",
+            "sub_09da(0x1)",
+        ));
+        assert!(e.contains("isn't an internal function"), "{e}");
+        // A call whose results aren't all assigned.
+        let e = err(&retext(&text, "0x5b, 0x61, 0x02, 0x64", "", "sub_066d()"));
+        assert!(e.contains("0 target(s) but 1 value(s)"), "{e}");
+        // An internal call inside an expression.
+        let e = err(&retext(
+            &text,
+            WITHDRAW_REQUIRE,
+            "",
+            "require((v3 >= sub_066d()))",
+        ));
+        assert!(e.contains("can't be compiled"), "{e}");
         // A name that isn't on the stack.
         let e = err(&retext(
             &text,
@@ -2900,6 +3446,165 @@ mod tests {
             let out = send(&mut m, ALICE, 0, quote, &[u(10), u(0), u(7)]);
             assert!(matches!(out, Outcome::Revert(_)), "{out:?}");
         }
+    }
+
+    #[test]
+    fn edited_and_added_calls() {
+        let code = weth();
+        let text = decompile_evm_to_text(&code);
+        // withdraw() takes half and pays it to BOB; deposit() credits
+        // twice; transfer() pulls from `param0` to the caller instead.
+        let edited = retext(
+            &text,
+            "0x5b, 0x61, 0x02, 0x64",
+            "",
+            "sub_09d9(param0 / 0x2)",
+        );
+        let edited = retext(&edited, "0xf1]", "send", "v6 = send(0xb0b, arg0)");
+        let edited = insert_before(&edited, "0x5b, 0x61, 0x03, 0xd2", "", "sub_0440()");
+        let edited = retext(
+            &edited,
+            "0x5b, 0x61, 0x03, 0xb0",
+            "",
+            "v1 = sub_068c(address(param0), msg.sender, param1)",
+        );
+        let new = compile(&edited).unwrap();
+        let relifted = decompile_evm_to_text(&new);
+        assert!(relifted.contains("0xb0b.send(arg0)") || relifted.contains("send(0xb0b, arg0)"));
+        assert!(relifted.contains("(param0 / 0x2))"), "{relifted}");
+        assert_eq!(compile(&relifted).unwrap(), new);
+        let mut m = Machine::new(&new);
+        assert_eq!(send(&mut m, ALICE, 1000, "deposit()", &[]), Outcome::Stop);
+        assert_eq!(m.logs.len(), 2);
+        assert_eq!(balance_of(&mut m, ALICE), u(2000));
+        assert_eq!(
+            send(&mut m, ALICE, 0, "withdraw(uint256)", &[u(600)]),
+            Outcome::Stop
+        );
+        assert_eq!(m.calls.last(), Some(&(u(BOB), u(300))));
+        assert_eq!(balance_of(&mut m, ALICE), u(1700));
+        send(
+            &mut m,
+            ALICE,
+            0,
+            "approve(address,uint256)",
+            &[u(BOB), u(50)],
+        );
+        let out = send(
+            &mut m,
+            BOB,
+            0,
+            "transfer(address,uint256)",
+            &[u(ALICE), u(30)],
+        );
+        assert_eq!(out, Outcome::Return(word(1)));
+        assert_eq!(balance_of(&mut m, BOB), u(30));
+        assert_eq!(balance_of(&mut m, ALICE), u(1670));
+        let out = send(
+            &mut m,
+            BOB,
+            0,
+            "allowance(address,address)",
+            &[u(ALICE), u(BOB)],
+        );
+        assert_eq!(out, Outcome::Return(word(20)));
+        let out = send(
+            &mut m,
+            BOB,
+            0,
+            "transfer(address,uint256)",
+            &[u(ALICE), u(30)],
+        );
+        assert!(matches!(out, Outcome::Revert(_)), "{out:?}");
+
+        // deposit() without its call.
+        let edited = comment_out(&text, "0x5b, 0x61, 0x03, 0xd2", "sub_0440()");
+        let new = compile(&edited).unwrap();
+        let mut m = Machine::new(&new);
+        assert_eq!(send(&mut m, ALICE, 1000, "deposit()", &[]), Outcome::Stop);
+        assert!(m.logs.is_empty());
+        assert_eq!(balance_of(&mut m, ALICE), u(0));
+    }
+
+    /// The router's `removeLiquidityETH` helper unwraps WETH with a raw
+    /// `call(…)`: its arguments and kind are editable.
+    #[test]
+    fn edited_raw_external_call() {
+        let code = fixture("uniswap-v2-router02-mainnet.evm");
+        let text = decompile_evm_to_text(&code);
+        let call = "v13 = call(gasleft(), v18, 0x0, v16, v15, v14, 0x0)";
+        let edited = in_fn(&text, "sub_0de4", |t| {
+            retext(
+                t,
+                "0x5b, 0x50, 0x5a, 0xf1]",
+                call,
+                "v13 = call(gasleft(), v18, 0x7, v16, v15, v14, 0x20)",
+            )
+        });
+        let new = compile(&edited).unwrap();
+        let relifted = decompile_evm_to_text(&new);
+        assert!(
+            relifted.contains("call(gasleft(), v18, 0x7, v16, v15, v14, 0x20)"),
+            "{relifted}"
+        );
+        assert_eq!(compile(&relifted).unwrap(), new);
+        let edited = in_fn(&text, "sub_0de4", |t| {
+            retext(
+                t,
+                "0x5b, 0x50, 0x5a, 0xf1]",
+                call,
+                "v13 = staticcall(gasleft(), v18, v16, v15, v14, 0x0)",
+            )
+        });
+        let relifted = decompile_evm_to_text(&compile(&edited).unwrap());
+        assert!(
+            relifted.contains("staticcall(gasleft(), v18, v16, v15, v14, 0x0)"),
+            "{relifted}"
+        );
+    }
+
+    /// `f` applied to the text of function `name` alone.
+    fn in_fn(text: &str, name: &str, f: impl Fn(&str) -> String) -> String {
+        let start = text.find(&format!("fn {name}() {{")).expect("function");
+        let end = start + text[start..].find("\n}\n").expect("end") + 3;
+        format!("{}{}{}", &text[..start], f(&text[start..end]), &text[end..])
+    }
+
+    /// Vyper calls push their return address as `PC + d`; an edited or
+    /// added call pushes the label instead.
+    #[test]
+    fn vyper_calls() {
+        let code = fixture("curve-3pool-mainnet.evm");
+        let text = decompile_evm_to_text(&code);
+        let call = "0x5b, 0x60, 0x06, 0x58, 0x01, 0x61, 0x00, 0xa9, 0x56";
+        let mut m = Machine::new(&code);
+        let a = send(&mut m, ALICE, 0, "A()", &[]);
+        let Outcome::Return(a) = a else {
+            panic!("{a:?}")
+        };
+        // A() calls its helper twice, then returns 7 more.
+        let edited = in_fn(&text, "A", |t| {
+            insert_before(
+                t,
+                "0x5b, 0x61, 0x01, 0x40, 0x52",
+                "",
+                "v0 = sub_00a9()\nv0 = v0 + 0x7",
+            )
+        });
+        let new = compile(&edited).unwrap();
+        let relifted = decompile_evm_to_text(&new);
+        assert_eq!(compile(&relifted).unwrap(), new);
+        let mut m = Machine::new(&new);
+        let want = U256::from_be(&a).add(u(7)).to_be().to_vec();
+        assert_eq!(send(&mut m, ALICE, 0, "A()", &[]), Outcome::Return(want));
+        // A() without the call, returning a constant.
+        let edited = in_fn(&text, "A", |t| comment_out(t, call, "v0 = sub_00a9()"));
+        let edited = in_fn(&edited, "A", |t| {
+            retext(t, "0x5b, 0x61, 0x01, 0x40, 0x52", "", "mstore(0x140, 0x7)")
+        });
+        let new = compile(&edited).unwrap();
+        let mut m = Machine::new(&new);
+        assert_eq!(send(&mut m, ALICE, 0, "A()", &[]), Outcome::Return(word(7)));
     }
 
     /// Vyper: the 3pool's `A()` made payable.
