@@ -160,16 +160,24 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
                 .collect(),
             params: selectors
                 .iter()
-                .filter_map(|(&addr, &sel)| {
-                    let types = static_params(function_by_selector(sel)?)?;
-                    Some((addr, types.len()))
+                .map(|(&addr, &sel)| {
+                    let words = match function_by_selector(sel).and_then(abi_head) {
+                        Some(head) => head.words,
+                        None => (0..UNKNOWN_SIG_PARAMS)
+                            .map(|k| format!("param{k}"))
+                            .collect(),
+                    };
+                    (addr, words)
                 })
                 .collect(),
             getters: selectors
                 .iter()
                 .filter_map(|(&addr, &sel)| {
                     let sig = function_by_selector(sel)?;
-                    let n = static_params(sig)?.len();
+                    let head = abi_head(sig)?;
+                    // Mapping keys are one word each.
+                    let n = head.types.len();
+                    (head.words.len() == n).then_some(())?;
                     Some((addr, (sig.split('(').next()?.to_string(), n)))
                 })
                 .collect(),
@@ -214,8 +222,8 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
         if let Some(sel) = selectors.get(&entry) {
             let what = match function_by_selector(*sel) {
                 // Name the parameters the body refers to.
-                Some(sig) if lift && static_params(sig).is_some_and(|t| !t.is_empty()) => {
-                    let types = static_params(sig).unwrap_or_default();
+                Some(sig) if lift && abi_head(sig).is_some_and(|h| !h.types.is_empty()) => {
+                    let types = abi_head(sig).map(|h| h.types).unwrap_or_default();
                     let named: Vec<String> = types
                         .iter()
                         .enumerate()
@@ -515,26 +523,96 @@ fn find_dispatch_targets(insns: &[DecodedInsn], jumpdests: &BTreeSet<u64>) -> BT
     out
 }
 
-/// Parameter types of `sig` when every one is a static ABI type (one
-/// calldata word each), so parameter `k` is `calldataload(4 + 32k)`.
-fn static_params(sig: &str) -> Option<Vec<&str>> {
+/// Head words named for an external function with no known
+/// signature: `param0…`, whatever it really takes.
+const UNKNOWN_SIG_PARAMS: usize = 16;
+
+/// Layout of the ABI-encoded parameters of a signature.
+#[derive(Debug, PartialEq, Eq)]
+struct AbiHead<'s> {
+    /// Top-level parameter types.
+    types: Vec<&'s str>,
+    /// Name of each 32-byte head word: `paramK` for a one-word
+    /// parameter or the offset of a dynamic one, `paramK.fJ` for the
+    /// `J`th word of a static tuple or fixed-size array.
+    words: Vec<String>,
+}
+
+fn abi_head(sig: &str) -> Option<AbiHead<'_>> {
     let inner = sig.split_once('(')?.1.strip_suffix(')')?;
-    if inner.is_empty() {
+    let types = split_types(inner)?;
+    let mut words = Vec::new();
+    for (k, t) in types.iter().enumerate() {
+        match head_words(t)? {
+            HeadWords::Static(n) if n > 1 => {
+                words.extend((0..n).map(|j| format!("param{k}.f{j}")));
+            }
+            _ => words.push(format!("param{k}")),
+        }
+    }
+    Some(AbiHead { types, words })
+}
+
+/// Split a comma-separated type list at its top level.
+fn split_types(list: &str) -> Option<Vec<&str>> {
+    if list.is_empty() {
         return Some(Vec::new());
     }
-    let types: Vec<&str> = inner.split(',').collect();
-    let is_static = |t: &str| {
-        let width = |rest: &str, max: u32| {
-            rest.is_empty() || rest.parse::<u32>().is_ok_and(|n| n > 0 && n <= max)
-        };
-        t == "address"
-            || t == "bool"
-            || t.strip_prefix("uint").is_some_and(|r| width(r, 256))
-            || t.strip_prefix("int").is_some_and(|r| width(r, 256))
-            || t.strip_prefix("bytes")
-                .is_some_and(|r| !r.is_empty() && width(r, 32))
-    };
-    types.iter().all(|t| is_static(t)).then_some(types)
+    let mut out = Vec::new();
+    let mut depth = 0u32;
+    let mut start = 0;
+    for (i, c) in list.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                out.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&list[start..]);
+    (depth == 0 && out.iter().all(|t| !t.is_empty())).then_some(out)
+}
+
+/// How a parameter type sits in the ABI head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadWords {
+    /// Encoded in place, in this many words.
+    Static(usize),
+    /// One word: the offset of its tail.
+    Dynamic,
+}
+
+/// Head layout of type `t`, or `None` when the text doesn't parse.
+fn head_words(t: &str) -> Option<HeadWords> {
+    if let Some(elem) = t.strip_suffix(']') {
+        let (elem, dim) = elem.rsplit_once('[')?;
+        if dim.is_empty() {
+            return Some(HeadWords::Dynamic);
+        }
+        let n: usize = dim.parse().ok()?;
+        return Some(match head_words(elem)? {
+            HeadWords::Static(w) => HeadWords::Static(w * n),
+            HeadWords::Dynamic => HeadWords::Dynamic,
+        });
+    }
+    if let Some(inner) = t.strip_prefix('(') {
+        let mut total = 0;
+        for member in split_types(inner.strip_suffix(')')?)? {
+            match head_words(member)? {
+                HeadWords::Static(n) => total += n,
+                HeadWords::Dynamic => return Some(HeadWords::Dynamic),
+            }
+        }
+        return Some(HeadWords::Static(total));
+    }
+    Some(if t == "bytes" || t == "string" {
+        HeadWords::Dynamic
+    } else {
+        HeadWords::Static(1)
+    })
 }
 
 /// Function names keyed by entry address: one per code segment start,
@@ -743,6 +821,23 @@ mod tests {
         let lifted = decompile_evm_to_text(&code);
         assert!(lifted.contains("if (msg.sig == 0xa9059cbb)"), "{lifted}");
         assert!(lifted.contains("jump(transfer)"), "{lifted}");
+    }
+
+    #[test]
+    fn abi_head_words() {
+        let head = abi_head("transfer(address,uint256)").unwrap();
+        assert_eq!(head.types, ["address", "uint256"]);
+        assert_eq!(head.words, ["param0", "param1"]);
+        // Dynamic parameters are an offset word; static tuples and
+        // fixed arrays one word per member.
+        let head = abi_head("f((address,uint24),bytes,uint8[2][3],(uint256,string))").unwrap();
+        assert_eq!(head.types.len(), 4);
+        let mut want = vec!["param0.f0".to_string(), "param0.f1".into(), "param1".into()];
+        want.extend((0..6).map(|j| format!("param2.f{j}")));
+        want.push("param3".into());
+        assert_eq!(head.words, want);
+        assert_eq!(abi_head("name()").unwrap().words, Vec::<String>::new());
+        assert_eq!(abi_head("bad((uint256)"), None);
     }
 
     #[test]

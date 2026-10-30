@@ -19,6 +19,13 @@
 //! the root frame every slot is `vN`. Blocks with no consistent depth
 //! fall back to `sN`, the Nth item from the top at block entry.
 //!
+//! Each block hands what it knows about its exit stack to successors
+//! whose predecessors all agree: constants, ABI parameters and
+//! `msg.*` values read in place of their slot names, and internal
+//! calls return what the callee's summary (from an earlier analysis
+//! pass) says — via-IR's ABI-decoder helpers return parameters, and a
+//! public getter's accessor returns the storage it names.
+//!
 //! A forward `JUMPI` whose fall-through run of blocks is entered only
 //! from that `JUMPI` becomes `if (!cond) { … }`; any other jump stays
 //! explicit as `jump(L_xxxx)`.
@@ -47,6 +54,11 @@ const DUP_INLINE_MAX_NODES: usize = 2;
 /// Operation standing for a value analysis can't follow (an entry slot
 /// no predecessor told us about). Never rendered.
 const UNKNOWN: &str = "?";
+
+/// Wraps a value an internal call returned, known from the callee's
+/// summary: analysis sees through it, but the text keeps naming the
+/// variable the call assigned.
+const RESULT: &str = "result";
 
 /// Resolved values larger than this are treated as [`UNKNOWN`].
 const RESOLVE_MAX_NODES: usize = 48;
@@ -647,9 +659,10 @@ pub(crate) struct LiftCtx<'a> {
     pub listing: &'a dyn Fn(&[DecodedInsn]) -> Vec<Stmt>,
     /// Addresses of call continuations (return addresses).
     pub continuations: HashSet<u64>,
-    /// External functions (by entry address) whose ABI parameters are
-    /// all static, with their count.
-    pub params: HashMap<u64, usize>,
+    /// External functions (by entry address) with the name of each
+    /// 32-byte word of their ABI-encoded parameters' head: word `k` is
+    /// `calldataload(4 + 32k)`.
+    pub params: HashMap<u64, Vec<String>>,
     /// External functions that may be public-variable getters: the
     /// name their known signature gives them and how many (static)
     /// parameters it takes.
@@ -765,6 +778,24 @@ fn summary_safe(e: &Expr) -> bool {
     }
 }
 
+/// Whether a known entry value is shown in place of its slot
+/// variable: constants, ABI parameters and call-wide environment
+/// values (`msg.sig`, `msg.sender`, …), none of which can change while
+/// the slot holds them.
+fn shows_inline(e: &Expr) -> bool {
+    match e {
+        Expr::Const(_) => true,
+        Expr::Var(_) => is_param(e),
+        Expr::Op(op, args) => {
+            args.is_empty() && (*op == "msg.sig" || (0x30..=0x4a).any(|o| env_name(o) == Some(op)))
+        }
+    }
+}
+
+fn is_param(e: &Expr) -> bool {
+    matches!(e, Expr::Var(v) if v.starts_with("param"))
+}
+
 fn is_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
@@ -845,7 +876,7 @@ fn strip_cleanup(mut e: &Expr) -> &Expr {
     let low_mask = |m: &Expr| m.is_const_bytes(|b| !b.is_empty() && b.iter().all(|&x| x == 0xff));
     loop {
         e = match e {
-            Expr::Op("address" | "bool", a) if a.len() == 1 => &a[0],
+            Expr::Op("address" | "bool" | RESULT, a) if a.len() == 1 => &a[0],
             Expr::Op("and", a) if a.len() == 2 && low_mask(&a[1]) => &a[0],
             Expr::Op("and", a) if a.len() == 2 && low_mask(&a[0]) => &a[1],
             Expr::Op("signextend", a) if a.len() == 2 && a[0].const_value().is_some() => &a[1],
@@ -1346,7 +1377,11 @@ impl FnBuilder<'_, '_> {
             mstores: Vec::new(),
             bindings: HashMap::new(),
             fmp_epoch: 0,
-            params: self.ctx.params.get(&self.range_start).copied().unwrap_or(0),
+            params: self
+                .ctx
+                .params
+                .get(&self.range_start)
+                .map_or(&[], Vec::as_slice),
             entry,
             resolved: HashMap::new(),
             summaries: self.summaries,
@@ -1529,9 +1564,9 @@ struct BlockLift<'a, 'c> {
     /// Bumped by every `mstore(0x40, …)`: free-memory-pointer reads in
     /// the same epoch see the same value.
     fmp_epoch: u64,
-    /// ABI parameters of the external function being lifted: the
-    /// `k`th static parameter is `calldataload(4 + 32k)`.
-    params: usize,
+    /// Names of the ABI head words of the external function being
+    /// lifted (see [`LiftCtx::params`]).
+    params: &'a [String],
     /// Known entry-stack values by frame position (see
     /// [`FnBuilder::entry_values`]).
     entry: HashMap<i64, Expr>,
@@ -1666,11 +1701,15 @@ impl BlockLift<'_, '_> {
         Some(out)
     }
 
-    /// `calldataload(4 + 32k)` as the external function's `paramK`.
+    /// `calldataload(4 + 32k)` as the external function's parameter
+    /// in head word `k`.
     fn param_at(&self, offset: &Expr) -> Option<Expr> {
         let rel = offset.const_value()?.checked_sub(4)?;
-        (rel % 32 == 0 && rel / 32 < self.params as u64)
-            .then(|| Expr::Var(format!("param{}", rel / 32)))
+        if rel % 32 != 0 {
+            return None;
+        }
+        let k = usize::try_from(rel / 32).ok()?;
+        self.params.get(k).map(|name| Expr::Var(name.clone()))
     }
 
     /// `e` with its calldata reads at parameter offsets named.
@@ -1719,10 +1758,21 @@ impl BlockLift<'_, '_> {
 
     fn ensure(&mut self, n: usize) {
         while self.stack.len() < n {
-            let name = self.entry_name(self.pulled);
-            self.stack.insert(0, Expr::Var(name));
+            let item = self.entry_item(self.pulled);
+            self.stack.insert(0, item);
             self.pulled += 1;
         }
+    }
+
+    /// The `j`th entry item from the top: its known value when that
+    /// reads better than the slot name (see [`shows_inline`]), else
+    /// the slot variable.
+    fn entry_item(&self, j: usize) -> Expr {
+        self.depth
+            .and_then(|d| self.entry.get(&(d.depth - 1 - j as i64)))
+            .filter(|e| shows_inline(e))
+            .cloned()
+            .unwrap_or_else(|| Expr::Var(self.entry_name(j)))
     }
 
     fn pop(&mut self) -> Expr {
@@ -1782,7 +1832,9 @@ impl BlockLift<'_, '_> {
             let name = self
                 .name_at(i)
                 .unwrap_or_else(|| format!("s{}", self.pulled as i64 - 1 - i as i64));
-            if *e != Expr::Var(name.clone()) {
+            // A slot still holding its entry value needs no write-back.
+            let unchanged = i < self.pulled && *e == self.entry_item(self.pulled - 1 - i);
+            if !unchanged && *e != Expr::Var(name.clone()) {
                 names.push(name);
                 vals.push(e.clone());
             }
@@ -1894,7 +1946,13 @@ impl BlockLift<'_, '_> {
                         // inputs: keep it as an expression.
                         bytes.extend(self.take(i));
                         let idx = self.stack.len();
-                        let name = self.bind_name(idx);
+                        // Not a name the slot expression uses, so a
+                        // later read can fold nested mappings back in.
+                        let mut name = self.bind_name(idx);
+                        if val.mentions(&name) {
+                            *self.temps += 1;
+                            name = format!("t{}", self.temps);
+                        }
                         self.out.push(Stmt::Move {
                             dst: name.clone(),
                             src: render_rhs(&val),
@@ -2379,6 +2437,14 @@ impl BlockLift<'_, '_> {
                             .map_or(Expr::Op(UNKNOWN, Vec::new()), |v| {
                                 self.paramize(subst_args(v, &actual))
                             });
+                        // A decoded parameter replaces the result's
+                        // variable; any other value keeps the call's
+                        // name in the text.
+                        let value = if is_param(&value) {
+                            value
+                        } else {
+                            Expr::Op(RESULT, vec![value])
+                        };
                         exit.insert(base + k as i64, value);
                     }
                     exit
@@ -2389,6 +2455,11 @@ impl BlockLift<'_, '_> {
                             return "_".to_string();
                         }
                         let idx = self.stack.len() + k;
+                        // A decoded parameter is named as such.
+                        let value = self.pos_of(idx).and_then(|p| self.exit.as_ref()?.get(&p));
+                        if let Some(Expr::Var(param)) = value.filter(|v| is_param(v)) {
+                            return param.clone();
+                        }
                         self.name_at(idx).unwrap_or_else(|| format!("r{k}"))
                     })
                     .collect();
@@ -2577,6 +2648,23 @@ mod tests {
         let names = unique_claims(&claims);
         assert_eq!(names.len(), 1);
         assert_eq!(names[&vec![2]], "totalSupply");
+    }
+
+    #[test]
+    fn call_summaries_substitute_all_arguments_at_once() {
+        // f(arg0, arg1) = arg0 - arg1, called as f(arg1, arg0).
+        let body = op("sub", vec![var("arg0"), var("arg1")]);
+        let r = subst_args(&body, &[var("arg1"), var("arg0")]);
+        assert_eq!(r, op("sub", vec![var("arg1"), var("arg0")]));
+        assert_eq!(subst_args(&body, &[c(5), c(3)]), c(2));
+        assert!(summary_safe(&body));
+        assert!(!summary_safe(&op("add", vec![var("v3"), c(1)])));
+        assert!(!summary_safe(&op(UNKNOWN, vec![])));
+        // Only stable values replace a slot's name in the text.
+        assert!(shows_inline(&c(4)) && shows_inline(&var("param1.f0")));
+        assert!(shows_inline(&op("msg.sender", vec![])));
+        assert!(!shows_inline(&op("returndatasize", vec![])));
+        assert!(!shows_inline(&op(RESULT, vec![c(1)])));
     }
 
     #[test]

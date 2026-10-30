@@ -130,7 +130,8 @@ fn weth9_lifts_to_statements() {
     // The getters' own internal accessors, and `decimals` (slot 2).
     assert!(text.contains("arg0 = balanceOf[arg0]"));
     assert!(text.contains("arg0 = allowance[arg0][arg1]"));
-    assert!(text.contains("v5 = &allowance[address(msg.sender)]"));
+    assert!(text.contains("allowance[address(msg.sender)][address(arg0)] = arg1"));
+    assert!(text.contains("v6 = allowance[address(arg0)][address(msg.sender)]"));
     assert!(text.contains("v2 = decimals"));
     assert!(!text.contains("mapping(0x"));
     // `name()`'s copy loop is structured.
@@ -158,14 +159,26 @@ fn poolmanager_uses_transient_storage_and_carries_solc_version() {
     // `if (Lock.isUnlocked()) AlreadyUnlocked.selector.revertWith();`
     assert!(text.contains("require(!v3, AlreadyUnlocked())"));
     assert!(text.contains("mstore(v5, unlockCallback.selector)"));
-    assert!(text.contains("emit(OperatorSet(msg.sender, address(v2), v1))"));
+    assert!(text.contains("emit(OperatorSet(msg.sender, address(param0), v1))"));
     assert!(text.contains("return abi.encode(address(v3));"));
     // Storage named from the public getters: `owner` (slot 0),
     // `protocolFeeController` (2), `isOperator` (3), `allowance` (5).
-    assert!(text.contains("owner = (v2 & v1) | t1"), "{text}");
     assert!(text.contains("v3 = protocolFeeController"));
-    assert!(text.contains("isOperator[msg.sender]"));
-    assert!(text.contains("&allowance[msg.sender]"));
+    assert!(text.contains("v4 = &isOperator[msg.sender]"));
+    // via-IR decodes calldata in shared helpers; their results are the
+    // parameters, which also key the named storage.
+    assert!(text.contains("param0 = sub_2d3f()"), "{text}");
+    assert!(text.contains("v3 = isOperator[address(param0)][address(param1)]"));
+    assert!(text.contains("return abi.encode(balanceOf[address(param0)][param1]);"));
+    assert!(text.contains("v2 = allowance[address(param0)][address(param1)][param2]"));
+    assert!(text.contains(
+        "owner = (v2 & 0xffffffffffffffffffffffff0000000000000000000000000000000000000000) | address(param0)"
+    ));
+    // Static tuples take one head word per member.
+    assert!(text.contains(
+        "swap((address,address,uint24,int24,address) param0, (bool,int256,uint160) param1, bytes param2)"
+    ));
+    assert!(text.contains("require(!(param1.f0 - bool(param1.f0)))"));
     assert!(!text.contains("unknown return value"));
     assert!(text.matches("@asm(").count() <= 8);
 }
@@ -183,6 +196,17 @@ fn router_selectors_resolve_to_names() {
     ] {
         assert!(text.contains(&format!("fn {name}")), "missing fn {name}");
     }
+    // solc 0.6 decodes inline from a `headStart` of 0x4 kept in a
+    // stack slot; dynamic parameters are their offset words, and
+    // unknown signatures get `param0…`.
+    assert!(text.contains(
+        "v1, v2 = sub_0de4(address(param0), param1, param2, param3, address(param4), param5)"
+    ));
+    assert!(text.contains(
+        "swapExactTokensForTokens(uint256 param0, uint256 param1, address[] param2, address param3, uint256 param4)"
+    ));
+    assert!(text.contains("v7 = 0x4 + param2"));
+    assert!(text.contains("= address(param0), address(param1), param2, param3"));
     // solc 0.6 `require(cond, "reason")` and `&&`, from the library's
     // `getAmountIn`.
     assert!(
