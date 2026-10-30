@@ -163,7 +163,7 @@ fn sub_09d9() {
     v2 = v6 - arg0
     sstore(v3, v2)
     …
-    v6 = call(v3, address(msg.sender), arg0, v7, v5 - v7, v7, 0x0)
+    v6 = msg.sender.send(arg0)
     require(bool(v6))
     // event Withdrawal(address,uint256)
     emit(Withdrawal(address(msg.sender), arg0))

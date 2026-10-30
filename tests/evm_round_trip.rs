@@ -122,7 +122,9 @@ fn weth9_lifts_to_statements() {
     );
     assert!(text.contains("v3 = &balanceOf[address(msg.sender)]"));
     assert!(text.contains("require((v3 >= arg0))"));
-    assert!(text.contains("call(v3, address(msg.sender), arg0"));
+    // `msg.sender.transfer(wad)`: a stipend-only send, then `require`.
+    assert!(text.contains("v6 = msg.sender.send(arg0)"), "{text}");
+    assert!(text.contains("require(bool(v6))"));
     // Events and return values with their ABI encoding folded.
     assert!(text.contains("emit(Withdrawal(address(msg.sender), arg0))"));
     assert!(text.contains("emit(Deposit(address(msg.sender), msg.value))"));

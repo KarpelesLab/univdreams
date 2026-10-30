@@ -2238,12 +2238,15 @@ impl BlockLift<'_, '_> {
             let (args, prefix) = self.inline_last(args);
             (Expr::Op(op, args), prefix)
         };
+        let src = self
+            .stipend_send(&val, &resolved)
+            .unwrap_or_else(|| render_rhs(&val));
         let idx = self.stack.len();
         let name = self.bind_name(idx);
         bytes.extend(self.take(i));
         self.out.push(Stmt::Move {
             dst: name.clone(),
-            src: render_rhs(&val),
+            src,
             bytes,
         });
         let bound = if is_fmp {
@@ -2256,6 +2259,47 @@ impl BlockLift<'_, '_> {
         };
         self.bind_resolved(&name, bound, resolved);
         self.stack.push(Expr::Var(name));
+    }
+
+    /// `call(!v * 2300, to, v, p, 0, p, 0)` — a value transfer with
+    /// only the gas stipend, no data and nothing returned — is
+    /// Solidity's `to.send(v)` (`to.transfer(v)` when a `require` of
+    /// the result follows). `resolved` is `val` resolved.
+    fn stipend_send(&self, val: &Expr, resolved: &Expr) -> Option<String> {
+        let (Expr::Op("call", a), Expr::Op("call", r)) = (val, resolved) else {
+            return None;
+        };
+        let stipend = |x: &Expr, y: &Expr| {
+            x.const_value() == Some(2300)
+                && matches!(y, Expr::Op("iszero", v) if v.len() == 1 && v[0] == r[2])
+        };
+        let gas_ok = matches!(&r[0], Expr::Op("mul", m) if m.len() == 2
+            && (stipend(&m[0], &m[1]) || stipend(&m[1], &m[0])));
+        let no_input = a[4].const_value() == Some(0)
+            || matches!(simplify(a[4].clone()), Expr::Op("sub", ab) if ab.len() == 2
+                && lin(&ab[0], &self.bindings, 0).is_some()
+                && lin(&ab[0], &self.bindings, 0) == lin(&ab[1], &self.bindings, 0));
+        if !(gas_ok && no_input && a[6].const_value() == Some(0)) {
+            return None;
+        }
+        // Member syntax only after a plain name: the text format's `.`
+        // lives inside identifiers.
+        let to = match &a[1] {
+            Expr::Op("address", x) if x.len() == 1 => &x[0],
+            other => other,
+        };
+        let name = render_arg(to);
+        let value = render_arg(&a[2]);
+        Some(
+            if name
+                .chars()
+                .all(|c| c == '_' || c == '.' || c.is_ascii_alphanumeric())
+            {
+                format!("{name}.send({value})")
+            } else {
+                format!("send({}, {value})", render_arg(&a[1]))
+            },
+        )
     }
 
     /// Fold the statement just emitted into `args` when it bound a

@@ -168,10 +168,11 @@ fail-soft-thunk / monitor-report machinery.
 - [x] ABI plumbing folded: static-word encodings into fresh memory become `return abi.encode(…)` and `emit(Event(indexed…, data…))`; external functions name their parameters (`withdraw(uint256 param0)`, `calldataload(0x4)` → `param0`); single-use temporaries fold into their use (`v3 = sload(mapping(…))`).
 - [x] Storage variables named from public getters: a function whose known signature is `name(k0, …)` and that returns `sload(slot)` or `sload(mapping(…(slot, k0)…))` keyed by its parameters in order — inline or through an internal accessor, whose return values are summarised over two analysis passes — names that slot. Reads render as `balanceOf[k]` / `allowance[a][b]` / `owner`, slot computations as `&balanceOf[k]`, stores as `owner = …`. Conflicting claims and ERC-1967 slots stay unnamed.
 - [x] Parameters for every compiler's decoder: known stack values flow between blocks (constants, parameters, `msg.*`), so solc 0.5–0.7's `headStart` in a stack slot folds (`calldataload(v2 + 0x20)` → `param1`), and via-IR's shared decoder helpers are recognised from their return summaries (`param0 = sub_2d3f()`, later uses read `param0`). Head words follow the signature's ABI layout — dynamic parameters are their offset word, static tuples / fixed arrays `paramK.fJ` per member — and unknown signatures use `param0…`.
+- [x] Stipend-only value transfers (`call(!v * 2300, to, v, p, 0, p, 0)`) read as `to.send(v)`; with the `require` that follows, Solidity's `to.transfer(v)`.
 - [x] The listing form (`--listing`) remains for editing; lifted statements are a read-only view over pinned bytes.
 - [ ] Editable lifted statements: an EVM expression compiler so canonical statements can drop their pinned bytes (as the listing does per instruction).
 - [ ] Symbolic jump targets (`PUSH2 L_01a3`) resolved at lower time, so edits that change code length keep jumps valid.
-- [ ] Dynamic-type (`bytes`, arrays, strings) encodings, struct fields decoded into memory (via-IR `PoolKey`), `to.transfer(v)` / external-call idioms, and recursive decompile of runtime code embedded in initcode.
+- [ ] Dynamic-type (`bytes`, arrays, strings) encodings, struct fields decoded into memory (via-IR `PoolKey`), known-selector external calls (`IERC20(t).transfer(a, n)`, whose memory setup spans blocks), and recursive decompile of runtime code embedded in initcode.
 
 ## Beyond v1
 
