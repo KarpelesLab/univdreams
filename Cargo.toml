@@ -1,6 +1,6 @@
 [package]
 name = "univdreams"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Byte-identical binary <-> source round-tripping: binary formats, multi-arch decode/encode, a .ud decompiler/compiler, and an x86 emulator with Win16/Win32/Linux hosts."
