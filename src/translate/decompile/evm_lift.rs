@@ -31,17 +31,25 @@
 // limit, so the usize/i64 conversions between them can't wrap.
 #![allow(clippy::cast_possible_wrap)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::arch::evm::{DecodedInsn, OPCODE_TABLE};
 use crate::ast::Stmt;
 use crate::signatures::evm::event_by_topic;
-use crate::translate::decompile::evm_cfg::{BlockDepth, Cfg, JumpRole, Term};
+use crate::translate::decompile::evm_cfg::{BlockDepth, Cfg, FrameId, JumpRole, Term};
 
 /// DUPs of expressions at least this large bind a variable instead of
 /// duplicating the text.
 const DUP_INLINE_MAX_NODES: usize = 2;
+
+/// Operation standing for a value analysis can't follow (an entry slot
+/// no predecessor told us about). Never rendered.
+const UNKNOWN: &str = "?";
+
+/// Resolved values larger than this are treated as [`UNKNOWN`].
+const RESOLVE_MAX_NODES: usize = 48;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Expr {
@@ -308,6 +316,12 @@ fn render_raw(e: &Expr) -> String {
             };
             format!("{} {sym} {}", render_child(l), render_child(r))
         }
+        // Named storage: `balanceOf[k]`, and the slot of one as
+        // `&balanceOf[k]`.
+        Expr::Op("index", args) if args.len() == 2 => {
+            format!("{}[{}]", render_child(&args[0]), render_raw(&args[1]))
+        }
+        Expr::Op("slot", args) if args.len() == 1 => format!("&{}", render_child(&args[0])),
         Expr::Op("iszero", args) if args.len() == 1 => format!("!{}", render_child(&args[0])),
         Expr::Op("not", args) if args.len() == 1 => format!("~{}", render_child(&args[0])),
         Expr::Op(op, args) => {
@@ -327,26 +341,100 @@ fn render_child(e: &Expr) -> String {
 
 /// Top-level rendering (conditions).
 fn render(e: &Expr) -> String {
-    render_raw(&simplify(e.clone()))
+    render_raw(&name_storage(simplify(e.clone())))
 }
 
 /// Rendering for a call argument or tuple element: no bare spaces at
 /// the top level, so infix expressions get parentheses.
 fn render_arg(e: &Expr) -> String {
-    render_child(&simplify(e.clone()))
+    render_child(&name_storage(simplify(e.clone())))
 }
 
 /// Rendering for the right-hand side of an assignment: comparisons
 /// are parenthesised so their `=` can't be mistaken for the
 /// assignment's.
 fn render_rhs(e: &Expr) -> String {
-    let s = simplify(e.clone());
+    let s = name_storage(simplify(e.clone()));
     match &s {
         Expr::Op(op, args) if args.len() == 2 && matches!(*op, "eq" | "ne" | "le" | "ge") => {
             format!("({})", render_raw(&s))
         }
         _ => render_raw(&s),
     }
+}
+
+// ---------------------------------------------------------------------
+// Storage-variable names
+// ---------------------------------------------------------------------
+
+/// Storage slot (big-endian, leading zeros stripped) → the name of
+/// the state variable that lives there.
+pub(crate) type StorageNames = HashMap<Vec<u8>, String>;
+
+thread_local! {
+    /// Names in effect while [`lift_ranges`] renders its final pass.
+    /// Rendering is spread over free functions; a scoped thread-local
+    /// spares them all from taking the table as a parameter.
+    static STORAGE_NAMES: RefCell<StorageNames> = RefCell::new(HashMap::new());
+}
+
+/// Installs a storage-name table for rendering until dropped.
+struct StorageScope;
+
+impl StorageScope {
+    fn enter(names: StorageNames) -> Self {
+        STORAGE_NAMES.with(|s| *s.borrow_mut() = names);
+        StorageScope
+    }
+}
+
+impl Drop for StorageScope {
+    fn drop(&mut self) {
+        STORAGE_NAMES.with(|s| s.borrow_mut().clear());
+    }
+}
+
+/// `slot` as a named storage location — `totalSupply`,
+/// `allowance[a][b]` — when its root slot has a name.
+fn storage_ref(slot: &Expr, names: &StorageNames) -> Option<Expr> {
+    match slot {
+        Expr::Const(b) => names.get(strip(b)).map(|n| Expr::Var(n.clone())),
+        Expr::Op("mapping", a) if a.len() == 2 => Some(Expr::Op(
+            "index",
+            vec![storage_ref(&a[0], names)?, name_storage_in(&a[1], names)],
+        )),
+        _ => None,
+    }
+}
+
+fn name_storage_in(e: &Expr, names: &StorageNames) -> Expr {
+    match e {
+        Expr::Op("sload", a) if a.len() == 1 => storage_ref(&a[0], names)
+            .unwrap_or_else(|| Expr::Op("sload", vec![name_storage_in(&a[0], names)])),
+        Expr::Op("mapping", _) if storage_ref(e, names).is_some() => {
+            Expr::Op("slot", vec![storage_ref(e, names).expect("checked")])
+        }
+        Expr::Op(op, a) => Expr::Op(op, a.iter().map(|x| name_storage_in(x, names)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Rewrite reads of named storage (`sload(mapping(0x3, k))` →
+/// `balanceOf[k]`) and slot computations (`&balanceOf[k]`).
+fn name_storage(e: Expr) -> Expr {
+    STORAGE_NAMES.with(|s| {
+        let names = s.borrow();
+        if names.is_empty() {
+            e
+        } else {
+            name_storage_in(&e, &names)
+        }
+    })
+}
+
+/// The named location an `sstore` to `slot` writes, if any.
+fn storage_lvalue(slot: &Expr) -> Option<Expr> {
+    STORAGE_NAMES.with(|s| storage_ref(&simplify(slot.clone()), &s.borrow()))
 }
 
 /// `e` as `(base, offset)`: a constant (empty base) or a variable /
@@ -562,6 +650,10 @@ pub(crate) struct LiftCtx<'a> {
     /// External functions (by entry address) whose ABI parameters are
     /// all static, with their count.
     pub params: HashMap<u64, usize>,
+    /// External functions that may be public-variable getters: the
+    /// name their known signature gives them and how many (static)
+    /// parameters it takes.
+    pub getters: HashMap<u64, (String, usize)>,
 }
 
 impl LiftCtx<'_> {
@@ -584,6 +676,27 @@ impl LiftCtx<'_> {
     }
 }
 
+/// Analysis passes before the one whose text is kept: the first
+/// summarises what internal functions return, the second sees those
+/// results at call sites (a public getter that calls an internal
+/// accessor).
+const ANALYSIS_PASSES: usize = 2;
+
+/// What one lifting pass learned, for the next.
+#[derive(Debug, Default)]
+struct Facts {
+    /// Values each `return` of an internal function hands back, keyed
+    /// by entry block, in terms of its `argN`.
+    returns: HashMap<usize, Vec<Vec<Expr>>>,
+    /// Words each `return abi.encode(…)` of an external function
+    /// returns, keyed by entry address.
+    encoded: HashMap<u64, Vec<Vec<Expr>>>,
+}
+
+/// Per internal function (by entry block), each return value that is
+/// the same expression of the arguments at every `return`.
+type Summaries = HashMap<usize, Vec<Option<Expr>>>;
+
 /// Lift every function range `[start, end)` to a statement body.
 pub(crate) fn lift_ranges(ctx: &LiftCtx<'_>, ranges: &[(u64, u64)]) -> Vec<Vec<Stmt>> {
     let mut plan = Plan::default();
@@ -592,22 +705,154 @@ pub(crate) fn lift_ranges(ctx: &LiftCtx<'_>, ranges: &[(u64, u64)]) -> Vec<Vec<S
         plan_slice(ctx, slice, None, &mut plan);
     }
     let labels = collect_labels(ctx, &plan);
-    slices
+    let pass = |summaries: &Summaries, facts: &mut Facts| -> Vec<Vec<Stmt>> {
+        slices
+            .iter()
+            .zip(ranges)
+            .map(|(slice, &(start, _))| {
+                let mut fb = FnBuilder {
+                    ctx,
+                    plan: &plan,
+                    labels: &labels,
+                    range_start: start,
+                    temps: 0,
+                    summaries,
+                    exits: HashMap::new(),
+                    facts: &mut *facts,
+                };
+                let mut body = fb.build(slice, None);
+                fold_short_circuits(&mut body);
+                body
+            })
+            .collect()
+    };
+    let mut summaries = Summaries::new();
+    let mut facts = Facts::default();
+    for _ in 0..ANALYSIS_PASSES {
+        facts = Facts::default();
+        pass(&summaries, &mut facts);
+        summaries = summarize(&facts);
+    }
+    let _scope = StorageScope::enter(storage_names(ctx, &facts));
+    pass(&summaries, &mut Facts::default())
+}
+
+fn summarize(facts: &Facts) -> Summaries {
+    facts
+        .returns
         .iter()
-        .zip(ranges)
-        .map(|(slice, &(start, _))| {
-            let mut fb = FnBuilder {
-                ctx,
-                plan: &plan,
-                labels: &labels,
-                range_start: start,
-                temps: 0,
-            };
-            let mut body = fb.build(slice, None);
-            fold_short_circuits(&mut body);
-            body
+        .map(|(&f, sites)| {
+            let n = sites.first().map_or(0, Vec::len);
+            let values = (0..n)
+                .map(|k| {
+                    let first = &sites[0][k];
+                    (sites.iter().all(|s| s.len() == n && s[k] == *first) && summary_safe(first))
+                        .then(|| first.clone())
+                })
+                .collect();
+            (f, values)
         })
         .collect()
+}
+
+/// Whether `e` is a value of the arguments alone: no unknown entry
+/// slot, no variable but `argN` (and return-address labels).
+fn summary_safe(e: &Expr) -> bool {
+    match e {
+        Expr::Const(_) => true,
+        Expr::Var(v) => v.starts_with("L_") || v.strip_prefix("arg").is_some_and(is_digits),
+        Expr::Op(op, args) => *op != UNKNOWN && args.iter().all(summary_safe),
+    }
+}
+
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Name storage slots after the public getters that read them: a
+/// function whose known signature is `name(k0, k1, …)` and that
+/// returns `sload(slot)` or `sload(mapping(…mapping(slot, k0)…, kN))`
+/// keyed by its parameters in order. A slot claimed by two names, or a
+/// name by two slots, stays unnamed, as do the ERC-1967 slots.
+fn storage_names(ctx: &LiftCtx<'_>, facts: &Facts) -> StorageNames {
+    let mut claims: Vec<(Vec<u8>, &str)> = Vec::new();
+    for (addr, (name, nparams)) in &ctx.getters {
+        let Some([first, rest @ ..]) = facts.encoded.get(addr).map(Vec::as_slice) else {
+            continue;
+        };
+        if rest.iter().any(|w| w != first) {
+            continue;
+        }
+        let [word] = first.as_slice() else { continue };
+        if let Some(slot) = getter_slot(word, *nparams)
+            && !is_standard_slot(&slot)
+            && !claims.contains(&(slot.clone(), name.as_str()))
+        {
+            claims.push((slot, name));
+        }
+    }
+    unique_claims(&claims)
+}
+
+/// The `(slot, name)` claims whose slot and name each appear in no
+/// other claim.
+fn unique_claims(claims: &[(Vec<u8>, &str)]) -> StorageNames {
+    claims
+        .iter()
+        .filter(|(slot, name)| {
+            claims.iter().filter(|(s, _)| s == slot).count() == 1
+                && claims.iter().filter(|(_, n)| n == name).count() == 1
+        })
+        .map(|(slot, name)| (slot.clone(), (*name).to_string()))
+        .collect()
+}
+
+/// Whether `slot` is one of the standard slots
+/// [`crate::signatures::evm::slot_name`] already names.
+fn is_standard_slot(slot: &[u8]) -> bool {
+    if slot.len() > 32 {
+        return false;
+    }
+    let mut word = [0u8; 32];
+    word[32 - slot.len()..].copy_from_slice(slot);
+    crate::signatures::evm::slot_name(&word).is_some()
+}
+
+/// The root slot a getter's returned `word` reads, when the read is
+/// keyed by exactly the getter's `nparams` parameters in order.
+fn getter_slot(word: &Expr, nparams: usize) -> Option<Vec<u8>> {
+    let Expr::Op("sload", a) = strip_cleanup(word) else {
+        return None;
+    };
+    let mut slot = &a[0];
+    let mut keys = Vec::new();
+    while let Expr::Op("mapping", m) = slot {
+        keys.push(&m[1]);
+        slot = &m[0];
+    }
+    keys.reverse();
+    let Expr::Const(b) = slot else { return None };
+    let in_order = keys
+        .iter()
+        .enumerate()
+        .all(|(k, key)| matches!(strip_cleanup(key), Expr::Var(v) if *v == format!("param{k}")));
+    (keys.len() == nparams && in_order).then(|| strip(b).to_vec())
+}
+
+/// `e` without the type cleanup compilers wrap around loaded values:
+/// `address(x)`, `bool(x)`, low-byte masks, `signextend`, `x / 1`.
+fn strip_cleanup(mut e: &Expr) -> &Expr {
+    let low_mask = |m: &Expr| m.is_const_bytes(|b| !b.is_empty() && b.iter().all(|&x| x == 0xff));
+    loop {
+        e = match e {
+            Expr::Op("address" | "bool", a) if a.len() == 1 => &a[0],
+            Expr::Op("and", a) if a.len() == 2 && low_mask(&a[1]) => &a[0],
+            Expr::Op("and", a) if a.len() == 2 && low_mask(&a[0]) => &a[1],
+            Expr::Op("signextend", a) if a.len() == 2 && a[0].const_value().is_some() => &a[1],
+            Expr::Op("div", a) if a.len() == 2 && a[1].const_value() == Some(1) => &a[0],
+            _ => return e,
+        };
+    }
 }
 
 /// `v = a; if (v) { v = b }` is `v = a && b` (and `if (!v)` is `||`):
@@ -881,6 +1126,11 @@ struct FnBuilder<'a, 'c> {
     labels: &'a HashSet<u64>,
     range_start: u64,
     temps: usize,
+    summaries: &'a Summaries,
+    /// What each block lifted so far leaves on the stack for its
+    /// successors: its frame, and known values by frame position.
+    exits: HashMap<usize, (FrameId, HashMap<i64, Expr>)>,
+    facts: &'a mut Facts,
 }
 
 /// How a lifted block hands control on.
@@ -1083,9 +1333,11 @@ impl FnBuilder<'_, '_> {
     }
 
     fn lift_block(&mut self, b: usize) -> (Vec<Stmt>, BlockEnd) {
+        let depth = self.ctx.cfg.depth[b];
+        let entry = self.entry_values(b);
         let mut bl = BlockLift {
             ctx: self.ctx,
-            depth: self.ctx.cfg.depth[b],
+            depth,
             stack: Vec::new(),
             pulled: 0,
             pending: self.ctx.cfg.blocks[b].insns.start,
@@ -1095,9 +1347,94 @@ impl FnBuilder<'_, '_> {
             bindings: HashMap::new(),
             fmp_epoch: 0,
             params: self.ctx.params.get(&self.range_start).copied().unwrap_or(0),
+            entry,
+            resolved: HashMap::new(),
+            summaries: self.summaries,
+            exit: None,
+            returned: None,
+            encoded: None,
         };
         let end = bl.run(b);
-        (bl.out, end)
+        let BlockLift {
+            out,
+            exit,
+            returned,
+            encoded,
+            ..
+        } = bl;
+        if let (Some(exit), Some(d)) = (exit, depth) {
+            self.exits.insert(b, (d.frame, exit));
+        }
+        if let (Some(vals), Some(frame)) = (returned, depth.and_then(|d| d.frame)) {
+            self.facts.returns.entry(frame).or_default().push(vals);
+        }
+        if let Some(words) = encoded {
+            self.facts
+                .encoded
+                .entry(self.range_start)
+                .or_default()
+                .push(words);
+        }
+        (out, end)
+    }
+
+    /// Known values of `b`'s entry stack, by frame position: the
+    /// arguments at an internal function's entry, else what every
+    /// predecessor (all lifted already, in the same frame) agrees on.
+    fn entry_values(&self, b: usize) -> HashMap<i64, Expr> {
+        let cfg = self.ctx.cfg;
+        let Some(d) = cfg.depth[b] else {
+            return HashMap::new();
+        };
+        if let Some(info) = cfg.functions.get(&b) {
+            return (0..info.nargs)
+                .map(|k| (k as i64 + 1, Expr::Var(format!("arg{k}"))))
+                .collect();
+        }
+        let mut known: Option<HashMap<i64, Expr>> = None;
+        for p in &cfg.preds[b] {
+            let Some((frame, exit)) = self.exits.get(p) else {
+                return HashMap::new();
+            };
+            if *frame != d.frame {
+                return HashMap::new();
+            }
+            match &mut known {
+                None => {
+                    known = Some(
+                        exit.iter()
+                            .filter(|&(&pos, _)| pos < d.depth)
+                            .map(|(&pos, e)| (pos, e.clone()))
+                            .collect(),
+                    );
+                }
+                Some(k) => k.retain(|pos, e| exit.get(pos) == Some(e)),
+            }
+        }
+        known.unwrap_or_default()
+    }
+}
+
+/// `e` with each `argN` replaced by `args[N]`, all at once.
+fn subst_args(e: &Expr, args: &[Expr]) -> Expr {
+    match e {
+        Expr::Var(v) => v
+            .strip_prefix("arg")
+            .filter(|k| is_digits(k))
+            .and_then(|k| args.get(k.parse::<usize>().ok()?))
+            .map_or_else(|| e.clone(), Clone::clone),
+        Expr::Op(op, a) => {
+            let r = simplify(Expr::Op(
+                op,
+                a.iter().map(|x| subst_args(x, args)).collect(),
+            ));
+            if r.nodes() > RESOLVE_MAX_NODES {
+                Expr::Op(UNKNOWN, Vec::new())
+            } else {
+                r
+            }
+        }
+        Expr::Const(_) => e.clone(),
     }
 }
 
@@ -1167,6 +1504,9 @@ struct MStore {
     /// `offset` resolved by [`lin`] when the store happened, so later
     /// rebinding of a variable it mentions can't change what it means.
     place: Option<(String, u64)>,
+    /// `value` resolved when the store happened (see
+    /// [`BlockLift::resolve`]), for the same reason.
+    resolved: Expr,
 }
 
 struct BlockLift<'a, 'c> {
@@ -1192,14 +1532,30 @@ struct BlockLift<'a, 'c> {
     /// ABI parameters of the external function being lifted: the
     /// `k`th static parameter is `calldataload(4 + 32k)`.
     params: usize,
+    /// Known entry-stack values by frame position (see
+    /// [`FnBuilder::entry_values`]).
+    entry: HashMap<i64, Expr>,
+    /// Each variable bound in this block, as an expression of the
+    /// entry values ([`Self::resolve`]).
+    resolved: HashMap<String, Expr>,
+    summaries: &'a Summaries,
+    /// Set when control leaves for successor blocks: the stack it
+    /// leaves, resolved, by frame position.
+    exit: Option<HashMap<i64, Expr>>,
+    /// Set by an internal function's `return`: the values returned,
+    /// resolved, deepest first.
+    returned: Option<Vec<Expr>>,
+    /// Set by `return abi.encode(…)`: the words returned, resolved.
+    encoded: Option<Vec<Expr>>,
 }
 
 impl BlockLift<'_, '_> {
     /// `mstore(0x0, key); mstore(0x20, slot); keccak256(0x0, 0x40)` is
     /// how Solidity addresses `mapping` entries. When the two stores
     /// are the statements just emitted, fold all three into
-    /// `mapping(slot, key)`, returning the stores' bytes.
-    fn take_mapping_stores(&mut self, args: &[Expr]) -> Option<(Expr, Vec<u8>)> {
+    /// `mapping(slot, key)`, returning it, its resolved form and the
+    /// stores' bytes.
+    fn take_mapping_stores(&mut self, args: &[Expr]) -> Option<(Expr, Expr, Vec<u8>)> {
         if args[0].const_value() != Some(0) || args[1].const_value() != Some(0x40) {
             return None;
         }
@@ -1211,10 +1567,15 @@ impl BlockLift<'_, '_> {
             return None;
         }
         let (key, slot) = match (a.offset.const_value()?, b.offset.const_value()?) {
-            (0, 0x20) => (a.value.clone(), b.value.clone()),
-            (0x20, 0) => (b.value.clone(), a.value.clone()),
+            (0, 0x20) => (a, b),
+            (0x20, 0) => (b, a),
             _ => return None,
         };
+        let val = Expr::Op("mapping", vec![slot.value.clone(), key.value.clone()]);
+        let resolved = simplify(Expr::Op(
+            "mapping",
+            vec![slot.resolved.clone(), key.resolved.clone()],
+        ));
         let mut bytes = Vec::new();
         for stmt in self.out.drain(n - 2..) {
             let Stmt::Call { bytes: b, .. } = stmt else {
@@ -1223,7 +1584,104 @@ impl BlockLift<'_, '_> {
             bytes.extend(b);
         }
         self.mstores.truncate(self.mstores.len() - 2);
-        Some((Expr::Op("mapping", vec![slot, key]), bytes))
+        Some((val, resolved, bytes))
+    }
+
+    /// `e` in terms of the block's entry values, for analysis: bound
+    /// variables are replaced by what they were bound to, entry slots
+    /// by their known values, and anything else by [`UNKNOWN`].
+    fn resolve(&self, e: &Expr) -> Expr {
+        match e {
+            Expr::Var(n) => {
+                if let Some(v) = self.resolved.get(n) {
+                    return v.clone();
+                }
+                if n.starts_with("param") || n.starts_with("L_") {
+                    return e.clone();
+                }
+                self.entry_pos(n)
+                    .and_then(|p| self.entry.get(&p))
+                    .cloned()
+                    .unwrap_or_else(|| Expr::Op(UNKNOWN, Vec::new()))
+            }
+            Expr::Op(op, args) => {
+                let r = simplify(Expr::Op(op, args.iter().map(|a| self.resolve(a)).collect()));
+                // Values are trees, so repeated substitution can grow
+                // them geometrically; analysis only needs small ones.
+                if r.nodes() > RESOLVE_MAX_NODES {
+                    Expr::Op(UNKNOWN, Vec::new())
+                } else {
+                    r
+                }
+            }
+            Expr::Const(_) => e.clone(),
+        }
+    }
+
+    /// Record a binding of `name` for both rendering and analysis.
+    fn bind(&mut self, name: &str, val: Expr) {
+        let resolved = if matches!(val, Expr::Op("fmp", _)) {
+            Expr::Op(UNKNOWN, Vec::new())
+        } else {
+            self.resolve(&val)
+        };
+        self.bind_resolved(name, val, resolved);
+    }
+
+    fn bind_resolved(&mut self, name: &str, val: Expr, resolved: Expr) {
+        self.resolved.insert(name.to_string(), resolved);
+        self.bindings.insert(name.to_string(), val);
+    }
+
+    /// Frame position of the entry slot called `name`.
+    fn entry_pos(&self, name: &str) -> Option<i64> {
+        let d = self.depth?;
+        let num = |s: &str| s.parse::<i64>().ok();
+        let pos = match d.frame {
+            Some(_) if name == "ret" => 0,
+            Some(_) => match name.strip_prefix("arg") {
+                Some(k) => num(k)? + 1,
+                None => num(name.strip_prefix('v')?)?,
+            },
+            None => num(name.strip_prefix('v')?)?,
+        };
+        (pos < d.depth).then_some(pos)
+    }
+
+    /// The stack as control leaves the block, resolved, by frame
+    /// position: slots below what the block touched keep their entry
+    /// values.
+    fn exit_values(&self) -> Option<HashMap<i64, Expr>> {
+        let d = self.depth?;
+        let base = d.depth - self.pulled as i64;
+        let mut out: HashMap<i64, Expr> = self
+            .entry
+            .iter()
+            .filter(|&(&p, _)| p < base)
+            .map(|(&p, e)| (p, e.clone()))
+            .collect();
+        for (i, e) in self.stack.iter().enumerate() {
+            out.insert(base + i as i64, self.resolve(e));
+        }
+        Some(out)
+    }
+
+    /// `calldataload(4 + 32k)` as the external function's `paramK`.
+    fn param_at(&self, offset: &Expr) -> Option<Expr> {
+        let rel = offset.const_value()?.checked_sub(4)?;
+        (rel % 32 == 0 && rel / 32 < self.params as u64)
+            .then(|| Expr::Var(format!("param{}", rel / 32)))
+    }
+
+    /// `e` with its calldata reads at parameter offsets named.
+    fn paramize(&self, e: Expr) -> Expr {
+        match e {
+            Expr::Op("calldataload", a) if a.len() == 1 && self.param_at(&a[0]).is_some() => {
+                self.param_at(&a[0]).expect("checked")
+            }
+            Expr::Op(op, a) => Expr::Op(op, a.into_iter().map(|x| self.paramize(x)).collect()),
+            other => other,
+        }
     }
 
     fn slot_name(&self, pos: i64) -> Option<String> {
@@ -1407,7 +1865,7 @@ impl BlockLift<'_, '_> {
                         let name = self.bind_name(idx);
                         let val = std::mem::replace(&mut self.stack[idx], Expr::Var(name.clone()));
                         self.emit_assign(name.clone(), render_rhs(&val), i);
-                        self.bindings.insert(name, val);
+                        self.bind(&name, val);
                     }
                     let v = self.stack[idx].clone();
                     self.stack.push(v);
@@ -1423,19 +1881,15 @@ impl BlockLift<'_, '_> {
                 }
                 _ if pure_name(op).is_some() => {
                     let args = self.pop_n(OPCODE_TABLE[op as usize].pops.into());
-                    let param = (op == 0x35)
-                        .then(|| args[0].const_value())
-                        .flatten()
-                        .and_then(|off| off.checked_sub(4))
-                        .filter(|rel| rel % 32 == 0 && rel / 32 < self.params as u64);
+                    let param = (op == 0x35).then(|| self.param_at(&args[0])).flatten();
                     self.stack.push(match param {
-                        Some(rel) => Expr::Var(format!("param{}", rel / 32)),
+                        Some(p) => p,
                         None => simplify(Expr::Op(pure_name(op).unwrap(), args)),
                     });
                 }
                 0x20 if !defer && self.mapping_ready() => {
                     let args = self.pop_n(2);
-                    if let Some((val, mut bytes)) = self.take_mapping_stores(&args) {
+                    if let Some((val, resolved, mut bytes)) = self.take_mapping_stores(&args) {
                         // A slot address is a pure function of its
                         // inputs: keep it as an expression.
                         bytes.extend(self.take(i));
@@ -1446,7 +1900,7 @@ impl BlockLift<'_, '_> {
                             src: render_rhs(&val),
                             bytes,
                         });
-                        self.bindings.insert(name.clone(), val);
+                        self.bind_resolved(&name, val, resolved);
                         self.stack.push(Expr::Var(name));
                     } else {
                         self.bind_read(&Expr::Op("keccak256", args), i);
@@ -1473,7 +1927,8 @@ impl BlockLift<'_, '_> {
                         })
                         .flatten();
                     if let Some(sig) = event {
-                        if let Some((data, bytes)) = self.collapse_encoded(&args[0], &args[1], i) {
+                        if let Some((data, _, bytes)) = self.collapse_encoded(&args[0], &args[1], i)
+                        {
                             // `emit Name(indexed…, data…)`: compilers put
                             // indexed parameters first in the vast
                             // majority of events; the comment keeps the
@@ -1507,7 +1962,24 @@ impl BlockLift<'_, '_> {
                             offset: args[0].clone(),
                             value: args[1].clone(),
                             place: lin(&args[0], &self.bindings, 0),
+                            resolved: self.resolve(&args[1]),
                         });
+                    }
+                    // A store to named storage reads as an assignment.
+                    // Not on a fall-through block's last instruction,
+                    // whose bytes a slot write-back may need to take.
+                    if op == 0x55
+                        && !defer
+                        && let Some(place) = storage_lvalue(&args[0])
+                    {
+                        let mut bytes = prefix;
+                        bytes.extend(self.take(i));
+                        self.out.push(Stmt::Move {
+                            dst: render_raw(&place),
+                            src: render_rhs(&args[1]),
+                            bytes,
+                        });
+                        continue;
                     }
                     let mut bytes = prefix;
                     bytes.extend(self.take(i));
@@ -1525,7 +1997,8 @@ impl BlockLift<'_, '_> {
                 0xf3 => {
                     let args = self.pop_n(2);
                     let (text, bytes) = match self.collapse_encoded(&args[0], &args[1], i) {
-                        Some((words, bytes)) => {
+                        Some((words, resolved, bytes)) => {
+                            self.encoded = Some(resolved);
                             let parts: Vec<String> = words.iter().map(render_arg).collect();
                             (format!("abi.encode({})", parts.join(", ")), bytes)
                         }
@@ -1553,6 +2026,7 @@ impl BlockLift<'_, '_> {
                 0x57 => {
                     let target = self.pop();
                     let cond = self.pop();
+                    self.exit = self.exit_values();
                     let bytes = self.jump_bytes(i);
                     let target = target.const_value().or_else(|| {
                         let t = &cfg.targets[b];
@@ -1572,6 +2046,7 @@ impl BlockLift<'_, '_> {
             }
         }
         // Fell off the end of the block.
+        self.exit = self.exit_values();
         if self.exit_writes().is_some() {
             if self.pending < blk.insns.end {
                 self.flush_exit(last);
@@ -1689,6 +2164,13 @@ impl BlockLift<'_, '_> {
     /// Bind a state read to the variable for the slot it lands in.
     fn bind_read(&mut self, val: &Expr, i: usize) {
         let is_fmp = matches!(val, Expr::Op("mload", a) if a[0].const_value() == Some(0x40));
+        // Before inlining: inlined values may name variables since
+        // rebound.
+        let resolved = if is_fmp {
+            Expr::Op(UNKNOWN, Vec::new())
+        } else {
+            self.resolve(val)
+        };
         let (val, mut bytes) = if is_fmp {
             (val.clone(), Vec::new())
         } else {
@@ -1714,7 +2196,7 @@ impl BlockLift<'_, '_> {
         } else {
             val
         };
-        self.bindings.insert(name.clone(), bound);
+        self.bind_resolved(&name, bound, resolved);
         self.stack.push(Expr::Var(name));
     }
 
@@ -1755,13 +2237,14 @@ impl BlockLift<'_, '_> {
     /// `p = mload(0x40); mstore(p, a); mstore(p + 0x20, b); …` — feeding
     /// a `RETURN` / `LOGn` of `(offset, len)` at instruction `i`. On a
     /// match the encoding statements are removed and their bytes (plus
-    /// the instruction's) returned with the words.
+    /// the instruction's) returned with the words, as written and
+    /// resolved.
     fn collapse_encoded(
         &mut self,
         offset: &Expr,
         len: &Expr,
         i: usize,
-    ) -> Option<(Vec<Expr>, Vec<u8>)> {
+    ) -> Option<(Vec<Expr>, Vec<Expr>, Vec<u8>)> {
         let (base, start_off) = lin(offset, &self.bindings, 0)?;
         let n_bytes = if let Some(n) = len.const_value() {
             n
@@ -1782,6 +2265,7 @@ impl BlockLift<'_, '_> {
         }
         let mut first = self.out.len();
         let mut words = Vec::new();
+        let mut resolved = Vec::new();
         for k in 0..n_bytes / 32 {
             let want = (base.clone(), start_off + 32 * k);
             let m = self
@@ -1791,6 +2275,7 @@ impl BlockLift<'_, '_> {
                 .find(|m| m.place.as_ref() == Some(&want))?;
             first = first.min(m.at);
             words.push(m.value.clone());
+            resolved.push(m.resolved.clone());
         }
         // Take in the pointer reads that located the buffer.
         while first > 0
@@ -1839,7 +2324,7 @@ impl BlockLift<'_, '_> {
         }
         self.mstores.retain(|m| m.at < first);
         bytes.extend(self.take(i));
-        Some((words, bytes))
+        Some((words, resolved, bytes))
     }
 
     /// Move the bytes of the most recent byte-carrying call statement
@@ -1882,6 +2367,22 @@ impl BlockLift<'_, '_> {
                 }
                 let info = cfg.functions[&c.callee];
                 let nrets = info.nrets;
+                // The continuation sees the stack below the call plus
+                // the callee's results, as far as its summary says.
+                self.exit = self.exit_values().map(|mut exit| {
+                    let base = self.pos_of(self.stack.len()).unwrap_or_default();
+                    let actual: Vec<Expr> = args.iter().map(|a| self.resolve(a)).collect();
+                    let summary = self.summaries.get(&c.callee);
+                    for k in 0..nrets.unwrap_or(0) {
+                        let value = summary
+                            .and_then(|s| s.get(k)?.as_ref())
+                            .map_or(Expr::Op(UNKNOWN, Vec::new()), |v| {
+                                self.paramize(subst_args(v, &actual))
+                            });
+                        exit.insert(base + k as i64, value);
+                    }
+                    exit
+                });
                 let ret_names: Vec<String> = (0..nrets.unwrap_or(0))
                     .map(|k| {
                         if k == 0 && info.keeps_ret {
@@ -1952,6 +2453,7 @@ impl BlockLift<'_, '_> {
                     .unwrap_or(0);
                 let mut vals = self.pop_n(nrets);
                 vals.reverse();
+                self.returned = Some(vals.iter().map(|v| self.resolve(v)).collect());
                 let keeps_ret = self
                     .depth
                     .and_then(|d| d.frame)
@@ -1964,6 +2466,7 @@ impl BlockLift<'_, '_> {
                 self.out.push(Stmt::ReturnExpr { text, bytes });
             }
             JumpRole::Local | JumpRole::Unknown => {
+                self.exit = self.exit_values();
                 let dest = match target.const_value() {
                     Some(v) => self.ctx.target_name(v),
                     None if cfg.targets[b].len() == 1 => {
@@ -2019,5 +2522,87 @@ mod tests {
         );
         assert_eq!(render(&addr), "address(msg.sender)");
         assert_eq!(render(&negate(Expr::Op("msg.value", vec![]))), "!msg.value");
+    }
+
+    fn op(name: &'static str, args: Vec<Expr>) -> Expr {
+        Expr::Op(name, args)
+    }
+
+    fn var(name: &str) -> Expr {
+        Expr::Var(name.into())
+    }
+
+    #[test]
+    fn getters_name_their_slots() {
+        // allowance(a, b): sload(mapping(mapping(4, address(a)), b)).
+        let nested = op(
+            "sload",
+            vec![op(
+                "mapping",
+                vec![
+                    op("mapping", vec![c(4), op("address", vec![var("param0")])]),
+                    var("param1"),
+                ],
+            )],
+        );
+        assert_eq!(getter_slot(&nested, 2), Some(vec![4]));
+        assert_eq!(getter_slot(&nested, 1), None, "key count must match");
+        let swapped = op(
+            "sload",
+            vec![op(
+                "mapping",
+                vec![op("mapping", vec![c(4), var("param1")]), var("param0")],
+            )],
+        );
+        assert_eq!(getter_slot(&swapped, 2), None, "keys must be in order");
+        // owner(): address(sload(0)), and legacy `0xff & (x / 1)`.
+        assert_eq!(
+            getter_slot(&op("address", vec![op("sload", vec![c(0)])]), 0),
+            Some(vec![])
+        );
+        let legacy = op(
+            "and",
+            vec![c(0xff), op("div", vec![op("sload", vec![c(2)]), c(1)])],
+        );
+        assert_eq!(getter_slot(&legacy, 0), Some(vec![2]));
+        assert_eq!(getter_slot(&op("sload", vec![var("v1")]), 0), None);
+        // Conflicting claims leave both sides unnamed.
+        let claims = [
+            (vec![2], "totalSupply"),
+            (vec![3], "balanceOf"),
+            (vec![3], "shares"),
+            (vec![5], "owner"),
+            (vec![6], "owner"),
+        ];
+        let names = unique_claims(&claims);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[&vec![2]], "totalSupply");
+    }
+
+    #[test]
+    fn named_storage_renders_as_variables() {
+        let names: StorageNames = [
+            (vec![2], "totalSupply".to_string()),
+            (vec![4], "allowance".to_string()),
+        ]
+        .into();
+        let _scope = StorageScope::enter(names);
+        let (a, b) = (var("a"), var("b"));
+        let slot = op("mapping", vec![op("mapping", vec![c(4), a.clone()]), b]);
+        assert_eq!(render(&op("sload", vec![c(2)])), "totalSupply");
+        assert_eq!(render(&op("sload", vec![slot.clone()])), "allowance[a][b]");
+        assert_eq!(
+            render_rhs(&op("mapping", vec![c(4), a.clone()])),
+            "&allowance[a]"
+        );
+        assert_eq!(
+            render_raw(&storage_lvalue(&slot).unwrap()),
+            "allowance[a][b]"
+        );
+        // Unnamed slots keep the raw form.
+        assert_eq!(
+            render(&op("sload", vec![op("mapping", vec![c(3), a])])),
+            "sload(mapping(0x3, a))"
+        );
     }
 }

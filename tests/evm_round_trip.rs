@@ -114,14 +114,25 @@ fn weth9_lifts_to_statements() {
     assert!(text.contains("require(!msg.value)"), "{text}");
     assert!(text.contains("sub_09d9(param0)"));
     assert!(text.contains("// internal function: 1 argument(s), 0 return value(s)"));
-    // balanceOf[msg.sender]: Solidity's mapping slot, read in place.
-    assert!(text.contains("v3 = sload(mapping(0x3, address(msg.sender)))"));
+    // balanceOf[msg.sender]: Solidity's mapping slot, read in place
+    // and named after the `balanceOf(address)` getter that reads it.
+    assert!(
+        text.contains("v3 = balanceOf[address(msg.sender)]"),
+        "{text}"
+    );
+    assert!(text.contains("v3 = &balanceOf[address(msg.sender)]"));
     assert!(text.contains("require((v3 >= arg0))"));
     assert!(text.contains("call(v3, address(msg.sender), arg0"));
     // Events and return values with their ABI encoding folded.
     assert!(text.contains("emit(Withdrawal(address(msg.sender), arg0))"));
     assert!(text.contains("emit(Deposit(address(msg.sender), msg.value))"));
     assert!(text.contains("return abi.encode(bool(v1));"));
+    // The getters' own internal accessors, and `decimals` (slot 2).
+    assert!(text.contains("arg0 = balanceOf[arg0]"));
+    assert!(text.contains("arg0 = allowance[arg0][arg1]"));
+    assert!(text.contains("v5 = &allowance[address(msg.sender)]"));
+    assert!(text.contains("v2 = decimals"));
+    assert!(!text.contains("mapping(0x"));
     // `name()`'s copy loop is structured.
     assert!(text.contains("whileblock ("));
     assert!(text.matches("@asm(").count() <= 4);
@@ -149,6 +160,12 @@ fn poolmanager_uses_transient_storage_and_carries_solc_version() {
     assert!(text.contains("mstore(v5, unlockCallback.selector)"));
     assert!(text.contains("emit(OperatorSet(msg.sender, address(v2), v1))"));
     assert!(text.contains("return abi.encode(address(v3));"));
+    // Storage named from the public getters: `owner` (slot 0),
+    // `protocolFeeController` (2), `isOperator` (3), `allowance` (5).
+    assert!(text.contains("owner = (v2 & v1) | t1"), "{text}");
+    assert!(text.contains("v3 = protocolFeeController"));
+    assert!(text.contains("isOperator[msg.sender]"));
+    assert!(text.contains("&allowance[msg.sender]"));
     assert!(!text.contains("unknown return value"));
     assert!(text.matches("@asm(").count() <= 8);
 }

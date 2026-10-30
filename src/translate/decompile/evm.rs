@@ -165,6 +165,14 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
                     Some((addr, types.len()))
                 })
                 .collect(),
+            getters: selectors
+                .iter()
+                .filter_map(|(&addr, &sel)| {
+                    let sig = function_by_selector(sel)?;
+                    let n = static_params(sig)?.len();
+                    Some((addr, (sig.split('(').next()?.to_string(), n)))
+                })
+                .collect(),
         };
         evm_lift::lift_ranges(&ctx, &ranges)
     } else {
@@ -186,7 +194,9 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
         names[&ranges[i].0].clone()
     };
     let mut callers: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-    for (&site, call) in &cfg.calls {
+    let mut sites: Vec<_> = cfg.calls.iter().collect();
+    sites.sort_by_key(|&(&site, _)| cfg.blocks[site].start);
+    for (&site, call) in sites {
         let list = callers.entry(cfg.blocks[call.callee].start).or_default();
         let who = range_name(cfg.blocks[site].start);
         if !list.contains(&who) {

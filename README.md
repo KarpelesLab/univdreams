@@ -143,30 +143,30 @@ $ ud roundtrip --through-source testdata/external/wmpcdcs8-mpg4c32.dll \
 source round-trip ok: testdata/external/wmpcdcs8-mpg4c32.dll == /tmp/mpg4c32.rebuilt (420240 bytes)
 ```
 
-EVM contracts lift to functions over named stack slots — internal calls, storage mappings, `require`, events. Here is mainnet WETH9's `withdraw`, fetched by address (each statement's pinned byte list elided):
+EVM contracts lift to functions over named stack slots — internal calls, storage variables named after their public getters, `require`, events. Here is mainnet WETH9's `withdraw`, fetched by address (each statement's pinned byte list elided):
 
 ```bash
 $ ud evm 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
 …
-// selector 0x2e1a7d4d: withdraw(uint256)
+// selector 0x2e1a7d4d: withdraw(uint256 param0)
 fn withdraw() {
     require(!msg.value)
-    sub_09d9(calldataload(0x4))
+    sub_09d9(param0)
     stop()
 }
 // internal function: 1 argument(s), 0 return value(s); called from withdraw
 fn sub_09d9() {
-    v3 = mapping(0x3, address(msg.sender))
-    v3 = sload(v3)
+    v3 = balanceOf[address(msg.sender)]
     require((v3 >= arg0))
-    …
+    v3 = &balanceOf[address(msg.sender)]
+    v6 = sload(v3)
+    v2 = v6 - arg0
     sstore(v3, v2)
     …
     v6 = call(v3, address(msg.sender), arg0, v7, v5 - v7, v7, 0x0)
     require(bool(v6))
-    …
     // event Withdrawal(address,uint256)
-    log2(t1, ((0x20 + v5) - t1), 0x7fcf…1b65, address(msg.sender))
+    emit(Withdrawal(address(msg.sender), arg0))
     return;
 }
 ```
