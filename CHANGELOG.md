@@ -8,6 +8,24 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/KarpelesLab/univdreams/compare/v0.5.0...v0.5.1) - 2026-10-30
+
+### Documentation
+
+- name the folded external-call forms that stay uneditable
+
+### Evm
+
+- name dynamic parameters' length and data offset
+- follow structs decoded into memory; name well-known struct members
+- Vyper >=0.3.10 selector tables, ERC-5202 blueprints, factory fixtures
+- point an EIP-1167 clone at another implementation
+- fold external calls with static arguments into Iface(t).f(args)
+- resize embedded contracts, follow codesize() - n
+- edit, add and delete internal and external calls
+- count Vyper 0.2 frame save/restore loops; msg.sig across cases
+- delete commented-out lifted statements, rename assignment targets
+
 ## [0.5.0](https://github.com/KarpelesLab/univdreams/compare/v0.4.0...v0.5.0) - 2026-10-30
 
 ### Documentation
