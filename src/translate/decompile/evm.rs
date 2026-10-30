@@ -19,10 +19,10 @@
 //!    before the `EQ`) names its targets after the selector — via
 //!    the [`crate::signatures::evm`] table when the signature is
 //!    known, `fn_<selector>` otherwise. Internal functions found by
-//!    [`super::evm_cfg`] become `sub_<addr>`, with their argument and
+//!    `evm_cfg` become `sub_<addr>`, with their argument and
 //!    return counts. Code at offset 0 is `entry`. Each function runs to
 //!    the next entry, giving a contiguous cover as the 6502 path does.
-//! 3. **Bodies.** By default, [`super::evm_lift`] turns each function
+//! 3. **Bodies.** By default, `evm_lift` turns each function
 //!    into statements over named stack slots — expressions,
 //!    `sstore`/`mstore`/`log`, internal calls and returns,
 //!    `if`/`while`/`do … while`, `require(…)` / `revert(Err())`. That
@@ -64,7 +64,7 @@ struct DataRegion {
 }
 
 /// Build the AST for a contract's bytecode, with function bodies
-/// lifted to statements (see [`super::evm_lift`]).
+/// lifted to statements (see `evm_lift`).
 #[must_use]
 pub fn decompile_evm(code: &[u8]) -> UdFile {
     decompile_evm_impl(code, true)
