@@ -28,6 +28,7 @@ const R_X86_64_JUMP_SLOT: u32 = 7;
 
 /// Errors specific to PLT thunk discovery.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PltError {
     #[error("`.rela.plt` size {size} is not a multiple of {entry}")]
     BadRelaSize { size: usize, entry: usize },

@@ -27,6 +27,7 @@ use crate::format::macho::{
 
 /// Errors specific to the Mach-O lower path.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MachoLowerError {
     #[error("missing field `{field}` in `@module.build`")]
     MissingField { field: String },

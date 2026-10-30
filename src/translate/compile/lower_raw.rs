@@ -19,6 +19,7 @@ use crate::translate::compile::lower::lower_function_bytes;
 use crate::translate::compile::module::resolve_arch_codec;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RawLowerError {
     #[error("`@module.format` is not `\"raw\"` (got {got:?})")]
     NotRaw { got: String },

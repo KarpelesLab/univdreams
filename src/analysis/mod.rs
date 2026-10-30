@@ -41,6 +41,7 @@ use crate::format::elf::Elf64File;
 
 /// Crate-level error type.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
     Symbol(#[from] SymbolError),

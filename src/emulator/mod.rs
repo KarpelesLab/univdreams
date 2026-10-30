@@ -244,6 +244,7 @@ pub use win32::vfw32::Bih;
 /// PE loader / Win32 stub) has its own variant; sublayers nest
 /// their detail enums.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Reserved placeholder. Removed in a later round once every
     /// caller has migrated to a more specific variant.

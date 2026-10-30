@@ -17,6 +17,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// error type and convert at the boundary; this enum is for things that
 /// genuinely belong at the top of the stack.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("I/O error on {path}: {source}")]
     Io {

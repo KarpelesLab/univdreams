@@ -1290,6 +1290,7 @@ fn normalize(s: &str) -> String {
 
 /// Errors produced by decode / encode / round-trip helpers.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("instruction decoder rejected bytes at offset {offset}")]
     DecodeFailed { offset: usize },
@@ -1467,6 +1468,7 @@ pub fn roundtrip_bytes(bitness: Bitness, bytes: &[u8], rip: u64) -> Result<Vec<D
 
 /// Errors emitted by [`encode_jmp`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum JumpEncodeError {
     #[error("jmp rel32 target out of i32 range: from=0x{from:x} to=0x{to:x}")]
     OutOfRange { from: u64, to: u64 },
@@ -1660,6 +1662,7 @@ pub fn jcc_cond_code_from_name(name: &str) -> Option<u8> {
 
 /// Errors emitted by [`encode_msvc_jmp_table_dispatch`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SwitchEncodeError {
     #[error("unsupported selector register {0:?} (expected eax/ecx/edx/ebx/esi/edi/ebp)")]
     UnsupportedSelector(String),

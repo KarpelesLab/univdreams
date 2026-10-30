@@ -45,6 +45,7 @@ pub struct LoweredFunction {
 
 /// Errors specific to the lower path.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LowerError {
     #[error(
         "function `{fn_name}` has an `@asm` statement without pinned bytes \

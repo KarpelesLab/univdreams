@@ -84,6 +84,7 @@ pub const ASF_AUDIO_MEDIA: Guid = Guid::new(
 /// exact ASF-spec rule that the input violated, so a test failure
 /// reads as a single-line spec citation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AsfParseError {
     /// File is shorter than the 30-byte ASF Header Object
     /// preamble (16 GUID + 8 size + 4 NumHeaderObjects + 2

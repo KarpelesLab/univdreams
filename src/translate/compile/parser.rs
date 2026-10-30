@@ -8,6 +8,7 @@ use crate::ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFi
 use crate::translate::compile::lexer::{LexError, Token, TokenKind, tokenize};
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ParseError {
     #[error(transparent)]
     Lex(#[from] LexError),

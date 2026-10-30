@@ -27,6 +27,7 @@ use crate::arch::x86::DecodedInsn;
 
 /// Errors specific to the lifter.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LiftError {
     #[error("cannot lift an empty instruction stream")]
     Empty,

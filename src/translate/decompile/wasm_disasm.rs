@@ -39,6 +39,7 @@ pub struct Op {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DisasmError {
     #[error("unexpected end of code at offset 0x{at:x}")]
     UnexpectedEof { at: usize },

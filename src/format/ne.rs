@@ -50,6 +50,7 @@ const NE_HEADER_LEN: usize = 0x40;
 
 /// Errors raised by [`NeFile::parse`].
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     #[error("buffer too short ({len} bytes); needs at least 64 for the DOS header")]
     TooShort { len: usize },

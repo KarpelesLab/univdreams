@@ -75,6 +75,7 @@ pub struct ElfImage {
 
 /// Errors the loader can surface.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum LoadError {
     Parse(String),
     Dynamic,

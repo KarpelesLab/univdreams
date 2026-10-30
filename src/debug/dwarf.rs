@@ -19,6 +19,7 @@ use gimli::{
 };
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DebugError {
     #[error("DWARF parser rejected the input: {0}")]
     Gimli(#[source] gimli::Error),

@@ -116,6 +116,7 @@ pub struct Token {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LexError {
     #[error("unexpected character {ch:?} at line {line}, col {col}")]
     UnexpectedChar { ch: char, line: u32, col: u32 },

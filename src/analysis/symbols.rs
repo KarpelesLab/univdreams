@@ -28,6 +28,7 @@ const STT_GNU_IFUNC: u8 = 10;
 
 /// Errors specific to symbol-table parsing.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SymbolError {
     #[error("symbol table section #{idx} has unexpected sh_entsize {got}, expected {expected}")]
     BadEntsize { idx: usize, got: u64, expected: u64 },

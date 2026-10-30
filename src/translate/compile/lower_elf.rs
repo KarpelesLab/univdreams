@@ -27,6 +27,7 @@ use crate::translate::compile::module::resolve_arch_codec;
 
 /// Errors specific to the ELF lower path.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ElfLowerError {
     #[error("missing field `{field}` in `@module.build`")]
     MissingField { field: String },

@@ -33,6 +33,7 @@ use crate::emulator::win32::{HostState, Registry};
 
 /// PE-loader-specific error variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PeError {
     /// File too small to contain a DOS header.
     TooSmall { got: usize, need: usize },

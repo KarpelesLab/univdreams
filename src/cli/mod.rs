@@ -121,6 +121,7 @@ pub struct DiffContext {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SourceRoundTripError {
     #[error("input is not a recognised binary format")]
     UnknownFormat,

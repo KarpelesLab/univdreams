@@ -89,6 +89,7 @@ pub enum LoaderKind {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("account data too short for {loader}: need ≥{need} bytes, got {got}")]
     TooShort {

@@ -16,6 +16,7 @@ use crate::common::VAddr;
 
 /// Errors returned by `RawImage` accessors.
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     #[error("address {addr:#06x} is outside the image (load=[{load:#06x}, {end:#06x}))")]
     OutOfRange { addr: u64, load: u64, end: u64 },

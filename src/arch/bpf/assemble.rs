@@ -50,6 +50,7 @@ use crate::arch::bpf::INSN_SIZE;
 /// decompile-time byte-drop pass can keep bytes pinned for
 /// the lines we can't yet handle (typically symbolic forms).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AssembleError {
     #[error("empty text")]
     Empty,

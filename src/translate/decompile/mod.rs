@@ -83,6 +83,7 @@ enum Arch {
 
 /// Errors surfaced by the top-level entry point.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("only x86 ELF inputs are supported; got e_machine = {0}")]
     UnsupportedMachine(u16),

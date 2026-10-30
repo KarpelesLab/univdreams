@@ -54,6 +54,7 @@ pub const SENTINEL_SELECTOR: u16 = 0xFFF8;
 
 /// Errors raised while loading an NE module.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum NeLoadError {
     #[error("NE parse failed: {0}")]
     Parse(#[from] crate::format::ne::Error),

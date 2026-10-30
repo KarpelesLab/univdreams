@@ -26,6 +26,7 @@ use crate::format::pe::{
 
 /// Errors specific to the PE lower path.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PeLowerError {
     #[error("missing field `{field}` in `@module.build`")]
     MissingField { field: String },

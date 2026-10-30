@@ -52,6 +52,7 @@ impl ArchInsn for DecodedInsn {
 
 /// Errors returned by the 6502 decoder.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error(
         "truncated instruction at offset {offset}: opcode {opcode:#04x} needs {needs} operand byte(s), only {have} available"

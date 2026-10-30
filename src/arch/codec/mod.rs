@@ -43,6 +43,7 @@ pub use registry::{CodecFactory, for_arch, register};
 /// bytes." Other variants are hard failures the caller surfaces to
 /// the user.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ArchError {
     /// Returned when an arch is asked to encode something its
     /// codec doesn't model. The caller (decompile-time byte-drop

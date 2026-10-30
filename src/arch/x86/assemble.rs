@@ -24,6 +24,7 @@ use crate::arch::x86::Bitness;
 
 /// Errors raised by [`assemble_intel`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AssembleError {
     /// The text is empty.
     #[error("empty text — assembler needs at least a mnemonic")]

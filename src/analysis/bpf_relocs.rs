@@ -32,6 +32,7 @@ const SYM_SIZE: usize = 24;
 
 /// Errors specific to BPF relocation resolution.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BpfRelocError {
     #[error("`.rel.dyn` size {size} is not a multiple of {entry}")]
     BadRelSize { size: usize, entry: usize },

@@ -69,6 +69,7 @@ pub enum BpfVariant {
 
 /// Errors specific to the BPF backend.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error(
         "byte buffer length {len} is not a multiple of {INSN_SIZE} (BPF slots are fixed-width)"

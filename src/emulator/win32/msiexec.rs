@@ -57,6 +57,7 @@ use thiserror::Error;
 
 /// Errors surfaced by [`process_msi`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The underlying `msi` crate couldn't open the MSI bytes
     /// (compound-document corruption, truncated payload, bad

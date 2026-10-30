@@ -33,6 +33,7 @@ use crate::translate::compile::lower_raw::{
 };
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EvmLowerError {
     #[error("`@module.format` is not `\"evm\"` (got {got:?})")]
     NotEvm { got: String },

@@ -20,6 +20,7 @@ use crate::analysis::function_map::{Function, FunctionSource};
 
 /// Errors specific to `.eh_frame` parsing.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EhFrameError {
     #[error("gimli rejected the .eh_frame section: {0}")]
     Gimli(gimli::Error),

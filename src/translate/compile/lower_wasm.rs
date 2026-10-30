@@ -16,6 +16,7 @@
 use crate::ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WasmLowerError {
     #[error("`@module.format` is not `\"wasm\"` (got {got:?})")]
     NotWasm { got: String },

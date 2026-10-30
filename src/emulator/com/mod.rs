@@ -242,6 +242,7 @@ impl core::fmt::Display for Guid {
 
 /// Error returned by [`Guid::parse`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GuidParseError {
     /// String length is not exactly 38 bytes.
     WrongLength { len: usize },

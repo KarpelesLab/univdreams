@@ -109,6 +109,7 @@ pub struct StubEntry {
 
 /// Errors a stub can raise. Wrapped in `crate::emulator::Error::Win32`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Win32Error {
     /// No stub registered for the requested `(dll, name)` pair.
     /// PE-load-time error; surfaces from

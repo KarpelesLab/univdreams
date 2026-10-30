@@ -114,6 +114,7 @@ pub enum MachoCpu {
 
 /// Errors surfaced when parsing or writing a Mach-O file.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("file too short: needed {needed} bytes at offset {offset}, have {have}")]
     Truncated { offset: u64, needed: u64, have: u64 },

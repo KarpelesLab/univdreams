@@ -191,6 +191,7 @@ pub fn classify(insn: &DecodedInsn) -> InsnKind {
 
 /// Errors from [`assemble_one`].
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AssembleError {
     #[error("empty instruction")]
     Empty,

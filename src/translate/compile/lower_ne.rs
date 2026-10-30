@@ -20,6 +20,7 @@
 use crate::ast::{Field, Item, Module, UdFile, Value};
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum NeLowerError {
     #[error("`@module.format` is not `\"ne\"` (got {got:?})")]
     NotNe { got: String },

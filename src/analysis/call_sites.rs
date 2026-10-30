@@ -32,6 +32,7 @@ use crate::analysis::function_map::{Function, FunctionSource};
 
 /// Errors specific to call-site discovery.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CallSiteError {
     #[error(transparent)]
     BpfDecode(crate::arch::bpf::Error),

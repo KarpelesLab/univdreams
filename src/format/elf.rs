@@ -145,6 +145,7 @@ const fn shdr_size(class: ElfClass) -> u16 {
 
 /// Errors surfaced when parsing or writing an ELF64 file.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("file too short: needed {needed} bytes at offset {offset}, have {have}")]
     Truncated { offset: u64, needed: u64, have: u64 },

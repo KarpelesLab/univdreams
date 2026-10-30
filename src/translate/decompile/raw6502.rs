@@ -34,6 +34,7 @@ const VECTORS_LEN: u64 = 6;
 
 /// Errors specific to the 6502 raw path.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("image is too small to contain reset vectors at $FFFA-$FFFF (got {got} bytes)")]
     TooSmall { got: usize },

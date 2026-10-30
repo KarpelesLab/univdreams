@@ -27,6 +27,7 @@ pub const MAGIC: [u8; 4] = [0x00, b'a', b's', b'm'];
 
 /// Errors raised by [`WasmFile::parse`].
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     #[error("buffer too short ({len} bytes); needs at least 8 for magic + version")]
     TooShort { len: usize },

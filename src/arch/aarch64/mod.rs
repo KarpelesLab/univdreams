@@ -28,6 +28,7 @@ pub const INSN_SIZE: usize = 4;
 
 /// Errors specific to the AArch64 backend.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error(
         "byte buffer length {len} is not a multiple of {INSN_SIZE} (AArch64 insns are fixed-width)"
