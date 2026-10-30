@@ -69,6 +69,25 @@ impl Expr {
         }
     }
 
+    fn count(&self, name: &str) -> usize {
+        match self {
+            Expr::Var(v) => usize::from(v == name),
+            Expr::Op(_, args) => args.iter().map(|a| a.count(name)).sum(),
+            Expr::Const(_) => 0,
+        }
+    }
+
+    fn substitute(&self, name: &str, with: &Expr) -> Expr {
+        match self {
+            Expr::Var(v) if v == name => with.clone(),
+            Expr::Op(op, args) => simplify(Expr::Op(
+                op,
+                args.iter().map(|a| a.substitute(name, with)).collect(),
+            )),
+            other => other.clone(),
+        }
+    }
+
     fn const_value(&self) -> Option<u64> {
         let Expr::Const(b) = self else { return None };
         let significant: Vec<u8> = b.iter().copied().skip_while(|&x| x == 0).collect();
@@ -330,6 +349,34 @@ fn render_rhs(e: &Expr) -> String {
     }
 }
 
+/// `e` as `(base, offset)`: a constant (empty base) or a variable /
+/// free-memory-pointer read plus a constant. Bound variables are
+/// looked through, so `v5 = 0x20 + v3` resolves against `v3`.
+fn lin(e: &Expr, bindings: &HashMap<String, Expr>, depth: u8) -> Option<(String, u64)> {
+    if depth > 8 {
+        return None;
+    }
+    match e {
+        Expr::Const(_) => Some((String::new(), e.const_value()?)),
+        Expr::Var(n) => match bindings.get(n) {
+            Some(Expr::Op("fmp", k)) => Some((format!("fmp{}", k[0].const_value()?), 0)),
+            Some(b) => lin(b, bindings, depth + 1).or_else(|| Some((n.clone(), 0))),
+            None => Some((n.clone(), 0)),
+        },
+        Expr::Op("add", ab) if ab.len() == 2 => {
+            let (b1, o1) = lin(&ab[0], bindings, depth + 1)?;
+            let (b2, o2) = lin(&ab[1], bindings, depth + 1)?;
+            let base = match (b1.is_empty(), b2.is_empty()) {
+                (_, true) => b1,
+                (true, false) => b2,
+                (false, false) => return None,
+            };
+            Some((base, o1.checked_add(o2)?))
+        }
+        Expr::Op(..) => None,
+    }
+}
+
 /// The selector in a `selector << 224` constant.
 fn shifted_selector(e: &Expr) -> Option<u32> {
     let Expr::Const(b) = e else { return None };
@@ -512,6 +559,9 @@ pub(crate) struct LiftCtx<'a> {
     pub listing: &'a dyn Fn(&[DecodedInsn]) -> Vec<Stmt>,
     /// Addresses of call continuations (return addresses).
     pub continuations: HashSet<u64>,
+    /// External functions (by entry address) whose ABI parameters are
+    /// all static, with their count.
+    pub params: HashMap<u64, usize>,
 }
 
 impl LiftCtx<'_> {
@@ -1042,6 +1092,9 @@ impl FnBuilder<'_, '_> {
             out: Vec::new(),
             temps: &mut self.temps,
             mstores: Vec::new(),
+            bindings: HashMap::new(),
+            fmp_epoch: 0,
+            params: self.ctx.params.get(&self.range_start).copied().unwrap_or(0),
         };
         let end = bl.run(b);
         (bl.out, end)
@@ -1105,6 +1158,17 @@ fn jump_stmt(dest: String, bytes: Vec<u8>) -> Stmt {
 // Per-block symbolic execution
 // ---------------------------------------------------------------------
 
+/// An `mstore` emitted by the block being lifted.
+struct MStore {
+    /// Index of its statement in `BlockLift::out`.
+    at: usize,
+    offset: Expr,
+    value: Expr,
+    /// `offset` resolved by [`lin`] when the store happened, so later
+    /// rebinding of a variable it mentions can't change what it means.
+    place: Option<(String, u64)>,
+}
+
 struct BlockLift<'a, 'c> {
     ctx: &'a LiftCtx<'c>,
     depth: Option<BlockDepth>,
@@ -1116,9 +1180,18 @@ struct BlockLift<'a, 'c> {
     pending: usize,
     out: Vec<Stmt>,
     temps: &'a mut usize,
-    /// `(index in out, offset, value)` of `mstore`s emitted in this
-    /// block, for the mapping-slot idiom.
-    mstores: Vec<(usize, Expr, Expr)>,
+    /// `mstore`s emitted in this block, for the mapping-slot and
+    /// ABI-encoding idioms.
+    mstores: Vec<MStore>,
+    /// What each variable bound in this block was bound to. A
+    /// free-memory-pointer read is recorded as `fmp(epoch)`.
+    bindings: HashMap<String, Expr>,
+    /// Bumped by every `mstore(0x40, …)`: free-memory-pointer reads in
+    /// the same epoch see the same value.
+    fmp_epoch: u64,
+    /// ABI parameters of the external function being lifted: the
+    /// `k`th static parameter is `calldataload(4 + 32k)`.
+    params: usize,
 }
 
 impl BlockLift<'_, '_> {
@@ -1131,15 +1204,15 @@ impl BlockLift<'_, '_> {
             return None;
         }
         let n = self.out.len();
-        let [.., (ia, oa, va), (ib, ob, vb)] = self.mstores.as_slice() else {
+        let [.., a, b] = self.mstores.as_slice() else {
             return None;
         };
-        if (*ia, *ib) != (n.checked_sub(2)?, n - 1) {
+        if (a.at, b.at) != (n.checked_sub(2)?, n - 1) {
             return None;
         }
-        let (key, slot) = match (oa.const_value()?, ob.const_value()?) {
-            (0, 0x20) => (va.clone(), vb.clone()),
-            (0x20, 0) => (vb.clone(), va.clone()),
+        let (key, slot) = match (a.offset.const_value()?, b.offset.const_value()?) {
+            (0, 0x20) => (a.value.clone(), b.value.clone()),
+            (0x20, 0) => (b.value.clone(), a.value.clone()),
             _ => return None,
         };
         let mut bytes = Vec::new();
@@ -1333,7 +1406,8 @@ impl BlockLift<'_, '_> {
                     if self.stack[idx].nodes() > DUP_INLINE_MAX_NODES && !defer {
                         let name = self.bind_name(idx);
                         let val = std::mem::replace(&mut self.stack[idx], Expr::Var(name.clone()));
-                        self.emit_assign(name, render_rhs(&val), i);
+                        self.emit_assign(name.clone(), render_rhs(&val), i);
+                        self.bindings.insert(name, val);
                     }
                     let v = self.stack[idx].clone();
                     self.stack.push(v);
@@ -1349,8 +1423,15 @@ impl BlockLift<'_, '_> {
                 }
                 _ if pure_name(op).is_some() => {
                     let args = self.pop_n(OPCODE_TABLE[op as usize].pops.into());
-                    self.stack
-                        .push(simplify(Expr::Op(pure_name(op).unwrap(), args)));
+                    let param = (op == 0x35)
+                        .then(|| args[0].const_value())
+                        .flatten()
+                        .and_then(|off| off.checked_sub(4))
+                        .filter(|rel| rel % 32 == 0 && rel / 32 < self.params as u64);
+                    self.stack.push(match param {
+                        Some(rel) => Expr::Var(format!("param{}", rel / 32)),
+                        None => simplify(Expr::Op(pure_name(op).unwrap(), args)),
+                    });
                 }
                 0x20 if !defer && self.mapping_ready() => {
                     let args = self.pop_n(2);
@@ -1365,6 +1446,7 @@ impl BlockLift<'_, '_> {
                             src: render_rhs(&val),
                             bytes,
                         });
+                        self.bindings.insert(name.clone(), val);
                         self.stack.push(Expr::Var(name));
                     } else {
                         self.bind_read(&Expr::Op("keccak256", args), i);
@@ -1381,23 +1463,60 @@ impl BlockLift<'_, '_> {
                 }
                 _ if effect_name(op).is_some() => {
                     let args = self.pop_n(OPCODE_TABLE[op as usize].pops.into());
-                    if (0xa1..=0xa4).contains(&op)
-                        && let Expr::Const(t) = &args[2]
-                        && t.len() == 32
-                        && let Some(sig) = event_by_topic(t.as_slice().try_into().expect("32"))
-                    {
+                    let event = (0xa1..=0xa4)
+                        .contains(&op)
+                        .then(|| match &args[2] {
+                            Expr::Const(t) if t.len() == 32 => {
+                                event_by_topic(t.as_slice().try_into().expect("32"))
+                            }
+                            _ => None,
+                        })
+                        .flatten();
+                    if let Some(sig) = event {
+                        if let Some((data, bytes)) = self.collapse_encoded(&args[0], &args[1], i) {
+                            // `emit Name(indexed…, data…)`: compilers put
+                            // indexed parameters first in the vast
+                            // majority of events; the comment keeps the
+                            // declared types.
+                            let name = sig.split('(').next().unwrap_or(sig);
+                            let parts: Vec<String> =
+                                args[3..].iter().chain(&data).map(render_arg).collect();
+                            self.out.push(Stmt::Comment(format!("event {sig}")));
+                            self.out.push(Stmt::Call {
+                                name: "emit".into(),
+                                args: vec![format!("{name}({})", parts.join(", "))],
+                                bytes,
+                                direct_target: None,
+                            });
+                            continue;
+                        }
                         self.out.push(Stmt::Comment(format!("event {sig}")));
                     }
+                    let (args, prefix) = self.inline_last(args);
                     if op == 0x39
                         && let Some(text) = self.copied_string(&args[1], &args[2])
                     {
                         self.out.push(Stmt::Comment(text));
                     }
-                    if matches!(op, 0x52) {
-                        self.mstores
-                            .push((self.out.len(), args[0].clone(), args[1].clone()));
+                    if op == 0x52 {
+                        if args[0].const_value() == Some(0x40) {
+                            self.fmp_epoch += 1;
+                        }
+                        self.mstores.push(MStore {
+                            at: self.out.len(),
+                            offset: args[0].clone(),
+                            value: args[1].clone(),
+                            place: lin(&args[0], &self.bindings, 0),
+                        });
                     }
-                    self.emit_call(effect_name(op).unwrap(), &args, i);
+                    let mut bytes = prefix;
+                    bytes.extend(self.take(i));
+                    self.out.push(Stmt::Call {
+                        name: effect_name(op).unwrap().to_string(),
+                        args: args.iter().map(render_arg).collect(),
+                        bytes,
+                        direct_target: None,
+                    });
                 }
                 0x00 => {
                     self.emit_call("stop", &[], i);
@@ -1405,9 +1524,16 @@ impl BlockLift<'_, '_> {
                 }
                 0xf3 => {
                     let args = self.pop_n(2);
-                    let bytes = self.take(i);
-                    let text =
-                        format!("memory({}, {})", render_arg(&args[0]), render_arg(&args[1]));
+                    let (text, bytes) = match self.collapse_encoded(&args[0], &args[1], i) {
+                        Some((words, bytes)) => {
+                            let parts: Vec<String> = words.iter().map(render_arg).collect();
+                            (format!("abi.encode({})", parts.join(", ")), bytes)
+                        }
+                        None => (
+                            format!("memory({}, {})", render_arg(&args[0]), render_arg(&args[1])),
+                            self.take(i),
+                        ),
+                    };
                     self.out.push(Stmt::ReturnExpr { text, bytes });
                     return BlockEnd::Other;
                 }
@@ -1475,7 +1601,7 @@ impl BlockLift<'_, '_> {
             .mstores
             .iter()
             .rev()
-            .find_map(|(at, _, v)| Some((*at, shifted_selector(v)?)))
+            .find_map(|m| Some((m.at, shifted_selector(&m.value)?)))
         else {
             return false;
         };
@@ -1496,8 +1622,8 @@ impl BlockLift<'_, '_> {
         let stores: Vec<&Expr> = self
             .mstores
             .iter()
-            .filter(|(k, _, _)| *k > at)
-            .map(|(_, _, v)| v)
+            .filter(|m| m.at > at)
+            .map(|m| &m.value)
             .collect();
         let (name, arg) = if sel != ERROR && sel != PANIC {
             // Custom error: `revert(Name(args…))`, args being the words
@@ -1535,7 +1661,7 @@ impl BlockLift<'_, '_> {
             }
         }
         bytes.extend(self.take(i));
-        self.mstores.retain(|(k, _, _)| *k < at);
+        self.mstores.retain(|m| m.at < at);
         self.out.push(Stmt::Call {
             name: name.into(),
             args: vec![arg],
@@ -1562,10 +1688,158 @@ impl BlockLift<'_, '_> {
 
     /// Bind a state read to the variable for the slot it lands in.
     fn bind_read(&mut self, val: &Expr, i: usize) {
+        let is_fmp = matches!(val, Expr::Op("mload", a) if a[0].const_value() == Some(0x40));
+        let (val, mut bytes) = if is_fmp {
+            (val.clone(), Vec::new())
+        } else {
+            let Expr::Op(op, args) = val.clone() else {
+                unreachable!("reads are ops")
+            };
+            let (args, prefix) = self.inline_last(args);
+            (Expr::Op(op, args), prefix)
+        };
         let idx = self.stack.len();
         let name = self.bind_name(idx);
-        self.emit_assign(name.clone(), render_rhs(val), i);
+        bytes.extend(self.take(i));
+        self.out.push(Stmt::Move {
+            dst: name.clone(),
+            src: render_rhs(&val),
+            bytes,
+        });
+        let bound = if is_fmp {
+            Expr::Op(
+                "fmp",
+                vec![Expr::Const(self.fmp_epoch.to_be_bytes().to_vec())],
+            )
+        } else {
+            val
+        };
+        self.bindings.insert(name.clone(), bound);
         self.stack.push(Expr::Var(name));
+    }
+
+    /// Fold the statement just emitted into `args` when it bound a
+    /// variable that `args` use exactly once and nothing else still
+    /// holds: `v3 = mapping(…); v3 = sload(v3)` reads as
+    /// `v3 = sload(mapping(…))`. Repeats while it applies. Returns the
+    /// folded statements' bytes, which precede the caller's.
+    fn inline_last(&mut self, mut args: Vec<Expr>) -> (Vec<Expr>, Vec<u8>) {
+        let mut prefix: Vec<u8> = Vec::new();
+        while let Some(Stmt::Move { dst, .. }) = self.out.last() {
+            let dst = dst.clone();
+            let Some(bound) = self.bindings.get(&dst).cloned() else {
+                break;
+            };
+            let uses: usize = args.iter().map(|a| a.count(&dst)).sum();
+            if matches!(bound, Expr::Op("fmp", _))
+                || uses != 1
+                || self.stack.iter().any(|e| e.mentions(&dst))
+            {
+                break;
+            }
+            let Some(Stmt::Move { bytes, .. }) = self.out.pop() else {
+                unreachable!("checked above")
+            };
+            self.bindings.remove(&dst);
+            for a in &mut args {
+                *a = a.substitute(&dst, &bound);
+            }
+            let mut b = bytes;
+            b.extend(prefix);
+            prefix = b;
+        }
+        (args, prefix)
+    }
+
+    /// Recognise the ABI encoding of static words into fresh memory —
+    /// `p = mload(0x40); mstore(p, a); mstore(p + 0x20, b); …` — feeding
+    /// a `RETURN` / `LOGn` of `(offset, len)` at instruction `i`. On a
+    /// match the encoding statements are removed and their bytes (plus
+    /// the instruction's) returned with the words.
+    fn collapse_encoded(
+        &mut self,
+        offset: &Expr,
+        len: &Expr,
+        i: usize,
+    ) -> Option<(Vec<Expr>, Vec<u8>)> {
+        let (base, start_off) = lin(offset, &self.bindings, 0)?;
+        let n_bytes = if let Some(n) = len.const_value() {
+            n
+        } else {
+            // `end - start` over the same buffer.
+            let Expr::Op("sub", ab) = simplify(len.clone()) else {
+                return None;
+            };
+            let (b1, o1) = lin(&ab[0], &self.bindings, 0)?;
+            let (b2, o2) = lin(&ab[1], &self.bindings, 0)?;
+            if b1 != b2 {
+                return None;
+            }
+            o1.checked_sub(o2)?
+        };
+        if n_bytes == 0 || n_bytes % 32 != 0 || n_bytes > 32 * 16 || base.is_empty() {
+            return None;
+        }
+        let mut first = self.out.len();
+        let mut words = Vec::new();
+        for k in 0..n_bytes / 32 {
+            let want = (base.clone(), start_off + 32 * k);
+            let m = self
+                .mstores
+                .iter()
+                .rev()
+                .find(|m| m.place.as_ref() == Some(&want))?;
+            first = first.min(m.at);
+            words.push(m.value.clone());
+        }
+        // Take in the pointer reads that located the buffer.
+        while first > 0
+            && matches!(&self.out[first - 1], Stmt::Move { src, .. } if src == "mload(0x40)")
+        {
+            first -= 1;
+        }
+        // Only encoding work may be folded away; its variables must be
+        // dead afterwards.
+        let mut dropped: Vec<String> = Vec::new();
+        for st in &self.out[first..] {
+            match st {
+                Stmt::Comment(_) => {}
+                Stmt::Call { name, .. } if name == "mstore" => {}
+                Stmt::Move { dst, .. } if !dst.contains(',') => dropped.push(dst.clone()),
+                _ => return None,
+            }
+        }
+        if dropped
+            .iter()
+            .any(|d| self.stack.iter().any(|e| e.mentions(d)))
+        {
+            return None;
+        }
+        // Words may name variables bound inside the folded range: put
+        // their values in.
+        for d in dropped.iter().rev() {
+            if let Some(bound) = self.bindings.get(d) {
+                if matches!(bound, Expr::Op("fmp", _)) {
+                    if words.iter().any(|w| w.mentions(d)) {
+                        return None;
+                    }
+                    continue;
+                }
+                for w in &mut words {
+                    *w = w.substitute(d, bound);
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        for st in self.out.drain(first..) {
+            match st {
+                Stmt::Move { bytes: b, .. } | Stmt::Call { bytes: b, .. } => bytes.extend(b),
+                _ => {}
+            }
+        }
+        self.mstores.retain(|m| m.at < first);
+        bytes.extend(self.take(i));
+        Some((words, bytes))
     }
 
     /// Move the bytes of the most recent byte-carrying call statement

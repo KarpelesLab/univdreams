@@ -108,15 +108,20 @@ fn weth9_dispatcher_is_recovered() {
 fn weth9_lifts_to_statements() {
     let code = read(&testdata().join("weth9-mainnet.evm"));
     let text = decompile_evm_to_text(&code);
-    // Nonpayable guard, then the call into the internal body.
+    // Nonpayable guard, then the call into the internal body with the
+    // ABI parameter named after the signature.
+    assert!(text.contains("// selector 0x2e1a7d4d: withdraw(uint256 param0)"));
     assert!(text.contains("require(!msg.value)"), "{text}");
-    assert!(text.contains("sub_09d9(calldataload(0x4))"));
+    assert!(text.contains("sub_09d9(param0)"));
     assert!(text.contains("// internal function: 1 argument(s), 0 return value(s)"));
-    // balanceOf[msg.sender]: Solidity's mapping slot.
-    assert!(text.contains("mapping(0x3, address(msg.sender))"));
+    // balanceOf[msg.sender]: Solidity's mapping slot, read in place.
+    assert!(text.contains("v3 = sload(mapping(0x3, address(msg.sender)))"));
     assert!(text.contains("require((v3 >= arg0))"));
     assert!(text.contains("call(v3, address(msg.sender), arg0"));
-    assert!(text.contains("event Withdrawal(address,uint256)"));
+    // Events and return values with their ABI encoding folded.
+    assert!(text.contains("emit(Withdrawal(address(msg.sender), arg0))"));
+    assert!(text.contains("emit(Deposit(address(msg.sender), msg.value))"));
+    assert!(text.contains("return abi.encode(bool(v1));"));
     // `name()`'s copy loop is structured.
     assert!(text.contains("whileblock ("));
     assert!(text.matches("@asm(").count() <= 4);
@@ -142,6 +147,8 @@ fn poolmanager_uses_transient_storage_and_carries_solc_version() {
     // `if (Lock.isUnlocked()) AlreadyUnlocked.selector.revertWith();`
     assert!(text.contains("require(!v3, AlreadyUnlocked())"));
     assert!(text.contains("mstore(v5, unlockCallback.selector)"));
+    assert!(text.contains("emit(OperatorSet(msg.sender, address(v2), v1))"));
+    assert!(text.contains("return abi.encode(address(v3));"));
     assert!(!text.contains("unknown return value"));
     assert!(text.matches("@asm(").count() <= 8);
 }

@@ -235,6 +235,17 @@ const EVENTS: &[&str] = &[
     "Mint(address,uint256,uint256)",
     "Burn(address,uint256,uint256,address)",
     "PairCreated(address,address,address,uint256)",
+    // ERC-6909
+    "Transfer(address,address,address,uint256,uint256)",
+    "Approval(address,address,uint256,uint256)",
+    "OperatorSet(address,address,bool)",
+    // Uniswap v4 pool manager
+    "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)",
+    "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)",
+    "Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)",
+    "Donate(bytes32,address,uint256,uint256)",
+    "ProtocolFeeControllerUpdated(address)",
+    "ProtocolFeeUpdated(bytes32,uint24)",
 ];
 
 /// ERC-1967 slots, defined as `keccak256(label) - 1`.

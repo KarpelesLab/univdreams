@@ -158,6 +158,13 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
                 .flatten()
                 .map(|&b| cfg.blocks[b].start)
                 .collect(),
+            params: selectors
+                .iter()
+                .filter_map(|(&addr, &sel)| {
+                    let types = static_params(function_by_selector(sel)?)?;
+                    Some((addr, types.len()))
+                })
+                .collect(),
         };
         evm_lift::lift_ranges(&ctx, &ranges)
     } else {
@@ -195,7 +202,24 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
             push_region(&mut items, code, r);
         }
         if let Some(sel) = selectors.get(&entry) {
-            let what = function_by_selector(*sel).unwrap_or("unknown signature");
+            let what = match function_by_selector(*sel) {
+                // Name the parameters the body refers to.
+                Some(sig) if lift && static_params(sig).is_some_and(|t| !t.is_empty()) => {
+                    let types = static_params(sig).unwrap_or_default();
+                    let named: Vec<String> = types
+                        .iter()
+                        .enumerate()
+                        .map(|(k, t)| format!("{t} param{k}"))
+                        .collect();
+                    format!(
+                        "{}({})",
+                        sig.split('(').next().unwrap_or(sig),
+                        named.join(", ")
+                    )
+                }
+                Some(sig) => sig.to_string(),
+                None => "unknown signature".to_string(),
+            };
             items.push(Item::Comment(format!("selector 0x{sel:08x}: {what}")));
         }
         if let Some(info) = internal.get(&entry) {
@@ -479,6 +503,28 @@ fn find_dispatch_targets(insns: &[DecodedInsn], jumpdests: &BTreeSet<u64>) -> BT
         }
     }
     out
+}
+
+/// Parameter types of `sig` when every one is a static ABI type (one
+/// calldata word each), so parameter `k` is `calldataload(4 + 32k)`.
+fn static_params(sig: &str) -> Option<Vec<&str>> {
+    let inner = sig.split_once('(')?.1.strip_suffix(')')?;
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let types: Vec<&str> = inner.split(',').collect();
+    let is_static = |t: &str| {
+        let width = |rest: &str, max: u32| {
+            rest.is_empty() || rest.parse::<u32>().is_ok_and(|n| n > 0 && n <= max)
+        };
+        t == "address"
+            || t == "bool"
+            || t.strip_prefix("uint").is_some_and(|r| width(r, 256))
+            || t.strip_prefix("int").is_some_and(|r| width(r, 256))
+            || t.strip_prefix("bytes")
+                .is_some_and(|r| !r.is_empty() && width(r, 32))
+    };
+    types.iter().all(|t| is_static(t)).then_some(types)
 }
 
 /// Function names keyed by entry address: one per code segment start,
