@@ -41,6 +41,7 @@ pub const DEFAULT_INSTR_LIMIT: u64 = 10_000_000;
 /// — used by integration tests to confirm a known instruction
 /// dispatched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StepOk {
     /// Normal advance.
     Continued,

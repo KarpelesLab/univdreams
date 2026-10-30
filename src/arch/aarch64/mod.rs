@@ -42,6 +42,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// out flow-control behaviour for CFG construction; everything else
 /// falls into `Other`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InsnKind {
     /// Unconditional direct branch (`B target`).
     BranchDirect { target: u64 },

@@ -221,7 +221,8 @@ fn count_function_bytes_as_insns(items: &[Item]) -> usize {
                         *c = (*addr).saturating_add((entries.len() as u64) * 4);
                     }
                 }
-                Item::Comment(_) => {}
+                // Comments and any future item kinds occupy no bytes.
+                _ => {}
             }
         }
     }

@@ -24,6 +24,7 @@ use crate::arch::x86::DecodedInsn;
 /// decompiler) turns this into a human-readable string using
 /// per-binary context (`.rodata` strings, function names, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ArgValue {
     /// A literal integer immediate (e.g. `mov edi, 8`).
     Const(i64),

@@ -55,6 +55,7 @@ pub struct DialogControl {
 /// "transcript" an expect-style driver reads.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GuiEvent {
     RegisterClass {
         name: String,

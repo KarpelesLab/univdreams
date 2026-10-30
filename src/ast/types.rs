@@ -26,6 +26,7 @@ pub struct Field {
 
 /// A value that can appear on the right-hand side of a `Field`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Value {
     /// A double-quoted string. Storage is the unescaped form.
     String(String),
@@ -64,6 +65,7 @@ pub struct Attribute {
 /// Right-hand side of an attribute. Kept small on purpose — every
 /// new variant has to round-trip through emit + parse + lower.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AttrValue {
     /// `"…"` — quoted string.
     String(String),
@@ -80,6 +82,7 @@ pub enum AttrValue {
 /// An item in the file: at the top level, or nested inside an
 /// [`Item::Section`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Item {
     /// Free-floating `// …` line. Preserved on emit so structural
     /// notes survive parse → re-emit.
@@ -216,6 +219,7 @@ pub struct LocalDecl {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocalKind {
     Stack,
     Register,
@@ -248,6 +252,7 @@ pub struct Param {
 /// pointers) lands as [`Type::Unknown`], which the parser still
 /// accepts so the round-trip closes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Type {
     Void,
     I8,
@@ -328,6 +333,7 @@ pub struct EpilogueParams {
 
 /// A statement inside a function body.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Stmt {
     /// `@asm("text")` or `@asm("text", [bytes])` — an instruction.
     ///

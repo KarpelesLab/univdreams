@@ -17,6 +17,7 @@ use super::guest::GuestCpu;
 /// Canonical syscall identity used inside the kernel engine. Per-arch
 /// number tables map onto this; the engine switches on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Sysno {
     Read,
     Write,

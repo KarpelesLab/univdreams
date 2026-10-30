@@ -67,6 +67,7 @@ pub const INSTRUCTIONS_PER_MS: u64 = 1_000;
 ///   table so an outstanding `WaitForSingleObject` on this TID
 ///   can resolve, but is never picked again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ThreadStatus {
     Ready,
     Running,
@@ -79,6 +80,7 @@ pub enum ThreadStatus {
 /// scheduler wakes the thread (either because the condition
 /// resolved, or because the wait timed out).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum WaitCondition {
     /// `Sleep(ms)` — wake when
     /// `instructions_global >= resume_after_instructions`.
@@ -105,6 +107,7 @@ pub enum WaitCondition {
 /// process + thread waits) are integers `≥ WAIT_OBJECT_HANDLE_BASE`
 /// that index this table.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum WaitObject {
     /// `CreateEventA` / `CreateEventW`. `manual_reset = false`
     /// means `WaitForSingleObject` consumes the signal (only
@@ -143,6 +146,7 @@ pub enum WaitObject {
 /// [`crate::emulator::win32::HostState::yield_requested`] and consumed by
 /// the run loop.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum YieldRequest {
     /// Block the current thread on the given condition. The
     /// run loop transitions the thread to `Waiting`, parks the

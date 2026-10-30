@@ -64,6 +64,7 @@ impl Sib {
 /// "load this operand" / "store to this operand" helpers so the
 /// switch on `mod` happens once during decode.
 #[derive(Copy, Clone, Debug)]
+#[non_exhaustive]
 pub enum Operand {
     Reg32(Reg32),
     Mem32(u32),

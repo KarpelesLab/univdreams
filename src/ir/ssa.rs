@@ -53,6 +53,7 @@ use crate::ir::{ArchInsn, BasicBlock, Function, Terminator};
 
 /// A variable tracked by SSA.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Var {
     /// A named register. The string identity is the arch's
     /// canonical full-width name (so a write to `al`
@@ -77,6 +78,7 @@ pub struct DefId(pub u32);
 
 /// Where a def lives.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum DefSite {
     /// Defined at the instruction with this IP.
     Insn(u64),

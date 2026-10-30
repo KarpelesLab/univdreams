@@ -38,6 +38,7 @@ use std::path::PathBuf;
 
 /// Memory-watchpoint trigger discipline.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WatchMode {
     /// Fire only on writes intersecting `[addr, addr+size)`.
     Write,

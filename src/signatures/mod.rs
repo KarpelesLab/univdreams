@@ -25,6 +25,7 @@ pub use x86_64::CRT_HELPERS_X86_64;
 
 /// One byte position inside a [`Signature::pattern`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PatternByte {
     /// Must equal this byte exactly.
     Exact(u8),

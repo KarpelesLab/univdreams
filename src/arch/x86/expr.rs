@@ -29,6 +29,7 @@ use crate::arch::x86::DecodedInsn;
 /// Tiny expression IR. See module docs for what's intentionally not
 /// represented.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ValueExpr {
     /// `[rbp+disp]` — a stack slot. Renders as a local name when the
     /// caller supplies one (typically via DWARF), otherwise as a raw

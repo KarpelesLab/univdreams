@@ -104,6 +104,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// PE32 vs PE32+ — the optional header's structural variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PeKind {
     /// PE32 (32-bit image).
     Pe32,

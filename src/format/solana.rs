@@ -76,6 +76,7 @@ const LOADER_V4_HEADER: usize = 48;
 /// pubkey as it comes out of the Solana JSON-RPC response;
 /// callers don't need to decode to raw bytes first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoaderKind {
     /// `BPFLoader2111…` — account data is the ELF directly.
     BpfLoader2,

@@ -263,6 +263,7 @@ pub struct NeEntry {
 /// A resource type or name id: either an integer (`MAKEINTRESOURCE`) or a
 /// string.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResId {
     Int(u16),
     Name(String),

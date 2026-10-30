@@ -162,6 +162,7 @@ pub fn format_insn(insn: &DecodedInsn) -> String {
 
 /// Control-flow classification used for block / label discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InsnKind {
     /// `JUMP` — target is the top of the stack.
     Jump,

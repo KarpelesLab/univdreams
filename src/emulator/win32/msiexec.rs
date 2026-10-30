@@ -80,6 +80,7 @@ pub enum Error {
 /// [`InstallSink`] decides how to handle each variant
 /// (synthesise into a VFS, log, override, skip).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum InstallAction {
     /// A `Directory` table entry resolved to a concrete path —
     /// emitted top-down so the sink can ensure each parent
@@ -181,6 +182,7 @@ pub enum InstallAction {
 
 /// Windows registry hive root, in canonical form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RegHive {
     /// HKEY_CLASSES_ROOT
     ClassesRoot,
@@ -232,6 +234,7 @@ impl RegHive {
 /// One typed registry value. Mirrors the small set of MSI
 /// registry-value encodings.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RegValue {
     /// Empty value (`Registry.Value` was NULL — common for
     /// "ensure key exists" rows).
@@ -1213,6 +1216,7 @@ pub fn is_msiexec_target(target: &str) -> bool {
 /// uninstall verbs; everything else falls through as `Unknown`
 /// so the caller still logs the attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MsiexecOp {
     /// `/i <path>` — install the named MSI.
     Install(String),

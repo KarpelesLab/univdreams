@@ -21,6 +21,7 @@ impl OpInfo {
 /// 6502 mnemonics. `Illegal` covers every undocumented opcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
+#[non_exhaustive]
 pub enum Mnemonic {
     ADC,
     AND,
@@ -85,6 +86,7 @@ pub enum Mnemonic {
 /// every undocumented opcode — it carries no operand bytes, matching
 /// how this decoder treats an `Illegal` instruction as a single byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AddressingMode {
     Implied,
     Accumulator,

@@ -120,6 +120,7 @@ pub fn decode_range(bytes: &[u8], start: u64) -> Result<Vec<DecodedInsn>> {
 
 /// Branch / call / return classification used by CFG construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InsnKind {
     /// Conditional branch (`BNE`, `BEQ`, ...). The target is computed
     /// from the relative operand and the address of the *next*

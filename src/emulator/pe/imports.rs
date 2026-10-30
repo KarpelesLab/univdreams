@@ -37,6 +37,7 @@ pub fn resolve(
 
 /// PE-import resolution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResolveMode {
     /// Strict: any unknown import is a hard load-time error.
     /// Default — what the codec path wants.

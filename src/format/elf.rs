@@ -42,6 +42,7 @@ const ELFDATA2LSB: u8 = 1;
 /// at parse time and consulted on write to round-trip the original
 /// byte layout exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ElfClass {
     Elf32,
     Elf64,

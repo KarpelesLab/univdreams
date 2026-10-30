@@ -8,6 +8,7 @@
 /// fields; matches Intel's /r convention).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Reg32 {
     Eax = 0,
     Ecx = 1,
@@ -54,6 +55,7 @@ impl Reg32 {
 /// 16-bit register index (the low halves of the 32-bit GPRs).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Reg16 {
     Ax = 0,
     Cx = 1,
@@ -85,6 +87,7 @@ impl Reg16 {
 /// 16-bit halves for indices 4..7.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Reg8 {
     Al = 0,
     Cl = 1,

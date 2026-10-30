@@ -186,6 +186,7 @@ pub struct LinuxKernel {
 /// Why the current process must park (set by a blocking syscall, consumed by the
 /// scheduler). Carries enough to know when to wake it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum BlockReason {
     /// Interactive stdin `read` with no complete input available yet.
     Stdin,

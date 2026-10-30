@@ -105,6 +105,7 @@ pub struct FileHandle {
 /// virtual filesystem honours the access bits so a
 /// `GENERIC_READ`-only handle can't `WriteFile`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FileAccess {
     Read,
     Write,
@@ -451,6 +452,7 @@ pub struct RegistryKey {
 /// One typed registry value. Mirrors the standard `REG_SZ` /
 /// `REG_DWORD` / `REG_BINARY` / `REG_MULTI_SZ` shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RegistryValue {
     /// `REG_SZ` — null-terminated string.
     Sz(String),

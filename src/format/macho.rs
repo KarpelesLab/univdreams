@@ -107,6 +107,7 @@ const SEGMENT_64_PREFIX_SIZE: usize = 72;
 
 /// Architecture flavour the parsed Mach-O targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MachoCpu {
     X86_64,
     Arm64,

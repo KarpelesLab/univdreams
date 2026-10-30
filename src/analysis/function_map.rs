@@ -13,6 +13,7 @@ use crate::common::VAddr;
 /// higher-numbered sources override lower-numbered ones for fields where
 /// they disagree (currently: function name).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum FunctionSource {
     /// Inferred from a prologue-pattern match. Lowest confidence.
     Prologue = 0,

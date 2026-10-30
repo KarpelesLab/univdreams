@@ -3240,6 +3240,7 @@ fn monitor_msi_install(
                         msiexec::RegValue::Dword(d) => RV::Dword(d),
                         msiexec::RegValue::Binary(b) => RV::Binary(b),
                         msiexec::RegValue::MultiSz(v) => RV::MultiSz(v),
+                        other => RV::Binary(format!("{other:?}").into_bytes()),
                     };
                     self.registry.set_value(&key_path, &name, v);
                 }
@@ -3265,6 +3266,7 @@ fn monitor_msi_install(
                         bytes.len()
                     ));
                 }
+                other => self.log.push(format!("msiexec: unhandled {other:?}")),
             }
             true
         }
@@ -4203,6 +4205,7 @@ fn print_gui_transcript(gui: &univdreams::emulator::win16::gui::GuiState) {
             GuiEvent::SetWindowText { hwnd, text } => {
                 println!("    SetWindowText hwnd={hwnd:#06x} {text:?}");
             }
+            other => println!("    {other:?}"),
         }
     }
 }
@@ -5439,6 +5442,7 @@ fn format_warning(w: &univdreams::translate::compile::AsmWarning) -> String {
             count,
             text,
         ),
+        other => format!("{other:?}"),
     }
 }
 

@@ -30,6 +30,7 @@
 /// slightly different encodings for the frame setup (REX
 /// prefix) and the endbr instruction (`endbr32` vs `endbr64`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CodecBits {
     Bits32,
     Bits64,

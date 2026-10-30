@@ -30,6 +30,7 @@ use crate::emulator::context::{FileAccess, VirtualFs};
 
 /// Kind of a filesystem node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NodeKind {
     File,
     Dir,

@@ -79,6 +79,7 @@ impl Metadata {
 
 /// The subset of CBOR that compiler metadata uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Cbor {
     Uint(u64),
     NegInt(u64),

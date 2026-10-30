@@ -67,6 +67,7 @@ use std::fmt::Write;
 
 /// Bit-width the simplifier assumes for constant folding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BitWidth {
     Bits32,
     Bits64,
@@ -332,6 +333,7 @@ fn tokenize(text: &str) -> Vec<Tok> {
 
 /// A parsed expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Expr {
     Lit(u64),
     Ident(String),

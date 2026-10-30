@@ -52,6 +52,7 @@ pub trait ArchInsn {
 /// treats a `call` as a regular instruction whose semantics include
 /// transferring control elsewhere and eventually returning.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Terminator {
     /// Reached only at the very end of a function whose body simply
     /// ran out of recorded bytes (e.g. `nop`s for alignment with no

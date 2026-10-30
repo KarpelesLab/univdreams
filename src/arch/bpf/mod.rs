@@ -53,6 +53,7 @@ pub const INSN_SIZE: usize = 8;
 /// know the mnemonic for and which ones are *legal* per the
 /// runtime that consumes the bytecode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BpfVariant {
     /// Linux eBPF — base ISA. ELF `e_machine = EM_BPF` (247).
     Linux,
@@ -89,6 +90,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// raw `opcode` byte at format time; we don't carry a separate
 /// mnemonic field on `DecodedInsn`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InsnKind {
     /// 32-bit ALU op (`add32`, `mov32`, etc.).
     Alu32,

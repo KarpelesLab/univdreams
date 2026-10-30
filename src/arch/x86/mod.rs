@@ -1223,6 +1223,7 @@ pub fn format_intel(insn: &Instruction) -> String {
 
 /// Result of [`verify_intel_text`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VerifyAsm {
     /// `text` matches the canonical Intel-syntax form for `bytes`.
     Match,
@@ -1313,6 +1314,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Bitness of an x86 decode/encode pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Bitness {
     Bits16,
     Bits32,

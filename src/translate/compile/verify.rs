@@ -17,6 +17,7 @@ use crate::ast::{Item, Stmt, UdFile, Value};
 /// One verification finding. Emitted to stderr by the CLI; collected
 /// for programmatic use elsewhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AsmWarning {
     /// `text` and the canonical form for `bytes` differ. The lower
     /// path will use `bytes`; the user's `text` is informational.

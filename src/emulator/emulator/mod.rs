@@ -35,6 +35,7 @@ pub use regs::{Flags, Regs};
 /// Trap variants nest enough detail to debug a misbehaving codec
 /// without losing the address of the offending instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Trap {
     /// Tried to access an unmapped page.
     MemoryFault { addr: u32 },
