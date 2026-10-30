@@ -53,8 +53,13 @@ use crate::translate::decompile::{evm_cfg, evm_lift};
 /// What a non-code span holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataKind {
-    /// Copied out by `CODECOPY` at this instruction offset.
-    CodeCopy { at: u64 },
+    /// Copied out by `CODECOPY` at this instruction offset. `returned`:
+    /// the copy is followed by a `RETURN` before any jump or other
+    /// copy, as when initcode deploys the runtime it carries.
+    CodeCopy { at: u64, returned: bool },
+    /// Constructor arguments: everything after the deployed runtime,
+    /// which the constructor reads with `CODECOPY(…, codesize - n)`.
+    CtorArgs { at: u64 },
     /// Compiler metadata trailer.
     Metadata,
     /// Data after the metadata trailer: Vyper's immutables, appended
@@ -73,7 +78,7 @@ struct DataRegion {
 /// lifted to statements (see `evm_lift`).
 #[must_use]
 pub fn decompile_evm(code: &[u8]) -> UdFile {
-    decompile_evm_impl(code, true)
+    decompile_evm_impl(code, true, 0)
 }
 
 /// Build the AST as an instruction listing: one `@asm` line per
@@ -81,7 +86,7 @@ pub fn decompile_evm(code: &[u8]) -> UdFile {
 /// them — the form to use when editing the code itself.
 #[must_use]
 pub fn decompile_evm_listing(code: &[u8]) -> UdFile {
-    decompile_evm_impl(code, false)
+    decompile_evm_impl(code, false, 0)
 }
 
 /// Convenience: lifted AST + canonical pretty-print.
@@ -97,7 +102,7 @@ pub fn decompile_evm_listing_to_text(code: &[u8]) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
+fn decompile_evm_impl(code: &[u8], lift: bool, depth: u32) -> UdFile {
     let metadata = find_metadata(code);
     let module = build_module(code, metadata.as_ref());
 
@@ -228,7 +233,7 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
     for (&(entry, _), body) in ranges.iter().zip(bodies) {
         // Data regions that sit before this function.
         while let Some(r) = region_iter.next_if(|r| r.start < entry) {
-            push_region(&mut items, code, r);
+            push_region(&mut items, code, r, lift, depth);
         }
         if let Some(sel) = selectors.get(&entry) {
             let what = match function_by_selector(*sel) {
@@ -278,7 +283,7 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
         }));
     }
     for r in region_iter {
-        push_region(&mut items, code, r);
+        push_region(&mut items, code, r, lift, depth);
     }
 
     UdFile { module, items }
@@ -374,21 +379,31 @@ fn layout(code: &[u8], metadata: Option<&Metadata>) -> Layout {
     }
 }
 
-fn push_region(items: &mut Vec<Item>, code: &[u8], r: &DataRegion) {
+/// Embedded contracts decompiled inside one another, at most.
+const MAX_NESTING: u32 = 4;
+
+fn push_region(items: &mut Vec<Item>, code: &[u8], r: &DataRegion, lift: bool, depth: u32) {
     let bytes = &code[r.start as usize..r.end as usize];
     let note = match r.kind {
-        DataKind::CodeCopy { at } => {
-            let mut s = format!(
+        DataKind::CodeCopy { at, returned } => {
+            let what = if returned {
+                "runtime code the constructor deploys"
+            } else {
+                "embedded contract code"
+            };
+            if depth < MAX_NESTING && crate::format::evm::looks_like_evm(bytes) {
+                push_embedded(items, bytes, r, at, what, lift, depth);
+                return;
+            }
+            format!(
                 "data 0x{:04x}..0x{:04x}: CODECOPY source at 0x{at:04x}",
                 r.start, r.end
-            );
-            if crate::format::evm::looks_like_evm(bytes) {
-                s.push_str(
-                    " — embedded contract code (initcode deploying it?); decompile it separately",
-                );
-            }
-            s
+            )
         }
+        DataKind::CtorArgs { at } => format!(
+            "data 0x{:04x}..0x{:04x}: constructor arguments (ABI-encoded), read by the CODECOPY at 0x{at:04x}",
+            r.start, r.end
+        ),
         DataKind::Appended => format!(
             "data 0x{:04x}..0x{:04x}: appended after the metadata (immutables, read with CODECOPY)",
             r.start, r.end
@@ -410,6 +425,41 @@ fn push_region(items: &mut Vec<Item>, code: &[u8], r: &DataRegion) {
     });
 }
 
+/// An embedded contract as a `@section`, decompiled on its own: its
+/// items are addressed from 0, as it runs once deployed.
+fn push_embedded(
+    items: &mut Vec<Item>,
+    bytes: &[u8],
+    r: &DataRegion,
+    at: u64,
+    what: &str,
+    lift: bool,
+    depth: u32,
+) {
+    let nested = decompile_evm_impl(bytes, lift, depth + 1);
+    let compiler = nested.module.fields.iter().find_map(|f| match &f.value {
+        Value::String(s) if f.name == "compiler" => Some(format!(", {s}")),
+        _ => None,
+    });
+    items.push(Item::Comment(format!(
+        "0x{:04x}..0x{:04x}: {what} ({} bytes{}), copied out by the CODECOPY at 0x{at:04x}; offsets inside are its own, from 0",
+        r.start,
+        r.end,
+        bytes.len(),
+        compiler.unwrap_or_default()
+    )));
+    let name = if what.starts_with("runtime") {
+        "runtime"
+    } else {
+        "contract"
+    };
+    items.push(Item::Section {
+        name: name.into(),
+        addr: r.start,
+        items: nested.items,
+    });
+}
+
 /// Locate `CODECOPY` data spans and the metadata trailer. The result
 /// is sorted and non-overlapping.
 fn find_data_regions(code: &[u8], metadata: Option<&Metadata>) -> Vec<DataRegion> {
@@ -418,8 +468,11 @@ fn find_data_regions(code: &[u8], metadata: Option<&Metadata>) -> Vec<DataRegion
     let insns = decode_range(&code[..code_end as usize], 0);
 
     let mut found: Vec<DataRegion> = Vec::new();
-    let mut stack = ConstStack::default();
-    for ins in &insns {
+    let mut stack = ConstStack {
+        items: Vec::new(),
+        codesize: len,
+    };
+    for (k, ins) in insns.iter().enumerate() {
         if ins.opcode == 0x39 {
             // CODECOPY(destOffset, offset, size)
             let _dest = stack.pop();
@@ -430,10 +483,17 @@ fn find_data_regions(code: &[u8], metadata: Option<&Metadata>) -> Vec<DataRegion
                 && off >= ins.next_addr()
                 && off.checked_add(size).is_some_and(|e| e <= len)
             {
+                let returned = insns[k + 1..]
+                    .iter()
+                    .find(|x| classify(x) != InsnKind::Other || x.opcode == 0x39)
+                    .is_some_and(|x| x.opcode == 0xf3);
                 found.push(DataRegion {
                     start: off,
                     end: off + size,
-                    kind: DataKind::CodeCopy { at: ins.addr.0 },
+                    kind: DataKind::CodeCopy {
+                        at: ins.addr.0,
+                        returned,
+                    },
                 });
             }
             continue;
@@ -448,6 +508,23 @@ fn find_data_regions(code: &[u8], metadata: Option<&Metadata>) -> Vec<DataRegion
         match merged.last_mut() {
             Some(last) if r.start < last.end => last.end = last.end.max(r.end),
             _ => merged.push(r),
+        }
+    }
+    // What follows the deployed runtime, up to the end, is the
+    // constructor's arguments.
+    let deployed_end = merged.iter().find_map(|r| match r.kind {
+        DataKind::CodeCopy { returned: true, .. } => Some(r.end),
+        _ => None,
+    });
+    for r in &mut merged {
+        if let DataKind::CodeCopy {
+            at,
+            returned: false,
+        } = r.kind
+            && Some(r.start) == deployed_end
+            && r.end == len
+        {
+            r.kind = DataKind::CtorArgs { at };
         }
     }
 
@@ -498,9 +575,12 @@ fn code_segments(len: u64, regions: &[DataRegion]) -> Vec<(u64, u64)> {
 /// `None` when unknown; the model resets at every `JUMPDEST` and
 /// after anything that ends a block, since the stack there depends on
 /// the path taken.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ConstStack {
     items: Vec<Option<u64>>,
+    /// `CODESIZE`: constructors locate their arguments as
+    /// `codesize - n`.
+    codesize: u64,
 }
 
 impl ConstStack {
@@ -519,6 +599,7 @@ impl ConstStack {
         let info = ins.info();
         match ins.opcode {
             0x5f..=0x7f => self.items.push(ins.push_value()),
+            0x38 => self.items.push(Some(self.codesize)),
             0x80..=0x8f => {
                 let n = usize::from(ins.opcode - 0x80);
                 let v = self.peek(n);
@@ -1014,20 +1095,53 @@ mod tests {
     }
 
     #[test]
-    fn initcode_runtime_becomes_data() {
+    fn initcode_runtime_becomes_a_nested_section() {
         // PUSH1 size DUP1 PUSH1 off PUSH0 CODECOPY PUSH0 RETURN INVALID
         // followed by a 5-byte "runtime".
         let runtime = [0x60, 0x80, 0x60, 0x40, 0x52];
         let mut code = vec![0x60, 5, 0x80, 0x60, 0x0a, 0x5f, 0x39, 0x5f, 0xf3, 0xfe];
         code.extend(runtime);
-        let ast = decompile_evm(&code);
-        assert!(
-            ast.items
-                .iter()
-                .any(|i| matches!(i, Item::Raw { addr: 0x0a, bytes } if bytes == &runtime))
-        );
-        let text = crate::ast::emit(&ast);
-        assert!(text.contains("embedded contract code"), "{text}");
+        for ast in [decompile_evm(&code), decompile_evm_listing(&code)] {
+            let Some(Item::Section { name, addr, items }) =
+                ast.items.iter().find(|i| matches!(i, Item::Section { .. }))
+            else {
+                panic!("no section: {ast:?}");
+            };
+            assert_eq!((name.as_str(), *addr), ("runtime", 0x0a));
+            // The runtime is decompiled from its own offset 0.
+            assert!(
+                items
+                    .iter()
+                    .any(|i| matches!(i, Item::Function(f) if f.addr == Some(0)))
+            );
+            let text = crate::ast::emit(&ast);
+            assert!(
+                text.contains("runtime code the constructor deploys"),
+                "{text}"
+            );
+            let parsed = crate::translate::compile::parse(&text).unwrap();
+            assert_eq!(
+                crate::translate::compile::lower_to_evm(&parsed).unwrap(),
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_arguments_after_the_runtime() {
+        // CODECOPY(0, 0x15, 5) RETURN(0, 5), then the constructor's own
+        // read of its arguments: CODECOPY(0, 0x1a, codesize - 0x1a).
+        let mut code = vec![
+            0x60, 0x1a, 0x38, 0x03, 0x80, 0x60, 0x1a, 0x5f, 0x39, // args copy
+            0x60, 0x05, 0x80, 0x60, 0x15, 0x5f, 0x39, 0x5f, 0xf3, // runtime
+            0xfe, 0xfe, 0xfe,
+        ];
+        assert_eq!(code.len(), 0x15);
+        code.extend([0x60, 0x80, 0x60, 0x40, 0x52]);
+        code.extend([0x11; 64]);
+        let text = decompile_evm_to_text(&code);
+        assert!(text.contains("constructor arguments"), "{text}");
+        assert!(text.contains("@section(\"runtime\", 0x15)"), "{text}");
         let parsed = crate::translate::compile::parse(&text).unwrap();
         assert_eq!(
             crate::translate::compile::lower_to_evm(&parsed).unwrap(),

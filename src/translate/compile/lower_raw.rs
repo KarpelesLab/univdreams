@@ -79,8 +79,29 @@ pub(crate) fn lower_flat_image(
     load_addr: u64,
     file_size: u64,
 ) -> Result<Vec<u8>, RawLowerError> {
-    let end = load_addr + file_size;
+    let blocks = flat_blocks(file)?;
+    place_blocks(&blocks, load_addr, file_size)
+}
 
+/// Like [`lower_flat_image`], for an image whose size is wherever its
+/// blocks end: a nested image (an EVM contract embedded in another)
+/// carries no `file_size` of its own.
+pub(crate) fn lower_flat_image_unsized(
+    file: &UdFile,
+    load_addr: u64,
+) -> Result<Vec<u8>, RawLowerError> {
+    let blocks = flat_blocks(file)?;
+    let end = blocks
+        .iter()
+        .map(|(addr, bytes)| addr + bytes.len() as u64)
+        .max()
+        .unwrap_or(load_addr);
+    place_blocks(&blocks, load_addr, end.saturating_sub(load_addr))
+}
+
+/// Every `@raw` block and `@addr` function of `file` lowered to bytes,
+/// in address order.
+fn flat_blocks(file: &UdFile) -> Result<Vec<(u64, Vec<u8>)>, RawLowerError> {
     let arch = resolve_arch_codec(&file.module)?;
     let mut owned_function_bytes: Vec<Vec<u8>> = Vec::new();
     let mut blocks: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -104,10 +125,21 @@ pub(crate) fn lower_flat_image(
         }
     }
     blocks.sort_by_key(|(addr, _)| *addr);
+    let _ = owned_function_bytes;
+    Ok(blocks)
+}
 
+/// Copy address-sorted `blocks` into an image of `file_size` bytes at
+/// `load_addr`, which they must cover exactly once.
+fn place_blocks(
+    blocks: &[(u64, Vec<u8>)],
+    load_addr: u64,
+    file_size: u64,
+) -> Result<Vec<u8>, RawLowerError> {
+    let end = load_addr + file_size;
     let mut out = vec![0u8; file_size as usize];
     let mut cursor = load_addr;
-    for (addr, bytes) in &blocks {
+    for (addr, bytes) in blocks {
         let len = bytes.len() as u64;
         if *addr < load_addr || addr.saturating_add(len) > end {
             return Err(RawLowerError::OutOfRange {
@@ -133,7 +165,6 @@ pub(crate) fn lower_flat_image(
         out[off..off + bytes.len()].copy_from_slice(bytes);
         cursor = addr + len;
     }
-    let _ = owned_function_bytes;
 
     let covered = cursor - load_addr;
     if covered != file_size {

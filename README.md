@@ -182,7 +182,7 @@ fn sub_09d9() {
 | **v1 (working)** | Mach-O (thin) | x86-64, arm64 (macOS) | ✅ whole-binary source round-trip; Ghidra-style listing |
 | **v1 (working)** | NE | x86-16 (Windows 1.x–3.x) | ✅ whole-binary source round-trip; Ghidra-style listing (imports, exports, 16-bit disasm) — structured lifting pending |
 | **v1 (working)** | raw / flat | 6502 (Apple I / WozMon) | ✅ round-trip + lift |
-| **v1 (working)** | EVM bytecode | EVM (solc / vyper output, any chain) | ✅ whole-contract source round-trip; lifted to functions / expressions / `if`-`while` / `require` (internal calls and frames recovered); selector-dispatcher functions (solc and Vyper) named from an ABI signature table; EIP-1167 clones shown as proxies; CODECOPY data + CBOR metadata split out |
+| **v1 (working)** | EVM bytecode | EVM (solc / vyper output, any chain) | ✅ whole-contract source round-trip; lifted to functions / expressions / `if`-`while` / `require` (internal calls and frames recovered); selector-dispatcher functions (solc and Vyper) named from an ABI signature table; EIP-1167 clones shown as proxies; creation code with its runtime decompiled as a nested section; CODECOPY data + CBOR metadata split out |
 | 2 | Mach-O fat | universal binaries | demux to thin first |
 | 2 | ARM / Thumb | 32-bit ARM | not yet |
 | 3 | High-level lifting | loops, types, struct fields | partial — see roadmap |
@@ -251,9 +251,11 @@ cargo test
 cargo run --bin ud -- decompile path/to/binary
 
 # Fetch + decompile an on-chain program: Solana by program ID, EVM by address
-# (any EVM chain via --rpc; Ethereum mainnet by default)
+# (any EVM chain via --rpc; Ethereum mainnet by default), or an EVM deployment's
+# creation code by transaction hash (constructor + nested runtime)
 cargo run --bin ud -- solana <program-id>
 cargo run --bin ud -- evm 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+cargo run --bin ud -- evm <0x…64-hex-digit deployment tx hash>
 
 # Source round-trip: decompile → emit → parse → lower → check byte-equality
 cargo run --bin ud -- roundtrip --through-source path/to/binary

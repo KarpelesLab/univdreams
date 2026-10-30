@@ -23,13 +23,25 @@
 //! * `crvusd-mainnet.evm` — the crvUSD stablecoin, vyper 0.3.7
 //!   (metadata trailer followed by appended immutables).
 //! * `eip1167-clone-mainnet.evm` — an EIP-1167 minimal proxy.
+//!
+//! and creation code (the `input` of the deploying transaction,
+//! `ud evm <tx-hash>`):
+//!
+//! * `initcode-immutable-mainnet.evm` — tx `0xaa4c0a4f…7b41cf3`,
+//!   solc 0.8.35; the constructor patches an immutable into the
+//!   runtime before returning it.
+//! * `initcode-ctor-args-mainnet.evm` — tx `0x4c94aedd…31cbee89`,
+//!   solc 0.8.24; one constructor argument after the runtime.
 
 use std::path::{Path, PathBuf};
 
+use univdreams::ast::Item;
 use univdreams::format::evm::{find_metadata, looks_like_evm, metadata_trailer, minimal_proxy};
 use univdreams::translate::compile::{lower_to_evm, parse};
 use univdreams::translate::decompile::decompile_evm_to_text;
-use univdreams::translate::decompile::evm::{decompile_evm_listing_to_text, dispatch_table};
+use univdreams::translate::decompile::evm::{
+    decompile_evm, decompile_evm_listing, decompile_evm_listing_to_text, dispatch_table,
+};
 
 fn testdata() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata")
@@ -60,7 +72,7 @@ fn read(path: &Path) -> Vec<u8> {
 #[test]
 fn evm_fixtures_round_trip_through_source() {
     let paths = fixtures();
-    assert!(paths.len() >= 7, "expected the committed .evm fixtures");
+    assert!(paths.len() >= 9, "expected the committed .evm fixtures");
     for path in paths {
         let code = read(&path);
         assert!(looks_like_evm(&code), "{} not detected", path.display());
@@ -302,4 +314,51 @@ fn eip1167_clone_is_a_proxy() {
         "{text}"
     );
     assert!(!text.contains("@asm("));
+}
+
+/// The `@section` holding the runtime that initcode deploys.
+fn runtime_section(items: &[Item]) -> (u64, &[Item]) {
+    items
+        .iter()
+        .find_map(|i| match i {
+            Item::Section { name, addr, items } if name == "runtime" => {
+                Some((*addr, items.as_slice()))
+            }
+            _ => None,
+        })
+        .expect("runtime section")
+}
+
+#[test]
+fn initcode_nests_the_runtime_it_deploys() {
+    for (fixture, start, end) in [
+        ("initcode-immutable-mainnet.evm", 0x31, 0x439),
+        ("initcode-ctor-args-mainnet.evm", 0xbe, 0x1b80),
+    ] {
+        let code = read(&testdata().join(fixture));
+        let forms: [fn(&[u8]) -> univdreams::ast::UdFile; 2] =
+            [decompile_evm, decompile_evm_listing];
+        for form in forms {
+            let ast = form(&code);
+            let (addr, items) = runtime_section(&ast.items);
+            assert_eq!(addr, start, "{fixture}");
+            // The section is the runtime decompiled on its own, from
+            // offset 0 — what `eth_getCode` would return, immutables
+            // aside.
+            let alone = form(&code[usize::try_from(start).unwrap()..end]);
+            assert_eq!(items, alone.items.as_slice(), "{fixture}");
+        }
+        let text = decompile_evm_to_text(&code);
+        assert!(text.contains("runtime code the constructor deploys"));
+        assert!(text.contains("fn transfer()") || text.contains("fn owner()"));
+    }
+    let code = read(&testdata().join("initcode-ctor-args-mainnet.evm"));
+    let text = decompile_evm_to_text(&code);
+    assert!(
+        text.contains("data 0x1b80..0x1ba0: constructor arguments"),
+        "{text}"
+    );
+    assert!(text.contains("codecopy(v0, 0x1b80, v1)"));
+    // Immutables are written into the memory copy before RETURN.
+    assert!(text.contains("return memory(0x0, 0x1ac2);"));
 }

@@ -155,9 +155,10 @@ fail-soft-thunk / monitor-report machinery.
 
 - [x] `arch::evm`: opcode table through Fusaka (`PUSH0`, `TLOAD`/`TSTORE`/`MCOPY`/`BLOBHASH`/`BLOBBASEFEE`, `CLZ`), linear decoder that keeps truncated trailing `PUSH`es byte-exact, and a text assembler — `@asm` lines carry no pinned bytes, so edited mnemonics and immediates recompile.
 - [x] `format::evm`: CBOR metadata trailer (solc / vyper, including Vyper's trailer followed by appended immutables), EIP-7702 delegation designators, EIP-1167 minimal proxies (with or without appended arguments), hex-text input; headerless detection from solc and Vyper 0.1–0.3 entry sequences.
-- [x] `translate::decompile::evm` / `compile::lower_to_evm`: data regions from constant-offset `CODECOPY`s (initcode → embedded runtime) and the metadata trailer become `@raw`; the Solidity selector dispatcher (and Vyper's chained `PUSH4 sel; …; EQ; ISZERO` / `XOR` tests, private functions skipped over) yields one function per entry point, named from `signatures::evm` (ABI signatures hashed with an in-tree keccak-256) or `fn_<selector>`; `JUMPDEST` labels and jump-target / selector / event-topic / ERC-1967- and ZeppelinOS-slot annotations. An EIP-1167 clone renders as `return delegatecall(<implementation>, msg.data);`.
-- [x] `ud evm <address> [--rpc URL]` fetches runtime code via `eth_getCode` (cached per chain ID); playground "EVM chain" tab.
-- [x] Whole-contract round-trip defended on mainnet WETH9 (solc 0.4), USDC's ZeppelinOS proxy (solc 0.4.24), Uniswap V2 Router02 (solc 0.6.6), Uniswap v4 PoolManager (solc 0.8.26 via-IR), Curve 3pool (vyper 0.2), crvUSD (vyper 0.3.7) and an EIP-1167 clone, for both output forms below.
+- [x] `translate::decompile::evm` / `compile::lower_to_evm`: data regions from constant-offset `CODECOPY`s and the metadata trailer become `@raw`; the Solidity selector dispatcher (and Vyper's chained `PUSH4 sel; …; EQ; ISZERO` / `XOR` tests, private functions skipped over) yields one function per entry point, named from `signatures::evm` (ABI signatures hashed with an in-tree keccak-256) or `fn_<selector>`; `JUMPDEST` labels and jump-target / selector / event-topic / ERC-1967- and ZeppelinOS-slot annotations. An EIP-1167 clone renders as `return delegatecall(<implementation>, msg.data);`.
+- [x] `ud evm <address> [--rpc URL]` fetches runtime code via `eth_getCode` (cached per chain ID); `ud evm <tx-hash>` fetches a deployment's creation code (`eth_getTransactionByHash`; calls through the CREATE2 deterministic-deployment proxy have their salt stripped); playground "EVM chain" tab.
+- [x] Creation code: the runtime a constructor `CODECOPY`s out and `RETURN`s (and any other embedded contract, e.g. a factory's child initcode) is decompiled recursively as a nested `@section("runtime", 0x…)` whose items are addressed from 0, as the code runs once deployed; `lower_to_evm` lowers sections in place. Constructor arguments after the runtime (`CODECOPY(…, codesize - n)`) are labelled as such.
+- [x] Whole-contract round-trip defended on mainnet WETH9 (solc 0.4), USDC's ZeppelinOS proxy (solc 0.4.24), Uniswap V2 Router02 (solc 0.6.6), Uniswap v4 PoolManager (solc 0.8.26 via-IR), Curve 3pool (vyper 0.2), crvUSD (vyper 0.3.7), an EIP-1167 clone, and two deployments' creation code (solc 0.8.24 with a constructor argument, 0.8.35 with an immutable), for both output forms below.
 
 **Lifted output (the default)** — `translate::decompile::evm_cfg` + `evm_lift`:
 
@@ -173,7 +174,7 @@ fail-soft-thunk / monitor-report machinery.
 - [ ] Editable lifted statements: an EVM expression compiler so canonical statements can drop their pinned bytes (as the listing does per instruction).
 - [ ] Vyper 0.2 saves and restores memory frames around private calls (and returns arrays) with stack-pushing loops whose trip count isn't tracked; blocks after those keep entry-relative `sN` names.
 - [ ] Symbolic jump targets (`PUSH2 L_01a3`) resolved at lower time, so edits that change code length keep jumps valid.
-- [ ] Dynamic-type (`bytes`, arrays, strings) encodings, struct fields decoded into memory (via-IR `PoolKey`), known-selector external calls (`IERC20(t).transfer(a, n)`, whose memory setup spans blocks), and recursive decompile of runtime code embedded in initcode.
+- [ ] Dynamic-type (`bytes`, arrays, strings) encodings, struct fields decoded into memory (via-IR `PoolKey`), and known-selector external calls (`IERC20(t).transfer(a, n)`, whose memory setup spans blocks).
 
 ## Beyond v1
 

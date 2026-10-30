@@ -399,16 +399,20 @@ enum Command {
         out: Option<PathBuf>,
     },
 
-    /// Fetch an EVM contract's runtime bytecode by address and
-    /// decompile it. Works against any EVM chain's JSON-RPC
-    /// endpoint (`eth_getCode`); the default is a public Ethereum
-    /// mainnet node.
+    /// Fetch an EVM contract's runtime bytecode by address — or the
+    /// creation code a deployment transaction carried — and decompile
+    /// it. Works against any EVM chain's JSON-RPC endpoint
+    /// (`eth_getCode` / `eth_getTransactionByHash`); the default is a
+    /// public Ethereum mainnet node.
     ///
     /// Code is cached under `~/.cache/univdreams/evm/<chain-id>/`.
     /// Pass `--no-cache` to force a fresh fetch (e.g. after an
     /// EIP-7702 re-delegation).
     Evm {
-        /// Contract address (`0x` + 40 hex digits).
+        /// Contract address (`0x` + 40 hex digits), or the hash of a
+        /// contract-creation transaction (`0x` + 64 hex digits) to
+        /// decompile its initcode: constructor, then the runtime it
+        /// deploys as a nested section.
         address: String,
 
         /// RPC endpoint URL. Defaults to a public Ethereum
@@ -2892,7 +2896,7 @@ fn evm_cmd(
     listing: bool,
     out: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let code = univdreams::cli::evm::fetch_code(address, rpc_url, use_cache)
+    let code = univdreams::cli::evm::fetch(address, rpc_url, use_cache)
         .with_context(|| format!("fetch {address} from {rpc_url}"))?;
     if let Some(path) = save_code {
         std::fs::write(path, &code).with_context(|| format!("write {}", path.display()))?;
