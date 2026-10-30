@@ -171,7 +171,7 @@ fn sub_09d9() {
 }
 ```
 
-`--listing` gives the editable instruction-level form instead; both recompile byte-identically.
+Lifted statements are editable: change `require((v3 >= arg0))` to `require((v3 >= (arg0 + 0x64)))`, add `require(param1 != 0x0, "zero amount")` or `balanceOf[msg.sender] = 0x2a` (no byte list) to a function, or edit an `sstore`, assignment, `return abi.encode(…)`, `emit` or `if` condition, and `ud compile` generates EVM code for it and relocates every jump in the contract. Unedited files still recompile byte-identically. Internal and external calls, deleted statements and unreachable code aren't editable yet and are reported as errors. `--listing` gives the instruction-level form instead, where mnemonics and immediates are edited directly.
 
 ## Targets
 
@@ -182,7 +182,7 @@ fn sub_09d9() {
 | **v1 (working)** | Mach-O (thin) | x86-64, arm64 (macOS) | ✅ whole-binary source round-trip; Ghidra-style listing |
 | **v1 (working)** | NE | x86-16 (Windows 1.x–3.x) | ✅ whole-binary source round-trip; Ghidra-style listing (imports, exports, 16-bit disasm) — structured lifting pending |
 | **v1 (working)** | raw / flat | 6502 (Apple I / WozMon) | ✅ round-trip + lift |
-| **v1 (working)** | EVM bytecode | EVM (solc / vyper output, any chain) | ✅ whole-contract source round-trip; lifted to functions / expressions / `if`-`while` / `require` (internal calls and frames recovered); selector-dispatcher functions (solc and Vyper) named from an ABI signature table; EIP-1167 clones shown as proxies; creation code with its runtime decompiled as a nested section; CODECOPY data + CBOR metadata split out |
+| **v1 (working)** | EVM bytecode | EVM (solc / vyper output, any chain) | ✅ whole-contract source round-trip; lifted to functions / expressions / `if`-`while` / `require` (internal calls and frames recovered), editable statements recompiled with whole-contract relocation; selector-dispatcher functions (solc and Vyper) named from an ABI signature table; EIP-1167 clones shown as proxies; creation code with its runtime decompiled as a nested section; CODECOPY data + CBOR metadata split out |
 | 2 | Mach-O fat | universal binaries | demux to thin first |
 | 2 | ARM / Thumb | 32-bit ARM | not yet |
 | 3 | High-level lifting | loops, types, struct fields | partial — see roadmap |

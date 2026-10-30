@@ -27,6 +27,8 @@ use crate::common::VAddr;
 use crate::ir::ArchInsn;
 
 mod codec;
+#[cfg(test)]
+pub(crate) mod interp;
 mod keccak;
 mod table;
 

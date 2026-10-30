@@ -30,9 +30,11 @@
 //! from that `JUMPI` becomes `if (!cond) { … }`; any other jump stays
 //! explicit as `jump(L_xxxx)`.
 //!
-//! The text is a reading aid: every statement pins the bytes of the
-//! instructions it stands for, in order, so lowering reproduces the
-//! code exactly. Edits to lifted text don't change the output.
+//! Every statement pins the bytes of the instructions it stands for,
+//! in order, so lowering an unedited file reproduces the code exactly.
+//! The lowerer re-lifts those bytes to spot edited statements and
+//! compiles them from their text (`compile::evm_edit`), using the
+//! stack-slot names recorded in a [`LiftTrace`].
 
 // Stack depths and positions are bounded by the EVM's 1024-item
 // limit, so the usize/i64 conversions between them can't wrap.
@@ -62,6 +64,36 @@ const RESULT: &str = "result";
 
 /// Resolved values larger than this are treated as [`UNKNOWN`].
 const RESOLVE_MAX_NODES: usize = 48;
+/// Stack items a [`LiftTrace`] snapshot names (DUP16 / SWAP16 reach
+/// plus one).
+const TRACE_DEPTH: usize = 17;
+
+/// Names of one stack item at an instruction boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlotNames {
+    /// The variable the item holds (`v6`, `arg1`, `param0`, `t2`,
+    /// `L_00b7`), if it is a plain variable rather than a pending
+    /// expression.
+    pub var: Option<String>,
+    /// The name of the frame position the item sits in, as used for
+    /// slot write-backs (`v4, v8 = …`).
+    pub slot: Option<String>,
+}
+
+/// Stack names the lifter saw, for compiling edited statements back
+/// against the same slots. Snapshots list items top first.
+#[derive(Debug, Default)]
+pub(crate) struct LiftTrace {
+    /// Before each lifted instruction, by instruction index.
+    pub before: HashMap<usize, Vec<SlotNames>>,
+    /// After the last instruction of a block that falls through, keyed
+    /// by the index one past it.
+    pub fall_end: HashMap<usize, Vec<SlotNames>>,
+    /// The storage-variable names the text uses.
+    pub storage: StorageNames,
+    /// Names of each external function's ABI head words, by entry.
+    pub params: HashMap<u64, Vec<String>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Expr {
@@ -691,6 +723,8 @@ pub(crate) struct LiftCtx<'a> {
     /// Vyper code: mapping slots hash `slot ‖ key` (Solidity hashes
     /// `key ‖ slot`), and 0.1 / 0.2 keep the selector at memory 0.
     pub vyper: bool,
+    /// Where to record stack names, when the caller wants them.
+    pub trace: Option<&'a RefCell<LiftTrace>>,
 }
 
 impl LiftCtx<'_> {
@@ -770,7 +804,13 @@ pub(crate) fn lift_ranges(ctx: &LiftCtx<'_>, ranges: &[(u64, u64)]) -> Vec<Vec<S
         pass(&summaries, &mut facts);
         summaries = summarize(&facts);
     }
-    let _scope = StorageScope::enter(storage_names(ctx, &facts));
+    let names = storage_names(ctx, &facts);
+    if let Some(trace) = ctx.trace {
+        let mut t = trace.borrow_mut();
+        t.storage.clone_from(&names);
+        t.params.clone_from(&ctx.params);
+    }
+    let _scope = StorageScope::enter(names);
     pass(&summaries, &mut Facts::default())
 }
 
@@ -1783,6 +1823,43 @@ impl BlockLift<'_, '_> {
             .unwrap_or_else(|| format!("s{j}"))
     }
 
+    /// Record the names of the stack items into the trace, if one is
+    /// being kept: before instruction `at`, or (`fall`) after a block
+    /// ending just before it.
+    fn record(&self, at: usize, fall: bool) {
+        let Some(trace) = self.ctx.trace else {
+            return;
+        };
+        let mut names: Vec<SlotNames> = self
+            .stack
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, e)| SlotNames {
+                var: match e {
+                    Expr::Var(v) => Some(v.clone()),
+                    _ => None,
+                },
+                slot: self.name_at(i),
+            })
+            .take(TRACE_DEPTH)
+            .collect();
+        let mut j = self.pulled;
+        while names.len() < TRACE_DEPTH {
+            names.push(SlotNames {
+                var: match self.entry_item(j) {
+                    Expr::Var(v) => Some(v),
+                    _ => None,
+                },
+                slot: Some(self.entry_name(j)),
+            });
+            j += 1;
+        }
+        let mut t = trace.borrow_mut();
+        let map = if fall { &mut t.fall_end } else { &mut t.before };
+        map.insert(at, names);
+    }
+
     fn ensure(&mut self, n: usize) {
         while self.stack.len() < n {
             let item = self.entry_item(self.pulled);
@@ -1912,6 +1989,7 @@ impl BlockLift<'_, '_> {
         let blk = cfg.blocks[b].clone();
         let last = blk.insns.end - 1;
         for i in blk.insns.clone() {
+            self.record(i, false);
             let ins = &self.ctx.insns[i];
             let op = ins.opcode;
             // A statement on the last instruction of a fall-through
@@ -2148,6 +2226,7 @@ impl BlockLift<'_, '_> {
         }
         // Fell off the end of the block.
         self.exit = self.exit_values();
+        self.record(blk.insns.end, true);
         if self.exit_writes().is_some() {
             if self.pending < blk.insns.end {
                 self.flush_exit(last);

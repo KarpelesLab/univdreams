@@ -373,6 +373,17 @@ pub fn function_by_selector(sel: u32) -> Option<&'static str> {
     selector_map().get(&sel).copied()
 }
 
+/// Selectors of the known functions / errors called `name`, one per
+/// overload.
+#[must_use]
+pub fn selectors_named(name: &str) -> Vec<u32> {
+    FUNCTIONS
+        .iter()
+        .filter(|sig| sig.split('(').next() == Some(name))
+        .map(|sig| selector(sig))
+        .collect()
+}
+
 /// Event signature for a `LOGn` topic-0 value.
 #[must_use]
 pub fn event_by_topic(topic: &[u8; 32]) -> Option<&'static str> {

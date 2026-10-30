@@ -70,9 +70,10 @@ enum Command {
         out: Option<PathBuf>,
 
         /// EVM bytecode: emit one `@asm` line per instruction instead
-        /// of lifted statements. The listing is the form to edit:
-        /// changed mnemonics and immediates recompile, while lifted
-        /// statements are a read-only view over pinned bytes.
+        /// of lifted statements, for instruction-level edits (changed
+        /// mnemonics and immediates recompile; jump targets stay
+        /// absolute). Lifted statements are editable too, and their
+        /// edits relocate the whole contract.
         #[arg(long)]
         listing: bool,
     },

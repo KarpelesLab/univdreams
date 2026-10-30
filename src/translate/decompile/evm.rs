@@ -25,9 +25,10 @@
 //! 3. **Bodies.** By default, `evm_lift` turns each function
 //!    into statements over named stack slots — expressions,
 //!    `sstore`/`mstore`/`log`, internal calls and returns,
-//!    `if`/`while`/`do … while`, `require(…)` / `revert(Err())`. That
-//!    view is read-only: every statement pins the bytes it stands for,
-//!    so editing its text changes nothing.
+//!    `if`/`while`/`do … while`, `require(…)` / `revert(Err())`. Every
+//!    statement pins the bytes it stands for; the lowerer re-lifts
+//!    them (see `relift`) and compiles statements whose text was
+//!    edited, or that were added without bytes, from their text.
 //!
 //!    [`decompile_evm_listing`] instead emits one `@asm` line per
 //!    instruction, with `JUMPDEST` labels and jump-target / selector /
@@ -38,6 +39,7 @@
 //!    absolute: an edit that changes code length must fix up the
 //!    affected `PUSH` targets by hand.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 
@@ -78,15 +80,44 @@ struct DataRegion {
 /// lifted to statements (see `evm_lift`).
 #[must_use]
 pub fn decompile_evm(code: &[u8]) -> UdFile {
-    decompile_evm_impl(code, true, 0)
+    decompile_evm_impl(code, true, 0, None)
 }
 
 /// Build the AST as an instruction listing: one `@asm` line per
 /// instruction, with bytes dropped wherever the text re-assembles to
-/// them — the form to use when editing the code itself.
+/// them — the form to use when editing individual instructions.
 #[must_use]
 pub fn decompile_evm_listing(code: &[u8]) -> UdFile {
-    decompile_evm_impl(code, false, 0)
+    decompile_evm_impl(code, false, 0, None)
+}
+
+/// The lifted AST of `code` together with what the lowerer needs to
+/// compile edited statements against it.
+pub(crate) struct Relift {
+    pub file: UdFile,
+    /// The decoded code segments, indexed like the trace.
+    pub insns: Vec<DecodedInsn>,
+    pub trace: evm_lift::LiftTrace,
+    /// Compiled by Vyper (mapping slots hash `slot ‖ key`).
+    pub vyper: bool,
+}
+
+/// Lift `code` as [`decompile_evm`] does, keeping the stack-name trace.
+pub(crate) fn relift(code: &[u8]) -> Relift {
+    let trace = RefCell::new(evm_lift::LiftTrace::default());
+    let file = decompile_evm_impl(code, true, 0, Some(&trace));
+    let (insns, vyper) = if delegation_target(code).is_some() || minimal_proxy(code).is_some() {
+        (Vec::new(), false)
+    } else {
+        let l = layout(code, find_metadata(code).as_ref());
+        (l.insns, l.vyper)
+    };
+    Relift {
+        file,
+        insns,
+        trace: trace.into_inner(),
+        vyper,
+    }
 }
 
 /// Convenience: lifted AST + canonical pretty-print.
@@ -102,7 +133,12 @@ pub fn decompile_evm_listing_to_text(code: &[u8]) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn decompile_evm_impl(code: &[u8], lift: bool, depth: u32) -> UdFile {
+fn decompile_evm_impl(
+    code: &[u8],
+    lift: bool,
+    depth: u32,
+    trace: Option<&RefCell<evm_lift::LiftTrace>>,
+) -> UdFile {
     let metadata = find_metadata(code);
     let module = build_module(code, metadata.as_ref());
 
@@ -197,6 +233,7 @@ fn decompile_evm_impl(code: &[u8], lift: bool, depth: u32) -> UdFile {
                 })
                 .collect(),
             vyper,
+            trace,
         };
         evm_lift::lift_ranges(&ctx, &ranges)
     } else {
@@ -436,7 +473,7 @@ fn push_embedded(
     lift: bool,
     depth: u32,
 ) {
-    let nested = decompile_evm_impl(bytes, lift, depth + 1);
+    let nested = decompile_evm_impl(bytes, lift, depth + 1, None);
     let compiler = nested.module.fields.iter().find_map(|f| match &f.value {
         Value::String(s) if f.name == "compiler" => Some(format!(", {s}")),
         _ => None,

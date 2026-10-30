@@ -12,6 +12,9 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+mod evm_edit;
+mod evm_emit;
+mod evm_expr;
 mod lexer;
 mod lower;
 mod lower_elf;
@@ -27,6 +30,7 @@ mod verify;
 
 pub use module::resolve_arch_codec;
 
+pub use evm_edit::EvmEditError;
 pub use lower::{
     LowerError, LoweredFunction, LoweredSection, lower_function_bytes, lower_function_bytes_at,
     lower_functions, lower_section_bytes, lower_sections,

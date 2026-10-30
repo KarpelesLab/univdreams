@@ -1232,7 +1232,7 @@ impl Parser {
         }
     }
 
-    /// Parse `if (cond) [#[attrs]] [bytes] { body } [else { else_body }]`.
+    /// Parse `if (cond) [#[attrs]] [[bytes]] { body } [else { else_body }]`.
     /// The `if` ident has not been consumed yet.
     ///
     /// Two body shapes are accepted:
@@ -1258,7 +1258,13 @@ impl Parser {
             return self.parse_if_goto_tail(cond_text);
         }
         let attrs = self.parse_attrs()?;
-        let cond_bytes = self.parse_byte_list()?;
+        // Bytes are optional: a hand-written `if` has none for the
+        // lowerer to fall back on (EVM compiles it from the text).
+        let cond_bytes = if self.peek().kind == TokenKind::LBracket {
+            self.parse_byte_list()?
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LBrace, "`{` to open `if` body")?;
         let (pre_body, then_body, else_body_in_braces) = self.parse_if_body_with_optional_arms()?;
         self.expect(&TokenKind::RBrace, "`}` to close `if` body")?;
