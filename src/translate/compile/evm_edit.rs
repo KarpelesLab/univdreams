@@ -82,7 +82,7 @@ use super::evm_expr::{BinOp, EExpr, UnOp, parse_expr, parse_list};
 use crate::arch::evm::{DecodedInsn, OPCODE_TABLE, assemble_one};
 use crate::ast::{FnDecl, Item, Stmt, UdFile};
 use crate::translate::decompile::evm::{Relift, relift};
-use crate::translate::decompile::evm_cfg::{self, Cfg, FuncInfo, JumpRole};
+use crate::translate::decompile::evm_cfg::{Cfg, FuncInfo, JumpRole};
 use crate::translate::decompile::evm_lift::SlotNames;
 
 /// An edit that can't be compiled.
@@ -148,7 +148,7 @@ pub(crate) fn apply_edits(
         return match (sections.is_empty(), in_place) {
             (true, _) => Ok(None),
             (false, true) => Ok(Some(splice())),
-            (false, false) => Err(whole_file(
+            (false, false) => blueprint_initcode(code, sections).map(Some).ok_or_else(|| whole_file(
                 "an embedded contract's code moved, and the code deploying it isn't in lifted form, so it can't be adjusted",
             )),
         };
@@ -169,7 +169,7 @@ pub(crate) fn apply_edits(
         return proxy_edit(&jobs, &proxy, code).map(|code| Some(Edited { code, moved: None }));
     }
 
-    let cfg = evm_cfg::build(&rl.insns);
+    let cfg = rl.cfg();
     let data_spans: Vec<(u64, u64)> = file
         .items
         .iter()
@@ -178,7 +178,15 @@ pub(crate) fn apply_edits(
             _ => None,
         })
         .collect();
-    let reloc = analyze_reloc(&rl.insns, &cfg, &data_spans);
+    let mut reloc = analyze_reloc(&rl.insns, &cfg, &data_spans);
+    // A selector table's address is pushed and offset at run time,
+    // never `CODECOPY`'d as a constant, but it is data all the same.
+    let table_words: &[u64] = rl.dispatch.as_ref().map_or(&[], |d| d.words.as_slice());
+    if let Some(d) = &rl.dispatch
+        && let Some(k) = rl.insns.iter().position(|i| i.addr.0 == d.base)
+    {
+        reloc.data.insert(k);
+    }
     let opts = Opts {
         push0: rl.insns.iter().any(|i| i.opcode == 0x5f),
         shifts: rl.insns.iter().any(|i| matches!(i.opcode, 0x1b..=0x1d)),
@@ -211,6 +219,7 @@ pub(crate) fn apply_edits(
             pc_rewrites: &rewrites,
             fixups: &fix.fixups,
             sections,
+            table_words,
         },
     )?;
     if out.len() != code.len()
@@ -270,6 +279,21 @@ fn proxy_edit(
     out.extend([0x57, 0xfd, 0x5b, 0xf3]);
     out.extend(&code[proxy.code_len..]);
     Ok(out)
+}
+
+/// An ERC-5202 blueprint whose initcode changed: it runs to the
+/// blueprint's end, and factories copy it whole, so it may change size.
+fn blueprint_initcode(code: &[u8], sections: &[SectionChange]) -> Option<Edited> {
+    let bp = crate::format::evm::blueprint(code)?;
+    let [s] = sections else { return None };
+    (s.addr == bp.initcode as u64 && bp.initcode + s.old.len() == code.len()).then(|| {
+        let mut out = code[..bp.initcode].to_vec();
+        out.extend(&s.new);
+        Edited {
+            code: out,
+            moved: None,
+        }
+    })
 }
 
 pub(crate) fn has_lifted_statements(file: &UdFile) -> bool {
@@ -3047,6 +3071,10 @@ struct Adjust<'a> {
     /// See [`deploy_fixups`].
     fixups: &'a HashMap<usize, Fixup>,
     sections: &'a [SectionChange],
+    /// Offsets of 2-byte words in the data that hold code or data
+    /// offsets (a Vyper ≥0.3.10 selector table), rewritten to where
+    /// those offsets moved.
+    table_words: &'a [u64],
 }
 
 /// Lay out the contract: the code and its patches, the data regions
@@ -3182,12 +3210,16 @@ fn layout(
     for (addr, bytes) in data {
         pieces.push(data_piece(addr, bytes));
     }
-    resolve(&pieces)
+    resolve(&pieces, adjust.table_words)
 }
 
-/// Assign offsets and emit bytes; also returns where each
-/// [`Piece::Mark`]ed instruction starts.
-fn resolve(pieces: &[Piece]) -> Result<(Vec<u8>, HashMap<u64, u64>), EvmEditError> {
+/// Assign offsets and emit bytes, rewriting `table_words` (see
+/// [`Adjust`]); also returns where each [`Piece::Mark`]ed instruction
+/// starts.
+fn resolve(
+    pieces: &[Piece],
+    table_words: &[u64],
+) -> Result<(Vec<u8>, HashMap<u64, u64>), EvmEditError> {
     let mut labels: HashMap<Target, u64> = HashMap::new();
     let mut marks: HashMap<u64, u64> = HashMap::new();
     // `(orig, new offset, orig len, new len)`.
@@ -3266,6 +3298,19 @@ fn resolve(pieces: &[Piece]) -> Result<(Vec<u8>, HashMap<u64, u64>), EvmEditErro
             }
         }
     }
+    for &w in table_words {
+        let moved = |what: &str| whole_file(format!("selector table word 0x{w:x}: {what}"));
+        let at = find(&Target::Orig(w)).ok_or_else(|| moved("not in the data"))?;
+        let at = usize::try_from(at).map_err(|_| moved("out of range"))?;
+        let old = out
+            .get(at..at + 2)
+            .map(|b| u64::from(u16::from_be_bytes([b[0], b[1]])))
+            .ok_or_else(|| moved("past the end"))?;
+        let new = find(&Target::Orig(old))
+            .ok_or_else(|| moved("its target was inside an edited statement's code"))?;
+        let new = u16::try_from(new).map_err(|_| moved("its target no longer fits 16 bits"))?;
+        out[at..at + 2].copy_from_slice(&new.to_be_bytes());
+    }
     Ok((out, marks))
 }
 
@@ -3274,6 +3319,7 @@ mod tests {
     use crate::arch::evm::interp::{Call, Machine, Outcome, U256, calldata};
     use crate::translate::compile::{lower_to_evm, parse};
     use crate::translate::decompile::decompile_evm_to_text;
+    use crate::translate::decompile::evm::dispatch_table;
 
     fn weth() -> Vec<u8> {
         fixture("weth9-mainnet.evm")
@@ -3527,6 +3573,56 @@ mod tests {
                 send(&mut m, BOB, 0, "totalSupply()", &[]),
                 Outcome::Return(word(supply))
             );
+        }
+    }
+
+    /// Growing the dispatcher of a Vyper ≥0.3.10 contract moves every
+    /// function; the selector table's code offsets (and a dense
+    /// table's bucket locations) move with them.
+    #[test]
+    fn relocated_selector_tables_still_dispatch() {
+        use crate::translate::decompile::evm_dispatch::tests::{dense_contract, sparse_contract};
+        type Calls<'a> = Vec<(&'a str, Vec<U256>)>;
+        let to = u(BOB);
+        let calls: [(Vec<u8>, Calls); 2] = [
+            (
+                sparse_contract(),
+                vec![
+                    ("transfer(address,uint256)", vec![]),
+                    ("approve(address,uint256)", vec![]),
+                    ("totalSupply()", vec![]),
+                ],
+            ),
+            (
+                dense_contract(),
+                vec![
+                    ("totalSupply()", vec![]),
+                    ("transfer(address,uint256)", vec![to, u(5)]),
+                    ("transfer(address,uint256)", vec![to]),
+                    ("approve(address,uint256)", vec![to, u(5)]),
+                ],
+            ),
+        ];
+        for (code, calls) in calls {
+            let text = decompile_evm_to_text(&code);
+            assert!(text.contains("selector table"), "{text}");
+            let at = text.find("fn entry() {\n").expect("entry") + "fn entry() {\n".len();
+            let edited = format!("{}    sstore(0xdead, 0x1)\n{}", &text[..at], &text[at..]);
+            let new = compile(&edited).unwrap();
+            assert!(new.len() > code.len());
+            let mut outcomes = Vec::new();
+            for bin in [&code, &new] {
+                let mut m = Machine::new(bin);
+                let out: Vec<Outcome> = calls
+                    .iter()
+                    .map(|(sig, args)| send(&mut m, ALICE, 0, sig, args))
+                    .collect();
+                outcomes.push(out);
+            }
+            assert_eq!(outcomes[0], outcomes[1]);
+            assert!(outcomes[0].iter().any(|o| !matches!(o, Outcome::Revert(_))));
+            // The relocated contract dispatches through moved tables.
+            assert_eq!(dispatch_table(&new).len(), dispatch_table(&code).len());
         }
     }
 

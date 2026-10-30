@@ -191,7 +191,7 @@ Lifted statements are editable: change `require((v3 >= arg0))` to `require((v3 >
 | **v1 (working)** | Mach-O (thin) | x86-64, arm64 (macOS) | ✅ whole-binary source round-trip; Ghidra-style listing |
 | **v1 (working)** | NE | x86-16 (Windows 1.x–3.x) | ✅ whole-binary source round-trip; Ghidra-style listing (imports, exports, 16-bit disasm) — structured lifting pending |
 | **v1 (working)** | raw / flat | 6502 (Apple I / WozMon) | ✅ round-trip + lift |
-| **v1 (working)** | EVM bytecode | EVM (solc / vyper output, any chain) | ✅ whole-contract source round-trip; lifted to functions / expressions / `if`-`while` / `require` (internal calls and frames recovered), editable statements recompiled with whole-contract relocation; selector-dispatcher functions (solc and Vyper) named from an ABI signature table; EIP-1167 clones shown as proxies; creation code with its runtime decompiled as a nested section; CODECOPY data + CBOR metadata split out |
+| **v1 (working)** | EVM bytecode | EVM (solc / vyper output, any chain) | ✅ whole-contract source round-trip; lifted to functions / expressions / `if`-`while` / `require` (internal calls and frames recovered), editable statements recompiled with whole-contract relocation; selector-dispatcher functions (solc and Vyper, including Vyper ≥0.3.10's hash-table dispatchers) named from an ABI signature table; EIP-1167 clones shown as proxies; creation code with its runtime decompiled as a nested section, as are a factory's embedded child initcode and ERC-5202 blueprints; CODECOPY data + CBOR metadata split out |
 | 2 | Mach-O fat | universal binaries | demux to thin first |
 | 2 | ARM / Thumb | 32-bit ARM | not yet |
 | 3 | High-level lifting | loops, types, struct fields | partial — see roadmap |

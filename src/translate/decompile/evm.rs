@@ -46,10 +46,11 @@ use std::fmt::Write as _;
 use crate::arch::evm::{self, DecodedInsn, InsnKind, classify, decode_range, format_insn};
 use crate::ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
 use crate::format::evm::{
-    Metadata, MinimalProxy, checksum_address, delegation_target, find_metadata, metadata_trailer,
-    minimal_proxy,
+    Blueprint, Metadata, MinimalProxy, blueprint, checksum_address, delegation_target,
+    find_metadata, looks_like_evm, metadata_trailer, minimal_proxy,
 };
 use crate::signatures::evm::{event_by_topic, function_by_selector, slot_name};
+use crate::translate::decompile::evm_dispatch::{self, HashDispatch};
 use crate::translate::decompile::{evm_cfg, evm_lift};
 
 /// What a non-code span holds.
@@ -67,6 +68,8 @@ enum DataKind {
     /// Data after the metadata trailer: Vyper's immutables, appended
     /// to the runtime code at deployment.
     Appended,
+    /// Vyper ≥0.3.10's selector table (see `evm_dispatch`).
+    SelectorTable { dense: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,24 +103,55 @@ pub(crate) struct Relift {
     pub trace: evm_lift::LiftTrace,
     /// Compiled by Vyper (mapping slots hash `slot ‖ key`).
     pub vyper: bool,
+    /// Vyper ≥0.3.10's selector table, whose words an edit that moves
+    /// code rewrites.
+    pub dispatch: Option<HashDispatch>,
+}
+
+impl Relift {
+    /// The CFG the lifter built.
+    pub fn cfg(&self) -> evm_cfg::Cfg {
+        evm_cfg::build_with(&self.insns, &jump_tables(self.dispatch.as_ref()))
+    }
 }
 
 /// Lift `code` as [`decompile_evm`] does, keeping the stack-name trace.
 pub(crate) fn relift(code: &[u8]) -> Relift {
     let trace = RefCell::new(evm_lift::LiftTrace::default());
     let file = decompile_evm_impl(code, true, 0, Some(&trace));
-    let (insns, vyper) = if delegation_target(code).is_some() || minimal_proxy(code).is_some() {
-        (Vec::new(), false)
+    let (insns, vyper, dispatch) = if is_wrapper(code) {
+        (Vec::new(), false, None)
     } else {
         let l = layout(code, find_metadata(code).as_ref());
-        (l.insns, l.vyper)
+        (l.insns, l.vyper, l.dispatch)
     };
     Relift {
         file,
         insns,
         trace: trace.into_inner(),
         vyper,
+        dispatch,
     }
+}
+
+/// Code that isn't decompiled as a contract of its own: a delegation
+/// designator, a minimal proxy, or a blueprint holding initcode.
+fn is_wrapper(code: &[u8]) -> bool {
+    delegation_target(code).is_some()
+        || minimal_proxy(code).is_some()
+        || code_blueprint(code).is_some()
+}
+
+/// An ERC-5202 blueprint whose initcode looks like EVM code.
+fn code_blueprint(code: &[u8]) -> Option<Blueprint> {
+    blueprint(code).filter(|b| looks_like_evm(&code[b.initcode..]))
+}
+
+fn jump_tables(dispatch: Option<&HashDispatch>) -> evm_cfg::JumpTables {
+    dispatch
+        .map(|d| (d.jump, d.targets.clone()))
+        .into_iter()
+        .collect()
 }
 
 /// Convenience: lifted AST + canonical pretty-print.
@@ -158,6 +192,11 @@ fn decompile_evm_impl(
     if let Some(proxy) = minimal_proxy(code) {
         return minimal_proxy_file(code, &proxy, module, lift);
     }
+    if let Some(bp) = code_blueprint(code)
+        && depth < MAX_NESTING
+    {
+        return blueprint_file(code, &bp, module, lift, depth);
+    }
 
     let Layout {
         regions,
@@ -166,8 +205,9 @@ fn decompile_evm_impl(
         jumpdests,
         selectors,
         vyper,
+        dispatch,
     } = layout(code, metadata.as_ref());
-    let cfg = evm_cfg::build(&insns);
+    let cfg = evm_cfg::build_with(&insns, &jump_tables(dispatch.as_ref()));
     let internal: BTreeMap<u64, &evm_cfg::FuncInfo> = cfg
         .functions
         .iter()
@@ -372,6 +412,47 @@ fn minimal_proxy_file(code: &[u8], proxy: &MinimalProxy, module: Module, lift: b
     UdFile { module, items }
 }
 
+/// An ERC-5202 blueprint: the preamble (and any data section) as
+/// data, then the initcode as a nested `@section("initcode", …)`,
+/// decompiled from its own offset 0 as `create_from_blueprint` runs it.
+fn blueprint_file(code: &[u8], bp: &Blueprint, module: Module, lift: bool, depth: u32) -> UdFile {
+    let initcode = &code[bp.initcode..];
+    let nested = decompile_evm_impl(initcode, lift, depth + 1, None);
+    let mut items = vec![
+        Item::Comment(format!(
+            "ERC-5202 blueprint (version {}): not meant to run; factories deploy copies of the initcode after the preamble with `create_from_blueprint`",
+            bp.version
+        )),
+        Item::Raw {
+            addr: 0,
+            bytes: code[..bp.preamble_len].to_vec(),
+        },
+    ];
+    let (data_at, data_len) = bp.data;
+    if data_len > 0 {
+        items.push(Item::Comment(format!(
+            "data 0x{data_at:04x}..0x{:04x}: blueprint data section",
+            data_at + data_len
+        )));
+        items.push(Item::Raw {
+            addr: data_at as u64,
+            bytes: code[data_at..data_at + data_len].to_vec(),
+        });
+    }
+    items.push(Item::Comment(format!(
+        "0x{:04x}..0x{:04x}: initcode ({} bytes); offsets inside are its own, from 0",
+        bp.initcode,
+        code.len(),
+        initcode.len()
+    )));
+    items.push(Item::Section {
+        name: "initcode".into(),
+        addr: bp.initcode as u64,
+        items: nested.items,
+    });
+    UdFile { module, items }
+}
+
 /// Everything recovered about where code, data and functions are.
 struct Layout {
     regions: Vec<DataRegion>,
@@ -384,10 +465,13 @@ struct Layout {
     selectors: BTreeMap<u64, u32>,
     /// Compiled by Vyper (per the metadata, or Vyper's dispatcher).
     vyper: bool,
+    /// Vyper ≥0.3.10's selector table.
+    dispatch: Option<HashDispatch>,
 }
 
 fn layout(code: &[u8], metadata: Option<&Metadata>) -> Layout {
-    let regions = find_data_regions(code, metadata);
+    let dispatch = evm_dispatch::find(code);
+    let regions = find_data_regions(code, metadata, dispatch.as_ref());
     let segments = code_segments(code.len() as u64, &regions);
     let mut insns: Vec<DecodedInsn> = Vec::new();
     for &(start, end) in &segments {
@@ -402,7 +486,10 @@ fn layout(code: &[u8], metadata: Option<&Metadata>) -> Layout {
     let mut vyper = metadata
         .and_then(Metadata::compiler)
         .is_some_and(|(name, _)| name == "vyper");
-    if selectors.is_empty() {
+    if let Some(d) = &dispatch {
+        selectors.clone_from(&d.selectors);
+        vyper = true;
+    } else if selectors.is_empty() {
         selectors = find_vyper_dispatch(&insns, &jumpdests);
         vyper |= !selectors.is_empty();
     }
@@ -413,6 +500,7 @@ fn layout(code: &[u8], metadata: Option<&Metadata>) -> Layout {
         jumpdests,
         selectors,
         vyper,
+        dispatch,
     }
 }
 
@@ -444,6 +532,16 @@ fn push_region(items: &mut Vec<Item>, code: &[u8], r: &DataRegion, lift: bool, d
         DataKind::Appended => format!(
             "data 0x{:04x}..0x{:04x}: appended after the metadata (immutables, read with CODECOPY)",
             r.start, r.end
+        ),
+        DataKind::SelectorTable { dense } => format!(
+            "data 0x{:04x}..0x{:04x}: selector table ({}), read by the dispatcher in `entry`",
+            r.start,
+            r.end,
+            if dense {
+                "dense: bucket headers and entries"
+            } else {
+                "sparse: one bucket head per entry"
+            }
         ),
         DataKind::Metadata => {
             let mut s = String::from("compiler metadata (CBOR)");
@@ -499,7 +597,11 @@ fn push_embedded(
 
 /// Locate `CODECOPY` data spans and the metadata trailer. The result
 /// is sorted and non-overlapping.
-fn find_data_regions(code: &[u8], metadata: Option<&Metadata>) -> Vec<DataRegion> {
+fn find_data_regions(
+    code: &[u8],
+    metadata: Option<&Metadata>,
+    dispatch: Option<&HashDispatch>,
+) -> Vec<DataRegion> {
     let len = code.len() as u64;
     let code_end = metadata.map_or(len, |m| m.offset as u64);
     let insns = decode_range(&code[..code_end as usize], 0);
@@ -538,6 +640,13 @@ fn find_data_regions(code: &[u8], metadata: Option<&Metadata>) -> Vec<DataRegion
         stack.step(ins);
     }
 
+    if let Some(d) = dispatch {
+        found.extend(d.spans.iter().map(|&(start, end)| DataRegion {
+            start,
+            end,
+            kind: DataKind::SelectorTable { dense: d.dense },
+        }));
+    }
     // Merge overlapping CODECOPY spans (several reads of one table).
     found.sort_by_key(|r| (r.start, std::cmp::Reverse(r.end)));
     let mut merged: Vec<DataRegion> = Vec::new();

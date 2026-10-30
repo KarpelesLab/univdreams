@@ -23,7 +23,9 @@
 //! lowered (edits included) as a contract of its own; when an edit
 //! moves its code, the enclosing contract is laid out again with the
 //! lengths and immutable offsets its deploying code uses adjusted
-//! (see `evm_edit`).
+//! (see `evm_edit`). An ERC-5202 blueprint's `@section("initcode", …)`
+//! runs to the blueprint's end and is copied whole, so it just grows
+//! or shrinks.
 
 use crate::ast::{Item, Module, UdFile};
 

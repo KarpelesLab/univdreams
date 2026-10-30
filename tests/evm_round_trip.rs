@@ -23,6 +23,20 @@
 //! * `crvusd-mainnet.evm` — the crvUSD stablecoin, vyper 0.3.7
 //!   (metadata trailer followed by appended immutables).
 //! * `eip1167-clone-mainnet.evm` — an EIP-1167 minimal proxy.
+//! * `curve-stableswap-ng-math-mainnet.evm` — the Curve
+//!   StableSwap-NG math library (`0xc9CBC565…bB3E5E`), vyper 0.3.10
+//!   runtime with no trailer: a sparse selector table.
+//! * `uniswap-v2-factory-mainnet.evm` — the Uniswap V2 factory
+//!   (`0x5C69bEe7…9cc5aA6f`), solc 0.5.16; embeds the `UniswapV2Pair`
+//!   initcode it `CREATE2`s, which embeds the pair's runtime.
+//!
+//! an ERC-5202 blueprint, the code a factory deploys contracts from
+//! with `create_from_blueprint`:
+//!
+//! * `curve-stableswap-ng-blueprint-mainnet.evm` — the StableSwap-NG
+//!   plain-pool blueprint (`0xDCc91f93…2958b202`): `0xFE7100`, then the
+//!   pools' initcode (vyper 0.3.10 trailer), which deploys a runtime
+//!   with a dense selector table.
 //!
 //! and creation code (the `input` of the deploying transaction,
 //! `ud evm <tx-hash>`):
@@ -36,7 +50,9 @@
 use std::path::{Path, PathBuf};
 
 use univdreams::ast::Item;
-use univdreams::format::evm::{find_metadata, looks_like_evm, metadata_trailer, minimal_proxy};
+use univdreams::format::evm::{
+    blueprint, find_metadata, looks_like_evm, metadata_trailer, minimal_proxy,
+};
 use univdreams::translate::compile::{lower_to_evm, parse};
 use univdreams::translate::decompile::decompile_evm_to_text;
 use univdreams::translate::decompile::evm::{
@@ -72,7 +88,7 @@ fn read(path: &Path) -> Vec<u8> {
 #[test]
 fn evm_fixtures_round_trip_through_source() {
     let paths = fixtures();
-    assert!(paths.len() >= 9, "expected the committed .evm fixtures");
+    assert!(paths.len() >= 12, "expected the committed .evm fixtures");
     for path in paths {
         let code = read(&path);
         assert!(looks_like_evm(&code), "{} not detected", path.display());
@@ -445,4 +461,129 @@ fn initcode_nests_the_runtime_it_deploys() {
     assert!(text.contains("codecopy(v0, 0x1b80, v1)"));
     // Immutables are written into the memory copy before RETURN.
     assert!(text.contains("return memory(0x0, 0x1ac2);"));
+}
+
+/// The `@section` named `name` among `items`.
+fn section<'a>(items: &'a [Item], name: &str) -> (u64, &'a [Item]) {
+    items
+        .iter()
+        .find_map(|i| match i {
+            Item::Section {
+                name: n,
+                addr,
+                items,
+            } if n == name => Some((*addr, items.as_slice())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no section {name}"))
+}
+
+#[test]
+fn vyper0310_blueprint_and_dense_selector_table() {
+    let code = read(&testdata().join("curve-stableswap-ng-blueprint-mainnet.evm"));
+    let bp = blueprint(&code).expect("ERC-5202 blueprint");
+    assert_eq!((bp.preamble_len, bp.version, bp.initcode), (3, 0, 3));
+    // Vyper ≥0.3.10 counts the length suffix in the trailer length,
+    // and only initcode carries one.
+    let md = metadata_trailer(&code).expect("vyper trailer");
+    assert_eq!(md.compiler(), Some(("vyper", "0.3.10".to_string())));
+    let text = decompile_evm_to_text(&code);
+    assert!(text.contains("compiler: \"vyper 0.3.10\""));
+    assert!(text.contains("ERC-5202 blueprint (version 0)"), "{text}");
+    assert!(text.contains("@section(\"initcode\", 0x3)"));
+    assert!(text.contains("@section(\"runtime\", 0x9c6)"));
+    assert!(text.contains("selector table (dense: bucket headers and entries)"));
+    let forms: [fn(&[u8]) -> univdreams::ast::UdFile; 2] = [decompile_evm, decompile_evm_listing];
+    let rt_code = &code[3 + 0x9c6..3 + 0x5db9];
+    for form in forms {
+        let ast = form(&code);
+        let (at, initcode) = section(&ast.items, "initcode");
+        assert_eq!(at, 3);
+        // The initcode and the runtime it deploys are each decompiled
+        // on their own, from offset 0.
+        assert_eq!(initcode, form(&code[3..]).items.as_slice());
+        let (rt, runtime) = section(initcode, "runtime");
+        assert_eq!(rt, 0x9c6);
+        assert_eq!(runtime, form(rt_code).items.as_slice());
+    }
+    // Every entry of the hash table is a named function.
+    let table = dispatch_table(rt_code);
+    assert_eq!(table.len(), 61);
+    // exchange(int128,int128,uint256,uint256), A(), get_virtual_price(),
+    // and the receiver overload exchange(…, address).
+    for sel in [0x3df0_2124u32, 0xf446_c1d0, 0xbb7b_8b80, 0xddc1_f59d] {
+        assert!(table.contains_key(&sel), "missing selector 0x{sel:08x}");
+    }
+    assert!(!text.contains("fn fn_"), "unnamed selector left");
+    assert!(text.contains("fn exchange_received()"));
+    assert!(text.contains(
+        "// selector 0xddc1f59d: exchange(int128 param0, int128 param1, uint256 param2, uint256 param3, address param4)"
+    ));
+    // The dispatcher's computed jump reaches every entry, and the
+    // selector it keeps on the stack reads as `msg.sig`.
+    assert!(text.contains("// one of: N_COINS, coins, fee,"));
+    assert!(text.contains("codecopy(0x1b, (0x522a + ((msg.sig % 0x6) * 0x5)), 0x5)"));
+    assert!(text.matches("@asm(").count() <= 40);
+}
+
+#[test]
+fn vyper0310_sparse_selector_table() {
+    let code = read(&testdata().join("curve-stableswap-ng-math-mainnet.evm"));
+    assert!(
+        find_metadata(&code).is_none(),
+        "0.3.10 runtime has no trailer"
+    );
+    // get_y(…), get_D(uint256[],uint256,uint256), get_y_D(…), exp(int256):
+    // three bucket heads, one of them chained to a second test.
+    assert_eq!(dispatch_table(&code).len(), 4);
+    let text = decompile_evm_to_text(&code);
+    for name in ["get_y", "get_D", "get_y_D", "exp"] {
+        assert!(text.contains(&format!("fn {name}()")), "missing fn {name}");
+    }
+    assert!(text.contains("selector table (sparse: one bucket head per entry)"));
+    assert!(text.contains("// one of: get_y, get_D, get_y_D"), "{text}");
+    assert!(text.contains("require((msg.sig == 0xaa3ded9b))"));
+    assert!(text.matches("@asm(").count() <= 16);
+}
+
+#[test]
+fn uniswap_v2_factory_embeds_pair_initcode() {
+    let code = read(&testdata().join("uniswap-v2-factory-mainnet.evm"));
+    let forms: [fn(&[u8]) -> univdreams::ast::UdFile; 2] = [decompile_evm, decompile_evm_listing];
+    let rt_code = &code[0x87b + 0x105..0x87b + 0x2d22];
+    for form in forms {
+        let ast = form(&code);
+        // The pair's initcode, which `createPair` copies out and
+        // `CREATE2`s, then the runtime that initcode deploys.
+        let (at, pair_init) = section(&ast.items, "contract");
+        assert_eq!(at, 0x87b);
+        assert_eq!(pair_init, form(&code[0x87b..0x35ef]).items.as_slice());
+        let (rt, pair) = section(pair_init, "runtime");
+        assert_eq!(rt, 0x105);
+        assert_eq!(pair, form(rt_code).items.as_slice());
+    }
+    let text = decompile_evm_to_text(&code);
+    assert!(
+        text.contains("embedded contract code (11636 bytes)"),
+        "{text}"
+    );
+    assert!(text.contains("codecopy(arg0, 0x87b, 0x2d74)"));
+    assert!(text.contains("create2(0x0, v8 + 0x20, mload(v8), v9)"));
+    for name in [
+        "createPair",
+        "allPairs",
+        "feeTo",
+        "setFeeToSetter",
+        "swap",
+        "mint",
+        "burn",
+        "skim",
+        "getReserves",
+        "initialize",
+        "kLast",
+    ] {
+        assert!(text.contains(&format!("fn {name}()")), "missing fn {name}");
+    }
+    assert!(!text.contains("fn fn_"), "unnamed selector left");
+    assert!(text.matches("@asm(").count() <= 16);
 }

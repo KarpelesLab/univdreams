@@ -38,6 +38,7 @@ mod build_module;
 mod data_lookup;
 pub mod evm;
 pub(crate) mod evm_cfg;
+pub(crate) mod evm_dispatch;
 pub(crate) mod evm_lift;
 mod expr;
 mod idioms;

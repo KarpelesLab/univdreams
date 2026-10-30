@@ -215,32 +215,38 @@ fn parse_cbor(bytes: &[u8], pos: &mut usize, depth: u32) -> Option<Cbor> {
 /// or array that consumes exactly `L` bytes and mentions a compiler
 /// or content-hash key — loose enough for every solc / vyper version
 /// that emits one, strict enough that random code tails don't match.
+/// Vyper 0.3.10 and later count the two length bytes in `L` (and put
+/// the trailer only on initcode, as `[runtime size, data sizes,
+/// immutables size, {"vyper": [x, y, z]}]`).
 #[must_use]
 pub fn metadata_trailer(code: &[u8]) -> Option<Metadata> {
     let n = code.len();
     if n < 2 {
         return None;
     }
-    let cbor_len = usize::from(u16::from_be_bytes([code[n - 2], code[n - 1]]));
-    if cbor_len == 0 || cbor_len + 2 > n {
-        return None;
-    }
-    let offset = n - 2 - cbor_len;
-    let body = &code[offset..n - 2];
-    let mut pos = 0;
-    let value = parse_cbor(body, &mut pos, 0)?;
-    if pos != body.len() || !matches!(value, Cbor::Map(_) | Cbor::Array(_)) {
-        return None;
-    }
+    let stated = usize::from(u16::from_be_bytes([code[n - 2], code[n - 1]]));
+    let parse = |cbor_len: usize, keys: &[&str]| -> Option<Metadata> {
+        if cbor_len == 0 || cbor_len + 2 > n {
+            return None;
+        }
+        let offset = n - 2 - cbor_len;
+        let body = &code[offset..n - 2];
+        let mut pos = 0;
+        let value = parse_cbor(body, &mut pos, 0)?;
+        if pos != body.len() || !matches!(value, Cbor::Map(_) | Cbor::Array(_)) {
+            return None;
+        }
+        keys.iter()
+            .any(|k| value.find_key(k).is_some())
+            .then_some(())?;
+        Some(Metadata {
+            offset,
+            end: n,
+            value,
+        })
+    };
     let known = ["solc", "vyper", "ipfs", "bzzr0", "bzzr1", "experimental"];
-    if !known.iter().any(|k| value.find_key(k).is_some()) {
-        return None;
-    }
-    Some(Metadata {
-        offset,
-        end: n,
-        value,
-    })
+    parse(stated, &known).or_else(|| parse(stated.checked_sub(2)?, &["vyper"]))
 }
 
 /// The compiler metadata of `code`: the trailer at its end, or else a
@@ -331,6 +337,50 @@ pub fn minimal_proxy(code: &[u8]) -> Option<MinimalProxy> {
     })
 }
 
+/// An ERC-5202 blueprint: code that isn't meant to run (it starts
+/// with `INVALID`), holding initcode a factory deploys copies of with
+/// `create_from_blueprint` (Vyper's `0xFE71` preamble).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blueprint {
+    /// Preamble length: `0xFE 0x71`, the version byte, and the data
+    /// length that follows when the version byte says so.
+    pub preamble_len: usize,
+    /// ERC-5202 version (the version byte's upper six bits).
+    pub version: u8,
+    /// Offset and length of the optional data section, between the
+    /// preamble and the initcode.
+    pub data: (usize, usize),
+    /// Offset of the initcode, which runs to the end.
+    pub initcode: usize,
+}
+
+/// Recognise an ERC-5202 blueprint: `0xFE 0x71`, a version byte whose
+/// low two bits give the size `n` of a big-endian data length (`n ==
+/// 3` is reserved), that length, the data, then initcode that must be
+/// non-empty.
+#[must_use]
+pub fn blueprint(code: &[u8]) -> Option<Blueprint> {
+    let [0xfe, 0x71, v, ..] = *code else {
+        return None;
+    };
+    let n = usize::from(v & 3);
+    if n == 3 {
+        return None;
+    }
+    let len_bytes = code.get(3..3 + n)?;
+    let data_len = len_bytes
+        .iter()
+        .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
+    let preamble_len = 3 + n;
+    let initcode = preamble_len.checked_add(data_len)?;
+    (initcode < code.len()).then_some(Blueprint {
+        preamble_len,
+        version: v >> 2,
+        data: (preamble_len, data_len),
+        initcode,
+    })
+}
+
 /// An address in EIP-55 mixed-case checksum form (`0x` + 40 digits).
 #[must_use]
 pub fn checksum_address(addr: &[u8; 20]) -> String {
@@ -362,18 +412,25 @@ pub fn checksum_address(addr: &[u8; 20]) -> String {
 ///
 /// * `PUSH1 0 CALLDATALOAD PUSH1 0x1c MSTORE` — vyper 0.1;
 /// * `PUSH1 4 CALLDATASIZE LT ISZERO PUSH2` — vyper 0.2;
-/// * `PUSH1 3 CALLDATASIZE GT PUSH2` — vyper 0.3 (0.3.10 and later
-///   also carry a metadata trailer).
+/// * `PUSH1 3 CALLDATASIZE GT PUSH2` — vyper 0.3;
+/// * `PUSH0 CALLDATALOAD PUSH1 0xe0 SHR PUSH1` (or `PUSH1 0` for
+///   `PUSH0`) — vyper 0.3.10 and later, whose runtime code carries no
+///   trailer and starts with its selector-table dispatcher.
+///
+/// An ERC-5202 blueprint counts when its initcode does.
 #[must_use]
 pub fn looks_like_evm(code: &[u8]) -> bool {
-    const VYPER: [&[u8]; 3] = [
+    const VYPER: [&[u8]; 5] = [
         &[0x60, 0x00, 0x35, 0x60, 0x1c, 0x52],
         &[0x60, 0x04, 0x36, 0x10, 0x15, 0x61],
         &[0x60, 0x03, 0x36, 0x11, 0x61],
+        &[0x5f, 0x35, 0x60, 0xe0, 0x1c, 0x60],
+        &[0x60, 0x00, 0x35, 0x60, 0xe0, 0x1c, 0x60],
     ];
     if delegation_target(code).is_some()
         || minimal_proxy(code).is_some()
         || metadata_trailer(code).is_some()
+        || blueprint(code).is_some_and(|b| looks_like_evm(&code[b.initcode..]))
     {
         return true;
     }
@@ -459,6 +516,47 @@ mod tests {
         let md = find_metadata(&code).expect("inner trailer");
         assert_eq!((md.offset, md.end), (4, end));
         assert_eq!(md.compiler(), Some(("vyper", "0.3.7".into())));
+    }
+
+    #[test]
+    fn vyper_0310_trailer_counts_its_length() {
+        // [runtime size, [data sizes], immutables size, {"vyper": [0, 3,
+        // 10]}], with a length that includes its own two bytes.
+        let mut code = vec![0x60, 0x00, 0x80, 0xfd];
+        code.extend([0x84, 0x19, 0x12, 0x34, 0x81, 0x18, 0x40, 0x00, 0xa1, 0x65]);
+        code.extend_from_slice(b"vyper");
+        code.extend([0x83, 0x00, 0x03, 0x0a]);
+        let cbor = code.len() - 4;
+        code.extend(u16::try_from(cbor + 2).unwrap().to_be_bytes());
+        let md = metadata_trailer(&code).expect("trailer");
+        assert_eq!((md.offset, md.end), (4, code.len()));
+        assert_eq!(md.compiler(), Some(("vyper", "0.3.10".into())));
+        assert!(looks_like_evm(&code));
+    }
+
+    #[test]
+    fn erc5202_blueprint() {
+        let initcode = [0x60, 0x80, 0x60, 0x40, 0x52, 0x00];
+        let mut code = vec![0xfe, 0x71, 0x00];
+        code.extend(initcode);
+        let bp = blueprint(&code).expect("blueprint");
+        assert_eq!(
+            (bp.preamble_len, bp.version, bp.data, bp.initcode),
+            (3, 0, (3, 0), 3)
+        );
+        assert!(looks_like_evm(&code));
+        // Version 1 with a one-byte data length (2), then the data.
+        let mut code = vec![0xfe, 0x71, 0x05, 0x02, 0xaa, 0xbb];
+        code.extend(initcode);
+        let bp = blueprint(&code).expect("blueprint with data");
+        assert_eq!(
+            (bp.preamble_len, bp.version, bp.data, bp.initcode),
+            (4, 1, (4, 2), 6)
+        );
+        // Reserved length size, or no initcode.
+        assert_eq!(blueprint(&[0xfe, 0x71, 0x03, 0x60]), None);
+        assert_eq!(blueprint(&[0xfe, 0x71, 0x00]), None);
+        assert!(!looks_like_evm(&[0xfe, 0x71, 0x00, 0x42, 0x42]));
     }
 
     #[test]

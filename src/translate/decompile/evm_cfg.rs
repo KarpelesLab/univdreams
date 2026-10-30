@@ -671,6 +671,7 @@ fn analyze_frame(
     shape: FrameShape,
     calls: &HashMap<usize, CallSite>,
     loops: &CountedLoops,
+    tables: &HashMap<usize, Vec<usize>>,
     functions: &BTreeMap<usize, FuncInfo>,
 ) -> FrameFacts {
     let mut facts = FrameFacts::default();
@@ -863,6 +864,14 @@ fn analyze_frame(
                         facts.unresolved = true;
                     }
                     // Unknown or non-`JUMPDEST` target.
+                    // A jump through a selector table: to any entry.
+                    (None | Some(Tag::Num(_) | Tag::Pc(_)), None) if tables.contains_key(&b) => {
+                        facts.locals.insert(b);
+                        for &tb in &tables[&b] {
+                            facts.targets.push((b, tb));
+                            enqueue(&mut work, &mut seen, tb, stack.clone());
+                        }
+                    }
                     (None | Some(Tag::Num(_) | Tag::Pc(_)), None) => facts.unresolved = true,
                 }
             }
@@ -931,15 +940,38 @@ fn mark_noreturn(functions: &mut BTreeMap<usize, FuncInfo>, facts: &[(FrameId, F
     }
 }
 
+/// Computed jumps whose targets are known from elsewhere, keyed by the
+/// `JUMP`'s offset: Vyper ≥0.3.10 dispatches through selector tables
+/// in data.
+pub(crate) type JumpTables = HashMap<u64, Vec<u64>>;
+
 /// Build the CFG for decoded code (`insns` in address order,
 /// possibly spanning several segments).
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 pub(crate) fn build(insns: &[DecodedInsn]) -> Cfg {
+    build_with(insns, &JumpTables::new())
+}
+
+/// [`build`], with the targets of table jumps.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn build_with(insns: &[DecodedInsn], jump_tables: &JumpTables) -> Cfg {
     let blocks = split_blocks(insns);
     let by_start: HashMap<u64, usize> = blocks
         .iter()
         .enumerate()
         .map(|(i, b)| (b.start, i))
+        .collect();
+    let tables: HashMap<usize, Vec<usize>> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, blk)| blk.term == Term::Jump)
+        .filter_map(|(b, blk)| {
+            let ts = jump_tables.get(&insns[blk.insns.end - 1].addr.0)?;
+            Some((
+                b,
+                ts.iter().filter_map(|t| by_start.get(t).copied()).collect(),
+            ))
+        })
         .collect();
     let jumpdests: HashSet<u64> = insns
         .iter()
@@ -972,7 +1004,7 @@ pub(crate) fn build(insns: &[DecodedInsn]) -> Cfg {
             .map(|&(id, entry, shape)| {
                 let f = analyze_frame(
                     &blocks, insns, &by_start, &jumpdests, &rets, entry, shape, &calls, &loops,
-                    &functions,
+                    &tables, &functions,
                 );
                 (id, f)
             })
