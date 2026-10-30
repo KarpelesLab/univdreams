@@ -498,6 +498,27 @@ fn ascii_word(e: &Expr) -> Option<String> {
         .then(|| text.to_string())
 }
 
+/// An `Error(string)` reason stored word by word after its length
+/// word (`[…, len, w0, w1, …]`), as solc writes reasons longer than
+/// 32 bytes when it doesn't `codecopy` them.
+fn multiword_reason(stores: &[&Expr]) -> Option<String> {
+    let (len, words) = (2..=stores.len().saturating_sub(1)).find_map(|n| {
+        let len = usize::try_from(stores[stores.len() - n - 1].const_value()?).ok()?;
+        (len > 32 * (n - 1) && len <= 32 * n).then(|| (len, &stores[stores.len() - n..]))
+    })?;
+    let mut raw = Vec::with_capacity(32 * words.len());
+    for w in words {
+        let Expr::Const(b) = w else { return None };
+        if b.len() != 32 {
+            return None;
+        }
+        raw.extend_from_slice(b);
+    }
+    let text = std::str::from_utf8(&raw[..len]).ok()?;
+    (raw[len..].iter().all(|&x| x == 0) && text.chars().all(|c| c.is_ascii_graphic() || c == ' '))
+        .then(|| text.to_string())
+}
+
 fn negate(e: Expr) -> Expr {
     match e {
         Expr::Op("iszero", mut args) if args.len() == 1 => args.pop().unwrap(),
@@ -667,6 +688,9 @@ pub(crate) struct LiftCtx<'a> {
     /// name their known signature gives them and how many (static)
     /// parameters it takes.
     pub getters: HashMap<u64, (String, usize)>,
+    /// Vyper code: mapping slots hash `slot ‖ key` (Solidity hashes
+    /// `key ‖ slot`), and 0.1 / 0.2 keep the selector at memory 0.
+    pub vyper: bool,
 }
 
 impl LiftCtx<'_> {
@@ -1601,11 +1625,12 @@ impl BlockLift<'_, '_> {
         if (a.at, b.at) != (n.checked_sub(2)?, n - 1) {
             return None;
         }
-        let (key, slot) = match (a.offset.const_value()?, b.offset.const_value()?) {
+        let (lo, hi) = match (a.offset.const_value()?, b.offset.const_value()?) {
             (0, 0x20) => (a, b),
             (0x20, 0) => (b, a),
             _ => return None,
         };
+        let (key, slot) = if self.ctx.vyper { (hi, lo) } else { (lo, hi) };
         let val = Expr::Op("mapping", vec![slot.value.clone(), key.value.clone()]);
         let resolved = simplify(Expr::Op(
             "mapping",
@@ -1730,10 +1755,12 @@ impl BlockLift<'_, '_> {
         }
         Some(match d.frame {
             Some(entry) => {
-                let nargs = self.ctx.cfg.functions[&entry].nargs as i64;
+                let info = &self.ctx.cfg.functions[&entry];
+                let (below, nargs) = (info.nbelow as i64, info.nargs as i64);
                 match pos {
-                    0 => "ret".to_string(),
-                    p if p <= nargs => format!("arg{}", p - 1),
+                    p if p < below => format!("arg{p}"),
+                    p if p == below && !info.ret_spilled => "ret".to_string(),
+                    p if p > below && p <= below + nargs => format!("arg{}", p - 1),
                     p => format!("v{p}"),
                 }
             }
@@ -1964,6 +1991,17 @@ impl BlockLift<'_, '_> {
                         self.bind_read(&Expr::Op("keccak256", args), i);
                     }
                 }
+                // Vyper 0.1 / 0.2 dispatch: `PUSH4 sel; PUSH1 0; MLOAD; EQ`
+                // reads the selector it stored at memory 0 on entry.
+                0x51 if self.ctx.vyper
+                    && i >= 2
+                    && self.ctx.insns[i - 2].opcode == 0x63
+                    && self.ctx.insns.get(i + 1).is_some_and(|n| n.opcode == 0x14)
+                    && self.stack.last().and_then(Expr::const_value) == Some(0) =>
+                {
+                    self.pop();
+                    self.stack.push(Expr::Op("msg.sig", vec![]));
+                }
                 _ if read_name(op).is_some() => {
                     let args = self.pop_n(OPCODE_TABLE[op as usize].pops.into());
                     let val = Expr::Op(read_name(op).unwrap(), args);
@@ -2083,7 +2121,12 @@ impl BlockLift<'_, '_> {
                 0x56 => return self.lift_jump(b, i),
                 0x57 => {
                     let target = self.pop();
-                    let cond = self.pop();
+                    // Only the condition's truth matters: `a ^ b` (Vyper's
+                    // selector test) is `a != b`.
+                    let cond = match self.pop() {
+                        Expr::Op("xor", ab) => simplify(Expr::Op("ne", ab)),
+                        c => c,
+                    };
                     self.exit = self.exit_values();
                     let bytes = self.jump_bytes(i);
                     let target = target.const_value().or_else(|| {
@@ -2175,7 +2218,8 @@ impl BlockLift<'_, '_> {
                 }
                 _ => None,
             });
-            let inline = || stores.last().and_then(|v| ascii_word(v));
+            let inline =
+                || multiword_reason(&stores).or_else(|| stores.last().and_then(|v| ascii_word(v)));
             let Some(reason) = copied.or_else(inline) else {
                 return false;
             };
@@ -2453,6 +2497,11 @@ impl BlockLift<'_, '_> {
                 let mut args = self.pop_n(c.nargs);
                 args.reverse(); // arg0 was deepest
                 self.pop(); // return address
+                // Arguments passed below the return address come first.
+                let mut below = self.pop_n(cfg.functions[&c.callee].nbelow);
+                below.reverse();
+                below.extend(args);
+                let args = below;
                 let callee = self.ctx.target_name(cfg.blocks[c.callee].start);
                 let call_text = {
                     let parts: Vec<String> = args.iter().map(render_arg).collect();
@@ -2534,7 +2583,9 @@ impl BlockLift<'_, '_> {
                         });
                     }
                 }
-                if nrets.is_none() {
+                if info.noreturn {
+                    self.out.push(Stmt::Comment("does not return".into()));
+                } else if nrets.is_none() {
                     self.out
                         .push(Stmt::Comment("return-value count unknown".into()));
                 }

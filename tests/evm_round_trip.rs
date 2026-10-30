@@ -15,10 +15,18 @@
 //! * `uniswap-v2-router02-mainnet.evm` — solc 0.6.6, IPFS metadata.
 //! * `uniswap-v4-poolmanager-mainnet.evm` — solc 0.8.26 via-IR,
 //!   transient storage (`TLOAD`/`TSTORE`), version-only metadata.
+//! * `usdc-proxy-mainnet.evm` — USDC's ZeppelinOS
+//!   `AdminUpgradeabilityProxy`, solc 0.4.24.
+//! * `curve-3pool-mainnet.evm` — Curve's 3pool, vyper 0.2 (no
+//!   metadata; selector kept in memory, private functions with
+//!   memory-held return addresses).
+//! * `crvusd-mainnet.evm` — the crvUSD stablecoin, vyper 0.3.7
+//!   (metadata trailer followed by appended immutables).
+//! * `eip1167-clone-mainnet.evm` — an EIP-1167 minimal proxy.
 
 use std::path::{Path, PathBuf};
 
-use univdreams::format::evm::{looks_like_evm, metadata_trailer};
+use univdreams::format::evm::{find_metadata, looks_like_evm, metadata_trailer, minimal_proxy};
 use univdreams::translate::compile::{lower_to_evm, parse};
 use univdreams::translate::decompile::decompile_evm_to_text;
 use univdreams::translate::decompile::evm::{decompile_evm_listing_to_text, dispatch_table};
@@ -52,7 +60,7 @@ fn read(path: &Path) -> Vec<u8> {
 #[test]
 fn evm_fixtures_round_trip_through_source() {
     let paths = fixtures();
-    assert!(paths.len() >= 3, "expected the committed .evm fixtures");
+    assert!(paths.len() >= 7, "expected the committed .evm fixtures");
     for path in paths {
         let code = read(&path);
         assert!(looks_like_evm(&code), "{} not detected", path.display());
@@ -218,4 +226,80 @@ fn router_selectors_resolve_to_names() {
     // Calls through masked library targets and shared tails resolve.
     assert!(!text.contains("unknown return value"));
     assert!(text.matches("@asm(").count() <= 8);
+}
+
+#[test]
+fn usdc_proxy_reads_like_its_source() {
+    let code = read(&testdata().join("usdc-proxy-mainnet.evm"));
+    let text = decompile_evm_to_text(&code);
+    for name in ["upgradeTo", "upgradeToAndCall", "implementation", "admin"] {
+        assert!(text.contains(&format!("fn {name}()")), "missing fn {name}");
+    }
+    // `_fallback()` ends in `_delegate()`'s assembly return / revert.
+    assert!(text.contains("never returns"), "{text}");
+    assert!(text.contains("// does not return"));
+    assert!(!text.contains("return-value count unknown"));
+    // solc 0.4 stores long revert reasons word by word.
+    assert!(text.contains(
+        "require((address(arg0) != address(0x0)), \"Cannot change the admin of a proxy to the zero address\")"
+    ));
+    assert!(text.contains("delegatecall(gasleft(), arg0, 0x0, msg.data.length, 0x0, 0x0)"));
+    let listing = decompile_evm_listing_to_text(&code);
+    assert!(listing.contains("ZeppelinOS implementation slot"));
+    assert!(text.matches("@asm(").count() <= 12);
+}
+
+#[test]
+fn vyper02_curve_3pool() {
+    let code = read(&testdata().join("curve-3pool-mainnet.evm"));
+    assert!(find_metadata(&code).is_none(), "vyper 0.2 has no trailer");
+    let table = dispatch_table(&code);
+    // A(), get_virtual_price(), exchange(int128,int128,uint256,uint256),
+    // remove_liquidity_one_coin(uint256,int128,uint256).
+    for sel in [0xf446_c1d0u32, 0xbb7b_8b80, 0x3df0_2124, 0x1a4d_01d2] {
+        assert!(table.contains_key(&sel), "missing selector 0x{sel:08x}");
+    }
+    assert!(table.len() >= 35, "{}", table.len());
+    let text = decompile_evm_to_text(&code);
+    assert!(!text.contains("fn fn_"), "unnamed selector left");
+    // Each case starts with its own selector test, read from memory 0.
+    assert!(text.contains("if (msg.sig != 0xf446c1d0)"), "{text}");
+    // Private functions keep their return address in memory.
+    assert!(text.matches("// internal function:").count() >= 8);
+    assert!(text.contains("v0 = sub_00a9()"));
+    assert!(text.matches("@asm(").count() <= 110);
+}
+
+#[test]
+fn vyper03_crvusd() {
+    let code = read(&testdata().join("crvusd-mainnet.evm"));
+    // The trailer is followed by the immutables vyper appends.
+    let md = find_metadata(&code).expect("vyper trailer");
+    assert!(md.end < code.len());
+    assert_eq!(md.compiler(), Some(("vyper", "0.3.7".to_string())));
+    assert!(metadata_trailer(&code).is_none());
+    let text = decompile_evm_to_text(&code);
+    assert!(text.contains("compiler: \"vyper 0.3.7\""));
+    assert!(text.contains("appended after the metadata"));
+    assert!(text.contains("fn transferFrom()"));
+    assert!(text.contains("fn set_minter()"));
+    assert!(text.contains("if (v0 != 0x23b872dd)"), "{text}");
+    // `self.allowance[_from][msg.sender]`: vyper hashes slot ‖ key.
+    assert!(text.contains("sload(mapping(mapping(0x0, mload(0xc0)), msg.sender))"));
+    assert!(!text.contains("fn fn_"));
+    assert!(text.matches("@asm(").count() <= 4);
+}
+
+#[test]
+fn eip1167_clone_is_a_proxy() {
+    let code = read(&testdata().join("eip1167-clone-mainnet.evm"));
+    let proxy = minimal_proxy(&code).expect("EIP-1167");
+    assert_eq!(proxy.code_len, code.len());
+    let text = decompile_evm_to_text(&code);
+    assert!(text.contains("EIP-1167 minimal proxy"));
+    assert!(
+        text.contains("return delegatecall(0x7F9F70Da4af54671a6abAc58e705b5634cac8819, msg.data);"),
+        "{text}"
+    );
+    assert!(!text.contains("@asm("));
 }

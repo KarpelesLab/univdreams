@@ -154,6 +154,58 @@ const FUNCTIONS: &[&str] = &[
     "unlockCallback(bytes)",
     "protocolFeeController()",
     "setProtocolFeeController(address)",
+    // Curve StableSwap (Vyper; the 3pool's ABI, shared by most
+    // plain pools) and crvUSD
+    "A()",
+    "get_virtual_price()",
+    "calc_token_amount(uint256[2],bool)",
+    "calc_token_amount(uint256[3],bool)",
+    "calc_token_amount(uint256[4],bool)",
+    "add_liquidity(uint256[2],uint256)",
+    "add_liquidity(uint256[3],uint256)",
+    "add_liquidity(uint256[4],uint256)",
+    "get_dy(int128,int128,uint256)",
+    "get_dy_underlying(int128,int128,uint256)",
+    "exchange(int128,int128,uint256,uint256)",
+    "exchange_underlying(int128,int128,uint256,uint256)",
+    "remove_liquidity(uint256,uint256[2])",
+    "remove_liquidity(uint256,uint256[3])",
+    "remove_liquidity(uint256,uint256[4])",
+    "remove_liquidity_imbalance(uint256[2],uint256)",
+    "remove_liquidity_imbalance(uint256[3],uint256)",
+    "remove_liquidity_imbalance(uint256[4],uint256)",
+    "calc_withdraw_one_coin(uint256,int128)",
+    "remove_liquidity_one_coin(uint256,int128,uint256)",
+    "ramp_A(uint256,uint256)",
+    "stop_ramp_A()",
+    "commit_new_fee(uint256,uint256)",
+    "apply_new_fee()",
+    "revert_new_parameters()",
+    "commit_transfer_ownership(address)",
+    "apply_transfer_ownership()",
+    "revert_transfer_ownership()",
+    "admin_balances(uint256)",
+    "withdraw_admin_fees()",
+    "donate_admin_fees()",
+    "kill_me()",
+    "unkill_me()",
+    "coins(uint256)",
+    "balances(uint256)",
+    "fee()",
+    "admin_fee()",
+    "initial_A()",
+    "future_A()",
+    "initial_A_time()",
+    "future_A_time()",
+    "admin_actions_deadline()",
+    "transfer_ownership_deadline()",
+    "future_fee()",
+    "future_admin_fee()",
+    "future_owner()",
+    "minter()",
+    "set_minter(address)",
+    "salt()",
+    "burn(address,uint256)",
     // Built-in revert payloads
     "Error(string)",
     "Panic(uint256)",
@@ -258,6 +310,16 @@ const ERC1967_SLOTS: &[(&str, &str)] = &[
     ("eip1967.proxy.beacon", "ERC-1967 beacon slot"),
 ];
 
+/// Pre-ERC-1967 ZeppelinOS proxy slots (USDC's proxy and other
+/// 2018-era upgradeable contracts), defined as plain `keccak256(label)`.
+const ZEPPELINOS_SLOTS: &[(&str, &str)] = &[
+    (
+        "org.zeppelinos.proxy.implementation",
+        "ZeppelinOS implementation slot",
+    ),
+    ("org.zeppelinos.proxy.admin", "ZeppelinOS admin slot"),
+];
+
 fn selector_map() -> &'static HashMap<u32, &'static str> {
     static MAP: OnceLock<HashMap<u32, &'static str>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -285,6 +347,11 @@ fn slot_map() -> &'static HashMap<[u8; 32], &'static str> {
         ERC1967_SLOTS
             .iter()
             .map(|(label, name)| (sub_one(keccak256(label.as_bytes())), *name))
+            .chain(
+                ZEPPELINOS_SLOTS
+                    .iter()
+                    .map(|(label, name)| (keccak256(label.as_bytes()), *name)),
+            )
             .collect()
     })
 }

@@ -43,7 +43,10 @@ use std::fmt::Write as _;
 
 use crate::arch::evm::{self, DecodedInsn, InsnKind, classify, decode_range, format_insn};
 use crate::ast::{Field, FnDecl, Item, Module, Stmt, UdFile, Value};
-use crate::format::evm::{Metadata, delegation_target, metadata_trailer};
+use crate::format::evm::{
+    Metadata, MinimalProxy, checksum_address, delegation_target, find_metadata, metadata_trailer,
+    minimal_proxy,
+};
 use crate::signatures::evm::{event_by_topic, function_by_selector, slot_name};
 use crate::translate::decompile::{evm_cfg, evm_lift};
 
@@ -54,6 +57,9 @@ enum DataKind {
     CodeCopy { at: u64 },
     /// Compiler metadata trailer.
     Metadata,
+    /// Data after the metadata trailer: Vyper's immutables, appended
+    /// to the runtime code at deployment.
+    Appended,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +98,7 @@ pub fn decompile_evm_listing_to_text(code: &[u8]) -> String {
 
 #[allow(clippy::too_many_lines)]
 fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
-    let metadata = metadata_trailer(code);
+    let metadata = find_metadata(code);
     let module = build_module(code, metadata.as_ref());
 
     if let Some(target) = delegation_target(code) {
@@ -108,6 +114,9 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
         ];
         return UdFile { module, items };
     }
+    if let Some(proxy) = minimal_proxy(code) {
+        return minimal_proxy_file(code, &proxy, module, lift);
+    }
 
     let Layout {
         regions,
@@ -115,6 +124,7 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
         insns,
         jumpdests,
         selectors,
+        vyper,
     } = layout(code, metadata.as_ref());
     let cfg = evm_cfg::build(&insns);
     let internal: BTreeMap<u64, &evm_cfg::FuncInfo> = cfg
@@ -181,6 +191,7 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
                     Some((addr, (sig.split('(').next()?.to_string(), n)))
                 })
                 .collect(),
+            vyper,
         };
         evm_lift::lift_ranges(&ctx, &ranges)
     } else {
@@ -241,15 +252,20 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
             items.push(Item::Comment(format!("selector 0x{sel:08x}: {what}")));
         }
         if let Some(info) = internal.get(&entry) {
-            let rets = info
-                .nrets
-                .map_or_else(|| "unknown".to_string(), |n| n.to_string());
+            let rets = if info.noreturn {
+                "never returns".to_string()
+            } else {
+                let n = info
+                    .nrets
+                    .map_or_else(|| "unknown".to_string(), |n| n.to_string());
+                format!("{n} return value(s)")
+            };
             let from = callers
                 .get(&entry)
                 .map_or_else(String::new, |c| format!("; called from {}", c.join(", ")));
             items.push(Item::Comment(format!(
-                "internal function: {} argument(s), {rets} return value(s){from}",
-                info.nargs
+                "internal function: {} argument(s), {rets}{from}",
+                info.total_args()
             )));
         }
         items.push(Item::Function(FnDecl {
@@ -268,6 +284,52 @@ fn decompile_evm_impl(code: &[u8], lift: bool) -> UdFile {
     UdFile { module, items }
 }
 
+/// An EIP-1167 clone: one function forwarding every call to the
+/// implementation. Lifted, its whole body is a single statement; the
+/// listing keeps the instructions. Appended immutable arguments stay
+/// as data.
+fn minimal_proxy_file(code: &[u8], proxy: &MinimalProxy, module: Module, lift: bool) -> UdFile {
+    let target = checksum_address(&proxy.target);
+    let body_code = &code[..proxy.code_len];
+    let body = if lift {
+        vec![Stmt::ReturnExpr {
+            text: format!("delegatecall({target}, msg.data)"),
+            bytes: body_code.to_vec(),
+        }]
+    } else {
+        build_body(
+            &decode_range(body_code, 0),
+            &BTreeSet::from([proxy.code_len as u64 - 2]),
+            &BTreeMap::new(),
+        )
+    };
+    let mut items = vec![
+        Item::Comment(format!(
+            "EIP-1167 minimal proxy: every call runs the code of {target} (DELEGATECALL; return data and reverts are passed through)"
+        )),
+        Item::Function(FnDecl {
+            addr: Some(0),
+            name: "proxy".into(),
+            attrs: Vec::new(),
+            signature: None,
+            locals: Vec::new(),
+            body,
+        }),
+    ];
+    if proxy.code_len < code.len() {
+        items.push(Item::Comment(format!(
+            "data 0x{:04x}..0x{:04x}: appended to the clone (immutable arguments); never executed",
+            proxy.code_len,
+            code.len()
+        )));
+        items.push(Item::Raw {
+            addr: proxy.code_len as u64,
+            bytes: code[proxy.code_len..].to_vec(),
+        });
+    }
+    UdFile { module, items }
+}
+
 /// Everything recovered about where code, data and functions are.
 struct Layout {
     regions: Vec<DataRegion>,
@@ -278,6 +340,8 @@ struct Layout {
     jumpdests: BTreeSet<u64>,
     /// Dispatcher target → selector.
     selectors: BTreeMap<u64, u32>,
+    /// Compiled by Vyper (per the metadata, or Vyper's dispatcher).
+    vyper: bool,
 }
 
 fn layout(code: &[u8], metadata: Option<&Metadata>) -> Layout {
@@ -292,13 +356,21 @@ fn layout(code: &[u8], metadata: Option<&Metadata>) -> Layout {
         .filter(|i| classify(i) == InsnKind::JumpDest)
         .map(|i| i.addr.0)
         .collect();
-    let selectors = find_dispatch_targets(&insns, &jumpdests);
+    let mut selectors = find_dispatch_targets(&insns, &jumpdests);
+    let mut vyper = metadata
+        .and_then(Metadata::compiler)
+        .is_some_and(|(name, _)| name == "vyper");
+    if selectors.is_empty() {
+        selectors = find_vyper_dispatch(&insns, &jumpdests);
+        vyper |= !selectors.is_empty();
+    }
     Layout {
         regions,
         segments,
         insns,
         jumpdests,
         selectors,
+        vyper,
     }
 }
 
@@ -317,6 +389,10 @@ fn push_region(items: &mut Vec<Item>, code: &[u8], r: &DataRegion) {
             }
             s
         }
+        DataKind::Appended => format!(
+            "data 0x{:04x}..0x{:04x}: appended after the metadata (immutables, read with CODECOPY)",
+            r.start, r.end
+        ),
         DataKind::Metadata => {
             let mut s = String::from("compiler metadata (CBOR)");
             if let Some(md) = metadata_trailer(bytes) {
@@ -377,6 +453,7 @@ fn find_data_regions(code: &[u8], metadata: Option<&Metadata>) -> Vec<DataRegion
 
     if let Some(md) = metadata {
         let start = md.offset as u64;
+        let end = md.end as u64;
         let covered = merged.iter().any(|r| r.start <= start && r.end >= len);
         if !covered {
             // Trim anything that ran into the trailer, then add it.
@@ -386,9 +463,16 @@ fn find_data_regions(code: &[u8], metadata: Option<&Metadata>) -> Vec<DataRegion
             });
             merged.push(DataRegion {
                 start,
-                end: len,
+                end,
                 kind: DataKind::Metadata,
             });
+            if end < len {
+                merged.push(DataRegion {
+                    start: end,
+                    end: len,
+                    kind: DataKind::Appended,
+                });
+            }
         }
     }
     merged
@@ -518,6 +602,86 @@ fn find_dispatch_targets(insns: &[DecodedInsn], jumpdests: &BTreeSet<u64>) -> BT
         if jumpdests.contains(&dest) && dest > ins.addr.0 {
             out.entry(dest).or_insert(sel as u32);
             first_body = first_body.min(dest);
+        }
+    }
+    out
+}
+
+/// Vyper (before 0.3.10's hash-bucket tables) dispatches with a chain
+/// of "not this selector? try the next one" tests, each followed
+/// inline by the function's body:
+///
+/// ```text
+/// [JUMPDEST] PUSH4 sel PUSH1 0 MLOAD EQ ISZERO PUSH2 next JUMPI   ; 0.1 / 0.2
+/// [JUMPDEST] PUSH4 sel DUPn XOR PUSH2 next JUMPI                  ; 0.3
+/// ```
+///
+/// (0.2 keeps the selector at memory 0 after `mstore(0x1c,
+/// calldataload(0))`; 0.3 keeps it on the stack.) A function is named
+/// from its test, so it starts with its own selector check. Tests are
+/// accepted along the chain only — the first one, then each at the
+/// previous one's `next` — so a body comparing against a 4-byte
+/// constant isn't mistaken for a case.
+fn find_vyper_dispatch(insns: &[DecodedInsn], jumpdests: &BTreeSet<u64>) -> BTreeMap<u64, u32> {
+    let op = |k: usize| insns.get(k).map(|x| x.opcode);
+    let mut cases: Vec<(u64, u32, u64)> = Vec::new();
+    for (i, ins) in insns.iter().enumerate() {
+        if !(0x60..=0x63).contains(&ins.opcode) {
+            continue;
+        }
+        let Some(sel) = ins.push_value() else {
+            continue;
+        };
+        let next_at = if op(i + 1) == Some(0x60)
+            && insns[i + 1].push_value() == Some(0)
+            && op(i + 2) == Some(0x51)
+            && op(i + 3) == Some(0x14)
+            && op(i + 4) == Some(0x15)
+        {
+            i + 5
+        } else if op(i + 1).is_some_and(|o| (0x80..=0x8f).contains(&o)) && op(i + 2) == Some(0x18) {
+            i + 3
+        } else {
+            continue;
+        };
+        let Some(next) = insns.get(next_at).and_then(DecodedInsn::push_value) else {
+            continue;
+        };
+        if op(next_at + 1) != Some(0x57) || !jumpdests.contains(&next) || next <= ins.addr.0 {
+            continue;
+        }
+        let entry = match i.checked_sub(1).map(|k| &insns[k]) {
+            Some(prev) if prev.opcode == evm::JUMPDEST => prev.addr.0,
+            _ => ins.addr.0,
+        };
+        cases.push((entry, sel as u32, next));
+    }
+    // Vyper 0.2 places private functions between cases and steps over
+    // them with an always-taken `PUSH1 0 ISZERO PUSH2 skip JUMPI`.
+    let skip = |addr: u64| -> Option<u64> {
+        let k = insns.partition_point(|x| x.addr.0 < addr);
+        let at = |n: usize| insns.get(k + n);
+        (at(0)?.opcode == evm::JUMPDEST
+            && at(1)?.opcode == 0x60
+            && at(1)?.push_value() == Some(0)
+            && at(2)?.opcode == 0x15
+            && at(4)?.opcode == 0x57)
+            .then(|| at(3)?.push_value())
+            .flatten()
+            .filter(|&t| t > addr)
+    };
+    let mut out = BTreeMap::new();
+    let mut expect: Option<u64> = None;
+    for (entry, sel, next) in cases {
+        let mut want = expect;
+        while let Some(w) = want
+            && w < entry
+        {
+            want = skip(w);
+        }
+        if expect.is_none() || want == Some(entry) {
+            out.insert(entry, sel);
+            expect = Some(next);
         }
     }
     out
@@ -776,7 +940,7 @@ fn hex(bytes: &[u8]) -> String {
 /// tooling that wants the function table without the AST.
 #[must_use]
 pub fn dispatch_table(code: &[u8]) -> BTreeMap<u32, u64> {
-    let metadata = metadata_trailer(code);
+    let metadata = find_metadata(code);
     layout(code, metadata.as_ref())
         .selectors
         .into_iter()

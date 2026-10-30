@@ -40,6 +40,8 @@ const MAX_STATES_PER_BLOCK: usize = 64;
 const MAX_ROUNDS: usize = 32;
 /// EVM stack limit.
 const MAX_STACK: usize = 1024;
+/// Arguments accepted below a spilled return address.
+const MAX_BELOW: usize = 64;
 
 /// How a basic block ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,14 +92,40 @@ pub(crate) struct FuncInfo {
     /// address as the deepest returned item for the caller to pop
     /// (legacy solc does this for some getters).
     pub keeps_ret: bool,
+    /// Every path ends in a halt (`REVERT`, `RETURN`, `STOP`, …) or in
+    /// a call that never returns, so callers never resume: proxies'
+    /// `_fallback()` / `_delegate()`, revert helpers.
+    pub noreturn: bool,
+    /// The function stores its return address to memory on entry and
+    /// returns with `MLOAD; JUMP` (Vyper 0.2), so frame slot `nbelow`
+    /// is free for other values after the first instruction.
+    pub ret_spilled: bool,
+    /// Arguments passed *below* the return address, which the callee
+    /// pops after spilling it (Vyper 0.2 pushes the return address
+    /// last). Frame slots `0..nbelow` hold them, slot `nbelow` the
+    /// return address, then the `nargs` arguments above it.
+    pub nbelow: usize,
+}
+
+impl FuncInfo {
+    /// Stack items the caller passes, return address excluded.
+    #[must_use]
+    pub fn total_args(&self) -> usize {
+        self.nbelow + self.nargs
+    }
 }
 
 /// Function a block's depth was computed in: an internal function's
 /// entry block, or `None` for the code reached from offset 0.
 pub(crate) type FrameId = Option<usize>;
 
+/// `(nbelow, nargs)` of an internal function's frame; `None` for the
+/// root frame.
+type FrameShape = Option<(usize, usize)>;
+
 /// Entry depth of a block within its frame. For internal functions
-/// slot 0 is the return address and slots `1..=nargs` the arguments;
+/// slot 0 is the return address (after any [`FuncInfo::nbelow`]
+/// arguments) and slots `1..=nargs` the arguments;
 /// for the root frame slot 0 is the bottom of the EVM stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlockDepth {
@@ -169,6 +197,9 @@ enum Tag {
     /// returns by jumping to one was given the wrong frame size: its
     /// real return address is that argument.
     Arg(u16),
+    /// The result of `PC`: Vyper 0.2 computes return addresses as
+    /// `PC + n`.
+    Pc(u64),
 }
 type Item = Option<Tag>;
 
@@ -202,6 +233,19 @@ fn split_blocks(insns: &[DecodedInsn]) -> Vec<Block> {
 
 fn step_item_stack(stack: &mut Vec<Item>, ins: &DecodedInsn, jumpdests: &HashSet<u64>) {
     match ins.opcode {
+        0x58 => stack.push(Some(Tag::Pc(ins.addr.0))),
+        0x01 => {
+            // ADD: `PUSH1 n; PC; ADD` is a return address.
+            let a = stack.pop().flatten();
+            let b = stack.pop().flatten();
+            let r = match (a, b) {
+                (Some(Tag::Pc(p)), Some(Tag::Num(n))) | (Some(Tag::Num(n)), Some(Tag::Pc(p))) => {
+                    Some(p + u64::from(n)).filter(|v| jumpdests.contains(v))
+                }
+                _ => None,
+            };
+            stack.push(r.map(Tag::Const));
+        }
         0x5f..=0x7f => {
             stack.push(ins.push_value().and_then(|v| {
                 if jumpdests.contains(&v) {
@@ -368,10 +412,17 @@ struct FrameFacts {
     tail_calls: HashSet<usize>,
     /// The frame returned by jumping to this argument.
     ret_via_arg: Option<u16>,
+    /// Some jump's target couldn't be resolved, so the frame may
+    /// return in a way the analysis didn't see.
+    unresolved: bool,
+    /// The return address was stored to memory.
+    ret_spilled: bool,
+    /// Most items popped from below the frame's initial stack.
+    underflow: usize,
 }
 
 /// Abstract interpretation of one function body (or the root code at
-/// offset 0 when `nargs` is `None`).
+/// offset 0 when `shape` is `None`). `shape` is `(nbelow, nargs)`.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn analyze_frame(
     blocks: &[Block],
@@ -380,7 +431,7 @@ fn analyze_frame(
     jumpdests: &HashSet<u64>,
     rets: &RetCandidates,
     entry: usize,
-    nargs: Option<usize>,
+    shape: FrameShape,
     calls: &HashMap<usize, CallSite>,
     functions: &BTreeMap<usize, FuncInfo>,
 ) -> FrameFacts {
@@ -396,13 +447,22 @@ fn analyze_frame(
             work.push((b, s));
         }
     };
-    let initial: Vec<Item> = match nargs {
-        Some(n) => std::iter::once(Some(Tag::Ret))
+    let initial: Vec<Item> = match shape {
+        Some((below, n)) => std::iter::repeat_n(None, below)
+            .chain(std::iter::once(Some(Tag::Ret)))
             .chain((0..n).map(|k| u16::try_from(k).ok().map(Tag::Arg)))
             .collect(),
         None => Vec::new(),
     };
     enqueue(&mut work, &mut seen, entry, initial);
+    // Constant memory offsets the frame spilled its return address to
+    // (Vyper 0.2 keeps it in memory and returns with `MLOAD; JUMP`).
+    let mut ret_slots: HashSet<u64> = HashSet::new();
+    let const_of = |it: Option<Tag>| match it {
+        Some(Tag::Const(v)) => Some(v),
+        Some(Tag::Num(v)) => Some(u64::from(v)),
+        _ => None,
+    };
 
     while let Some((b, mut stack)) = work.pop() {
         facts
@@ -416,7 +476,32 @@ fn analyze_frame(
             _ => blk.insns.end,
         };
         for ins in &insns[blk.insns.start..body_end] {
-            step_item_stack(&mut stack, ins, jumpdests);
+            let n = stack.len();
+            let needs = match ins.opcode {
+                0x80..=0x8f => usize::from(ins.opcode - 0x80) + 1,
+                0x90..=0x9f => usize::from(ins.opcode - 0x90) + 2,
+                op => usize::from(OPCODE_TABLE[op as usize].pops),
+            };
+            if b == entry {
+                // Arguments below the return address are popped on
+                // entry, right after it is spilled.
+                facts.underflow = facts.underflow.max(needs.saturating_sub(n));
+            }
+            match ins.opcode {
+                0x52 if n >= 2 && stack[n - 2] == Some(Tag::Ret) => {
+                    if let Some(off) = const_of(stack[n - 1]) {
+                        ret_slots.insert(off);
+                        facts.ret_spilled = true;
+                    }
+                    stack.truncate(n - 2);
+                }
+                0x51 if n >= 1
+                    && const_of(stack[n - 1]).is_some_and(|o| ret_slots.contains(&o)) =>
+                {
+                    stack[n - 1] = Some(Tag::Ret);
+                }
+                _ => step_item_stack(&mut stack, ins, jumpdests),
+            }
         }
         let next = by_start.get(&blk.end).copied();
         match blk.term {
@@ -429,12 +514,15 @@ fn analyze_frame(
             Term::JumpI => {
                 let t = stack.pop().flatten();
                 stack.pop();
+                let falls = !always_taken(&insns[blk.insns.clone()]);
                 if let Some(Tag::Const(v)) = t {
                     let tb = by_start[&v];
                     facts.targets.push((b, tb));
                     enqueue(&mut work, &mut seen, tb, stack.clone());
+                } else {
+                    facts.unresolved = true;
                 }
-                if let Some(nb) = next {
+                if falls && let Some(nb) = next {
                     enqueue(&mut work, &mut seen, nb, stack);
                 }
             }
@@ -464,6 +552,7 @@ fn analyze_frame(
                         facts.targets.push((b, c.callee));
                         let callee = functions.get(&c.callee);
                         let callee_rets = callee.and_then(|f| f.nrets);
+                        let below = callee.map_or(0, |f| f.nbelow);
                         // The callee's own frame size is authoritative
                         // once known (it may have been corrected).
                         let c = CallSite {
@@ -480,8 +569,10 @@ fn analyze_frame(
                             Some(Tag::Const(r)) => {
                                 let cont = by_start[&r];
                                 facts.conts.push((b, cont));
-                                if let Some(nrets) = callee_rets {
-                                    stack.truncate(ret_at);
+                                if let Some(nrets) = callee_rets
+                                    && let Some(base) = ret_at.checked_sub(below)
+                                {
+                                    stack.truncate(base);
                                     stack.extend(std::iter::repeat_n(None, nrets));
                                     enqueue(&mut work, &mut seen, cont, stack);
                                 }
@@ -491,8 +582,9 @@ fn analyze_frame(
                                 facts.tail_calls.insert(b);
                                 if let Some(nrets) = callee_rets
                                     && facts.nrets.is_none()
+                                    && let Some(base) = ret_at.checked_sub(below)
                                 {
-                                    facts.nrets = Some(ret_at + nrets);
+                                    facts.nrets = Some(base + nrets);
                                 }
                             }
                             _ => {}
@@ -515,14 +607,75 @@ fn analyze_frame(
                     }
                     (Some(Tag::Arg(k)), None) => {
                         facts.ret_via_arg.get_or_insert(k);
+                        facts.unresolved = true;
                     }
                     // Unknown or non-`JUMPDEST` target.
-                    (None | Some(Tag::Num(_)), None) => {}
+                    (None | Some(Tag::Num(_) | Tag::Pc(_)), None) => facts.unresolved = true,
                 }
             }
         }
     }
     facts
+}
+
+/// Vyper 0.2 jumps over code it never falls into (private functions
+/// placed between dispatcher cases) with `PUSH1 0; ISZERO; PUSH2 skip;
+/// JUMPI`, a conditional jump whose condition is always true.
+fn always_taken(block: &[DecodedInsn]) -> bool {
+    let [.., z, iszero, target, jumpi] = block else {
+        return false;
+    };
+    z.opcode == 0x60
+        && z.push_value() == Some(0)
+        && iszero.opcode == 0x15
+        && (0x60..=0x7f).contains(&target.opcode)
+        && jumpi.opcode == 0x57
+}
+
+/// Flag the functions that never return: no return or tail call was
+/// seen, every jump resolved, and every call they make either never
+/// returns either or has its continuation analysed. Computed as a
+/// greatest fixpoint, so mutually recursive dead ends qualify.
+fn mark_noreturn(functions: &mut BTreeMap<usize, FuncInfo>, facts: &[(FrameId, FrameFacts)]) {
+    let mut candidates: HashSet<usize> = facts
+        .iter()
+        .filter_map(|(id, f)| {
+            let e = (*id)?;
+            let info = functions.get(&e)?;
+            (info.nrets.is_none()
+                && f.returns.is_empty()
+                && f.tail_calls.is_empty()
+                && f.ret_via_arg.is_none()
+                && !f.unresolved)
+                .then_some(e)
+        })
+        .collect();
+    loop {
+        let failing: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|e| {
+                let Some((_, f)) = facts.iter().find(|(id, _)| *id == Some(*e)) else {
+                    return true;
+                };
+                !f.reached_calls.iter().all(|c| {
+                    candidates.contains(&c.callee)
+                        || functions.get(&c.callee).is_some_and(|i| i.nrets.is_some())
+                })
+            })
+            .collect();
+        if failing.is_empty() {
+            break;
+        }
+        for e in failing {
+            candidates.remove(&e);
+        }
+    }
+    for e in candidates {
+        if let Some(info) = functions.get_mut(&e) {
+            info.noreturn = true;
+        }
+    }
 }
 
 /// Build the CFG for decoded code (`insns` in address order,
@@ -551,16 +704,20 @@ pub(crate) fn build(insns: &[DecodedInsn]) -> Cfg {
     let mut functions: BTreeMap<usize, FuncInfo> = BTreeMap::new();
     let mut facts: Vec<(FrameId, FrameFacts)> = Vec::new();
     for _round in 0..MAX_ROUNDS {
-        let frames: Vec<(FrameId, usize, Option<usize>)> = root
+        let frames: Vec<(FrameId, usize, FrameShape)> = root
             .map(|r| (None, r, None))
             .into_iter()
-            .chain(functions.iter().map(|(&e, f)| (Some(e), e, Some(f.nargs))))
+            .chain(
+                functions
+                    .iter()
+                    .map(|(&e, f)| (Some(e), e, Some((f.nbelow, f.nargs)))),
+            )
             .collect();
         facts = frames
             .iter()
-            .map(|&(id, entry, nargs)| {
+            .map(|&(id, entry, shape)| {
                 let f = analyze_frame(
-                    &blocks, insns, &by_start, &jumpdests, &rets, entry, nargs, &calls, &functions,
+                    &blocks, insns, &by_start, &jumpdests, &rets, entry, shape, &calls, &functions,
                 );
                 (id, f)
             })
@@ -569,7 +726,15 @@ pub(crate) fn build(insns: &[DecodedInsn]) -> Cfg {
         for (id, f) in &facts {
             if let Some(e) = id {
                 let info = functions.get_mut(e).expect("frame of a known function");
-                if info.nrets.is_none()
+                info.ret_spilled = f.ret_spilled;
+                if f.ret_spilled && f.underflow > 0 && info.nbelow < MAX_BELOW {
+                    // Popped below its frame: those items are arguments
+                    // passed under the return address. The facts were
+                    // computed on a too-small frame, so redo them.
+                    info.nbelow = (info.nbelow + f.underflow).min(MAX_BELOW);
+                    info.nrets = None;
+                    changed = true;
+                } else if info.nrets.is_none()
                     && let Some(k) = f.ret_via_arg
                 {
                     // Return address found among the "arguments":
@@ -598,6 +763,9 @@ pub(crate) fn build(insns: &[DecodedInsn]) -> Cfg {
                         nargs: c.nargs,
                         nrets: None,
                         keeps_ret: false,
+                        noreturn: false,
+                        ret_spilled: false,
+                        nbelow: 0,
                     });
                     changed = true;
                 }
@@ -607,6 +775,7 @@ pub(crate) fn build(insns: &[DecodedInsn]) -> Cfg {
             break;
         }
     }
+    mark_noreturn(&mut functions, &facts);
 
     let mut reached = vec![false; n];
     let mut targets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
@@ -733,6 +902,9 @@ mod tests {
                 nargs: 1,
                 nrets: Some(1),
                 keeps_ret: false,
+                noreturn: false,
+                ret_spilled: false,
+                nbelow: 0,
             }
         );
         // Continuation sees the one return value on the root stack.
@@ -776,6 +948,55 @@ mod tests {
                 depth: 1
             })
         );
+    }
+
+    /// Vyper 0.2's calling convention: the return address is
+    /// `PC + n`, pushed last (above the arguments); the callee spills
+    /// it and its arguments to memory and returns with `MLOAD; JUMP`.
+    #[test]
+    fn vyper02_memory_return_address() {
+        let code = vec![
+            0x60, 0x07, // 00 PUSH1 7         ; argument
+            0x60, 0x05, 0x58, 0x01, // 02 PUSH1 5; PC; ADD  ; = 0x09
+            0x60, 0x0b, 0x56, // 06 PUSH1 callee; JUMP
+            0x5b, 0x00, // 09 continuation: JUMPDEST STOP
+            0x5b, // 0b callee
+            0x60, 0x00, 0x52, // spill the return address to 0x00
+            0x60, 0x20, 0x52, // and the argument to 0x20
+            0x60, 0x2a, // return value
+            0x60, 0x00, 0x51, 0x56, // MLOAD 0x00; JUMP
+        ];
+        let insns = decode_range(&code, 0);
+        let cfg = build(&insns);
+        let callee = cfg.block_at(0x0b).unwrap();
+        let info = cfg.functions[&callee];
+        assert_eq!((info.nbelow, info.nargs, info.nrets), (1, 0, Some(1)));
+        assert!(info.ret_spilled && !info.noreturn);
+        let cont = cfg.block_at(0x09).unwrap();
+        assert_eq!(
+            cfg.depth[cont],
+            Some(BlockDepth {
+                frame: None,
+                depth: 1
+            })
+        );
+    }
+
+    #[test]
+    fn noreturn_callee() {
+        // Root calls a function that always reverts; its continuation
+        // is never reached.
+        let code = vec![
+            0x60, 0x06, 0x60, 0x08, 0x56, // 00 PUSH1 ret; PUSH1 f; JUMP
+            0xfe, // 05
+            0x5b, 0x00, // 06 continuation
+            0x5b, 0x5f, 0x5f, 0xfd, // 08 f: REVERT(0, 0)
+        ];
+        let insns = decode_range(&code, 0);
+        let cfg = build(&insns);
+        let f = cfg.block_at(0x08).unwrap();
+        assert!(cfg.functions[&f].noreturn);
+        assert!(!cfg.reached[cfg.block_at(0x06).unwrap()]);
     }
 
     #[test]

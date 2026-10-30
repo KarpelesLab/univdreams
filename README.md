@@ -182,7 +182,7 @@ fn sub_09d9() {
 | **v1 (working)** | Mach-O (thin) | x86-64, arm64 (macOS) | ✅ whole-binary source round-trip; Ghidra-style listing |
 | **v1 (working)** | NE | x86-16 (Windows 1.x–3.x) | ✅ whole-binary source round-trip; Ghidra-style listing (imports, exports, 16-bit disasm) — structured lifting pending |
 | **v1 (working)** | raw / flat | 6502 (Apple I / WozMon) | ✅ round-trip + lift |
-| **v1 (working)** | EVM bytecode | EVM (solc / vyper output, any chain) | ✅ whole-contract source round-trip; lifted to functions / expressions / `if`-`while` / `require` (internal calls and frames recovered); selector-dispatcher functions named from an ABI signature table; CODECOPY data + CBOR metadata split out |
+| **v1 (working)** | EVM bytecode | EVM (solc / vyper output, any chain) | ✅ whole-contract source round-trip; lifted to functions / expressions / `if`-`while` / `require` (internal calls and frames recovered); selector-dispatcher functions (solc and Vyper) named from an ABI signature table; EIP-1167 clones shown as proxies; CODECOPY data + CBOR metadata split out |
 | 2 | Mach-O fat | universal binaries | demux to thin first |
 | 2 | ARM / Thumb | 32-bit ARM | not yet |
 | 3 | High-level lifting | loops, types, struct fields | partial — see roadmap |

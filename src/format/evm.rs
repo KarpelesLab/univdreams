@@ -12,6 +12,10 @@
 //!   that the claimed span parses as exactly one CBOR item.
 //! * **EIP-7702 delegation.** An EOA that delegated to a contract has
 //!   code `0xef0100 || address` (23 bytes); [`delegation_target`].
+//! * **EIP-1167 minimal proxy.** A 45-byte clone that `DELEGATECALL`s
+//!   a fixed implementation with the caller's calldata and passes the
+//!   result back; [`minimal_proxy`]. Clone factories that append
+//!   immutable arguments keep the same code and add data after it.
 //!
 //! Bytecode is often distributed as hex text (`solc --bin`, block
 //! explorers, JSON-RPC); [`decode_hex_text`] accepts that form.
@@ -25,8 +29,11 @@ pub const DELEGATION_PREFIX: [u8; 3] = [0xef, 0x01, 0x00];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
     /// Offset of the first CBOR byte. The trailer runs from here to
-    /// the end of the code, including the 2-byte length suffix.
+    /// `end`, including the 2-byte length suffix.
     pub offset: usize,
+    /// One past the length suffix: the end of the code, except when
+    /// data was appended after the trailer (see [`find_metadata`]).
+    pub end: usize,
     /// Decoded top-level CBOR item.
     pub value: Cbor,
 }
@@ -228,7 +235,39 @@ pub fn metadata_trailer(code: &[u8]) -> Option<Metadata> {
     if !known.iter().any(|k| value.find_key(k).is_some()) {
         return None;
     }
-    Some(Metadata { offset, value })
+    Some(Metadata {
+        offset,
+        end: n,
+        value,
+    })
+}
+
+/// The compiler metadata of `code`: the trailer at its end, or else a
+/// Vyper trailer followed by data. Vyper appends a contract's
+/// immutables to its runtime code at deployment, after the trailer,
+/// and reads them back with `CODECOPY`.
+#[must_use]
+pub fn find_metadata(code: &[u8]) -> Option<Metadata> {
+    const KEY: &[u8] = b"\x65vyper";
+    if let Some(md) = metadata_trailer(code) {
+        return Some(md);
+    }
+    let mut from = code.len();
+    while let Some(pos) = code[..from].windows(KEY.len()).rposition(|w| w == KEY) {
+        from = pos;
+        // The map header (`0xa1`…) sits right before the first key.
+        let Some(start) = pos.checked_sub(1) else {
+            break;
+        };
+        let mut end = start;
+        if parse_cbor(code, &mut end, 0).is_some()
+            && let Some(md) = code.get(..end + 2).and_then(metadata_trailer)
+            && md.offset == start
+        {
+            return Some(md);
+        }
+    }
+    None
 }
 
 /// The delegate address of an EIP-7702 delegation designator.
@@ -241,21 +280,112 @@ pub fn delegation_target(code: &[u8]) -> Option<[u8; 20]> {
     }
 }
 
+/// An EIP-1167 minimal proxy (clone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinimalProxy {
+    /// The implementation every call is delegated to, left-padded to
+    /// 20 bytes (vanity addresses with leading zero bytes are pushed
+    /// with a shorter `PUSHn`).
+    pub target: [u8; 20],
+    /// Length of the proxy code; anything after it is appended data
+    /// (immutable arguments) that the code itself never runs.
+    pub code_len: usize,
+}
+
+/// Recognise EIP-1167 minimal-proxy code:
+///
+/// ```text
+/// 363d3d373d3d3d363d 73<20-byte address> 5af43d82803e903d91 602b 57fd5bf3
+/// ```
+///
+/// i.e. `calldatacopy(0, 0, calldatasize)`, `delegatecall(gas, impl,
+/// 0, calldatasize, 0, 0)`, copy the return data out and `return` or
+/// `revert` it. The address may be pushed with a shorter `PUSHn`, in
+/// which case the `JUMPI` target moves with it; trailing bytes are
+/// allowed (clones with immutable arguments).
+#[must_use]
+pub fn minimal_proxy(code: &[u8]) -> Option<MinimalProxy> {
+    const HEAD: [u8; 9] = [0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d];
+    const MID: [u8; 9] = [0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91];
+    const TAIL: [u8; 4] = [0x57, 0xfd, 0x5b, 0xf3];
+    let rest = code.strip_prefix(&HEAD)?;
+    let push = *rest.first()?;
+    if !(0x60..=0x73).contains(&push) {
+        return None;
+    }
+    let n = usize::from(push - 0x5f);
+    let addr = rest.get(1..=n)?;
+    let rest = rest[n + 1..].strip_prefix(&MID)?;
+    // PUSH1 <offset of the JUMPDEST>
+    let dest = HEAD.len() + 1 + n + MID.len() + 2 + 2;
+    if rest.first() != Some(&0x60) || rest.get(1).map(|&d| usize::from(d)) != Some(dest) {
+        return None;
+    }
+    rest[2..].strip_prefix(&TAIL)?;
+    let mut target = [0u8; 20];
+    target[20 - n..].copy_from_slice(addr);
+    Some(MinimalProxy {
+        target,
+        code_len: dest + 2,
+    })
+}
+
+/// An address in EIP-55 mixed-case checksum form (`0x` + 40 digits).
+#[must_use]
+pub fn checksum_address(addr: &[u8; 20]) -> String {
+    let mut lower = String::with_capacity(40);
+    for b in addr {
+        let _ = write!(lower, "{b:02x}");
+    }
+    let hash = crate::arch::evm::keccak256(lower.as_bytes());
+    let mut out = String::from("0x");
+    for (i, c) in lower.chars().enumerate() {
+        let nibble = (hash[i / 2] >> (if i % 2 == 0 { 4 } else { 0 })) & 0xf;
+        out.push(if nibble >= 8 {
+            c.to_ascii_uppercase()
+        } else {
+            c
+        });
+    }
+    out
+}
+
 /// Heuristic "is this EVM bytecode" check for headerless input.
 ///
-/// Accepts a recognised metadata trailer, an EIP-7702 designator, or
-/// solc's free-memory-pointer prologue (`PUSH1 0x80 PUSH1 0x40
-/// MSTORE`, or the `0x60`/`0xa0`/… and `DUP1` variants older and
-/// via-IR builds emit).
+/// Accepts a recognised metadata trailer, an EIP-7702 designator, an
+/// EIP-1167 minimal proxy, solc's free-memory-pointer prologue
+/// (`PUSH1 0x80 PUSH1 0x40 MSTORE`, or the `PUSH2`, `0x60`/`0xa0`/…
+/// and `DUP1` variants older, immutable-heavy and via-IR builds
+/// emit), or one of Vyper's entry sequences (which have no
+/// free-memory pointer):
+///
+/// * `PUSH1 0 CALLDATALOAD PUSH1 0x1c MSTORE` — vyper 0.1;
+/// * `PUSH1 4 CALLDATASIZE LT ISZERO PUSH2` — vyper 0.2;
+/// * `PUSH1 3 CALLDATASIZE GT PUSH2` — vyper 0.3 (0.3.10 and later
+///   also carry a metadata trailer).
 #[must_use]
 pub fn looks_like_evm(code: &[u8]) -> bool {
-    if delegation_target(code).is_some() || metadata_trailer(code).is_some() {
+    const VYPER: [&[u8]; 3] = [
+        &[0x60, 0x00, 0x35, 0x60, 0x1c, 0x52],
+        &[0x60, 0x04, 0x36, 0x10, 0x15, 0x61],
+        &[0x60, 0x03, 0x36, 0x11, 0x61],
+    ];
+    if delegation_target(code).is_some()
+        || minimal_proxy(code).is_some()
+        || metadata_trailer(code).is_some()
+    {
         return true;
     }
-    let prologue = |rest: &[u8]| rest.starts_with(&[0x60, 0x40, 0x52]);
-    code.len() >= 5
-        && code[0] == 0x60
-        && (prologue(&code[2..]) || (code[2] == 0x80 && prologue(&code[3..])))
+    let fmp = |rest: &[u8]| {
+        let rest = rest.strip_prefix(&[0x80]).unwrap_or(rest);
+        rest.starts_with(&[0x60, 0x40, 0x52])
+    };
+    let solc = match code.first() {
+        Some(0x60) => code.get(2..).is_some_and(fmp),
+        Some(0x61) => code.get(3..).is_some_and(fmp),
+        _ => false,
+    };
+    solc || VYPER.iter().any(|p| code.starts_with(p))
 }
 
 /// Decode bytecode written as hex text: optional `0x` prefix, ASCII
@@ -314,6 +444,23 @@ mod tests {
     }
 
     #[test]
+    fn vyper_trailer_before_immutables() {
+        // vyper 0.3.7: {"vyper": [0, 3, 7]} + 0x000b, then 64 bytes of
+        // immutables appended at deployment.
+        let mut code = vec![0x60, 0x00, 0x80, 0xfd];
+        code.extend([0xa1, 0x65]);
+        code.extend_from_slice(b"vyper");
+        code.extend([0x83, 0x00, 0x03, 0x07, 0x00, 0x0b]);
+        let end = code.len();
+        code.extend([0u8; 63]);
+        code.push(0x17);
+        assert!(metadata_trailer(&code).is_none());
+        let md = find_metadata(&code).expect("inner trailer");
+        assert_eq!((md.offset, md.end), (4, end));
+        assert_eq!(md.compiler(), Some(("vyper", "0.3.7".into())));
+    }
+
+    #[test]
     fn random_tail_is_not_a_trailer() {
         assert!(metadata_trailer(&[0x60, 0x80, 0x60, 0x40, 0x52, 0x00, 0x03]).is_none());
         // Claimed length runs past the start of the code.
@@ -337,7 +484,60 @@ mod tests {
         assert!(looks_like_evm(&[0x60, 0x80, 0x60, 0x40, 0x52]));
         assert!(looks_like_evm(&[0x60, 0x60, 0x60, 0x40, 0x52]));
         assert!(looks_like_evm(&[0x60, 0xa0, 0x80, 0x60, 0x40, 0x52]));
+        assert!(looks_like_evm(&[0x61, 0x01, 0x00, 0x60, 0x40, 0x52]));
+        // Vyper 0.2 / 0.3 entry checks.
+        assert!(looks_like_evm(&[0x60, 0x04, 0x36, 0x10, 0x15, 0x61, 0x00]));
+        assert!(looks_like_evm(&[0x60, 0x03, 0x36, 0x11, 0x61, 0x00]));
         assert!(!looks_like_evm(b"\x7fELF\x02\x01"));
+        assert!(!looks_like_evm(&[0x60, 0x80]));
+    }
+
+    fn clone_code(addr: &[u8]) -> Vec<u8> {
+        let mut c = vec![0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d];
+        c.push(0x5f + u8::try_from(addr.len()).unwrap());
+        c.extend_from_slice(addr);
+        c.extend([0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91]);
+        c.extend([0x60, u8::try_from(addr.len()).unwrap() + 23]);
+        c.extend([0x57, 0xfd, 0x5b, 0xf3]);
+        c
+    }
+
+    #[test]
+    fn eip1167_minimal_proxy() {
+        let addr = [0xbe; 20];
+        let mut code = clone_code(&addr);
+        assert_eq!(code.len(), 45);
+        assert_eq!(code[40], 0x2b);
+        let p = minimal_proxy(&code).expect("clone");
+        assert_eq!(p.target, addr);
+        assert_eq!(p.code_len, 45);
+        assert!(looks_like_evm(&code));
+        // Appended immutable arguments.
+        code.extend([1, 2, 3]);
+        assert_eq!(minimal_proxy(&code).map(|p| p.code_len), Some(45));
+        // Vanity address pushed with PUSH18.
+        let short = clone_code(&[0x11; 18]);
+        let p = minimal_proxy(&short).expect("short clone");
+        assert_eq!(p.code_len, 43);
+        assert_eq!(&p.target[..2], &[0, 0]);
+        // Wrong JUMPI target.
+        let mut bad = clone_code(&addr);
+        bad[40] = 0x2c;
+        assert!(minimal_proxy(&bad).is_none());
+    }
+
+    #[test]
+    fn eip55_checksum() {
+        // From the EIP-55 test vectors.
+        let mut a = [0u8; 20];
+        let hex = "5aaeb6053f3e94c9b9a09f33669435e7ef1beaed";
+        for (i, b) in a.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+        }
+        assert_eq!(
+            checksum_address(&a),
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+        );
     }
 
     #[test]
