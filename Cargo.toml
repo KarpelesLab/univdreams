@@ -52,6 +52,8 @@ iced-x86 = { version = "1", default-features = false, features = [
 # Read MSI compound-document tables / CAB archives for the emulator's msiexec.
 msi = "0.10"
 cab = "0.6"
+# Well-known EVM function / event / error signatures for the decompiler.
+evmabiless = { version = "0.1.17", default-features = false, features = ["signatures"] }
 # cli
 clap = { version = "4", features = ["derive"], optional = true }
 anyhow = { version = "1", optional = true }

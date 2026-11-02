@@ -620,3 +620,18 @@ fn uniswap_v2_factory_embeds_pair_initcode() {
     assert!(!text.contains("fn fn_"), "unnamed selector left");
     assert!(text.matches("@asm(").count() <= 16);
 }
+
+#[test]
+fn evmabiless_signatures_name_what_the_curated_list_does_not() {
+    // A dispatched function, with its parameters.
+    let text = decompile_evm_to_text(&read(&testdata().join("initcode-immutable-mainnet.evm")));
+    assert!(text.contains("fn withdrawEth()"), "{text}");
+    assert!(text.contains("withdrawEth(address param0)"), "{text}");
+    assert!(!text.contains("fn_25e16063"), "{text}");
+    // A selector constant.
+    let text = decompile_evm_to_text(&read(&testdata().join("crvusd-mainnet.evm")));
+    assert!(text.contains("isValidSignature.selector"), "{text}");
+    // An event topic.
+    let text = decompile_evm_to_text(&read(&testdata().join("curve-3pool-mainnet.evm")));
+    assert!(text.contains("// event NewAdmin(address)"), "{text}");
+}

@@ -4,9 +4,16 @@
 //! Entries are stored as canonical signature text and hashed with
 //! keccak-256 at first use, so a typo can only cost a missed match —
 //! it can never attach the wrong name to a selector.
+//!
+//! The curated lists below are extended with the table of the
+//! [`evmabiless`] crate. Its signatures are hashed the same way rather
+//! than trusting its stored selectors, and a curated entry wins a
+//! selector collision.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+
+use evmabiless::{AbiType, signatures};
 
 use crate::arch::evm::{keccak256, selector};
 
@@ -551,8 +558,12 @@ fn selector_map() -> &'static HashMap<u32, &'static str> {
     static MAP: OnceLock<HashMap<u32, &'static str>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut map = HashMap::new();
-        for sig in FUNCTIONS {
-            map.entry(selector(sig)).or_insert(*sig);
+        let table = signatures()
+            .iter()
+            .filter(|abi| matches!(abi.kind, AbiType::Function | AbiType::Error))
+            .map(|abi| abi.compact);
+        for sig in FUNCTIONS.iter().copied().chain(table) {
+            map.entry(selector(sig)).or_insert(sig);
         }
         map
     })
@@ -561,10 +572,15 @@ fn selector_map() -> &'static HashMap<u32, &'static str> {
 fn topic_map() -> &'static HashMap<[u8; 32], &'static str> {
     static MAP: OnceLock<HashMap<[u8; 32], &'static str>> = OnceLock::new();
     MAP.get_or_init(|| {
-        EVENTS
+        let table = signatures()
             .iter()
-            .map(|sig| (keccak256(sig.as_bytes()), *sig))
-            .collect()
+            .filter(|abi| abi.kind == AbiType::Event)
+            .map(|abi| abi.compact);
+        let mut map = HashMap::new();
+        for sig in EVENTS.iter().copied().chain(table) {
+            map.entry(keccak256(sig.as_bytes())).or_insert(sig);
+        }
+        map
     })
 }
 
@@ -604,11 +620,13 @@ pub fn function_by_selector(sel: u32) -> Option<&'static str> {
 /// overload.
 #[must_use]
 pub fn selectors_named(name: &str) -> Vec<u32> {
-    FUNCTIONS
+    let mut sels: Vec<u32> = selector_map()
         .iter()
-        .filter(|sig| sig.split('(').next() == Some(name))
-        .map(|sig| selector(sig))
-        .collect()
+        .filter(|(_, sig)| sig.split('(').next() == Some(name))
+        .map(|(&sel, _)| sel)
+        .collect();
+    sels.sort_unstable();
+    sels
 }
 
 /// The interface declaring the known function `sig` (`IERC20` for
@@ -658,6 +676,58 @@ mod tests {
         assert_eq!(function_by_selector(0x4e48_7b71), Some("Panic(uint256)"));
         assert_eq!(function_by_selector(0xd0e3_0db0), Some("deposit()"));
         assert_eq!(function_by_selector(0xdead_beef), None);
+    }
+
+    #[test]
+    fn evmabiless_table() {
+        // A function, an error and an event only that table knows.
+        assert_eq!(
+            function_by_selector(selector(
+                "tokensReceived(address,address,address,uint256,bytes,bytes)"
+            )),
+            Some("tokensReceived(address,address,address,uint256,bytes,bytes)")
+        );
+        assert_eq!(
+            function_by_selector(selector("OwnableUnauthorizedAccount(address)")),
+            Some("OwnableUnauthorizedAccount(address)")
+        );
+        let topic = keccak256(b"RefundsClosed()");
+        assert_eq!(event_by_topic(&topic), Some("RefundsClosed()"));
+
+        for abi in signatures() {
+            match abi.kind {
+                AbiType::Function | AbiType::Error => {
+                    // Every entry resolves under its own hash, and the
+                    // crate agrees on that hash.
+                    let sel = selector(abi.compact);
+                    assert_eq!(abi.selector.to_u32(), sel, "{}", abi.compact);
+                    assert_eq!(function_by_selector(sel), Some(abi.compact));
+                    assert!(selectors_named(abi.name).contains(&sel));
+                }
+                AbiType::Event => {
+                    let topic = keccak256(abi.compact.as_bytes());
+                    assert_eq!(event_by_topic(&topic), Some(abi.compact));
+                    // An event's 4-byte prefix isn't a function selector.
+                    let prefix = u32::from_be_bytes([topic[0], topic[1], topic[2], topic[3]]);
+                    assert_eq!(function_by_selector(prefix), None, "{}", abi.compact);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn selectors_named_counts_each_overload_once() {
+        // `transfer(address,uint256)` is in both the curated list and
+        // the crate's table, and has an ERC-6909 overload.
+        let mut want = vec![
+            selector("transfer(address,uint256)"),
+            selector("transfer(address,uint256,uint256)"),
+        ];
+        want.sort_unstable();
+        assert_eq!(selectors_named("transfer"), want);
+        assert_eq!(selectors_named("DOMAIN_SEPARATOR").len(), 1);
+        assert_eq!(selectors_named("noSuchFunction"), Vec::<u32>::new());
     }
 
     #[test]
