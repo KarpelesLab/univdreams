@@ -53,7 +53,9 @@ fn elf_of_an_unnumbered_architecture() {
 #[test]
 fn headerless_bytes() {
     // Larger than one @raw block, with a short last block.
-    let bytes: Vec<u8> = (0..10_000u32).map(|i| (i * 7 + i / 13).to_le_bytes()[0]).collect();
+    let bytes: Vec<u8> = (0..10_000u32)
+        .map(|i| (i * 7 + i / 13).to_le_bytes()[0])
+        .collect();
     for (arch, load) in [("unknown", 0), ("hexagon", 0x8000_0000)] {
         let text = decompile_raw_opaque_to_text(&bytes, arch, load);
         let ast = parse(&text).unwrap_or_else(|e| panic!("parse: {e}"));
