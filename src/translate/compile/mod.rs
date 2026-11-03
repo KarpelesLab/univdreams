@@ -15,7 +15,7 @@
 mod evm_edit;
 mod evm_emit;
 mod evm_expr;
-mod lexer;
+pub(crate) mod lexer;
 mod lower;
 mod lower_elf;
 mod lower_evm;

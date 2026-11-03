@@ -1087,8 +1087,23 @@ impl Parser {
             }
             return Ok(text);
         }
+        // `(expr)(args)`: a target that isn't a name, such as an
+        // indirect call through a register known to hold a constant.
+        // The parentheses are the emitter's, so they aren't kept.
+        if matches!(tok.kind, TokenKind::LParen) {
+            let close = self
+                .find_matching_close(self.pos)
+                .ok_or(ParseError::UnexpectedEof)?;
+            let inner = self.src[tok.end..self.tokens[close].start]
+                .trim()
+                .to_string();
+            while self.pos < self.tokens.len() && self.pos <= close {
+                self.bump();
+            }
+            return Ok(inner);
+        }
         Err(ParseError::Expected {
-            expected: "a call target name (identifier or `[…]`)".into(),
+            expected: "a call target name (identifier, `[…]` or `(…)`)".into(),
             got: describe(&tok.kind),
             line: tok.line,
             col: tok.col,

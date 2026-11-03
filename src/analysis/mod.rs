@@ -88,7 +88,16 @@ pub fn discover_functions(elf: &Elf64File) -> Result<FunctionMap> {
     // syscall relocation map to exclude syscall call sites
     // (whose `imm` is a helper id or Murmur3 hash, not a code
     // offset).
-    let bpf_syscalls = bpf_relocs::build_call_site_names(elf)?;
+    // Only BPF / SBF: other machines' `.rel.dyn` has its own layout.
+    let is_bpf = matches!(
+        elf.ehdr.e_machine,
+        crate::format::elf::EM_BPF | crate::format::elf::EM_SBF
+    );
+    let bpf_syscalls = if is_bpf {
+        bpf_relocs::build_call_site_names(elf)?
+    } else {
+        std::collections::HashMap::new()
+    };
     for f in discover_from_bpf_call_sites(elf, &bpf_syscalls)? {
         map.insert(f);
     }

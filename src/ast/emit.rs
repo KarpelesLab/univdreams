@@ -386,7 +386,17 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             bytes,
             direct_target,
         } => {
-            write!(out, "{indent}{name}(").unwrap();
+            // A target that isn't a name or a bracketed expression (an
+            // indirect call through a register known to hold `0`) is
+            // parenthesized, which the parser reads as the call target.
+            let starts_ok = name.chars().next().is_some_and(|c| {
+                c.is_ascii_alphabetic() || matches!(c, '_' | '[' | '(' | '*' | '&')
+            });
+            if starts_ok && lexes(name) {
+                write!(out, "{indent}{name}(").unwrap();
+            } else {
+                write!(out, "{indent}({name})(").unwrap();
+            }
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
@@ -597,8 +607,16 @@ fn emit_move_side(out: &mut String, s: &str) {
     }
 }
 
+/// Whether the parser's lexer accepts every character of `s`: the
+/// shape checks below only look for delimiters, so a character the
+/// lexer doesn't know (`` ` ``, `?`, …) would otherwise reach the output
+/// bare and fail to parse back.
+fn lexes(s: &str) -> bool {
+    crate::translate::compile::lexer::tokenize(s).is_ok()
+}
+
 fn move_side_is_unquoted_safe(s: &str) -> bool {
-    if s.is_empty() {
+    if s.is_empty() || !lexes(s) {
         return false;
     }
     let mut depth = 0i32;
@@ -648,7 +666,7 @@ fn render_cond(s: &str) -> String {
 }
 
 fn cond_is_unquoted_safe(s: &str) -> bool {
-    if s.is_empty() {
+    if s.is_empty() || !lexes(s) {
         return false;
     }
     let mut depth = 0i32;
@@ -683,7 +701,7 @@ fn cond_is_unquoted_safe(s: &str) -> bool {
 /// * No top-level `,`, `)`, or `]` — those would be parsed as the
 ///   end of the arg / arg list.
 fn arg_is_unquoted_safe(s: &str) -> bool {
-    if s.is_empty() {
+    if s.is_empty() || !lexes(s) {
         return false;
     }
     let mut depth = 0i32;
@@ -1381,6 +1399,39 @@ mod tests {
         let out = emit(&f);
         assert!(out.contains("    if ("));
         assert!(!out.contains("else"), "should not emit else: {out}");
+    }
+
+    /// Corpus regressions: text that must parse back after emitting.
+    #[test]
+    fn emitted_calls_parse_back() {
+        let call = |name: &str, args: &[&str]| crate::ast::UdFile {
+            module: crate::ast::Module { fields: vec![] },
+            items: vec![crate::ast::Item::Function(crate::ast::FnDecl {
+                addr: Some(0x1000),
+                name: "f".into(),
+                attrs: vec![],
+                signature: None,
+                locals: vec![],
+                body: vec![Stmt::Call {
+                    name: name.into(),
+                    args: args.iter().map(|a| (*a).to_string()).collect(),
+                    bytes: vec![0xff, 0xd0],
+                    direct_target: None,
+                }],
+            })],
+        };
+        for (name, args) in [
+            // A one-character "string" read from `.data.rel.ro`.
+            ("__cxa_finalize", &["`"][..]),
+            ("f", &["a?b"][..]),
+            // `call eax` with eax known to be 0.
+            ("0", &["0x804d328"][..]),
+            ("0x401000", &[][..]),
+        ] {
+            let text = emit(&call(name, args));
+            crate::translate::compile::parse(&text)
+                .unwrap_or_else(|e| panic!("{name}({args:?}): {e}\n{text}"));
+        }
     }
 
     #[test]
