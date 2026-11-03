@@ -274,31 +274,10 @@ fn make_diff_context(off: usize, input: &[u8], output: &[u8]) -> DiffContext {
 /// the natural load address is `0x10000 - L` so the image extends
 /// exactly to $FFFF.
 ///
-/// v0 heuristic: accept files in `[6, 65536]` bytes whose reset
-/// vector at $FFFC under that load address points back into the
-/// image. WozMon (256 bytes, load $FF00, reset $FF00) matches.
+/// See [`crate::arch::mos6502::raw_image_load_addr`] for the checks.
 #[must_use]
 pub fn raw_6502_load_addr(bytes: &[u8]) -> Option<u64> {
-    let len = bytes.len();
-    if !(6..=0x10000).contains(&len) {
-        return None;
-    }
-    let load_addr = 0x10000u64 - len as u64;
-    let end = 0x10000u64;
-    let reset_lo_off = usize::try_from(0xFFFCu64 - load_addr).ok()?;
-    let reset_hi_off = reset_lo_off + 1;
-    if reset_hi_off >= len {
-        return None;
-    }
-    let reset = u64::from(u16::from_le_bytes([
-        bytes[reset_lo_off],
-        bytes[reset_hi_off],
-    ]));
-    if reset >= load_addr && reset < end {
-        Some(load_addr)
-    } else {
-        None
-    }
+    crate::arch::mos6502::raw_image_load_addr(bytes)
 }
 
 fn first_byte_diff(a: &[u8], b: &[u8]) -> Option<usize> {

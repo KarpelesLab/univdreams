@@ -776,7 +776,11 @@ impl Parser {
                         body.push(stmt);
                     }
                 }
-                TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::LParen => {
+                // `$0D = A`: a 6502 store to an unnamed address.
+                TokenKind::Ident(_)
+                | TokenKind::LBracket
+                | TokenKind::LParen
+                | TokenKind::Dollar => {
                     let stmt = self.parse_call_or_move_stmt()?;
                     body.push(stmt);
                 }
@@ -1710,7 +1714,7 @@ impl Parser {
                     self.parse_call_or_move_stmt()
                 }
             }
-            TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::LParen => {
+            TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::LParen | TokenKind::Dollar => {
                 self.parse_call_or_move_stmt()
             }
             other => Err(ParseError::Expected {

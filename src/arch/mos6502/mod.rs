@@ -118,6 +118,68 @@ pub fn decode_range(bytes: &[u8], start: u64) -> Result<Vec<DecodedInsn>> {
     Ok(out)
 }
 
+/// Load address of a headerless 6502 ROM image, if `bytes` looks like
+/// one.
+///
+/// A 6502 image of length L is taken to end at `$FFFF`, putting the
+/// NMI/RESET/IRQ vectors at `$FFFA..$FFFF`. It is accepted when the
+/// reset vector points inside the image and the code there decodes as
+/// documented instructions, with no `BRK`, for [`ENTRY_PROBE`]
+/// instructions or up to a return, following direct jumps. The vector check alone
+/// passes most large blobs, since a random vector lands inside an image
+/// of L bytes with probability L / 64 KiB; the decode check rejects
+/// arbitrary data (about 0.6 documented opcodes per random byte), so
+/// other CPUs' firmware isn't taken for 6502 code. WozMon (256 bytes,
+/// load `$FF00`, reset `$FF00`) passes.
+#[must_use]
+pub fn raw_image_load_addr(bytes: &[u8]) -> Option<u64> {
+    let len = bytes.len();
+    if !(6..=0x10000).contains(&len) {
+        return None;
+    }
+    let load_addr = 0x10000u64 - len as u64;
+    let reset_off = usize::try_from(0xFFFCu64 - load_addr).ok()?;
+    let reset = u64::from(u16::from_le_bytes([
+        *bytes.get(reset_off)?,
+        *bytes.get(reset_off + 1)?,
+    ]));
+    if reset < load_addr {
+        return None;
+    }
+    plausible_entry(bytes, load_addr, reset).then_some(load_addr)
+}
+
+/// Instructions decoded from a candidate entry point by
+/// [`raw_image_load_addr`].
+pub const ENTRY_PROBE: usize = 12;
+
+fn plausible_entry(bytes: &[u8], load_addr: u64, entry: u64) -> bool {
+    let mut at = entry;
+    for _ in 0..ENTRY_PROBE {
+        let Some(rest) = usize::try_from(at.wrapping_sub(load_addr))
+            .ok()
+            .and_then(|off| bytes.get(off..))
+            .filter(|r| !r.is_empty())
+        else {
+            return false;
+        };
+        let Ok(insn) = decode_one(rest, at) else {
+            return false;
+        };
+        if insn.mnemonic == Mnemonic::Illegal {
+            return false;
+        }
+        match classify(&insn) {
+            InsnKind::Break => return false,
+            InsnKind::Return | InsnKind::JumpIndirect => return true,
+            // Follow the jump; leaving the image fails the probe.
+            InsnKind::JumpDirect { target } => at = target,
+            _ => at += insn.original_bytes.len() as u64,
+        }
+    }
+    true
+}
+
 /// Branch / call / return classification used by CFG construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -295,6 +357,37 @@ fn mnemonic_name(m: Mnemonic) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn raw_image_detection() {
+        let woz = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/wozmon-apple1.bin"
+        ))
+        .unwrap();
+        assert_eq!(raw_image_load_addr(&woz), Some(0xFF00));
+        // A reset vector inside the image isn't enough: the code there
+        // must decode. 0x02 is undocumented, 0x00 is BRK.
+        for filler in [0x02u8, 0x00] {
+            let mut img = vec![filler; 0x1000];
+            img[0xFFC] = 0x00;
+            img[0xFFD] = 0xF0; // reset = $F000, the image start
+            assert_eq!(raw_image_load_addr(&img), None, "filler {filler:#04x}");
+        }
+        // NOPs then a JMP back to the start: accepted.
+        let mut img = vec![0xEAu8; 0x1000];
+        img[4..7].copy_from_slice(&[0x4C, 0x00, 0xF0]);
+        img[0xFFC] = 0x00;
+        img[0xFFD] = 0xF0;
+        assert_eq!(raw_image_load_addr(&img), Some(0xF000));
+        // A JMP out of the image: rejected.
+        img[4..7].copy_from_slice(&[0x4C, 0x00, 0x10]);
+        assert_eq!(raw_image_load_addr(&img), None);
+        img[4..7].copy_from_slice(&[0x4C, 0x00, 0xF0]);
+        img[0xFFC] = 0x00;
+        img[0xFFD] = 0xF0;
+        assert_eq!(raw_image_load_addr(&img), Some(0xF000));
+    }
     use super::*;
 
     #[test]

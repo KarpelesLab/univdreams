@@ -23,7 +23,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::arch::mos6502::{
-    AddressingMode, DecodedInsn, InsnKind, Mnemonic, classify, decode_range, format_insn_with,
+    AddressingMode, DecodedInsn, InsnKind, Mnemonic, classify, decode_one, format_insn_with,
 };
 use crate::ast::{Field, FnDecl, Item, Module, Param, Signature, Stmt, Type, UdFile, Value};
 use crate::format::raw::RawImage;
@@ -60,23 +60,45 @@ pub fn decompile_raw_6502(image: &RawImage) -> Result<UdFile> {
     let code_end = image.end().saturating_sub(VECTORS_LEN);
     let code_len = (code_end - image.start()) as usize;
     let code_bytes = &image.bytes[..code_len];
-    let insns = decode_range(code_bytes, image.start()).map_err(|e| Error::Decode {
-        offset: 0,
-        source: e,
-    })?;
+    // Decode whole instructions; a last one cut short by the vectors
+    // stays raw bytes.
+    let mut insns = Vec::new();
+    let mut off = 0;
+    while off < code_bytes.len() {
+        let Ok(insn) = decode_one(&code_bytes[off..], image.start() + off as u64) else {
+            break;
+        };
+        off += insn.original_bytes.len();
+        insns.push(insn);
+    }
+    let decoded_end = image.start() + off as u64;
 
     let reset_addr = u64::from(image.read_u16_le(0xFFFC).map_err(|_| Error::TooSmall {
         got: image.bytes.len(),
     })?);
 
-    let entries = discover_entries(&insns, reset_addr, image.start(), code_end);
+    // Functions start on instruction boundaries of the linear decode;
+    // a call target inside another instruction can't be one without
+    // losing or repeating bytes.
+    let starts: HashSet<u64> = insns.iter().map(|i| i.addr.0).collect();
+    let mut entries = discover_entries(&insns, reset_addr, image.start(), decoded_end);
+    entries.retain(|e| starts.contains(e));
     let labels = discover_labels(&insns, &entries);
     let resolver = pick_resolver(image);
     let signatures = infer_signatures(&insns, &entries);
 
+    let raw = |from: u64, to: u64| Item::Raw {
+        addr: from,
+        bytes: image.bytes[(from - image.start()) as usize..(to - image.start()) as usize].to_vec(),
+    };
     let mut items: Vec<Item> = Vec::new();
+    // Bytes before the first function.
+    let first = entries.first().copied().unwrap_or(decoded_end);
+    if first > image.start() {
+        items.push(raw(image.start(), first));
+    }
     for (idx, &entry) in entries.iter().enumerate() {
-        let end = entries.get(idx + 1).copied().unwrap_or(code_end);
+        let end = entries.get(idx + 1).copied().unwrap_or(decoded_end);
         let body = build_body_range(&insns, entry, end, &labels, &entries, resolver, &signatures);
         let name = function_name(entry, reset_addr);
         let signature = signatures.get(&entry).cloned();
@@ -88,6 +110,9 @@ pub fn decompile_raw_6502(image: &RawImage) -> Result<UdFile> {
             locals: Vec::new(),
             body,
         }));
+    }
+    if decoded_end < code_end {
+        items.push(raw(decoded_end, code_end));
     }
 
     let vectors_bytes = image.bytes[code_len..].to_vec();

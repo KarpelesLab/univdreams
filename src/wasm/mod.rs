@@ -276,33 +276,10 @@ fn read_string(module: &Module, name: &str) -> Option<String> {
     })
 }
 
-/// 6502 raw-image load-address heuristic. Mirrors
-/// `crate::cli::raw_6502_load_addr` but duplicated here so the WASM
-/// build doesn't pull `clap` (and the rest of the CLI deps) in.
-///
-/// Convention: a 6502 image of length L "wants" to live so that it
-/// ends at `$FFFF`, putting the canonical NMI/RESET/IRQ vectors at
-/// `$FFFA..$FFFF`. We then sanity-check that the reset vector at
-/// `$FFFC` points back inside the image — a cheap "is this even
-/// 6502 code" filter that pseudoinputs like `0`-filled regions
-/// fail.
+/// 6502 raw-image load-address heuristic (see
+/// [`crate::arch::mos6502::raw_image_load_addr`]).
 fn raw_6502_load_addr(bytes: &[u8]) -> Option<u64> {
-    let len = bytes.len();
-    if !(6..=0x10000).contains(&len) {
-        return None;
-    }
-    let load_addr = 0x10000u64 - len as u64;
-    let end = 0x10000u64;
-    let reset_lo_off = usize::try_from(0xFFFCu64 - load_addr).ok()?;
-    let reset_hi_off = reset_lo_off.checked_add(1)?;
-    let lo = u64::from(*bytes.get(reset_lo_off)?);
-    let hi = u64::from(*bytes.get(reset_hi_off)?);
-    let reset = (hi << 8) | lo;
-    if reset < load_addr || reset >= end {
-        None
-    } else {
-        Some(load_addr)
-    }
+    crate::arch::mos6502::raw_image_load_addr(bytes)
 }
 
 /// Wire the panic hook AND populate the arch-codec registry once.
