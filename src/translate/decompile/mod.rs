@@ -46,6 +46,7 @@ pub mod macho;
 pub mod ne;
 mod patterns;
 pub mod pe;
+pub mod raw;
 pub mod raw6502;
 mod ssa;
 mod stack_slots;
@@ -57,6 +58,7 @@ pub use evm::{decompile_evm, decompile_evm_to_text};
 pub use macho::{decompile_macho, decompile_macho_to_text};
 pub use ne::{decompile_ne, decompile_ne_to_text};
 pub use pe::{decompile_pe, decompile_pe_to_text};
+pub use raw::{decompile_raw_opaque, decompile_raw_opaque_to_text};
 pub use raw6502::{decompile_raw_6502, decompile_raw_6502_to_text};
 pub use wasm::{decompile_wasm, decompile_wasm_to_text};
 
@@ -80,6 +82,8 @@ enum Arch {
     Bpf {
         variant: crate::arch::bpf::BpfVariant,
     },
+    /// No decoder yet: code stays `@raw`.
+    Opaque,
 }
 
 /// Errors surfaced by the top-level entry point.
@@ -139,12 +143,19 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
         (ElfClass::Elf64, EM_SBF) => Arch::Bpf {
             variant: crate::arch::bpf::BpfVariant::Sbfv1,
         },
-        _ => return Err(Error::UnsupportedMachine(elf.ehdr.e_machine)),
+        _ => Arch::Opaque,
     };
 
     let module = build_module::build_module(elf);
-    let map = discover_functions(elf)?;
-    let debug_by_addr: HashMap<u64, DebugFunction> = crate::debug::read_debug_info(elf)?;
+    // Without a decoder there's nothing to body: sections stay `@raw`.
+    let (map, debug_by_addr) = if matches!(arch, Arch::Opaque) {
+        (FunctionMap::default(), HashMap::new())
+    } else {
+        (
+            discover_functions(elf)?,
+            crate::debug::read_debug_info(elf)?,
+        )
+    };
 
     // Build an address → name map once; passed to every build_function so
     // call sites can be annotated with target names.
@@ -243,7 +254,7 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
             let codec = crate::arch::x86::X86Codec(bitness);
             drop_regenerable_bytes(&mut items, &codec);
         }
-        Arch::Aarch64 => {}
+        Arch::Aarch64 | Arch::Opaque => {}
     }
 
     Ok(UdFile { module, items })
@@ -1222,6 +1233,8 @@ fn build_section_items(
         let hi = lo + f.size as usize;
         let slice = &data[lo..hi];
         let fn_decl = match arch {
+            // Opaque arches have no functions (see `decompile`).
+            Arch::Opaque => continue,
             Arch::X86 { bitness } => {
                 let insns = decode(bitness, slice, f.addr.0)?;
                 let lifted = lift_function(f.name.clone(), &insns)?;

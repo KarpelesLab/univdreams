@@ -239,7 +239,14 @@ pub fn roundtrip_through_source(
         let rebuilt = crate::translate::compile::lower_to_raw(&parsed)?;
         (text, warnings, rebuilt)
     } else {
-        return Err(SourceRoundTripError::UnknownFormat);
+        // Nothing recognised it: opaque bytes, which always round-trip.
+        let ast = crate::translate::decompile::decompile_raw_opaque(&input_bytes, "unknown", 0);
+        let text = crate::ast::emit(&ast);
+        let parsed = crate::translate::compile::parse(&text)
+            .map_err(|e| SourceRoundTripError::Parse(e.to_string()))?;
+        let warnings = crate::translate::compile::verify_asm(&parsed);
+        let rebuilt = crate::translate::compile::lower_to_raw(&parsed)?;
+        (text, warnings, rebuilt)
     };
     let _ = text; // kept for future debug surfacing
 

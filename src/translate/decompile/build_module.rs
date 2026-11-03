@@ -9,21 +9,14 @@
 //! [`Elf64File::from_parts`]: crate::format::elf::Elf64File::from_parts
 
 use crate::ast::{Field, Module, Value};
-use crate::format::elf::{EM_386, EM_AARCH64, EM_BPF, EM_SBF, EM_X86_64, Elf64File, Phdr64};
+use crate::format::elf::{Elf64File, Phdr64};
 
 /// Construct a [`Module`] capturing the full ELF metadata: the
 /// interpreted header fields, the program-header table, the section-
 /// header table, and the file padding regions.
 #[must_use]
 pub fn build_module(elf: &Elf64File) -> Module {
-    let arch = match elf.ehdr.e_machine {
-        EM_X86_64 => "x86_64",
-        EM_386 => "i386",
-        EM_AARCH64 => "aarch64",
-        EM_BPF => "bpf",
-        EM_SBF => "sbf",
-        _ => "unknown",
-    };
+    let arch = crate::arch::opaque::elf_machine_name(elf.ehdr.e_machine).unwrap_or("unknown");
     let abi = guess_abi(elf);
 
     let build = Value::Block(vec![

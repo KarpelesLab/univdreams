@@ -76,6 +76,18 @@ enum Command {
         /// edits relocate the whole contract.
         #[arg(long)]
         listing: bool,
+
+        /// Headerless input: the architecture it holds (`arm`, `hexagon`,
+        /// `6502`, …), instead of guessing. Inputs in a container format
+        /// (ELF, PE, …) ignore it. Architectures without a decoder yet
+        /// round-trip as `@raw` bytes.
+        #[arg(long)]
+        arch: Option<String>,
+
+        /// Headerless input: the address it loads at (default 0; a 6502
+        /// image defaults to ending at $FFFF).
+        #[arg(long, value_parser = parse_u64)]
+        load_addr: Option<u64>,
     },
 
     /// Verify a `.ud` source file: parse, then check every `@asm`
@@ -963,6 +975,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             input,
             out,
             listing,
+            arch,
+            load_addr,
         } => {
             let evm = |code: &[u8]| {
                 if listing {
@@ -973,7 +987,29 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             };
             let bytes =
                 std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
-            let source = if univdreams::format::elf::is_elf64_le(&bytes) {
+            let headerless = |bytes: &[u8], arch: &str| -> anyhow::Result<String> {
+                if arch == "6502" {
+                    let load = load_addr.unwrap_or(0x10000 - bytes.len() as u64);
+                    let image = univdreams::format::raw::RawImage::new(bytes.to_vec(), load);
+                    return univdreams::translate::decompile::decompile_raw_6502_to_text(&image)
+                        .with_context(|| format!("decompile {} as 6502 raw", input.display()));
+                }
+                Ok(
+                    univdreams::translate::decompile::decompile_raw_opaque_to_text(
+                        bytes,
+                        arch,
+                        load_addr.unwrap_or(0),
+                    ),
+                )
+            };
+            let container = univdreams::format::elf::is_elf64_le(&bytes)
+                || univdreams::format::ne::is_ne(&bytes)
+                || univdreams::format::pe::is_pe(&bytes)
+                || univdreams::format::macho::is_macho64(&bytes)
+                || univdreams::format::wasm::is_wasm(&bytes);
+            let source = if let Some(arch) = arch.as_deref().filter(|_| !container) {
+                headerless(&bytes, arch)?
+            } else if univdreams::format::elf::is_elf64_le(&bytes) {
                 let elf = univdreams::format::elf::Elf64File::parse(&bytes)
                     .with_context(|| format!("parse {} as ELF", input.display()))?;
                 univdreams::translate::decompile::decompile_to_text(&elf)
@@ -1009,10 +1045,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 univdreams::translate::decompile::decompile_raw_6502_to_text(&image)
                     .with_context(|| format!("decompile {} as 6502 raw", input.display()))?
             } else {
-                anyhow::bail!(
-                    "unrecognised binary format: {} (expected ELF, PE, NE, Mach-O, WASM, EVM bytecode, or 6502 raw image)",
-                    input.display()
-                );
+                // Nothing recognised it: keep it whole as opaque bytes.
+                headerless(&bytes, "unknown")?
             };
             if let Some(path) = out {
                 std::fs::write(&path, source)
@@ -5458,4 +5492,14 @@ fn hex_window(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Parse a decimal or `0x`-prefixed hexadecimal integer argument.
+fn parse_u64(s: &str) -> Result<u64, String> {
+    let s = s.trim().replace('_', "");
+    let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => s.parse(),
+    };
+    parsed.map_err(|e| format!("invalid number {s:?}: {e}"))
 }

@@ -36,6 +36,8 @@ use crate::translate::compile::AsmWarning;
 /// * `"raw-6502"` — interpret as a raw 6502 image whose load address
 ///   is derived from the file length (top of the 16-bit address
 ///   space).
+/// * `"raw"` — opaque bytes of an unknown architecture, kept as
+///   `@raw` blocks. `"auto"` falls back to this.
 ///
 /// `"auto"` also picks EVM bytecode when
 /// [`looks_like_evm`](crate::format::evm::looks_like_evm) accepts it
@@ -54,8 +56,11 @@ pub fn decompile(bytes: &[u8], format: &str) -> Result<String, JsError> {
         "evm" => Ok(decompile_as_evm(bytes, false)),
         "evm-listing" => Ok(decompile_as_evm(bytes, true)),
         "raw-6502" => decompile_as_raw_6502(bytes),
+        "raw" => Ok(crate::translate::decompile::decompile_raw_opaque_to_text(
+            bytes, "unknown", 0,
+        )),
         other => Err(JsError::new(&format!(
-            "unsupported format hint {other:?} (expected \"auto\", \"elf\", \"pe\", \"macho\", \"wasm\", \"evm\", \"evm-listing\", or \"raw-6502\")"
+            "unsupported format hint {other:?} (expected \"auto\", \"elf\", \"pe\", \"macho\", \"wasm\", \"evm\", \"evm-listing\", \"raw-6502\", or \"raw\")"
         ))),
     }
 }
@@ -78,8 +83,10 @@ fn decompile_auto(bytes: &[u8]) -> Result<String, JsError> {
     {
         return Ok(decompile_as_evm(bytes, false));
     }
-    Err(JsError::new(
-        "auto-detect found no ELF / PE / Mach-O / WASM header or EVM bytecode. Pick an explicit format if this is a raw image (e.g. 6502).",
+    // Nothing recognised it: opaque bytes, which always round-trip.
+    // Pick "raw-6502" explicitly for a 6502 image.
+    Ok(crate::translate::decompile::decompile_raw_opaque_to_text(
+        bytes, "unknown", 0,
     ))
 }
 

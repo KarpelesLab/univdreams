@@ -51,4 +51,6 @@ pub fn register_all_arches() {
     crate::arch::mos6502::register();
     crate::arch::bpf::register();
     crate::arch::evm::register();
+    // Last: it answers for every architecture the others don't.
+    crate::arch::opaque::register();
 }

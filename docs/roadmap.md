@@ -186,6 +186,15 @@ fail-soft-thunk / monitor-report machinery.
 - [ ] Editing or deleting folded external calls (`IERC20(t).transfer(a, n)`, `t.call(Iface.f(…))`), calls inside expressions, tail calls (`return sub_x(…);`) and calls to functions that never return, moving statements (delete and re-add them instead), deleting statements that end a block, statements in code the lifter couldn't reach, moving a `PC` that isn't a return address, `CODESIZE` other than as `codesize() - n` (constructor arguments) once the size changes, and moving the code of an embedded contract whose deploying code copies it with a computed length or isn't in lifted form — all rejected with an error naming the statement. The listing form's jump targets stay absolute.
 - [ ] ABI encodings of dynamic values (`bytes`, strings, arrays) into returns, events and reverts (solc's copy loops; errors with dynamic arguments, such as v4's `WrappedError`, stay as their stores), element reads of calldata arrays (`path[i]`), external calls with dynamic arguments (hook calls, `pair.swap(…, data)`) or a selector computed at run time, and decoding a call's return data.
 
+### Firmware corpus — every file round-trips (in progress)
+
+Driven by a corpus of a few thousand firmware blobs (raw images and ELF, for ARM / Thumb, Hexagon, NDS32, Z80, ARC, AArch64, Dalvik, C166, 6502, 8051, MIPS, Xtensa and a long tail).
+
+- [x] Opaque architectures: ELF of any `e_machine` keeps its headers, sections and segments, with code as `@raw` until a decoder lands, and names its CPU (`arch: "hexagon"`); headerless inputs nothing recognises become a `format: "raw"` image of `@raw` blocks; `ud decompile --arch <cpu> --load-addr <addr>` labels a headerless input instead of guessing.
+- [x] 6502 raw images: the image heuristic checks that the reset code decodes; bytes before the first function and a truncated last instruction stay `@raw`; unnamed zero-page stores (`$0D = A`) parse back.
+- [ ] Containers: Intel HEX, Qualcomm MBN, Cypress CYACD, TI ROM boot tables; big-endian ELF.
+- [ ] Decoders for the corpus' CPUs from Ghidra's SLEIGH processor specs (a pure-Rust SLEIGH engine), so instructions round-trip as `@asm` with pinned bytes; encoders and lifting after.
+
 ## Beyond v1
 
 In open consideration once Phases 5–9 stabilize:
