@@ -166,11 +166,11 @@ impl DosHeader {
             e_res2: [0; 10],
             e_lfanew: read_u32(bytes, E_LFANEW_OFFSET),
         };
-        for i in 0..4 {
-            h.e_res[i] = read_u16(bytes, 28 + 2 * i);
+        for (i, w) in h.e_res.iter_mut().enumerate() {
+            *w = read_u16(bytes, 28 + 2 * i);
         }
-        for i in 0..10 {
-            h.e_res2[i] = read_u16(bytes, 40 + 2 * i);
+        for (i, w) in h.e_res2.iter_mut().enumerate() {
+            *w = read_u16(bytes, 40 + 2 * i);
         }
         h
     }

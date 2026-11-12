@@ -1214,9 +1214,7 @@ impl RegTracker {
                 if matches!(insn.kind, InsnKind::Call | InsnKind::CallReg) {
                     // r0 = return; r1..r5 clobbered.
                     self.state[0] = Some("<return>".into());
-                    for r in 1..=5 {
-                        self.state[r] = None;
-                    }
+                    self.state[1..=5].fill(None);
                 }
                 // EXIT / jumps / etc. don't change reg values.
             }

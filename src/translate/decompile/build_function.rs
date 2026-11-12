@@ -5229,8 +5229,8 @@ fn emit_block_stmts(
                 Some(end_idx)
             };
             if let Some(end) = bytes_end_inclusive {
-                for j in setup_start..=end {
-                    bytes.extend_from_slice(&block.insns[j].original_bytes);
+                for insn in &block.insns[setup_start..=end] {
+                    bytes.extend_from_slice(&insn.original_bytes);
                 }
             }
             let name = ctx
@@ -6317,8 +6317,8 @@ fn try_lift_local_compound(
         .collect();
     let (consumed, dst, op, src) = crate::arch::x86::match_local_compound(&window)?;
     let mut bytes = Vec::new();
-    for j in start..start + consumed {
-        bytes.extend_from_slice(&block.insns[j].original_bytes);
+    for insn in &block.insns[start..start + consumed] {
+        bytes.extend_from_slice(&insn.original_bytes);
     }
     out.push(Stmt::LocalCompound {
         dst,

@@ -4,7 +4,7 @@
 //! Every instruction becomes `@asm("text", [bytes])` with its bytes
 //! pinned, so the source compiles back byte for byte whatever the text
 //! says; bytes that don't decode become `@asm(".byte 0xNN", [0xNN])`.
-//! Code is split into `code_<addr>` blocks of at most [`BLOCK`]
+//! Code is split into `code_<addr>` blocks of at most 512
 //! instructions, since nothing yet says where functions start.
 
 use crate::ast::Item;
