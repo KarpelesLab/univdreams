@@ -149,7 +149,11 @@ fn emit_fn_indented(out: &mut String, f: &FnDecl, depth: usize) {
     if let Some(addr) = f.addr {
         writeln!(out, "{indent}@addr(0x{addr:x})").unwrap();
     }
-    write!(out, "{indent}fn {}(", f.name).unwrap();
+    if is_identifier(&f.name) {
+        write!(out, "{indent}fn {}(", f.name).unwrap();
+    } else {
+        write!(out, "{indent}fn {}(", quote_string(&f.name)).unwrap();
+    }
     if let Some(sig) = &f.signature {
         emit_params(out, &sig.params);
     }
@@ -611,8 +615,23 @@ fn emit_move_side(out: &mut String, s: &str) {
 /// shape checks below only look for delimiters, so a character the
 /// lexer doesn't know (`` ` ``, `?`, …) would otherwise reach the output
 /// bare and fail to parse back.
+/// `s` lexes as a single identifier.
+fn is_identifier(s: &str) -> bool {
+    use crate::translate::compile::lexer::{TokenKind, tokenize};
+    tokenize(s).is_ok_and(|toks| {
+        matches!(
+            toks.as_slice(),
+            [t, eof] if matches!(&t.kind, TokenKind::Ident(n) if n == s)
+                && eof.kind == TokenKind::Eof
+        )
+    })
+}
+
+/// `s` lexes as tokens other than comments: a `//` would hide the
+/// rest of the line from the parser.
 fn lexes(s: &str) -> bool {
-    crate::translate::compile::lexer::tokenize(s).is_ok()
+    use crate::translate::compile::lexer::{TokenKind, tokenize};
+    tokenize(s).is_ok_and(|toks| !toks.iter().any(|t| matches!(t.kind, TokenKind::Comment(_))))
 }
 
 fn move_side_is_unquoted_safe(s: &str) -> bool {
@@ -638,7 +657,7 @@ fn move_side_is_unquoted_safe(s: &str) -> bool {
         }
         match c {
             '"' => in_string = true,
-            '\\' => return false,
+            '\\' | '{' | '}' => return false,
             '(' | '[' => depth += 1,
             ')' | ']' => {
                 if depth == 0 {
@@ -677,7 +696,7 @@ fn cond_is_unquoted_safe(s: &str) -> bool {
             return false;
         }
         match c {
-            '"' | '\\' => return false,
+            '"' | '\\' | '{' | '}' => return false,
             '(' | '[' => depth += 1,
             ')' | ']' => {
                 if depth == 0 {
@@ -748,7 +767,7 @@ fn arg_is_unquoted_safe(s: &str) -> bool {
         }
         match c {
             '"' => in_string = true,
-            '\\' => return false,
+            '\\' | '{' | '}' => return false,
             '(' | '[' => {
                 depth += 1;
                 saw_non_string = true;
@@ -1021,7 +1040,19 @@ fn emit_params(out: &mut String, params: &[Param]) {
         if i > 0 {
             out.push_str(", ");
         }
-        write!(out, "{}: ", p.name).unwrap();
+        // Debug info can leave a parameter unnamed (or named with
+        // characters an identifier can't hold).
+        let named = p
+            .name
+            .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && p.name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if named {
+            write!(out, "{}: ", p.name).unwrap();
+        } else {
+            write!(out, "unnamed{i}: ").unwrap();
+        }
         emit_type(out, &p.ty);
         if let Some(loc) = &p.location {
             write!(out, " @{loc}").unwrap();
@@ -1424,6 +1455,9 @@ mod tests {
             // A one-character "string" read from `.data.rel.ro`.
             ("__cxa_finalize", &["`"][..]),
             ("f", &["a?b"][..]),
+            ("f", &["{"][..]),
+            ("f", &["}", "a{b}"][..]),
+            ("f", &["http://relaxng.org/ns/structure/1.0"][..]),
             // `call eax` with eax known to be 0.
             ("0", &["0x804d328"][..]),
             ("0x401000", &[][..]),
@@ -1431,6 +1465,30 @@ mod tests {
             let text = emit(&call(name, args));
             crate::translate::compile::parse(&text)
                 .unwrap_or_else(|e| panic!("{name}({args:?}): {e}\n{text}"));
+        }
+    }
+
+    #[test]
+    fn function_names_that_are_not_identifiers() {
+        for name in ["a$b", "memcpy@GLIBC_2.2.5", "operator new", "", "fn"] {
+            let file = crate::ast::UdFile {
+                module: crate::ast::Module { fields: vec![] },
+                items: vec![crate::ast::Item::Function(crate::ast::FnDecl {
+                    addr: Some(0x1000),
+                    name: name.into(),
+                    attrs: vec![],
+                    signature: None,
+                    locals: vec![],
+                    body: vec![],
+                })],
+            };
+            let text = emit(&file);
+            let parsed = crate::translate::compile::parse(&text)
+                .unwrap_or_else(|e| panic!("{name:?}: {e}\n{text}"));
+            let crate::ast::Item::Function(f) = &parsed.items[0] else {
+                panic!("{name:?}: {text}");
+            };
+            assert_eq!(f.name, name);
         }
     }
 

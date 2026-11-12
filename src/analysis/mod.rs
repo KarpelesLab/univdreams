@@ -111,6 +111,7 @@ pub fn discover_functions(elf: &Elf64File) -> Result<FunctionMap> {
         map.insert(f);
     }
 
+    map.end_at_plt_thunks();
     fill_in_sizes_from_neighbors(&mut map, elf);
 
     Ok(map)

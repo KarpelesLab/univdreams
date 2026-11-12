@@ -149,6 +149,25 @@ impl FunctionMap {
         self.by_addr.get(&addr)
     }
 
+    /// Shorten every function that runs into a PLT thunk so it ends
+    /// where the thunk starts. A PLT's first entry (`PLT0`) has no
+    /// relocation of its own, so an `.eh_frame` FDE covering the whole
+    /// `.plt` would otherwise make it swallow every thunk after it.
+    pub fn end_at_plt_thunks(&mut self) {
+        let thunks: Vec<u64> = self
+            .by_addr
+            .values()
+            .filter(|f| f.sources.contains(&FunctionSource::Plt))
+            .map(|f| f.addr.0)
+            .collect();
+        for f in self.by_addr.values_mut() {
+            let end = f.addr.0.saturating_add(f.size);
+            if let Some(&thunk) = thunks.iter().find(|&&t| t > f.addr.0 && t < end) {
+                f.size = thunk - f.addr.0;
+            }
+        }
+    }
+
     /// Find the function whose `[addr, addr + size)` range contains `addr`,
     /// if any. For functions with `size = 0` the result is `None` because
     /// the range is empty.

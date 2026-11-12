@@ -103,7 +103,8 @@ fn decompile_as_evm(bytes: &[u8], listing: bool) -> String {
 fn decompile_as_elf(bytes: &[u8]) -> Result<String, JsError> {
     let elf = crate::format::elf::Elf64File::parse(bytes)
         .map_err(|e| JsError::new(&format!("parse ELF: {e}")))?;
-    crate::translate::decompile::decompile_to_text(&elf)
+    crate::translate::decompile::decompile_verified(&elf, bytes)
+        .map(|v| crate::ast::emit(&v.ast))
         .map_err(|e| JsError::new(&format!("decompile ELF: {e}")))
 }
 

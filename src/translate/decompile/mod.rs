@@ -62,7 +62,7 @@ pub use raw::{decompile_raw_opaque, decompile_raw_opaque_to_text};
 pub use raw6502::{decompile_raw_6502, decompile_raw_6502_to_text};
 pub use wasm::{decompile_wasm, decompile_wasm_to_text};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::analysis::{FunctionMap, discover_functions};
 use crate::arch::x86::{Bitness, decode, lift_function};
@@ -117,10 +117,26 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// What [`decompile_with`] leaves as bytes instead of decoding.
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// Functions, by start address, to keep as `@raw`.
+    pub raw_functions: HashSet<u64>,
+    /// Keep all code as `@raw`, as for an architecture without a
+    /// decoder.
+    pub opaque: bool,
+}
+
 /// Build the AST for `elf`. The structural form is the primary output
 /// of decompilation; [`decompile_to_text`] is a thin convenience.
 pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
+    decompile_with(elf, &Options::default())
+}
+
+/// [`decompile`], keeping what `options` names as bytes.
+pub fn decompile_with(elf: &Elf64File, options: &Options) -> Result<UdFile> {
     let arch = match (elf.class, elf.ehdr.e_machine) {
+        _ if options.opaque => Arch::Opaque,
         (ElfClass::Elf64, EM_X86_64) => Arch::X86 {
             bitness: Bitness::Bits64,
         },
@@ -153,7 +169,9 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
     } else {
         (
             discover_functions(elf)?,
-            crate::debug::read_debug_info(elf)?,
+            // Debug info only names things: a malformed one isn't
+            // worth failing over.
+            crate::debug::read_debug_info(elf).unwrap_or_default(),
         )
     };
 
@@ -208,6 +226,7 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
             &name_at,
             &call_site_names,
             arch,
+            &options.raw_functions,
         )?;
         drop_redundant_function_addrs(sh.sh_addr, &mut section_items);
         items.push(Item::Section {
@@ -1029,6 +1048,216 @@ pub fn decompile_to_text(elf: &Elf64File) -> Result<String> {
     Ok(crate::ast::emit(&ast))
 }
 
+/// A decompilation checked to compile back to the input.
+#[derive(Debug)]
+pub struct Verified {
+    pub ast: UdFile,
+    /// Functions kept as `@raw` because their source didn't compile
+    /// back to their bytes: `(address, name)`.
+    pub raw_functions: Vec<(u64, String)>,
+    /// Why all code was kept as `@raw`, when narrowing it down to
+    /// functions wasn't enough.
+    pub opaque: Option<String>,
+}
+
+/// Decompile `elf`, whose file is `bytes`, so the result compiles back
+/// to exactly `bytes`. A function whose source doesn't is kept as
+/// `@raw` and listed in [`Verified::raw_functions`]; if the difference
+/// can't be pinned on functions, or the source doesn't compile at all,
+/// every function is kept as bytes.
+pub fn decompile_verified(elf: &Elf64File, bytes: &[u8]) -> Result<Verified> {
+    let map = discover_functions(elf)?;
+    let mut options = Options::default();
+    let reason = loop {
+        let ast = decompile_with(elf, &options)?;
+        let culprits = match rebuild(elf, &map, &ast) {
+            Rebuilt::Bytes(rebuilt) if rebuilt == bytes => {
+                let mut raw_functions: Vec<(u64, String)> = options
+                    .raw_functions
+                    .iter()
+                    .map(|&a| (a, map.get(a).map(|f| f.name.clone()).unwrap_or_default()))
+                    .collect();
+                raw_functions.sort_unstable();
+                return Ok(Verified {
+                    ast,
+                    raw_functions,
+                    opaque: None,
+                });
+            }
+            Rebuilt::Bytes(rebuilt) => differing_functions(elf, &map, bytes, &rebuilt)
+                .ok_or_else(|| "differs outside of any function".to_string()),
+            Rebuilt::Failed { culprits, .. } if !culprits.is_empty() => Ok(culprits),
+            Rebuilt::Failed { reason, .. } => Err(reason),
+        };
+        match culprits {
+            Ok(addrs) if !addrs.is_subset(&options.raw_functions) => {
+                options.raw_functions.extend(addrs);
+            }
+            Ok(_) => break "differs where no function is left to keep as bytes".into(),
+            Err(reason) => break reason,
+        }
+    };
+    let ast = decompile_with(
+        elf,
+        &Options {
+            opaque: true,
+            ..Options::default()
+        },
+    )?;
+    Ok(Verified {
+        ast,
+        raw_functions: Vec::new(),
+        opaque: Some(reason),
+    })
+}
+
+/// The result of compiling a decompilation back.
+enum Rebuilt {
+    Bytes(Vec<u8>),
+    /// It didn't compile. `culprits` are functions known to be at
+    /// fault, if any.
+    Failed {
+        reason: String,
+        culprits: HashSet<u64>,
+    },
+}
+
+/// Compile `ast`'s source back, through its text as a user would.
+/// Functions are checked one by one first, so every function at fault
+/// is found in one pass rather than one failed compile at a time.
+fn rebuild(elf: &Elf64File, map: &FunctionMap, ast: &UdFile) -> Rebuilt {
+    use crate::translate::compile::{ElfLowerError, LowerError};
+    let text = crate::ast::emit(ast);
+    let parsed = match crate::translate::compile::parse(&text) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return Rebuilt::Failed {
+                reason: e.to_string(),
+                culprits: HashSet::new(),
+            };
+        }
+    };
+    let culprits = mismatched_functions(elf, map, &parsed);
+    if !culprits.is_empty() {
+        return Rebuilt::Failed {
+            reason: "functions don't compile back".into(),
+            culprits,
+        };
+    }
+    match crate::translate::compile::lower_to_elf(&parsed) {
+        Ok(rebuilt) => Rebuilt::Bytes(rebuilt),
+        Err(e) => {
+            // The item before an overlap came out longer than it was.
+            let culprits = match &e {
+                ElfLowerError::Lower(LowerError::SectionOverlap { item_addr, .. }) => item_addr
+                    .checked_sub(1)
+                    .and_then(|at| map.containing(at))
+                    .map(|f| HashSet::from([f.addr.0]))
+                    .unwrap_or_default(),
+                _ => HashSet::new(),
+            };
+            Rebuilt::Failed {
+                reason: e.to_string(),
+                culprits,
+            }
+        }
+    }
+}
+
+/// Functions of `parsed` that don't lower to their bytes in `elf`.
+fn mismatched_functions(elf: &Elf64File, map: &FunctionMap, parsed: &UdFile) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    let Ok(arch) = crate::translate::compile::resolve_arch_codec(&parsed.module) else {
+        return out;
+    };
+    for item in &parsed.items {
+        let Item::Section { name, items, addr } = item else {
+            continue;
+        };
+        let Some(data) = elf
+            .sections()
+            .find(|&(idx, _, _)| elf.section_name(idx) == Some(name.as_str()))
+            .map(|(_, _, data)| data)
+        else {
+            continue;
+        };
+        // `addr..addr + len` of this section's original bytes.
+        let original = |at: u64, len: u64| {
+            let lo = usize::try_from(at.checked_sub(*addr)?).ok()?;
+            data.get(lo..lo.checked_add(usize::try_from(len).ok()?)?)
+        };
+        // Where the next item starts, as `lower_section_bytes` places
+        // it, while that's known.
+        let mut cursor = Some(*addr);
+        for item in items {
+            match item {
+                Item::Comment(_) => {}
+                Item::Raw { addr, bytes } => cursor = Some(addr + bytes.len() as u64),
+                Item::Function(f) => {
+                    let Some(start) = f.addr.or(cursor) else {
+                        continue;
+                    };
+                    let Some(func) = map.get(start).filter(|f| f.size > 0) else {
+                        cursor = None;
+                        continue;
+                    };
+                    let lowered = crate::translate::compile::lower_function_bytes_at(
+                        f,
+                        Some(start),
+                        arch.as_ref(),
+                    );
+                    if lowered.ok().as_deref() != original(start, func.size) {
+                        out.insert(start);
+                    }
+                    cursor = Some(start + func.size);
+                }
+                _ => cursor = None,
+            }
+        }
+    }
+    out
+}
+
+const SHT_NOBITS: u32 = 8;
+
+/// The functions covering every byte where `rebuilt` differs from
+/// `original`, or `None` if a difference lies outside every function.
+fn differing_functions(
+    elf: &Elf64File,
+    map: &FunctionMap,
+    original: &[u8],
+    rebuilt: &[u8],
+) -> Option<HashSet<u64>> {
+    let code: Vec<(u64, u64, u64)> = elf
+        .shdrs
+        .iter()
+        .filter(|sh| sh.sh_flags & SHF_EXECINSTR != 0 && sh.sh_type != SHT_NOBITS)
+        .map(|sh| {
+            (
+                sh.sh_offset,
+                sh.sh_offset.saturating_add(sh.sh_size),
+                sh.sh_addr,
+            )
+        })
+        .collect();
+    let len = original.len().max(rebuilt.len());
+    let mut found = HashSet::new();
+    let mut off = 0usize;
+    while off < len {
+        if original.get(off) == rebuilt.get(off) {
+            off += 1;
+            continue;
+        }
+        let at = off as u64;
+        let (start, _, addr) = code.iter().find(|(s, e, _)| at >= *s && at < *e)?;
+        let f = map.containing(addr + (at - start))?;
+        found.insert(f.addr.0);
+        // Skip to the end of the function in the file.
+        off = usize::try_from(f.addr.0 + f.size - addr + start).ok()?;
+    }
+    Some(found)
+}
+
 /// Whether a section will be emitted as `@section`. Skips sections
 /// without on-disk content (NULL, NOBITS, zero-size). Sections with
 /// `sh_addr == 0` (debug info, `.comment`, `.symtab`, …) ARE emitted —
@@ -1145,6 +1374,7 @@ fn build_section_items(
     name_at: &HashMap<u64, String>,
     call_site_names: &HashMap<u64, String>,
     arch: Arch,
+    raw_functions: &HashSet<u64>,
 ) -> Result<Vec<Item>> {
     // Structured-form sections short-circuit before the
     // function-coverage walk: ELF string tables and note sections
@@ -1232,29 +1462,20 @@ fn build_section_items(
         let lo = (f.addr.0 - section_start) as usize;
         let hi = lo + f.size as usize;
         let slice = &data[lo..hi];
-        let fn_decl = match arch {
-            // Opaque arches have no functions (see `decompile`).
-            Arch::Opaque => continue,
-            Arch::X86 { bitness } => {
-                let insns = decode(bitness, slice, f.addr.0)?;
-                let lifted = lift_function(f.name.clone(), &insns)?;
-                let debug = debug_by_addr.get(&f.addr.0);
-                build_function::build_function(&lifted, debug, name_at, elf)
-            }
-            Arch::Aarch64 => {
-                let insns =
-                    crate::arch::aarch64::decode(slice, f.addr.0).map_err(Error::Aarch64Decode)?;
-                let lifted = crate::arch::aarch64::lift_function(f.name.clone(), &insns);
-                aarch64::build_function(&lifted, name_at)
-            }
-            Arch::Bpf { variant } => {
-                let insns =
-                    crate::arch::bpf::decode(slice, f.addr.0, variant).map_err(Error::BpfDecode)?;
-                let lifted = crate::arch::bpf::lift_function(f.name.clone(), &insns);
-                bpf::build_function(&lifted, name_at, call_site_names, variant, Some(elf))
-            }
-        };
-        out.push(Item::Function(fn_decl));
+        // Opaque arches have no functions (see `decompile`).
+        if matches!(arch, Arch::Opaque) {
+            continue;
+        }
+        if raw_functions.contains(&f.addr.0) {
+            out.push(Item::Raw {
+                addr: f.addr.0,
+                bytes: slice.to_vec(),
+            });
+        } else {
+            let built =
+                decode_function(elf, f, slice, arch, debug_by_addr, name_at, call_site_names);
+            out.extend(function_or_bytes(f, slice, built));
+        }
         cursor = f.addr.0.saturating_add(f.size);
     }
 
@@ -1274,6 +1495,62 @@ fn build_section_items(
     }
 
     Ok(out)
+}
+
+/// The item for a decoded function, or for its bytes, with a note on
+/// why, when it couldn't be decoded.
+fn function_or_bytes(
+    f: &crate::analysis::Function,
+    slice: &[u8],
+    built: Result<crate::ast::FnDecl>,
+) -> Vec<Item> {
+    match built {
+        Ok(fn_decl) => vec![Item::Function(fn_decl)],
+        Err(e) => vec![
+            Item::Comment(format!(
+                "note: `{}` at 0x{:x} kept as bytes: {e}",
+                f.name, f.addr.0
+            )),
+            Item::Raw {
+                addr: f.addr.0,
+                bytes: slice.to_vec(),
+            },
+        ],
+    }
+}
+
+/// Decode, lift and build one function.
+fn decode_function(
+    elf: &Elf64File,
+    f: &crate::analysis::Function,
+    slice: &[u8],
+    arch: Arch,
+    debug_by_addr: &HashMap<u64, DebugFunction>,
+    name_at: &HashMap<u64, String>,
+    call_site_names: &HashMap<u64, String>,
+) -> Result<crate::ast::FnDecl> {
+    match arch {
+        Arch::Opaque => Err(Error::UnsupportedMachine(elf.ehdr.e_machine)),
+        Arch::X86 { bitness } => decode(bitness, slice, f.addr.0)
+            .map_err(Error::from)
+            .and_then(|insns| Ok(lift_function(f.name.clone(), &insns)?))
+            .map(|lifted| {
+                let debug = debug_by_addr.get(&f.addr.0);
+                build_function::build_function(&lifted, debug, name_at, elf)
+            }),
+        Arch::Aarch64 => crate::arch::aarch64::decode(slice, f.addr.0)
+            .map_err(Error::Aarch64Decode)
+            .map(|insns| {
+                let lifted = crate::arch::aarch64::lift_function(f.name.clone(), &insns);
+                aarch64::build_function(&lifted, name_at)
+            }),
+        Arch::Bpf { variant } => crate::arch::bpf::decode(slice, f.addr.0, variant)
+            .map_err(Error::BpfDecode)
+            .map(|insns| {
+                let lifted = crate::arch::bpf::lift_function(f.name.clone(), &insns);
+                bpf::build_function(&lifted, name_at, call_site_names, variant, Some(elf))
+            }),
+    }
 }
 
 /// Emit a section gap. For non-executable sections or non-BPF

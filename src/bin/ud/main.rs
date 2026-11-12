@@ -88,6 +88,12 @@ enum Command {
         /// image defaults to ending at $FFFF).
         #[arg(long, value_parser = parse_u64)]
         load_addr: Option<u64>,
+
+        /// ELF: emit the decompiler's source as is. By default it is
+        /// compiled back first, and any function whose source doesn't
+        /// rebuild its bytes is kept as `@raw` instead.
+        #[arg(long)]
+        no_verify: bool,
     },
 
     /// Verify a `.ud` source file: parse, then check every `@asm`
@@ -977,6 +983,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             listing,
             arch,
             load_addr,
+            no_verify,
         } => {
             let evm = |code: &[u8]| {
                 if listing {
@@ -1012,8 +1019,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             } else if univdreams::format::elf::is_elf64_le(&bytes) {
                 let elf = univdreams::format::elf::Elf64File::parse(&bytes)
                     .with_context(|| format!("parse {} as ELF", input.display()))?;
-                univdreams::translate::decompile::decompile_to_text(&elf)
-                    .with_context(|| format!("decompile {}", input.display()))?
+                if no_verify {
+                    univdreams::translate::decompile::decompile_to_text(&elf)
+                        .with_context(|| format!("decompile {}", input.display()))?
+                } else {
+                    verified_elf_source(&elf, &bytes, &input)?
+                }
             } else if univdreams::format::ne::is_ne(&bytes) {
                 // Before PE: both start with `MZ`, and `is_pe` checks only
                 // that, so the 16-bit NE has to be detected first.
@@ -2909,8 +2920,7 @@ fn solana_cmd(
     }
     let elf = univdreams::format::elf::Elf64File::parse(&elf_bytes)
         .with_context(|| format!("parse stripped ELF from {program_id}"))?;
-    let source = univdreams::translate::decompile::decompile_to_text(&elf)
-        .with_context(|| format!("decompile {program_id}"))?;
+    let source = verified_elf_source(&elf, &elf_bytes, Path::new(program_id))?;
     if let Some(path) = out {
         std::fs::write(path, source).with_context(|| format!("write {}", path.display()))?;
     } else {
@@ -5502,4 +5512,40 @@ fn parse_u64(s: &str) -> Result<u64, String> {
         None => s.parse(),
     };
     parsed.map_err(|e| format!("invalid number {s:?}: {e}"))
+}
+
+/// Decompile an ELF so it compiles back to `bytes`, warning about each
+/// part kept as bytes because its source didn't.
+fn verified_elf_source(
+    elf: &univdreams::format::elf::Elf64File,
+    bytes: &[u8],
+    input: &Path,
+) -> anyhow::Result<String> {
+    let verified = univdreams::translate::decompile::decompile_verified(elf, bytes)
+        .with_context(|| format!("decompile {}", input.display()))?;
+    if let Some(reason) = &verified.opaque {
+        eprintln!(
+            "warning: {}: all code kept as bytes, its source didn't compile back: {reason}",
+            input.display()
+        );
+    } else if !verified.raw_functions.is_empty() {
+        let names: Vec<String> = verified
+            .raw_functions
+            .iter()
+            .take(8)
+            .map(|(addr, name)| format!("{name}@{addr:#x}"))
+            .collect();
+        eprintln!(
+            "warning: {}: {} function(s) kept as bytes, their source didn't compile back: {}{}",
+            input.display(),
+            verified.raw_functions.len(),
+            names.join(", "),
+            if verified.raw_functions.len() > names.len() {
+                ", …"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(univdreams::ast::emit(&verified.ast))
 }

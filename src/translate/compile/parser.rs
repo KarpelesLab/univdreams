@@ -24,8 +24,17 @@ pub enum ParseError {
     #[error("unknown directive `@{name}` at line {line}, col {col}")]
     UnknownDirective { name: String, line: u32, col: u32 },
 
-    #[error("unexpected end of input")]
-    UnexpectedEof,
+    #[error("unexpected end of input{}", open_at(.0))]
+    UnexpectedEof(Vec<(u32, u32)>),
+}
+
+/// ` in the statement at line L, col C`: where the innermost statement
+/// still open at end of input began, which is usually the one that
+/// swallowed the rest of the file.
+fn open_at(open: &[(u32, u32)]) -> String {
+    open.last()
+        .map(|(line, col)| format!(" in the statement at line {line}, col {col}"))
+        .unwrap_or_default()
 }
 
 /// Parse `input` into an AST. Returns the first error encountered.
@@ -45,6 +54,9 @@ struct Parser {
     /// fixtures without an explicit `bits` field still encode
     /// correctly.
     bits: u32,
+    /// Token indices of the statements being parsed, outermost first,
+    /// so an unexpected end of input can say where it went wrong.
+    open_stmts: Vec<usize>,
 }
 
 impl Parser {
@@ -54,6 +66,7 @@ impl Parser {
             tokens,
             pos: 0,
             bits: 32,
+            open_stmts: Vec::new(),
         }
     }
 
@@ -612,7 +625,15 @@ impl Parser {
                 col: kw_tok.col,
             });
         }
-        let name = self.expect_ident("function name")?;
+        // A name that isn't an identifier (`foo$bar`, `memcpy@GLIBC`)
+        // is written as a string.
+        let name = if let TokenKind::String(name) = &self.peek().kind {
+            let name = name.clone();
+            self.bump();
+            name
+        } else {
+            self.expect_ident("function name")?
+        };
         self.expect(&TokenKind::LParen, "`(` after function name")?;
 
         // Parameter list: empty `(...)` means no signature; non-empty
@@ -720,9 +741,14 @@ impl Parser {
     fn parse_stmt_list_until_rbrace(&mut self) -> Result<Vec<Stmt>, ParseError> {
         let mut body = Vec::new();
         loop {
+            match self.peek().kind {
+                TokenKind::RBrace => break,
+                TokenKind::Eof => return Err(self.eof()),
+                _ => self.open_stmts.push(self.pos),
+            }
             match self.peek().kind.clone() {
                 TokenKind::RBrace => break,
-                TokenKind::Eof => return Err(ParseError::UnexpectedEof),
+                TokenKind::Eof => return Err(self.eof()),
                 TokenKind::Comment(text) => {
                     self.bump();
                     body.push(Stmt::Comment(text));
@@ -793,8 +819,21 @@ impl Parser {
                     });
                 }
             }
+            self.open_stmts.pop();
         }
         Ok(body)
+    }
+
+    /// The error for running out of tokens, naming the statements that
+    /// were still open.
+    fn eof(&self) -> ParseError {
+        ParseError::UnexpectedEof(
+            self.open_stmts
+                .iter()
+                .filter_map(|&i| self.tokens.get(i))
+                .map(|t| (t.line, t.col))
+                .collect(),
+        )
     }
 
     /// Pick between call and assignment statement based on the
@@ -1077,9 +1116,7 @@ impl Parser {
         }
         if matches!(tok.kind, TokenKind::LBracket) {
             let start = tok.start;
-            let close = self
-                .find_matching_close(self.pos)
-                .ok_or(ParseError::UnexpectedEof)?;
+            let close = self.find_matching_close(self.pos).ok_or(self.eof())?;
             let end = self.tokens[close].end;
             let text = self.src[start..end].to_string();
             while self.pos < self.tokens.len() && self.pos <= close {
@@ -1091,9 +1128,7 @@ impl Parser {
         // indirect call through a register known to hold a constant.
         // The parentheses are the emitter's, so they aren't kept.
         if matches!(tok.kind, TokenKind::LParen) {
-            let close = self
-                .find_matching_close(self.pos)
-                .ok_or(ParseError::UnexpectedEof)?;
+            let close = self.find_matching_close(self.pos).ok_or(self.eof())?;
             let inner = self.src[tok.end..self.tokens[close].start]
                 .trim()
                 .to_string();
@@ -1208,7 +1243,7 @@ impl Parser {
                     seg_token_count = 0;
                 }
                 TokenKind::Eof => {
-                    return Err(ParseError::UnexpectedEof);
+                    return Err(self.eof());
                 }
                 TokenKind::String(s) => {
                     if seg_token_count == 0 {
@@ -1614,7 +1649,7 @@ impl Parser {
         loop {
             match self.peek().kind {
                 TokenKind::Semicolon | TokenKind::Hash => break,
-                TokenKind::Eof => return Err(ParseError::UnexpectedEof),
+                TokenKind::Eof => return Err(self.eof()),
                 _ => {
                     self.bump();
                 }
@@ -1634,7 +1669,7 @@ impl Parser {
         loop {
             match self.peek().kind {
                 TokenKind::Semicolon => break,
-                TokenKind::Eof => return Err(ParseError::UnexpectedEof),
+                TokenKind::Eof => return Err(self.eof()),
                 _ => {
                     self.bump();
                 }
@@ -1703,8 +1738,18 @@ impl Parser {
     /// `parse_stmt_list_until_rbrace` so we can reuse the dispatch
     /// logic in `parse_if_body_with_optional_arms`.
     fn parse_stmt_list_one(&mut self) -> Result<Stmt, ParseError> {
+        if self.peek().kind == TokenKind::Eof {
+            return Err(self.eof());
+        }
+        self.open_stmts.push(self.pos);
+        let stmt = self.parse_stmt_list_one_inner()?;
+        self.open_stmts.pop();
+        Ok(stmt)
+    }
+
+    fn parse_stmt_list_one_inner(&mut self) -> Result<Stmt, ParseError> {
         match self.peek().kind.clone() {
-            TokenKind::Eof => Err(ParseError::UnexpectedEof),
+            TokenKind::Eof => Err(self.eof()),
             TokenKind::Comment(text) => {
                 self.bump();
                 Ok(Stmt::Comment(text))
@@ -1902,7 +1947,7 @@ impl Parser {
                     let end_pos = tok.start;
                     return Ok(self.src[start_pos..end_pos].trim().to_string());
                 }
-                TokenKind::Eof => return Err(ParseError::UnexpectedEof),
+                TokenKind::Eof => return Err(self.eof()),
                 _ => {
                     self.bump();
                 }
@@ -2198,7 +2243,7 @@ impl Parser {
                     self.bump();
                     break;
                 }
-                TokenKind::Eof => return Err(ParseError::UnexpectedEof),
+                TokenKind::Eof => return Err(self.eof()),
                 TokenKind::Comment(_) => {
                     self.bump(); // tolerate comments between arms; they're not retained
                 }
@@ -2988,5 +3033,14 @@ fn f() {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn end_of_input_names_the_open_statement() {
+        let err = parse("@module {}\n\nfn f() {\n    x = 1\n    if (a == 0) {\n").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unexpected end of input in the statement at line 5, col 5"
+        );
     }
 }
