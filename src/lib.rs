@@ -23,6 +23,7 @@ pub mod emulator;
 pub mod format;
 pub mod ir;
 pub mod signatures;
+pub mod sleigh;
 pub mod translate;
 #[cfg(feature = "wasm")]
 pub mod wasm;

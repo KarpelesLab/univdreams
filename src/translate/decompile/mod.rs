@@ -135,8 +135,17 @@ pub fn decompile(elf: &Elf64File) -> Result<UdFile> {
 
 /// [`decompile`], keeping what `options` names as bytes.
 pub fn decompile_with(elf: &Elf64File, options: &Options) -> Result<UdFile> {
-    let arch = match (elf.class, elf.ehdr.e_machine) {
-        _ if options.opaque => Arch::Opaque,
+    let arch = if options.opaque {
+        Arch::Opaque
+    } else {
+        arch_of(elf)
+    };
+    decompile_arch(elf, arch, options)
+}
+
+/// The backend that decodes `elf`'s code.
+fn arch_of(elf: &Elf64File) -> Arch {
+    match (elf.class, elf.ehdr.e_machine) {
         (ElfClass::Elf64, EM_X86_64) => Arch::X86 {
             bitness: Bitness::Bits64,
         },
@@ -160,8 +169,10 @@ pub fn decompile_with(elf: &Elf64File, options: &Options) -> Result<UdFile> {
             variant: crate::arch::bpf::BpfVariant::Sbfv1,
         },
         _ => Arch::Opaque,
-    };
+    }
+}
 
+fn decompile_arch(elf: &Elf64File, arch: Arch, options: &Options) -> Result<UdFile> {
     let module = build_module::build_module(elf);
     // Without a decoder there's nothing to body: sections stay `@raw`.
     let (map, debug_by_addr) = if matches!(arch, Arch::Opaque) {
@@ -1066,6 +1077,14 @@ pub struct Verified {
 /// can't be pinned on functions, or the source doesn't compile at all,
 /// every function is kept as bytes.
 pub fn decompile_verified(elf: &Elf64File, bytes: &[u8]) -> Result<Verified> {
+    if matches!(arch_of(elf), Arch::Opaque) {
+        // All code is bytes already.
+        return Ok(Verified {
+            ast: decompile(elf)?,
+            raw_functions: Vec::new(),
+            opaque: None,
+        });
+    }
     let map = discover_functions(elf)?;
     let mut options = Options::default();
     let reason = loop {

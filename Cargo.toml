@@ -14,7 +14,10 @@ readme = "README.md"
 exclude = ["/testdata", "/site", "/docs", "/.github"]
 
 [features]
-default = ["cli"]
+default = ["cli", "sleigh"]
+# Embed Ghidra's SLEIGH specifications (`sleigh-specs/`, ~9 MB of text) to
+# decode the architectures without a hand-written decoder.
+sleigh = []
 # The `ud` command-line driver (and the `cli` module it is built on).
 cli = ["dep:clap", "dep:anyhow", "dep:serde_json", "dep:ureq", "dep:bs58", "dep:base64", "dep:libc"]
 # `ud script`: drive the sandbox from JavaScript (kataan engine).

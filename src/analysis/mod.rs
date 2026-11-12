@@ -78,7 +78,10 @@ pub fn discover_functions(elf: &Elf64File) -> Result<FunctionMap> {
     for f in entry::discover_entry_point(elf) {
         map.insert(f);
     }
-    for f in discover_from_eh_frame(elf)? {
+    // Unwind tables and PLT relocations are best-effort sources: a
+    // malformed one (or a layout not handled yet, such as ELF32 RELA)
+    // contributes nothing rather than failing discovery.
+    for f in discover_from_eh_frame(elf).unwrap_or_default() {
         map.insert(f);
     }
     // BPF / SBF: harvest function entries from local `call`
@@ -104,7 +107,7 @@ pub fn discover_functions(elf: &Elf64File) -> Result<FunctionMap> {
     for f in discover_from_signatures(elf) {
         map.insert(f);
     }
-    for f in discover_plt_thunks(elf)? {
+    for f in discover_plt_thunks(elf).unwrap_or_default() {
         map.insert(f);
     }
     for f in discover_from_symbol_tables(elf)? {

@@ -7,4 +7,6 @@ pub mod codec;
 pub mod evm;
 pub mod mos6502;
 pub mod opaque;
+#[cfg(feature = "sleigh")]
+pub mod sleigh;
 pub mod x86;
