@@ -193,7 +193,8 @@ Driven by a corpus of a few thousand firmware blobs (raw images and ELF, for ARM
 - [x] Opaque architectures: ELF of any `e_machine` keeps its headers, sections and segments, with code as `@raw` until a decoder lands, and names its CPU (`arch: "hexagon"`); headerless inputs nothing recognises become a `format: "raw"` image of `@raw` blocks; `ud decompile --arch <cpu> --load-addr <addr>` labels a headerless input instead of guessing.
 - [x] 6502 raw images: the image heuristic checks that the reset code decodes; bytes before the first function and a truncated last instruction stay `@raw`; unnamed zero-page stores (`$0D = A`) parse back.
 - [x] ELF decompiles are verified: `ud decompile` compiles the source back, and a function whose source doesn't rebuild its bytes (or that doesn't decode) is kept as `@raw` and reported; `--no-verify` skips it.
-- [ ] Containers: Intel HEX, Qualcomm MBN, Cypress CYACD, TI ROM boot tables; big-endian ELF.
+- [x] Big-endian ELF (MIPS, PowerPC, SPARC, S/390, …) round-trips; a truncated or malformed ELF falls back to a raw image labelled with its header's CPU.
+- [ ] Containers: Intel HEX, Qualcomm MBN, Cypress CYACD, TI ROM boot tables.
 - [ ] Decoders for the corpus' CPUs from Ghidra's SLEIGH processor specs (a pure-Rust SLEIGH engine), so instructions round-trip as `@asm` with pinned bytes; encoders and lifting after.
   - [x] icicle-emu's SLEIGH engine vendored (`src/sleigh/`), Ghidra's specs for 32 processors embedded (`sleigh-specs/`, feature `sleigh`); 72 of 126 languages compile.
   - [ ] Engine gaps: named offsets outside the register space (AVR, NDS32, V850, RISC-V, PIC-18), parser gaps (Hexagon, TriCore, SH-4, M16C, PIC24, ARMv8-M, MCS96), partially overlapping registers (Dalvik, CR16), panics (PIC-12/16/17, CP1600).

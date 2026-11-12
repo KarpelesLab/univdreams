@@ -1017,13 +1017,28 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let source = if let Some(arch) = arch.as_deref().filter(|_| !container) {
                 headerless(&bytes, arch)?
             } else if univdreams::format::elf::is_elf64_le(&bytes) {
-                let elf = univdreams::format::elf::Elf64File::parse(&bytes)
-                    .with_context(|| format!("parse {} as ELF", input.display()))?;
-                if no_verify {
-                    univdreams::translate::decompile::decompile_to_text(&elf)
-                        .with_context(|| format!("decompile {}", input.display()))?
-                } else {
-                    verified_elf_source(&elf, &bytes, &input)?
+                match univdreams::format::elf::Elf64File::parse(&bytes) {
+                    Err(e) => {
+                        // Truncated or otherwise malformed: keep every byte,
+                        // labelled with the CPU its header names.
+                        eprintln!(
+                            "warning: {}: not a well-formed ELF ({e}); kept as raw bytes",
+                            input.display()
+                        );
+                        let arch = univdreams::format::elf::header_machine(&bytes)
+                            .and_then(univdreams::arch::opaque::elf_machine_name)
+                            .unwrap_or("unknown");
+                        univdreams::translate::decompile::decompile_raw_opaque_to_text(
+                            &bytes,
+                            arch,
+                            load_addr.unwrap_or(0),
+                        )
+                    }
+                    Ok(elf) if no_verify => {
+                        univdreams::translate::decompile::decompile_to_text(&elf)
+                            .with_context(|| format!("decompile {}", input.display()))?
+                    }
+                    Ok(elf) => verified_elf_source(&elf, &bytes, &input)?,
                 }
             } else if univdreams::format::ne::is_ne(&bytes) {
                 // Before PE: both start with `MZ`, and `is_pe` checks only

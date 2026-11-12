@@ -1421,7 +1421,10 @@ fn build_section_items(
             strings,
         }]);
     }
+    // `@notes` encodes little-endian; a big-endian file's notes stay
+    // `@raw`.
     if sh.sh_type == SHT_NOTE
+        && !elf.ehdr.is_big_endian()
         && let Some(entries) = decode_notes(data)
     {
         return Ok(vec![Item::Notes {

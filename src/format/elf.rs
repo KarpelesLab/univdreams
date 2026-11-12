@@ -37,6 +37,8 @@ const ELFCLASS64: u8 = 2;
 
 /// `e_ident[EI_DATA]` value for 2's complement little-endian.
 const ELFDATA2LSB: u8 = 1;
+/// `e_ident[EI_DATA]` value for 2's complement big-endian.
+const ELFDATA2MSB: u8 = 2;
 
 /// Whether the on-disk image used 32-bit or 64-bit headers. Recorded
 /// at parse time and consulted on write to round-trip the original
@@ -157,7 +159,7 @@ pub enum Error {
     #[error("unsupported ELF class: {0} (only ELFCLASS32 = 1 and ELFCLASS64 = 2 are implemented)")]
     UnsupportedClass(u8),
 
-    #[error("unsupported ELF data encoding: {0} (only ELFDATA2LSB = 1 is implemented)")]
+    #[error("unsupported ELF data encoding: {0} (only ELFDATA2LSB = 1 and ELFDATA2MSB = 2 exist)")]
     UnsupportedEncoding(u8),
 
     #[error("unexpected e_ehsize: header says {got}, on-disk ELF64 size is {expected}")]
@@ -216,6 +218,12 @@ pub struct Ehdr64 {
 }
 
 impl Ehdr64 {
+    /// Whether the file is big-endian (`ELFDATA2MSB`).
+    #[must_use]
+    pub fn is_big_endian(&self) -> bool {
+        self.e_ident[5] == ELFDATA2MSB
+    }
+
     fn parse(bytes: &[u8]) -> Result<(Self, ElfClass)> {
         if bytes.len() < EI_NIDENT {
             return Err(Error::Truncated {
@@ -232,7 +240,7 @@ impl Ehdr64 {
             bad.copy_from_slice(&e_ident[0..4]);
             return Err(Error::BadMagic(bad));
         }
-        if e_ident[5] != ELFDATA2LSB {
+        if e_ident[5] != ELFDATA2LSB && e_ident[5] != ELFDATA2MSB {
             return Err(Error::UnsupportedEncoding(e_ident[5]));
         }
 
@@ -249,20 +257,21 @@ impl Ehdr64 {
     }
 
     fn parse_64(bytes: &[u8], e_ident: [u8; EI_NIDENT]) -> Result<Self> {
+        let be = e_ident[5] == ELFDATA2MSB;
         ensure_len(bytes, 0, EHDR64_SIZE.into())?;
-        let e_type = read_u16(bytes, 16);
-        let e_machine = read_u16(bytes, 18);
-        let e_version = read_u32(bytes, 20);
-        let e_entry = read_u64(bytes, 24);
-        let e_phoff = read_u64(bytes, 32);
-        let e_shoff = read_u64(bytes, 40);
-        let e_flags = read_u32(bytes, 48);
-        let e_ehsize = read_u16(bytes, 52);
-        let e_phentsize = read_u16(bytes, 54);
-        let e_phnum = read_u16(bytes, 56);
-        let e_shentsize = read_u16(bytes, 58);
-        let e_shnum = read_u16(bytes, 60);
-        let e_shstrndx = read_u16(bytes, 62);
+        let e_type = read_u16(be, bytes, 16);
+        let e_machine = read_u16(be, bytes, 18);
+        let e_version = read_u32(be, bytes, 20);
+        let e_entry = read_u64(be, bytes, 24);
+        let e_phoff = read_u64(be, bytes, 32);
+        let e_shoff = read_u64(be, bytes, 40);
+        let e_flags = read_u32(be, bytes, 48);
+        let e_ehsize = read_u16(be, bytes, 52);
+        let e_phentsize = read_u16(be, bytes, 54);
+        let e_phnum = read_u16(be, bytes, 56);
+        let e_shentsize = read_u16(be, bytes, 58);
+        let e_shnum = read_u16(be, bytes, 60);
+        let e_shstrndx = read_u16(be, bytes, 62);
 
         if e_ehsize != EHDR64_SIZE {
             return Err(Error::BadEhsize {
@@ -302,20 +311,21 @@ impl Ehdr64 {
     }
 
     fn parse_32(bytes: &[u8], e_ident: [u8; EI_NIDENT]) -> Result<Self> {
+        let be = e_ident[5] == ELFDATA2MSB;
         ensure_len(bytes, 0, EHDR32_SIZE.into())?;
-        let e_type = read_u16(bytes, 16);
-        let e_machine = read_u16(bytes, 18);
-        let e_version = read_u32(bytes, 20);
-        let e_entry = u64::from(read_u32(bytes, 24));
-        let e_phoff = u64::from(read_u32(bytes, 28));
-        let e_shoff = u64::from(read_u32(bytes, 32));
-        let e_flags = read_u32(bytes, 36);
-        let e_ehsize = read_u16(bytes, 40);
-        let e_phentsize = read_u16(bytes, 42);
-        let e_phnum = read_u16(bytes, 44);
-        let e_shentsize = read_u16(bytes, 46);
-        let e_shnum = read_u16(bytes, 48);
-        let e_shstrndx = read_u16(bytes, 50);
+        let e_type = read_u16(be, bytes, 16);
+        let e_machine = read_u16(be, bytes, 18);
+        let e_version = read_u32(be, bytes, 20);
+        let e_entry = u64::from(read_u32(be, bytes, 24));
+        let e_phoff = u64::from(read_u32(be, bytes, 28));
+        let e_shoff = u64::from(read_u32(be, bytes, 32));
+        let e_flags = read_u32(be, bytes, 36);
+        let e_ehsize = read_u16(be, bytes, 40);
+        let e_phentsize = read_u16(be, bytes, 42);
+        let e_phnum = read_u16(be, bytes, 44);
+        let e_shentsize = read_u16(be, bytes, 46);
+        let e_shnum = read_u16(be, bytes, 48);
+        let e_shstrndx = read_u16(be, bytes, 50);
 
         if e_ehsize != EHDR32_SIZE {
             return Err(Error::BadEhsize {
@@ -362,39 +372,41 @@ impl Ehdr64 {
     }
 
     fn write_64(&self, out: &mut [u8]) {
+        let be = self.e_ident[5] == ELFDATA2MSB;
         debug_assert!(out.len() >= EHDR64_SIZE as usize);
         out[..EI_NIDENT].copy_from_slice(&self.e_ident);
-        write_u16(out, 16, self.e_type);
-        write_u16(out, 18, self.e_machine);
-        write_u32(out, 20, self.e_version);
-        write_u64(out, 24, self.e_entry);
-        write_u64(out, 32, self.e_phoff);
-        write_u64(out, 40, self.e_shoff);
-        write_u32(out, 48, self.e_flags);
-        write_u16(out, 52, self.e_ehsize);
-        write_u16(out, 54, self.e_phentsize);
-        write_u16(out, 56, self.e_phnum);
-        write_u16(out, 58, self.e_shentsize);
-        write_u16(out, 60, self.e_shnum);
-        write_u16(out, 62, self.e_shstrndx);
+        write_u16(be, out, 16, self.e_type);
+        write_u16(be, out, 18, self.e_machine);
+        write_u32(be, out, 20, self.e_version);
+        write_u64(be, out, 24, self.e_entry);
+        write_u64(be, out, 32, self.e_phoff);
+        write_u64(be, out, 40, self.e_shoff);
+        write_u32(be, out, 48, self.e_flags);
+        write_u16(be, out, 52, self.e_ehsize);
+        write_u16(be, out, 54, self.e_phentsize);
+        write_u16(be, out, 56, self.e_phnum);
+        write_u16(be, out, 58, self.e_shentsize);
+        write_u16(be, out, 60, self.e_shnum);
+        write_u16(be, out, 62, self.e_shstrndx);
     }
 
     fn write_32(&self, out: &mut [u8]) {
+        let be = self.e_ident[5] == ELFDATA2MSB;
         debug_assert!(out.len() >= EHDR32_SIZE as usize);
         out[..EI_NIDENT].copy_from_slice(&self.e_ident);
-        write_u16(out, 16, self.e_type);
-        write_u16(out, 18, self.e_machine);
-        write_u32(out, 20, self.e_version);
-        write_u32(out, 24, self.e_entry as u32);
-        write_u32(out, 28, self.e_phoff as u32);
-        write_u32(out, 32, self.e_shoff as u32);
-        write_u32(out, 36, self.e_flags);
-        write_u16(out, 40, self.e_ehsize);
-        write_u16(out, 42, self.e_phentsize);
-        write_u16(out, 44, self.e_phnum);
-        write_u16(out, 46, self.e_shentsize);
-        write_u16(out, 48, self.e_shnum);
-        write_u16(out, 50, self.e_shstrndx);
+        write_u16(be, out, 16, self.e_type);
+        write_u16(be, out, 18, self.e_machine);
+        write_u32(be, out, 20, self.e_version);
+        write_u32(be, out, 24, self.e_entry as u32);
+        write_u32(be, out, 28, self.e_phoff as u32);
+        write_u32(be, out, 32, self.e_shoff as u32);
+        write_u32(be, out, 36, self.e_flags);
+        write_u16(be, out, 40, self.e_ehsize);
+        write_u16(be, out, 42, self.e_phentsize);
+        write_u16(be, out, 44, self.e_phnum);
+        write_u16(be, out, 46, self.e_shentsize);
+        write_u16(be, out, 48, self.e_shnum);
+        write_u16(be, out, 50, self.e_shstrndx);
     }
 }
 
@@ -412,73 +424,73 @@ pub struct Phdr64 {
 }
 
 impl Phdr64 {
-    fn parse(class: ElfClass, bytes: &[u8]) -> Self {
+    fn parse(class: ElfClass, be: bool, bytes: &[u8]) -> Self {
         match class {
-            ElfClass::Elf64 => Self::parse_64(bytes),
-            ElfClass::Elf32 => Self::parse_32(bytes),
+            ElfClass::Elf64 => Self::parse_64(be, bytes),
+            ElfClass::Elf32 => Self::parse_32(be, bytes),
         }
     }
 
-    fn parse_64(bytes: &[u8]) -> Self {
+    fn parse_64(be: bool, bytes: &[u8]) -> Self {
         debug_assert!(bytes.len() >= PHDR64_SIZE as usize);
         Self {
-            p_type: read_u32(bytes, 0),
-            p_flags: read_u32(bytes, 4),
-            p_offset: read_u64(bytes, 8),
-            p_vaddr: read_u64(bytes, 16),
-            p_paddr: read_u64(bytes, 24),
-            p_filesz: read_u64(bytes, 32),
-            p_memsz: read_u64(bytes, 40),
-            p_align: read_u64(bytes, 48),
+            p_type: read_u32(be, bytes, 0),
+            p_flags: read_u32(be, bytes, 4),
+            p_offset: read_u64(be, bytes, 8),
+            p_vaddr: read_u64(be, bytes, 16),
+            p_paddr: read_u64(be, bytes, 24),
+            p_filesz: read_u64(be, bytes, 32),
+            p_memsz: read_u64(be, bytes, 40),
+            p_align: read_u64(be, bytes, 48),
         }
     }
 
-    fn parse_32(bytes: &[u8]) -> Self {
+    fn parse_32(be: bool, bytes: &[u8]) -> Self {
         // Note the Elf32_Phdr field order differs from Elf64_Phdr:
         //   type offset vaddr paddr filesz memsz flags align
         // (whereas Elf64 places `flags` immediately after `type`).
         debug_assert!(bytes.len() >= PHDR32_SIZE as usize);
         Self {
-            p_type: read_u32(bytes, 0),
-            p_offset: u64::from(read_u32(bytes, 4)),
-            p_vaddr: u64::from(read_u32(bytes, 8)),
-            p_paddr: u64::from(read_u32(bytes, 12)),
-            p_filesz: u64::from(read_u32(bytes, 16)),
-            p_memsz: u64::from(read_u32(bytes, 20)),
-            p_flags: read_u32(bytes, 24),
-            p_align: u64::from(read_u32(bytes, 28)),
+            p_type: read_u32(be, bytes, 0),
+            p_offset: u64::from(read_u32(be, bytes, 4)),
+            p_vaddr: u64::from(read_u32(be, bytes, 8)),
+            p_paddr: u64::from(read_u32(be, bytes, 12)),
+            p_filesz: u64::from(read_u32(be, bytes, 16)),
+            p_memsz: u64::from(read_u32(be, bytes, 20)),
+            p_flags: read_u32(be, bytes, 24),
+            p_align: u64::from(read_u32(be, bytes, 28)),
         }
     }
 
-    fn write(&self, class: ElfClass, out: &mut [u8]) {
+    fn write(&self, class: ElfClass, be: bool, out: &mut [u8]) {
         match class {
-            ElfClass::Elf64 => self.write_64(out),
-            ElfClass::Elf32 => self.write_32(out),
+            ElfClass::Elf64 => self.write_64(be, out),
+            ElfClass::Elf32 => self.write_32(be, out),
         }
     }
 
-    fn write_64(&self, out: &mut [u8]) {
+    fn write_64(&self, be: bool, out: &mut [u8]) {
         debug_assert!(out.len() >= PHDR64_SIZE as usize);
-        write_u32(out, 0, self.p_type);
-        write_u32(out, 4, self.p_flags);
-        write_u64(out, 8, self.p_offset);
-        write_u64(out, 16, self.p_vaddr);
-        write_u64(out, 24, self.p_paddr);
-        write_u64(out, 32, self.p_filesz);
-        write_u64(out, 40, self.p_memsz);
-        write_u64(out, 48, self.p_align);
+        write_u32(be, out, 0, self.p_type);
+        write_u32(be, out, 4, self.p_flags);
+        write_u64(be, out, 8, self.p_offset);
+        write_u64(be, out, 16, self.p_vaddr);
+        write_u64(be, out, 24, self.p_paddr);
+        write_u64(be, out, 32, self.p_filesz);
+        write_u64(be, out, 40, self.p_memsz);
+        write_u64(be, out, 48, self.p_align);
     }
 
-    fn write_32(&self, out: &mut [u8]) {
+    fn write_32(&self, be: bool, out: &mut [u8]) {
         debug_assert!(out.len() >= PHDR32_SIZE as usize);
-        write_u32(out, 0, self.p_type);
-        write_u32(out, 4, self.p_offset as u32);
-        write_u32(out, 8, self.p_vaddr as u32);
-        write_u32(out, 12, self.p_paddr as u32);
-        write_u32(out, 16, self.p_filesz as u32);
-        write_u32(out, 20, self.p_memsz as u32);
-        write_u32(out, 24, self.p_flags);
-        write_u32(out, 28, self.p_align as u32);
+        write_u32(be, out, 0, self.p_type);
+        write_u32(be, out, 4, self.p_offset as u32);
+        write_u32(be, out, 8, self.p_vaddr as u32);
+        write_u32(be, out, 12, self.p_paddr as u32);
+        write_u32(be, out, 16, self.p_filesz as u32);
+        write_u32(be, out, 20, self.p_memsz as u32);
+        write_u32(be, out, 24, self.p_flags);
+        write_u32(be, out, 28, self.p_align as u32);
     }
 }
 
@@ -498,79 +510,79 @@ pub struct Shdr64 {
 }
 
 impl Shdr64 {
-    fn parse(class: ElfClass, bytes: &[u8]) -> Self {
+    fn parse(class: ElfClass, be: bool, bytes: &[u8]) -> Self {
         match class {
-            ElfClass::Elf64 => Self::parse_64(bytes),
-            ElfClass::Elf32 => Self::parse_32(bytes),
+            ElfClass::Elf64 => Self::parse_64(be, bytes),
+            ElfClass::Elf32 => Self::parse_32(be, bytes),
         }
     }
 
-    fn parse_64(bytes: &[u8]) -> Self {
+    fn parse_64(be: bool, bytes: &[u8]) -> Self {
         debug_assert!(bytes.len() >= SHDR64_SIZE as usize);
         Self {
-            sh_name: read_u32(bytes, 0),
-            sh_type: read_u32(bytes, 4),
-            sh_flags: read_u64(bytes, 8),
-            sh_addr: read_u64(bytes, 16),
-            sh_offset: read_u64(bytes, 24),
-            sh_size: read_u64(bytes, 32),
-            sh_link: read_u32(bytes, 40),
-            sh_info: read_u32(bytes, 44),
-            sh_addralign: read_u64(bytes, 48),
-            sh_entsize: read_u64(bytes, 56),
+            sh_name: read_u32(be, bytes, 0),
+            sh_type: read_u32(be, bytes, 4),
+            sh_flags: read_u64(be, bytes, 8),
+            sh_addr: read_u64(be, bytes, 16),
+            sh_offset: read_u64(be, bytes, 24),
+            sh_size: read_u64(be, bytes, 32),
+            sh_link: read_u32(be, bytes, 40),
+            sh_info: read_u32(be, bytes, 44),
+            sh_addralign: read_u64(be, bytes, 48),
+            sh_entsize: read_u64(be, bytes, 56),
         }
     }
 
-    fn parse_32(bytes: &[u8]) -> Self {
+    fn parse_32(be: bool, bytes: &[u8]) -> Self {
         // Elf32_Shdr field order matches Elf64_Shdr; only widths differ.
         debug_assert!(bytes.len() >= SHDR32_SIZE as usize);
         Self {
-            sh_name: read_u32(bytes, 0),
-            sh_type: read_u32(bytes, 4),
-            sh_flags: u64::from(read_u32(bytes, 8)),
-            sh_addr: u64::from(read_u32(bytes, 12)),
-            sh_offset: u64::from(read_u32(bytes, 16)),
-            sh_size: u64::from(read_u32(bytes, 20)),
-            sh_link: read_u32(bytes, 24),
-            sh_info: read_u32(bytes, 28),
-            sh_addralign: u64::from(read_u32(bytes, 32)),
-            sh_entsize: u64::from(read_u32(bytes, 36)),
+            sh_name: read_u32(be, bytes, 0),
+            sh_type: read_u32(be, bytes, 4),
+            sh_flags: u64::from(read_u32(be, bytes, 8)),
+            sh_addr: u64::from(read_u32(be, bytes, 12)),
+            sh_offset: u64::from(read_u32(be, bytes, 16)),
+            sh_size: u64::from(read_u32(be, bytes, 20)),
+            sh_link: read_u32(be, bytes, 24),
+            sh_info: read_u32(be, bytes, 28),
+            sh_addralign: u64::from(read_u32(be, bytes, 32)),
+            sh_entsize: u64::from(read_u32(be, bytes, 36)),
         }
     }
 
-    fn write(&self, class: ElfClass, out: &mut [u8]) {
+    fn write(&self, class: ElfClass, be: bool, out: &mut [u8]) {
         match class {
-            ElfClass::Elf64 => self.write_64(out),
-            ElfClass::Elf32 => self.write_32(out),
+            ElfClass::Elf64 => self.write_64(be, out),
+            ElfClass::Elf32 => self.write_32(be, out),
         }
     }
 
-    fn write_64(&self, out: &mut [u8]) {
+    fn write_64(&self, be: bool, out: &mut [u8]) {
         debug_assert!(out.len() >= SHDR64_SIZE as usize);
-        write_u32(out, 0, self.sh_name);
-        write_u32(out, 4, self.sh_type);
-        write_u64(out, 8, self.sh_flags);
-        write_u64(out, 16, self.sh_addr);
-        write_u64(out, 24, self.sh_offset);
-        write_u64(out, 32, self.sh_size);
-        write_u32(out, 40, self.sh_link);
-        write_u32(out, 44, self.sh_info);
-        write_u64(out, 48, self.sh_addralign);
-        write_u64(out, 56, self.sh_entsize);
+        write_u32(be, out, 0, self.sh_name);
+        write_u32(be, out, 4, self.sh_type);
+        write_u64(be, out, 8, self.sh_flags);
+        write_u64(be, out, 16, self.sh_addr);
+        write_u64(be, out, 24, self.sh_offset);
+        write_u64(be, out, 32, self.sh_size);
+        write_u32(be, out, 40, self.sh_link);
+        write_u32(be, out, 44, self.sh_info);
+        write_u64(be, out, 48, self.sh_addralign);
+        write_u64(be, out, 56, self.sh_entsize);
     }
 
-    fn write_32(&self, out: &mut [u8]) {
+    fn write_32(&self, be: bool, out: &mut [u8]) {
         debug_assert!(out.len() >= SHDR32_SIZE as usize);
-        write_u32(out, 0, self.sh_name);
-        write_u32(out, 4, self.sh_type);
-        write_u32(out, 8, self.sh_flags as u32);
-        write_u32(out, 12, self.sh_addr as u32);
-        write_u32(out, 16, self.sh_offset as u32);
-        write_u32(out, 20, self.sh_size as u32);
-        write_u32(out, 24, self.sh_link);
-        write_u32(out, 28, self.sh_info);
-        write_u32(out, 32, self.sh_addralign as u32);
-        write_u32(out, 36, self.sh_entsize as u32);
+        write_u32(be, out, 0, self.sh_name);
+        write_u32(be, out, 4, self.sh_type);
+        write_u32(be, out, 8, self.sh_flags as u32);
+        write_u32(be, out, 12, self.sh_addr as u32);
+        write_u32(be, out, 16, self.sh_offset as u32);
+        write_u32(be, out, 20, self.sh_size as u32);
+        write_u32(be, out, 24, self.sh_link);
+        write_u32(be, out, 28, self.sh_info);
+        write_u32(be, out, 32, self.sh_addralign as u32);
+        write_u32(be, out, 36, self.sh_entsize as u32);
     }
 
     fn occupies_file(&self) -> bool {
@@ -615,8 +627,9 @@ pub fn is_elf(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[..4] == ELFMAG
 }
 
-/// Returns true iff `bytes` are an ELF little-endian image of either
-/// class — the flavors [`Elf64File::parse`] handles. Callers that
+/// Returns true iff `bytes` are an ELF image of either class and either
+/// byte order — the flavors [`Elf64File::parse`] handles. (The name
+/// predates big-endian support.) Callers that
 /// route by format (e.g. the CLI's round-trip pipeline) should gate
 /// on this and fall through to a byte-copy for unsupported variants
 /// so the round-trip contract still holds.
@@ -625,7 +638,17 @@ pub fn is_elf64_le(bytes: &[u8]) -> bool {
     bytes.len() >= 6
         && bytes[..4] == ELFMAG
         && (bytes[4] == ELFCLASS32 || bytes[4] == ELFCLASS64)
-        && bytes[5] == ELFDATA2LSB
+        && (bytes[5] == ELFDATA2LSB || bytes[5] == ELFDATA2MSB)
+}
+
+/// The `e_machine` of an ELF header, read in its own byte order, even
+/// when the rest of the file doesn't parse.
+#[must_use]
+pub fn header_machine(bytes: &[u8]) -> Option<u16> {
+    if !is_elf(bytes) || bytes.len() < 20 {
+        return None;
+    }
+    Some(read_u16(bytes[5] == ELFDATA2MSB, bytes, 18))
 }
 
 impl Elf64File {
@@ -669,7 +692,11 @@ impl Elf64File {
         let mut phdrs = Vec::with_capacity(count);
         for i in 0..count {
             let off = start + i * entry_size;
-            phdrs.push(Phdr64::parse(class, &bytes[off..off + entry_size]));
+            phdrs.push(Phdr64::parse(
+                class,
+                ehdr.is_big_endian(),
+                &bytes[off..off + entry_size],
+            ));
         }
         Ok(phdrs)
     }
@@ -698,7 +725,7 @@ impl Elf64File {
         let mut section_data = Vec::with_capacity(count);
         for i in 0..count {
             let off = start + i * entry_size;
-            let sh = Shdr64::parse(class, &bytes[off..off + entry_size]);
+            let sh = Shdr64::parse(class, ehdr.is_big_endian(), &bytes[off..off + entry_size]);
             if sh.occupies_file() {
                 ensure_len(bytes, sh.sh_offset, sh.sh_size)?;
                 let data_off = sh.sh_offset as usize;
@@ -821,7 +848,11 @@ impl Elf64File {
             let entry_size = phdr_size(class) as usize;
             for (i, ph) in self.phdrs.iter().enumerate() {
                 let off = start + i * entry_size;
-                ph.write(class, &mut out[off..off + entry_size]);
+                ph.write(
+                    class,
+                    self.ehdr.is_big_endian(),
+                    &mut out[off..off + entry_size],
+                );
             }
         }
 
@@ -830,7 +861,11 @@ impl Elf64File {
             let entry_size = shdr_size(class) as usize;
             for (i, sh) in self.shdrs.iter().enumerate() {
                 let off = start + i * entry_size;
-                sh.write(class, &mut out[off..off + entry_size]);
+                sh.write(
+                    class,
+                    self.ehdr.is_big_endian(),
+                    &mut out[off..off + entry_size],
+                );
             }
         }
 
@@ -972,28 +1007,58 @@ fn ensure_len(bytes: &[u8], offset: u64, needed: u64) -> Result<()> {
     Ok(())
 }
 
-fn read_u16(bytes: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes(bytes[at..at + 2].try_into().expect("slice was 2 bytes"))
+fn read_u16(be: bool, bytes: &[u8], at: usize) -> u16 {
+    let b = bytes[at..at + 2].try_into().expect("slice was 2 bytes");
+    if be {
+        u16::from_be_bytes(b)
+    } else {
+        u16::from_le_bytes(b)
+    }
 }
 
-fn read_u32(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("slice was 4 bytes"))
+fn read_u32(be: bool, bytes: &[u8], at: usize) -> u32 {
+    let b = bytes[at..at + 4].try_into().expect("slice was 4 bytes");
+    if be {
+        u32::from_be_bytes(b)
+    } else {
+        u32::from_le_bytes(b)
+    }
 }
 
-fn read_u64(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("slice was 8 bytes"))
+fn read_u64(be: bool, bytes: &[u8], at: usize) -> u64 {
+    let b = bytes[at..at + 8].try_into().expect("slice was 8 bytes");
+    if be {
+        u64::from_be_bytes(b)
+    } else {
+        u64::from_le_bytes(b)
+    }
 }
 
-fn write_u16(bytes: &mut [u8], at: usize, value: u16) {
-    bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+fn write_u16(be: bool, bytes: &mut [u8], at: usize, value: u16) {
+    let b = if be {
+        value.to_be_bytes()
+    } else {
+        value.to_le_bytes()
+    };
+    bytes[at..at + 2].copy_from_slice(&b);
 }
 
-fn write_u32(bytes: &mut [u8], at: usize, value: u32) {
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+fn write_u32(be: bool, bytes: &mut [u8], at: usize, value: u32) {
+    let b = if be {
+        value.to_be_bytes()
+    } else {
+        value.to_le_bytes()
+    };
+    bytes[at..at + 4].copy_from_slice(&b);
 }
 
-fn write_u64(bytes: &mut [u8], at: usize, value: u64) {
-    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+fn write_u64(be: bool, bytes: &mut [u8], at: usize, value: u64) {
+    let b = if be {
+        value.to_be_bytes()
+    } else {
+        value.to_le_bytes()
+    };
+    bytes[at..at + 8].copy_from_slice(&b);
 }
 
 #[cfg(test)]
@@ -1031,11 +1096,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_big_endian() {
+    fn rejects_unknown_data_encoding() {
         let mut v = minimal_ehdr_bytes();
-        v[5] = 2; // ELFDATA2MSB
+        v[5] = 3;
         let err = Elf64File::parse(&v).unwrap_err();
-        assert!(matches!(err, Error::UnsupportedEncoding(2)));
+        assert!(matches!(err, Error::UnsupportedEncoding(3)));
+    }
+
+    #[test]
+    fn big_endian_round_trips() {
+        // The minimal header, byte-swapped field by field.
+        let le = minimal_ehdr_bytes();
+        let mut be = le.clone();
+        be[5] = 2;
+        for (at, len) in [
+            (16, 2),
+            (18, 2),
+            (20, 4),
+            (24, 8),
+            (32, 8),
+            (40, 8),
+            (48, 4),
+        ]
+        .into_iter()
+        .chain([(52, 2), (54, 2), (56, 2), (58, 2), (60, 2), (62, 2)])
+        {
+            be[at..at + len].reverse();
+        }
+        let file = Elf64File::parse(&be).expect("big-endian header parses");
+        assert!(file.ehdr.is_big_endian());
+        assert_eq!(file.ehdr.e_ehsize, EHDR64_SIZE);
+        assert_eq!(file.write_to_vec(), be);
     }
 
     #[test]
