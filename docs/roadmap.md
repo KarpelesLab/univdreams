@@ -198,7 +198,8 @@ Driven by a corpus of a few thousand firmware blobs (raw images and ELF, for ARM
 - [ ] Decoders for the corpus' CPUs from Ghidra's SLEIGH processor specs (a pure-Rust SLEIGH engine), so instructions round-trip as `@asm` with pinned bytes; encoders and lifting after.
   - [x] icicle-emu's SLEIGH engine vendored (`src/sleigh/`), Ghidra's specs for 32 processors embedded (`sleigh-specs/`, feature `sleigh`); 72 of 126 languages compile.
   - [ ] Engine gaps: named offsets outside the register space (AVR, NDS32, V850, RISC-V, PIC-18), parser gaps (Hexagon, TriCore, SH-4, M16C, PIC24, ARMv8-M, MCS96), partially overlapping registers (Dalvik, CR16), panics (PIC-12/16/17, CP1600).
-  - [ ] Decode opaque ELF and raw code as `@asm` with pinned bytes.
+  - [x] Opaque ELF code (ARM, MIPS, PowerPC, SPARC, 68k, Xtensa, SH-2, MSP430, Z80, LoongArch) and `--arch` raw images disassemble to `@asm` with pinned bytes, in `code_<addr>` blocks.
+  - [ ] Function boundaries and ARM/Thumb interworking (mapping symbols); ELF without section headers (code from `PT_LOAD` segments); memory use on very large images.
 
 ## Beyond v1
 

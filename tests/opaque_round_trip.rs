@@ -32,15 +32,18 @@ fn elf_round_trip(bytes: &[u8]) -> String {
 
 #[test]
 fn elf_of_an_undecoded_architecture() {
-    // Real ELF64 and ELF32 layouts, relabelled as CPUs with no decoder.
-    for (name, machine, arch) in [
-        ("sqrt-gcc13-O0", 164, "hexagon"),
-        ("sqrt-gcc13-O0-m32", 40, "arm"),
-        ("loops-gcc14-O0-m32", 8, "mips"),
+    // Real ELF64 and ELF32 layouts, relabelled as CPUs with no
+    // hand-written decoder. x86 code read as ARM or MIPS is nonsense,
+    // but each instruction keeps its bytes, so it still round-trips.
+    for (name, machine, arch, sleigh) in [
+        ("sqrt-gcc13-O0", 164, "hexagon", false),
+        ("sqrt-gcc13-O0-m32", 40, "arm", true),
+        ("loops-gcc14-O0-m32", 8, "mips", true),
     ] {
         let text = elf_round_trip(&with_machine(fixture(name), machine));
         assert!(text.contains(&format!("arch: \"{arch}\"")), "{name}");
-        assert!(!text.contains("@asm("), "{name}: code should stay @raw");
+        let disassembled = cfg!(feature = "sleigh") && sleigh;
+        assert_eq!(text.contains("@asm("), disassembled, "{name}");
     }
 }
 

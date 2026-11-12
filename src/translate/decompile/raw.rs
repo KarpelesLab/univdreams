@@ -29,6 +29,13 @@ pub fn decompile_raw_opaque(bytes: &[u8], arch: &str, load_addr: u64) -> UdFile 
             ),
         ],
     };
+    // Disassembled when a SLEIGH spec covers `arch`.
+    let code = super::sleigh::named_language(arch)
+        .filter(|_| !bytes.is_empty())
+        .and_then(|lang| super::sleigh::code_items(lang, load_addr, bytes));
+    if let Some(items) = code {
+        return UdFile { module, items };
+    }
     let items = bytes
         .chunks(BLOCK)
         .enumerate()

@@ -245,6 +245,11 @@ impl Disassembler<'_> {
     /// The instruction at the start of `bytes`, loaded at `addr`: its
     /// length and text. `None` if the bytes don't decode.
     pub fn decode(&mut self, bytes: &[u8], addr: u64) -> Option<(usize, String)> {
+        // The engine copies what it's given; no instruction is longer
+        // than this, and copying the rest of a large image per
+        // instruction would make a sweep quadratic.
+        const WINDOW: usize = 64;
+        let bytes = &bytes[..bytes.len().min(WINDOW)];
         let sleigh = &self.lang.sleigh;
         let insn = self.runtime.decode(sleigh, addr, bytes)?;
         let len = usize::try_from(insn.inst_next.checked_sub(insn.inst_start)?).ok()?;

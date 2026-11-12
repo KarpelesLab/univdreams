@@ -48,6 +48,7 @@ mod patterns;
 pub mod pe;
 pub mod raw;
 pub mod raw6502;
+pub mod sleigh;
 mod ssa;
 mod stack_slots;
 pub mod wasm;
@@ -174,6 +175,17 @@ fn arch_of(elf: &Elf64File) -> Arch {
 
 fn decompile_arch(elf: &Elf64File, arch: Arch, options: &Options) -> Result<UdFile> {
     let module = build_module::build_module(elf);
+    // No hand-written decoder: disassemble with SLEIGH when a spec
+    // covers the machine (unless all code is to stay bytes).
+    let sleigh_language = if matches!(arch, Arch::Opaque) && !options.opaque {
+        sleigh::elf_language(
+            elf.ehdr.e_machine,
+            matches!(elf.class, ElfClass::Elf64),
+            elf.ehdr.is_big_endian(),
+        )
+    } else {
+        None
+    };
     // Without a decoder there's nothing to body: sections stay `@raw`.
     let (map, debug_by_addr) = if matches!(arch, Arch::Opaque) {
         (FunctionMap::default(), HashMap::new())
@@ -228,17 +240,23 @@ fn decompile_arch(elf: &Elf64File, arch: Arch, options: &Options) -> Result<UdFi
         let name = elf
             .section_name(idx)
             .map_or_else(|| format!("section{idx}"), str::to_string);
-        let mut section_items = build_section_items(
-            elf,
-            sh,
-            data,
-            &map,
-            &debug_by_addr,
-            &name_at,
-            &call_site_names,
-            arch,
-            &options.raw_functions,
-        )?;
+        let sleigh_code = sleigh_language
+            .filter(|_| sh.sh_flags & SHF_EXECINSTR != 0 && !data.is_empty())
+            .and_then(|lang| sleigh::code_items(lang, sh.sh_addr, data));
+        let mut section_items = match sleigh_code {
+            Some(items) => items,
+            None => build_section_items(
+                elf,
+                sh,
+                data,
+                &map,
+                &debug_by_addr,
+                &name_at,
+                &call_site_names,
+                arch,
+                &options.raw_functions,
+            )?,
+        };
         drop_redundant_function_addrs(sh.sh_addr, &mut section_items);
         items.push(Item::Section {
             name,
@@ -1078,11 +1096,30 @@ pub struct Verified {
 /// every function is kept as bytes.
 pub fn decompile_verified(elf: &Elf64File, bytes: &[u8]) -> Result<Verified> {
     if matches!(arch_of(elf), Arch::Opaque) {
-        // All code is bytes already.
+        // Code is bytes, or SLEIGH instructions with their bytes pinned:
+        // check it all the same, and keep bytes if anything is off.
+        let ast = decompile(elf)?;
+        let reason = match rebuild(elf, &FunctionMap::default(), &ast) {
+            Rebuilt::Bytes(rebuilt) if rebuilt == bytes => {
+                return Ok(Verified {
+                    ast,
+                    raw_functions: Vec::new(),
+                    opaque: None,
+                });
+            }
+            Rebuilt::Bytes(_) => "differs".to_string(),
+            Rebuilt::Failed { reason, .. } => reason,
+        };
         return Ok(Verified {
-            ast: decompile(elf)?,
+            ast: decompile_with(
+                elf,
+                &Options {
+                    opaque: true,
+                    ..Options::default()
+                },
+            )?,
             raw_functions: Vec::new(),
-            opaque: None,
+            opaque: Some(reason),
         });
     }
     let map = discover_functions(elf)?;
