@@ -104,6 +104,7 @@ fn collect_one_table(
         });
     }
 
+    let be = elf.ehdr.is_big_endian();
     let strtab_idx = shdr.sh_link as usize;
     let strtab = elf
         .section_data(strtab_idx)
@@ -111,8 +112,8 @@ fn collect_one_table(
 
     for (sym_idx, chunk) in table.chunks_exact(entry_size).enumerate() {
         let (st_name, st_info, st_shndx, st_value, st_size) = match elf.class {
-            ElfClass::Elf64 => parse_sym64(chunk),
-            ElfClass::Elf32 => parse_sym32(chunk),
+            ElfClass::Elf64 => parse_sym64(chunk, be),
+            ElfClass::Elf32 => parse_sym32(chunk, be),
         };
 
         let st_type = st_info & 0xf;
@@ -157,38 +158,116 @@ fn collect_one_table(
     Ok(())
 }
 
+/// A `u16`, `u32` or `u64` field of a symbol, in the file's byte order.
+fn field<const N: usize>(chunk: &[u8], at: usize, be: bool) -> u64 {
+    let bytes: [u8; N] = chunk[at..at + N].try_into().unwrap();
+    let mut value = 0u64;
+    for i in 0..N {
+        let byte = if be { bytes[i] } else { bytes[N - 1 - i] };
+        value = value << 8 | u64::from(byte);
+    }
+    value
+}
+
 /// Decode an `Elf64_Sym` entry. Field order:
 /// `st_name(4) st_info(1) st_other(1) st_shndx(2) st_value(8) st_size(8)`.
-fn parse_sym64(chunk: &[u8]) -> (u32, u8, u16, u64, u64) {
-    let st_name = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-    let st_info = chunk[4];
+#[allow(clippy::cast_possible_truncation)]
+fn parse_sym64(chunk: &[u8], be: bool) -> (u32, u8, u16, u64, u64) {
     // chunk[5] is st_other (visibility); preserved on round-trip
     // but irrelevant to function discovery.
-    let st_shndx = u16::from_le_bytes(chunk[6..8].try_into().unwrap());
-    let st_value = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
-    let st_size = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
-    (st_name, st_info, st_shndx, st_value, st_size)
+    (
+        field::<4>(chunk, 0, be) as u32,
+        chunk[4],
+        field::<2>(chunk, 6, be) as u16,
+        field::<8>(chunk, 8, be),
+        field::<8>(chunk, 16, be),
+    )
 }
 
 /// Decode an `Elf32_Sym` entry. Field order differs from `Elf64_Sym`:
 /// `st_name(4) st_value(4) st_size(4) st_info(1) st_other(1) st_shndx(2)`.
-fn parse_sym32(chunk: &[u8]) -> (u32, u8, u16, u64, u64) {
-    let st_name = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-    let st_value = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-    let st_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
-    let st_info = chunk[12];
+#[allow(clippy::cast_possible_truncation)]
+fn parse_sym32(chunk: &[u8], be: bool) -> (u32, u8, u16, u64, u64) {
     // chunk[13] is st_other.
-    let st_shndx = u16::from_le_bytes(chunk[14..16].try_into().unwrap());
     (
-        st_name,
-        st_info,
-        st_shndx,
-        u64::from(st_value),
-        u64::from(st_size),
+        field::<4>(chunk, 0, be) as u32,
+        chunk[12],
+        field::<2>(chunk, 14, be) as u16,
+        field::<4>(chunk, 4, be),
+        field::<4>(chunk, 8, be),
     )
 }
 
-/// Read a NUL-terminated byte slice starting at `offset` in `strtab`.
+/// What an ARM mapping symbol says about the bytes from its address on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmMapping {
+    /// `$a`: ARM instructions.
+    Arm,
+    /// `$t`: Thumb instructions.
+    Thumb,
+    /// `$d`: data (literal pools, jump tables).
+    Data,
+}
+
+/// The ARM mapping symbols of `elf` as `(section index, address, kind)`,
+/// sorted. Without any, function symbols stand in: an odd address is a
+/// Thumb function, an even one ARM.
+#[must_use]
+pub fn arm_mapping(elf: &Elf64File) -> Vec<(usize, u64, ArmMapping)> {
+    let mut mapping = Vec::new();
+    let mut functions = Vec::new();
+    let be = elf.ehdr.is_big_endian();
+    for (idx, shdr, _) in elf.sections() {
+        if shdr.sh_type != SHT_SYMTAB && shdr.sh_type != SHT_DYNSYM {
+            continue;
+        }
+        let entry_size = match elf.class {
+            ElfClass::Elf32 => SYM32_SIZE,
+            ElfClass::Elf64 => SYM64_SIZE,
+        };
+        let table = elf.section_data(idx).unwrap_or(&[]);
+        let strtab = elf.section_data(shdr.sh_link as usize).unwrap_or(&[]);
+        for chunk in table.chunks_exact(entry_size) {
+            let (st_name, st_info, st_shndx, st_value, _) = match elf.class {
+                ElfClass::Elf64 => parse_sym64(chunk, be),
+                ElfClass::Elf32 => parse_sym32(chunk, be),
+            };
+            // Section indices from SHN_LORESERVE up are special.
+            if st_shndx == SHN_UNDEF || st_shndx >= 0xff00 {
+                continue;
+            }
+            let section = usize::from(st_shndx);
+            let name = read_strtab_cstring(strtab, st_name as usize).unwrap_or(&[]);
+            // `$a`, `$t`, `$d`, optionally followed by `.<anything>`.
+            let kind = match name {
+                [b'$', k] | [b'$', k, b'.', ..] => match k {
+                    b'a' => Some(ArmMapping::Arm),
+                    b't' => Some(ArmMapping::Thumb),
+                    b'd' => Some(ArmMapping::Data),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                mapping.push((section, st_value, kind));
+            } else if st_info & 0xf == STT_FUNC {
+                let kind = if st_value & 1 == 1 {
+                    ArmMapping::Thumb
+                } else {
+                    ArmMapping::Arm
+                };
+                functions.push((section, st_value & !1, kind));
+            }
+        }
+    }
+    if mapping.is_empty() {
+        mapping = functions;
+    }
+    mapping.sort_unstable_by_key(|&(section, addr, _)| (section, addr));
+    mapping.dedup_by_key(|&mut (section, addr, _)| (section, addr));
+    mapping
+}
+
 fn read_strtab_cstring(strtab: &[u8], offset: usize) -> Result<&[u8], ()> {
     let tail = strtab.get(offset..).ok_or(())?;
     let nul = tail.iter().position(|&b| b == 0).ok_or(())?;

@@ -255,6 +255,16 @@ impl std::fmt::Debug for Disassembler<'_> {
 }
 
 impl Disassembler<'_> {
+    /// Set context field `name` (ARM's `TMode`) for the instructions
+    /// decoded from now on. False if the language has no such field.
+    pub fn set_context(&mut self, name: &str, value: i64) -> bool {
+        let Some(field) = self.lang.sleigh.get_context_field(name) else {
+            return false;
+        };
+        field.field.set(&mut self.runtime.context, value);
+        true
+    }
+
     /// The instruction at the start of `bytes`, loaded at `addr`: its
     /// length and text. `None` if the bytes don't decode.
     pub fn decode(&mut self, bytes: &[u8], addr: u64) -> Option<(usize, String)> {

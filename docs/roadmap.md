@@ -201,7 +201,8 @@ Driven by a corpus of a few thousand firmware blobs (raw images and ELF, for ARM
   - [x] icicle-emu's SLEIGH engine vendored (`src/sleigh/`), Ghidra's specs for 32 processors embedded (`sleigh-specs/`, feature `sleigh`); all 126 languages compile, with a 128-bit context register (Hexagon and PA-RISC need more than 64 bits). Engine extensions for Ghidra's grammar: names in non-register spaces, compound `if` conditions and store addresses, `[expr]` branch targets, sizeless constant targets, space attributes in any order, `_` in attach values, partially overlapping registers (own storage), named p-code sections and `crossbuild` (Hexagon, accepted, not modelled); constructors whose p-code the engine can't type, or that `globalset` a computed address, still decode without p-code. Delay slots decode as their own instruction.
   - [ ] Engine gaps: p-code for the constructors above; Hexagon packets and `crossbuild`.
   - [x] Opaque ELF code (ARM, MIPS, PowerPC, SPARC, 68k, Xtensa, SuperH, TriCore, Hexagon, PA-RISC, RISC-V, V850, NDS32, AVR, 8051, HCS12, MSP430, Z80, LoongArch) and `--arch` raw images disassemble to `@asm` with pinned bytes, in `code_<addr>` blocks.
-  - [ ] Function boundaries and ARM/Thumb interworking (mapping symbols); ELF without section headers (code from `PT_LOAD` segments); memory use on very large images.
+  - [x] ARM/Thumb interworking: `$a`/`$t`/`$d` mapping symbols (or Thumb function symbols, or an odd entry point) switch between ARM, Thumb and literal-pool data.
+  - [ ] Function boundaries; ELF without section headers (code from `PT_LOAD` segments); memory use on very large images.
 
 ## Beyond v1
 

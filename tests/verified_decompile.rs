@@ -63,3 +63,23 @@ fn object_with_same_named_sections() {
     let v = verified(&fixture("comdat-groups-gcc-O0.o"));
     assert!(v.opaque.is_none(), "{:?}", v.opaque);
 }
+
+#[cfg(feature = "sleigh")]
+#[test]
+fn arm_mapping_symbols_pick_thumb_arm_and_data() {
+    // arm-none-eabi-gcc -O1: a Thumb function, an ARM one and a
+    // literal pool, told apart by `$t`, `$a` and `$d`.
+    let v = verified(&fixture("arm-thumb-interwork-gcc-O1.o"));
+    assert!(v.opaque.is_none(), "{:?}", v.opaque);
+    let text = univdreams::ast::emit(&v.ast);
+    // Thumb `bx lr`, ARM `bx lr`, and the pool kept as data.
+    assert!(text.contains("@asm(\"bx lr\", [0x70, 0x47])"), "{text}");
+    assert!(
+        text.contains("@asm(\"bx lr\", [0x1e, 0xff, 0x2f, 0xe1])"),
+        "{text}"
+    );
+    assert!(
+        text.contains("@asm(\".byte 0x68, 0x03, 0x9d, 0x36\""),
+        "{text}"
+    );
+}

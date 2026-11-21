@@ -70,8 +70,27 @@ use crate::arch::x86::{Bitness, decode, lift_function};
 use crate::ast::{Item, UdFile};
 use crate::debug::DebugFunction;
 use crate::format::elf::{
-    EM_386, EM_AARCH64, EM_BPF, EM_SBF, EM_X86_64, Elf64File, ElfClass, SHF_EXECINSTR, Shdr64,
+    EM_386, EM_AARCH64, EM_ARM, EM_BPF, EM_SBF, EM_X86_64, Elf64File, ElfClass, SHF_EXECINSTR,
+    Shdr64,
 };
+
+/// The code of executable section `idx`, disassembled with SLEIGH
+/// `language`; ARM's mapping symbols pick Thumb, ARM and data.
+fn sleigh_section(
+    elf: &Elf64File,
+    language: &str,
+    arm_mapping: &[(usize, u64, crate::analysis::ArmMapping)],
+    idx: usize,
+    sh: &Shdr64,
+    data: &[u8],
+) -> Option<Vec<Item>> {
+    let mut modes = sleigh::arm_modes(arm_mapping, idx);
+    // No symbols at all: an odd entry point means Thumb code.
+    if arm_mapping.is_empty() && elf.ehdr.e_machine == EM_ARM && elf.ehdr.e_entry & 1 == 1 {
+        modes.push((sh.sh_addr, sleigh::Mode::Context("TMode", 1)));
+    }
+    sleigh::code_items_with(language, sh.sh_addr, data, &modes)
+}
 
 /// Which arch backend to drive for a given ELF.
 #[derive(Debug, Clone, Copy)]
@@ -186,6 +205,12 @@ fn decompile_arch(elf: &Elf64File, arch: Arch, options: &Options) -> Result<UdFi
     } else {
         None
     };
+    // ARM: mapping symbols say where Thumb code and literal pools are.
+    let arm_mapping = if sleigh_language.is_some() && elf.ehdr.e_machine == EM_ARM {
+        crate::analysis::arm_mapping(elf)
+    } else {
+        Vec::new()
+    };
     // Without a decoder there's nothing to body: sections stay `@raw`.
     let (map, debug_by_addr) = if matches!(arch, Arch::Opaque) {
         (FunctionMap::default(), HashMap::new())
@@ -242,7 +267,7 @@ fn decompile_arch(elf: &Elf64File, arch: Arch, options: &Options) -> Result<UdFi
             .map_or_else(|| format!("section{idx}"), str::to_string);
         let sleigh_code = sleigh_language
             .filter(|_| sh.sh_flags & SHF_EXECINSTR != 0 && !data.is_empty())
-            .and_then(|lang| sleigh::code_items(lang, sh.sh_addr, data));
+            .and_then(|lang| sleigh_section(elf, lang, &arm_mapping, idx, sh, data));
         let mut section_items = match sleigh_code {
             Some(items) => items,
             None => build_section_items(

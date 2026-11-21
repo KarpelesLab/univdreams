@@ -125,37 +125,110 @@ pub fn named_language(arch: &str) -> Option<&str> {
     })
 }
 
+/// How to read the bytes from an address on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Instructions, with a context field set first (ARM's `TMode`).
+    Context(&'static str, i64),
+    /// Data, not instructions.
+    Data,
+}
+
+/// The modes ARM mapping symbols give a section's bytes.
+#[must_use]
+pub fn arm_modes(
+    mapping: &[(usize, u64, crate::analysis::ArmMapping)],
+    section: usize,
+) -> Vec<(u64, Mode)> {
+    use crate::analysis::ArmMapping;
+    mapping
+        .iter()
+        .filter(|&&(s, _, _)| s == section)
+        .map(|&(_, addr, kind)| {
+            let mode = match kind {
+                ArmMapping::Arm => Mode::Context("TMode", 0),
+                ArmMapping::Thumb => Mode::Context("TMode", 1),
+                ArmMapping::Data => Mode::Data,
+            };
+            (addr, mode)
+        })
+        .collect()
+}
+
 /// `bytes`, loaded at `addr`, disassembled with `language` as blocks of
 /// pinned instructions. `None` if the language isn't available.
 #[must_use]
 pub fn code_items(language: &str, addr: u64, bytes: &[u8]) -> Option<Vec<Item>> {
+    code_items_with(language, addr, bytes, &[])
+}
+
+/// [`code_items`], switching [`Mode`] at each of `modes`' addresses
+/// (sorted); no instruction runs across one.
+#[must_use]
+pub fn code_items_with(
+    language: &str,
+    addr: u64,
+    bytes: &[u8],
+    modes: &[(u64, Mode)],
+) -> Option<Vec<Item>> {
     #[cfg(feature = "sleigh")]
     {
         let lang = crate::arch::sleigh::language(language).ok()?;
         // The engine asserts on some encodings; keep the bytes then.
-        std::panic::catch_unwind(|| disassemble(&lang, addr, bytes)).ok()
+        std::panic::catch_unwind(|| disassemble(&lang, addr, bytes, modes)).ok()
     }
     #[cfg(not(feature = "sleigh"))]
     {
-        let _ = (language, addr, bytes);
+        let _ = (language, addr, bytes, modes);
         None
     }
 }
 
 #[cfg(feature = "sleigh")]
-fn disassemble(lang: &crate::arch::sleigh::Language, addr: u64, bytes: &[u8]) -> Vec<Item> {
+fn disassemble(
+    lang: &crate::arch::sleigh::Language,
+    addr: u64,
+    bytes: &[u8],
+    modes: &[(u64, Mode)],
+) -> Vec<Item> {
     let mut d = lang.disassembler();
     let mut items = Vec::new();
     let mut body = Vec::new();
     let mut start = addr;
     let mut off = 0usize;
+    let mut next_mode = 0;
+    let mut data = false;
     while off < bytes.len() {
         let at = addr + off as u64;
+        while let Some(&(_, mode)) = modes.get(next_mode).filter(|&&(from, _)| from <= at) {
+            match mode {
+                Mode::Context(field, value) => {
+                    d.set_context(field, value);
+                    data = false;
+                }
+                Mode::Data => data = true,
+            }
+            next_mode += 1;
+        }
+        // Up to the next mode change.
+        let end = modes.get(next_mode).map_or(bytes.len(), |&(from, _)| {
+            usize::try_from(from - addr).map_or(bytes.len(), |o| o.min(bytes.len()))
+        });
         if body.len() >= BLOCK {
             items.push(block(start, std::mem::take(&mut body)));
             start = at;
         }
-        if let Some((len, text)) = d.decode(&bytes[off..], at) {
+        if data {
+            let chunk = &bytes[off..end.min(off + 4)];
+            let text: Vec<String> = chunk.iter().map(|b| format!("0x{b:02x}")).collect();
+            body.push(Stmt::asm(
+                format!(".byte {}", text.join(", ")),
+                chunk.to_vec(),
+            ));
+            off += chunk.len();
+            continue;
+        }
+        if let Some((len, text)) = d.decode(&bytes[off..end], at) {
             body.push(Stmt::asm(text, bytes[off..off + len].to_vec()));
             off += len;
         } else {

@@ -34,7 +34,7 @@ pub use eh_frame::{EhFrameError, discover_from_eh_frame};
 pub use function_map::{Function, FunctionMap, FunctionSource};
 pub use plt::{PltError, discover_plt_thunks};
 pub use signatures::discover_from_signatures;
-pub use symbols::{SymbolError, discover_from_symbol_tables};
+pub use symbols::{ArmMapping, SymbolError, arm_mapping, discover_from_symbol_tables};
 
 use crate::common::VAddr;
 use crate::format::elf::Elf64File;
