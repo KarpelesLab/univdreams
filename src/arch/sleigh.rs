@@ -226,6 +226,13 @@ fn compile(id: &str) -> Result<Language, String> {
 }
 
 impl Language {
+    /// The spec's `define alignment`: instructions start at multiples of
+    /// it.
+    #[must_use]
+    pub fn alignment(&self) -> usize {
+        usize::from(self.sleigh.alignment).max(1)
+    }
+
     /// A disassembler starting from the language's initial context.
     #[must_use]
     pub fn disassembler(&self) -> Disassembler<'_> {

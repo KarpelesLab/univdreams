@@ -198,6 +198,10 @@ fn disassemble(
     let mut off = 0usize;
     let mut next_mode = 0;
     let mut data = false;
+    // The shortest instruction decoded so far: bytes that don't decode
+    // are skipped up to the next multiple of it (and of the spec's
+    // alignment), so fixed-width code (ARM, MIPS) stays in step.
+    let mut shortest = usize::MAX;
     while off < bytes.len() {
         let at = addr + off as u64;
         while let Some(&(_, mode)) = modes.get(next_mode).filter(|&&(from, _)| from <= at) {
@@ -231,12 +235,20 @@ fn disassemble(
         if let Some((len, text)) = d.decode(&bytes[off..end], at) {
             body.push(Stmt::asm(text, bytes[off..off + len].to_vec()));
             off += len;
+            shortest = shortest.min(len);
         } else {
+            let step =
+                lang.alignment()
+                    .max(if shortest == usize::MAX { 1 } else { shortest }) as u64;
+            let next = (at / step + 1) * step;
+            let skip = usize::try_from(next - at).map_or(1, |n| n.min(end - off).max(1));
+            let chunk = &bytes[off..off + skip];
+            let text: Vec<String> = chunk.iter().map(|b| format!("0x{b:02x}")).collect();
             body.push(Stmt::asm(
-                format!(".byte 0x{:02x}", bytes[off]),
-                vec![bytes[off]],
+                format!(".byte {}", text.join(", ")),
+                chunk.to_vec(),
             ));
-            off += 1;
+            off += skip;
         }
     }
     if !body.is_empty() {

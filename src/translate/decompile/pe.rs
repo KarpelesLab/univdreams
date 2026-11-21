@@ -240,7 +240,7 @@ fn build_pe_module(pe: &PeFile) -> Module {
     let arch = match pe.coff.machine {
         IMAGE_FILE_MACHINE_I386 => "i386",
         IMAGE_FILE_MACHINE_AMD64 => "x86_64",
-        _ => "unknown",
+        other => pe_machine_name(other).unwrap_or("unknown"),
     };
     let bits = match pe.kind {
         PeKind::Pe32 => 32,
@@ -358,6 +358,72 @@ fn build_pe_module(pe: &PeFile) -> Module {
             field("build", build),
         ],
     }
+}
+
+/// The CPU a PE `Machine` value names, for machines without a
+/// hand-written decoder (Windows CE and NT on ARM, MIPS, SuperH,
+/// PowerPC, …): the same names ELF's `e_machine` maps to.
+fn pe_machine_name(machine: u16) -> Option<&'static str> {
+    Some(match machine {
+        0x01c0 | 0x01c2 | 0x01c4 => "arm",
+        0x0162 | 0x0166 | 0x0168 | 0x0169 | 0x0266 | 0x0366 | 0x0466 => "mips",
+        0x01a2 | 0x01a3 | 0x01a4 | 0x01a6 | 0x01a8 => "sh",
+        0x01f0 | 0x01f1 => "ppc",
+        0x0184 | 0x0284 => "alpha",
+        0x0200 => "ia64",
+        0x9041 => "m32r",
+        0xaa64 => "aarch64",
+        _ => return None,
+    })
+}
+
+/// The SLEIGH language for a PE `Machine` value, and the context it
+/// starts in (ARMNT, Windows on Thumb-2, is all Thumb).
+fn pe_sleigh_language(machine: u16) -> Option<(&'static str, Vec<(&'static str, i64)>)> {
+    Some(match machine {
+        0x01c0 | 0x01c2 => ("ARM:LE:32:v8", Vec::new()),
+        0x01c4 => ("ARM:LE:32:v8", vec![("TMode", 1)]),
+        0x0162 | 0x0166 | 0x0168 | 0x0169 | 0x0366 | 0x0466 => ("MIPS:LE:32:default", Vec::new()),
+        0x01a2 | 0x01a3 | 0x01a4 | 0x01a6 => ("SuperH4:LE:32:default", Vec::new()),
+        0x01f0 | 0x01f1 => ("PowerPC:LE:32:default", Vec::new()),
+        _ => return None,
+    })
+}
+
+/// A code section of a machine without a hand-written decoder,
+/// disassembled with SLEIGH: blocks of pinned instructions at file
+/// offsets, decoded at their virtual addresses.
+fn sleigh_section_items(
+    pe: &PeFile,
+    sec_idx: usize,
+    file_off: usize,
+    data: &[u8],
+) -> Option<Vec<Item>> {
+    const IMAGE_SCN_CNT_CODE: u32 = 0x20;
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    let sh = pe.sections.get(sec_idx)?;
+    if sh.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) == 0 {
+        return None;
+    }
+    let (language, context) = pe_sleigh_language(pe.coff.machine)?;
+    let va = pe.image_base + u64::from(sh.virtual_address);
+    let modes: Vec<(u64, crate::translate::decompile::sleigh::Mode)> = context
+        .into_iter()
+        .map(|(field, value)| {
+            (
+                va,
+                crate::translate::decompile::sleigh::Mode::Context(field, value),
+            )
+        })
+        .collect();
+    let mut items =
+        crate::translate::decompile::sleigh::code_items_with(language, va, data, &modes)?;
+    for item in &mut items {
+        if let Item::Function(f) = item {
+            f.addr = f.addr.map(|at| at - va + file_off as u64);
+        }
+    }
+    Some(items)
 }
 
 /// Scan the read-only data sections for sequences of 4-byte
@@ -509,7 +575,21 @@ fn build_pe_items(pe: &PeFile, keep: &Keep<'_>) -> Vec<Item> {
                 bytes: bytes[cursor..*start].to_vec(),
             });
         }
-        if let Some(funcs) = funcs_by_section.get(sec_idx) {
+        // A section with a block the verifier keeps as bytes stays
+        // bytes whole.
+        let disassemble = match keep {
+            Keep::None => true,
+            Keep::These(at) => !at
+                .iter()
+                .any(|&a| (*start as u64..*end as u64).contains(&a)),
+            Keep::All => false,
+        };
+        if let Some(code) = disassemble
+            .then(|| sleigh_section_items(pe, *sec_idx, *start, &bytes[*start..*end]))
+            .flatten()
+        {
+            items.extend(code);
+        } else if let Some(funcs) = funcs_by_section.get(sec_idx) {
             emit_section_with_function_split(
                 pe,
                 *sec_idx,

@@ -84,3 +84,21 @@ fn elf_without_section_headers() {
     assert!(text.contains("@section(\"segment"), "{text}");
     assert_eq!(text.contains("@asm("), cfg!(feature = "sleigh"));
 }
+
+#[test]
+fn pe_of_an_undecoded_architecture() {
+    // A PE relabelled as Windows CE ARM (machine 0x1c0): its code
+    // section disassembles with SLEIGH, each instruction pinned.
+    let mut bytes = fixture("sqrt-mingw15-O0.exe");
+    let lfanew = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    bytes[lfanew + 4..lfanew + 6].copy_from_slice(&0x01c0u16.to_le_bytes());
+    let pe = univdreams::format::pe::PeFile::parse(&bytes).expect("parse PE");
+    let verified = univdreams::translate::decompile::decompile_pe_verified(&pe);
+    assert!(verified.opaque.is_none(), "{:?}", verified.opaque);
+    let text = univdreams::ast::emit(&verified.ast);
+    assert!(text.contains("arch: \"arm\""));
+    assert_eq!(text.contains("@asm("), cfg!(feature = "sleigh"));
+    let ast = parse(&text).unwrap_or_else(|e| panic!("parse: {e}"));
+    let rebuilt = univdreams::translate::compile::lower_to_pe(&ast).expect("lower");
+    assert!(rebuilt == bytes, "differs after round-trip");
+}

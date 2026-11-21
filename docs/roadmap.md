@@ -196,6 +196,7 @@ Driven by a corpus of a few thousand firmware blobs (raw images and ELF, for ARM
 - [x] Big-endian ELF (MIPS, PowerPC, SPARC, S/390, …) round-trips; a truncated or malformed ELF falls back to a raw image labelled with its header's CPU.
 - [x] Relocatable objects with several sections of one name (COMDAT `.group`) round-trip.
 - [x] PE decompiles are verified like ELF's: each lifted function is emitted, parsed and lowered on its own, then the whole file; a function that doesn't give its bytes back is kept as `@raw` (32-bit PE in the corpus sample: 339 → 916 of 916). Calls to targets that aren't names (imports by ordinal, `COREDLL@199`; mangled `?f@@YAXXZ`; `&sym`) are quoted; sections whose file data overlaps round-trip.
+- [x] PE for Windows CE / NT on ARM (ARMNT as Thumb), MIPS, SuperH and PowerPC names its CPU and disassembles code sections with SLEIGH.
 - [ ] Functions of relocatable objects: every section starts at 0, so functions are only told apart by address within one section; objects with several code sections (`-ffunction-sections`, `.text.startup`, COMDAT) keep all their code as bytes.
 - [ ] Containers: Intel HEX, Qualcomm MBN, Cypress CYACD, TI ROM boot tables.
 - [ ] Decoders for the corpus' CPUs from Ghidra's SLEIGH processor specs (a pure-Rust SLEIGH engine), so instructions round-trip as `@asm` with pinned bytes; encoders and lifting after.
