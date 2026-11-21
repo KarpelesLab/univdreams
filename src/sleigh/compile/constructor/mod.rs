@@ -26,6 +26,9 @@ pub(crate) struct Constructor {
     /// The table associated with this constructor
     pub table: TableId,
 
+    /// univdreams: its semantics didn't build and were left out.
+    pub semantics_dropped: bool,
+
     /// The mnemonic associated with the constructor
     pub mnemonic: Option<String>,
 
@@ -81,15 +84,37 @@ pub(crate) fn build(
     // special "instruction" keyword.
     let table_ident = constructor.table.unwrap_or(symbols.root_table_ident);
     let table = symbols.lookup_kind(table_ident, SymbolKind::Table)?;
+    match build_with(ctx, symbols, constructor, table, &constructor.semantics) {
+        // univdreams: semantics the engine can't type (such as a 2-byte
+        // pointer into a 3-byte space, which Ghidra zero-extends) would
+        // drop the instruction entirely; keep it for decoding and
+        // disassembly, without p-code.
+        Err(e) if !constructor.semantics.is_empty() => {
+            let mut built = build_with(ctx, symbols, constructor, table, &[]).map_err(|_| e)?;
+            built.semantics_dropped = true;
+            Ok(built)
+        }
+        result => result,
+    }
+}
+
+fn build_with(
+    ctx: &mut Context,
+    symbols: &SymbolTable,
+    constructor: &ast::Constructor,
+    table: TableId,
+    semantics: &[ast::Statement],
+) -> Result<Constructor, String> {
     let mut scope = Scope::new(symbols);
 
     let (constraints, decode_actions) = constraints::resolve(&mut scope, &constructor.constraint)?;
 
     let disasm_actions = disasm_actions::resolve(&mut scope, &constructor.disasm_actions)?;
-    let mut semantics = semantics::resolve(&mut scope, &constructor.semantics)?;
+    let mut semantics = semantics::resolve(&mut scope, semantics)?;
     semantics.temporaries = scope.temporaries.clone();
 
     Ok(Constructor {
+        semantics_dropped: false,
         table,
         mnemonic: constructor.mnemonic.clone(),
         display: display::resolve(ctx, &scope, constructor)?,

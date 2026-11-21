@@ -96,12 +96,11 @@ pub(crate) fn resolve(
                     ContextModValue::InstStart => GlobalSetAddr::InstStart,
                     ContextModValue::InstNext => GlobalSetAddr::InstNext,
                     ContextModValue::Subtable(idx) => GlobalSetAddr::Subtable(idx),
-                    _ => {
-                        return Err(format!(
-                            "globalset address must be inst_start, inst_next, or a subtable, got: {}",
-                            scope.debug(addr_sym)
-                        ));
-                    }
+                    // univdreams: a computed address (ARM's `blx` setting
+                    // Thumb mode at its target) only steers decoding at
+                    // that target; linear disassembly doesn't follow it,
+                    // so skip the action rather than lose the constructor.
+                    _ => continue,
                 };
 
                 section

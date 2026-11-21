@@ -133,9 +133,18 @@ struct Embedded {
     dir: String,
 }
 
+/// `name` in `dir`, or in its parent: deprecated languages' `.ldefs`
+/// sit in an `old/` subdirectory but name the main specs.
+fn file_in(dir: &str, name: &str) -> Option<&'static str> {
+    file(&format!("{dir}/{name}")).or_else(|| {
+        let (parent, _) = dir.rsplit_once('/')?;
+        file(&format!("{parent}/{name}"))
+    })
+}
+
 impl crate::sleigh::parse::Input for Embedded {
     fn open(&mut self, name: &str) -> std::io::Result<String> {
-        file(&format!("{}/{name}", self.dir))
+        file_in(&self.dir, name)
             .map(str::to_string)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, name.to_string()))
     }
@@ -197,9 +206,11 @@ fn compile(id: &str) -> Result<Language, String> {
     if let Err(e) = parser.include_file(def.slaspec.clone()) {
         return Err(format!("{}", parser.error_formatter(e)));
     }
-    let sleigh = crate::sleigh::compile::build_inner(parser, false)?;
+    // `SLEIGH_VERBOSE=1` prints the constructors the engine leaves out.
+    let verbose = std::env::var_os("SLEIGH_VERBOSE").is_some();
+    let sleigh = crate::sleigh::compile::build_inner(parser, verbose)?;
     let mut initial_ctx = 0u64;
-    let pspec = file(&format!("{}/{}", def.dir, def.pspec)).unwrap_or("");
+    let pspec = file_in(&def.dir, &def.pspec).unwrap_or("");
     for (name, val) in pspec_context(pspec) {
         if let Some(field) = sleigh.get_context_field(&name) {
             field.field.set(&mut initial_ctx, val);
@@ -289,6 +300,44 @@ mod tests {
         let (len, text) = d.decode(&code[4..], 0x1004).unwrap();
         assert_eq!(len, 4);
         assert_eq!(text, "bx lr");
+    }
+
+    #[test]
+    fn languages_with_engine_gaps_decode() {
+        // Each names registers outside the register space (CSRs, I/O,
+        // system registers).
+        for (id, code, want) in [
+            // addi a0,a0,0x1 ; ret
+            (
+                "RISCV:LE:32:default",
+                &[0x13, 0x05, 0x15, 0x00][..],
+                "addi a0,a0,0x1",
+            ),
+            ("RISCV:LE:64:default", &[0x67, 0x80, 0x00, 0x00][..], "ret"),
+            // csrr a0,mstatus
+            ("RISCV:LE:32:default", &[0x73, 0x25, 0x00, 0x30][..], "csrr"),
+            // AVR: ret, pop r16 (their p-code doesn't build in the
+            // engine; they still decode)
+            ("avr8:LE:16:extended", &[0x08, 0x95][..], "ret"),
+            ("avr8:LE:16:extended", &[0x0f, 0x91][..], "pop R16"),
+            // ARM blx #imm: a globalset to a computed address
+            ("ARM:LE:32:v8", &[0x00, 0x00, 0x00, 0xfa][..], "blx"),
+            // V850: jmp [lp]
+            ("V850:LE:32:default", &[0x7f, 0x00][..], "jmp"),
+        ] {
+            let lang = language(id).unwrap_or_else(|e| panic!("{id}: {e}"));
+            let (len, text) = lang
+                .disassembler()
+                .decode(code, 0x1000)
+                .unwrap_or_else(|| panic!("{id}: {code:02x?} doesn't decode"));
+            assert_eq!(len, code.len(), "{id}: {text}");
+            assert!(text.starts_with(want), "{id}: {text}");
+        }
+    }
+
+    #[test]
+    fn deprecated_languages_find_their_specs() {
+        language("RISCV:LE:64:RV64I").expect("compile");
     }
 
     #[test]

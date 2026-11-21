@@ -32,7 +32,14 @@ pub fn elf_language(machine: u16, is_64: bool, big_endian: bool) -> Option<&'sta
         (42, _) if big_endian => "SuperH:BE:32:SH-2",
         (94, _) => e("Xtensa:BE:32:default", "Xtensa:LE:32:default"),
         (105, _) => "TI_MSP430X:LE:32:default",
+        (83, _) => "avr8:LE:16:extended",
+        (87, _) => "V850:LE:32:default",
+        (165, _) => "8051:BE:16:default",
+        (167, _) => e("NDS32:BE:32:default", "NDS32:LE:32:default"),
+        (185, _) => "avr32:BE:32:default",
         (220, _) => "z80:LE:16:default",
+        (243, false) => "RISCV:LE:32:default",
+        (243, true) => "RISCV:LE:64:default",
         (258, true) => "Loongarch:LE:64:lp64d",
         (258, false) => "Loongarch:LE:32:ilp32d",
         _ => return None,
@@ -79,6 +86,16 @@ pub fn named_language(arch: &str) -> Option<&str> {
         "cr16" => "CR16AB:LE:16:default",
         "loongarch" | "loongarch64" => "Loongarch:LE:64:lp64d",
         "jvm" => "JVM:BE:32:default",
+        "riscv" | "riscv32" | "rv32" => "RISCV:LE:32:default",
+        "riscv64" | "rv64" => "RISCV:LE:64:default",
+        "v850" => "V850:LE:32:default",
+        "nds32" | "andes" => "NDS32:LE:32:default",
+        "nds32be" => "NDS32:BE:32:default",
+        "avr" | "avr8" => "avr8:LE:16:extended",
+        "xmega" => "avr8:LE:24:xmega",
+        "pic18" => "PIC-18:LE:24:PIC-18",
+        "hcs12x" => "HCS-12X:BE:24:default",
+        "6805" => "6805:BE:16:default",
         _ => return None,
     })
 }
@@ -150,6 +167,7 @@ mod tests {
     fn names_map_to_languages() {
         assert_eq!(elf_language(8, false, true), Some("MIPS:BE:32:default"));
         assert_eq!(elf_language(40, false, false), Some("ARM:LE:32:v8"));
+        assert_eq!(elf_language(243, true, false), Some("RISCV:LE:64:default"));
         assert_eq!(elf_language(164, false, false), None);
         assert_eq!(named_language("mipsel"), Some("MIPS:LE:32:default"));
         assert_eq!(named_language("ARM:BE:32:v7"), Some("ARM:BE:32:v7"));

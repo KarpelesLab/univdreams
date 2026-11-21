@@ -217,9 +217,16 @@ impl SymbolTable {
     /// other spaces is not currently supported), or if any identifier overlaps with an existing
     /// identifier.
     pub fn define_register_names(&mut self, def: ast::SpaceNameDef) -> Result<(), String> {
-        if def.space != self.register_space_ident {
-            return Err("Can only name offsets within a register_space".into());
-        }
+        // univdreams: names in other spaces (RISC-V CSRs, AVR I/O, V850
+        // system registers) are kept as registers too, each space in its
+        // own offset range so they never overlap the register space's.
+        // That's what disassembly needs; their p-code reads registers
+        // rather than that space.
+        let bias: u64 = if def.space == self.register_space_ident {
+            0
+        } else {
+            (u64::from(self.lookup_kind(def.space, SymbolKind::Space)?) + 1) << 24
+        };
 
         for (i, ident) in def.names.into_iter().enumerate() {
             if ident == self.placeholder_ident {
@@ -227,9 +234,9 @@ impl SymbolTable {
             }
 
             // Each entry within the list is offset by its position in the list
-            let offset = (def.offset + (i as u64 * def.size as u64))
+            let offset = (bias + def.offset + (i as u64 * def.size as u64))
                 .try_into()
-                .unwrap();
+                .map_err(|_| "register offset out of range".to_string())?;
             insert_and_map!(
                 self,
                 registers,
@@ -482,7 +489,11 @@ impl SymbolTable {
 
         let table = &mut self.tables[result.table as usize];
 
-        let export_size = result.semantics.export.and_then(|value| value.size());
+        let export_size = if result.semantics_dropped {
+            table.export
+        } else {
+            result.semantics.export.and_then(|value| value.size())
+        };
         if existing_table && table.export != export_size {
             return Err(format!(
                 "Failed to add constructor \"{}\" to \"{}\": export size mismatch (existing: {:?}, new: {:?})",
