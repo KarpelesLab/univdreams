@@ -1047,14 +1047,34 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     .with_context(|| format!("parse {} as NE", input.display()))?;
                 univdreams::translate::decompile::decompile_ne_to_text(&ne)
             } else if univdreams::format::pe::is_pe(&bytes) {
-                let pe = univdreams::format::pe::PeFile::parse(&bytes)
-                    .with_context(|| format!("parse {} as PE", input.display()))?;
-                if no_verify {
-                    univdreams::translate::decompile::decompile_pe_to_text(&pe)
-                } else {
-                    let verified = univdreams::translate::decompile::decompile_pe_verified(&pe);
-                    warn_kept_as_bytes(&input, verified.opaque.as_deref(), &verified.raw_functions);
-                    univdreams::ast::emit(&verified.ast)
+                match univdreams::format::pe::PeFile::parse(&bytes) {
+                    // An MZ file that isn't a well-formed PE (a DOS
+                    // executable whose e_lfanew points nowhere): bytes.
+                    Err(e) => {
+                        eprintln!(
+                            "warning: {}: not a well-formed PE ({e}); kept as raw bytes",
+                            input.display()
+                        );
+                        univdreams::translate::decompile::decompile_raw_opaque_to_text(
+                            &bytes,
+                            arch.as_deref().unwrap_or("unknown"),
+                            load_addr.unwrap_or(0),
+                        )
+                    }
+                    Ok(pe) => {
+                        if no_verify {
+                            univdreams::translate::decompile::decompile_pe_to_text(&pe)
+                        } else {
+                            let verified =
+                                univdreams::translate::decompile::decompile_pe_verified(&pe);
+                            warn_kept_as_bytes(
+                                &input,
+                                verified.opaque.as_deref(),
+                                &verified.raw_functions,
+                            );
+                            univdreams::ast::emit(&verified.ast)
+                        }
+                    }
                 }
             } else if univdreams::format::macho::is_macho64(&bytes) {
                 let macho = univdreams::format::macho::MachoFile::parse(&bytes)
