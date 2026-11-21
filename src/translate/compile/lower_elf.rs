@@ -50,7 +50,7 @@ pub enum ElfLowerError {
     #[error("`@section` block named `{section}` has no matching shdr in `@module.build.shdrs`")]
     UnknownSection { section: String },
 
-    #[error("duplicate `@section` block named `{section}` (matches multiple shdrs by name)")]
+    #[error("more `@section` blocks named `{section}` than sections of that name")]
     DuplicateSection { section: String },
 
     #[error(
@@ -89,16 +89,14 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
     let mut file_size = read_int(build, "file_size")?;
 
     let arch = resolve_arch_codec(&file.module)?;
-    // Lower every @section block; index by name.
-    let mut by_name: HashMap<String, (u64, Vec<u8>)> = HashMap::new();
+    // Lower every @section block; index by name. Relocatable objects
+    // can have several sections of one name (`.group`, `.text` of
+    // COMDAT groups): those match shdrs of that name in order.
+    let mut by_name: HashMap<String, std::collections::VecDeque<Vec<u8>>> = HashMap::new();
     for item in &file.items {
         if let Item::Section { name, addr, items } = item {
             let bytes = lower_section_bytes(name, *addr, items, arch.as_ref())?;
-            if by_name.insert(name.clone(), (*addr, bytes)).is_some() {
-                return Err(ElfLowerError::DuplicateSection {
-                    section: name.clone(),
-                });
-            }
+            by_name.entry(name.clone()).or_default().push_back(bytes);
         }
     }
 
@@ -112,15 +110,18 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
             continue;
         }
         let name = shdr_name(file, idx)?;
-        let Some((_, bytes)) = by_name.remove(&name) else {
+        let Some(bytes) = by_name
+            .get_mut(&name)
+            .and_then(std::collections::VecDeque::pop_front)
+        else {
             return Err(ElfLowerError::UnknownSection { section: name });
         };
         section_data.push(bytes);
     }
 
     // Any leftover @section blocks didn't map to a shdr.
-    if let Some(stray) = by_name.into_keys().next() {
-        return Err(ElfLowerError::UnknownSection { section: stray });
+    if let Some((stray, _)) = by_name.into_iter().find(|(_, q)| !q.is_empty()) {
+        return Err(ElfLowerError::DuplicateSection { section: stray });
     }
 
     // Cascade-shift the ELF layout to match any per-section

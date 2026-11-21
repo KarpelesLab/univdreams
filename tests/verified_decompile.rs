@@ -55,3 +55,11 @@ fn undecodable_function_is_kept_as_bytes() {
     );
     assert!(text.contains("fn do_fac("), "other functions still decode");
 }
+
+#[test]
+fn object_with_same_named_sections() {
+    // g++ -O0 of two template instantiations: two COMDAT `.group`
+    // sections, both named `.group`.
+    let v = verified(&fixture("comdat-groups-gcc-O0.o"));
+    assert!(v.opaque.is_none(), "{:?}", v.opaque);
+}

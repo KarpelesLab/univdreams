@@ -96,7 +96,9 @@ fn lift_every_x86_64_fixture_function() {
         let Ok(elf) = Elf64File::parse(&bytes) else {
             continue;
         };
-        if elf.ehdr.e_machine != EM_X86_64 {
+        // Relocatable objects (`e_type` 1): every section starts at 0,
+        // so addresses don't name functions on their own yet.
+        if elf.ehdr.e_machine != EM_X86_64 || elf.ehdr.e_type == 1 {
             continue;
         }
 

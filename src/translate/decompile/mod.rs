@@ -1226,13 +1226,20 @@ fn mismatched_functions(elf: &Elf64File, map: &FunctionMap, parsed: &UdFile) -> 
     let Ok(arch) = crate::translate::compile::resolve_arch_codec(&parsed.module) else {
         return out;
     };
+    // Same-named sections (`.group` in objects) pair up in order.
+    let mut seen: HashMap<&str, usize> = HashMap::new();
     for item in &parsed.items {
         let Item::Section { name, items, addr } = item else {
             continue;
         };
+        let nth = seen.entry(name.as_str()).or_default();
+        *nth += 1;
         let Some(data) = elf
             .sections()
-            .find(|&(idx, _, _)| elf.section_name(idx) == Some(name.as_str()))
+            .filter(|&(idx, sh, _)| {
+                section_is_emittable(sh) && elf.section_name(idx) == Some(name.as_str())
+            })
+            .nth(*nth - 1)
             .map(|(_, _, data)| data)
         else {
             continue;

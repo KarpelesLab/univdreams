@@ -76,7 +76,9 @@ fn source_round_trip_byte_identity_per_section() {
         let Ok(elf) = Elf64File::parse(&bytes) else {
             continue;
         };
-        if elf.ehdr.e_machine != EM_X86_64 {
+        // Relocatable objects (`e_type` 1) repeat section names and
+        // addresses; `tests/verified_decompile.rs` covers them.
+        if elf.ehdr.e_machine != EM_X86_64 || elf.ehdr.e_type == 1 {
             continue;
         }
 
