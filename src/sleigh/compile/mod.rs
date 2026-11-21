@@ -120,13 +120,22 @@ pub fn build_inner(mut parser: Parser, verbose: bool) -> Result<SleighData, Stri
         let mut name = ctx.add_string(name_str);
 
         // Check if there is an existing mapping for this register, if so add it as an alias.
-        if let Some(&(parent_idx, mut local_offset)) = ctx.data.register_mapping.get(&reg.offset) {
+        let parent = ctx.data.register_mapping.get(&reg.offset).copied();
+        // univdreams: a register that only partly overlaps the one it
+        // starts in (CR16C's R2R1 over R1R0, Dalvik's register pairs)
+        // gets storage of its own instead of failing the language: they
+        // no longer alias in p-code, which decoding doesn't need.
+        let slice = parent.and_then(|(parent_idx, mut local_offset)| {
             let parent_reg = &ctx.data.named_registers[parent_idx as usize];
 
             // Fix offsets for big-endian registers.
             let mut offset = reg.offset;
             if ctx.data.big_endian {
-                local_offset = parent_reg.get_raw_var().size - local_offset - reg.size as u8;
+                local_offset = parent_reg
+                    .get_raw_var()
+                    .size
+                    .checked_sub(local_offset)?
+                    .checked_sub(reg.size as u8)?;
                 offset = parent_reg.offset + local_offset as u32;
             }
 
@@ -134,13 +143,11 @@ pub fn build_inner(mut parser: Parser, verbose: bool) -> Result<SleighData, Stri
             // register that this register overlaps.
             let var = parent_reg
                 .get_raw_var()
-                .try_slice(local_offset, reg.size as u8)
-                .ok_or_else(|| {
-                    format!(
-                        "{name_str} partially overlaps with {}",
-                        ctx.data.get_str(parent_reg.name)
-                    )
-                })?;
+                .try_slice(local_offset, reg.size as u8)?;
+            Some((offset, var))
+        });
+        let partial = parent.is_some() && slice.is_none();
+        if let Some((offset, var)) = slice {
             ctx.data.named_registers[idx] = NamedRegister::new(name, offset, var);
 
             // Add the current register as an alias in the parent register (used for the display
@@ -166,12 +173,16 @@ pub fn build_inner(mut parser: Parser, verbose: bool) -> Result<SleighData, Stri
                 crate::sleigh::pcode::VarNode::new(reg_id, reg.size as u8),
             );
 
-            // Map all the bytes within this range to the register.
+            // Map all the bytes within this range to the register (a
+            // partly overlapping one leaves the bytes it shares mapped
+            // to the register they came from).
             for byte in 0..reg.size {
                 let varnode_offset = reg.offset + byte as u32;
-                ctx.data
-                    .register_mapping
-                    .insert(varnode_offset, (idx as u32, byte as u8));
+                let mapping = &mut ctx.data.register_mapping;
+                if partial && mapping.contains_key(&varnode_offset) {
+                    continue;
+                }
+                mapping.insert(varnode_offset, (idx as u32, byte as u8));
             }
 
             // We only support operating on registers that are at most 128-bits. This is only an

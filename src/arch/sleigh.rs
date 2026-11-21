@@ -144,8 +144,10 @@ fn file_in(dir: &str, name: &str) -> Option<&'static str> {
 
 impl crate::sleigh::parse::Input for Embedded {
     fn open(&mut self, name: &str) -> std::io::Result<String> {
+        // A last line without its newline (HC12.slaspec, ending on its
+        // `@include`) is still a line to the preprocessor.
         file_in(&self.dir, name)
-            .map(str::to_string)
+            .map(|text| format!("{text}\n"))
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, name.to_string()))
     }
 }
@@ -263,7 +265,12 @@ impl Disassembler<'_> {
         let bytes = &bytes[..bytes.len().min(WINDOW)];
         let sleigh = &self.lang.sleigh;
         let insn = self.runtime.decode(sleigh, addr, bytes)?;
-        let len = usize::try_from(insn.inst_next.checked_sub(insn.inst_start)?).ok()?;
+        let mut len = usize::try_from(insn.inst_next.checked_sub(insn.inst_start)?).ok()?;
+        // With delay slots ignored, the engine counts the slot as one
+        // more instruction of the same size; it's decoded on its own.
+        if insn.has_delay_slot() {
+            len /= 2;
+        }
         if len == 0 || len > bytes.len() {
             return None;
         }
@@ -336,6 +343,36 @@ mod tests {
     }
 
     #[test]
+    fn languages_with_grammar_gaps_compile() {
+        // Each used a construct the vendored parser lacked: `if` with a
+        // compound condition (SH-4, MCS96), a store to a computed address
+        // (TriCore), `return [expr]` (PIC24), a sizeless call target
+        // (M16C), space attributes out of order (PIC-16), `_` in attach
+        // values (80251), a last line without newline (HC12), partially
+        // overlapping registers (CR16C, Dalvik).
+        for id in [
+            "SuperH4:LE:32:default",
+            "MCS96:LE:16:default",
+            "tricore:LE:32:default",
+            "PIC-24F:LE:24:default",
+            "M16C/60:LE:16:default",
+            "PIC-16:LE:16:PIC-16F",
+            "80251:BE:24:default",
+            "HC-12:BE:16:default",
+            "CR16C:LE:16:default",
+            "Dalvik:LE:32:default",
+        ] {
+            language(id).unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
+        // SH-4: rts ; nop -- the delay slot decodes on its own.
+        let sh4 = language("SuperH4:LE:32:default").unwrap();
+        let mut d = sh4.disassembler();
+        let code = [0x0b, 0x00, 0x09, 0x00];
+        assert_eq!(d.decode(&code, 0x1000), Some((2, "rts".to_string())));
+        assert_eq!(d.decode(&code[2..], 0x1002), Some((2, "nop".to_string())));
+    }
+
+    #[test]
     fn deprecated_languages_find_their_specs() {
         language("RISCV:LE:64:RV64I").expect("compile");
     }
@@ -363,6 +400,9 @@ mod survey {
             let t = std::time::Instant::now();
             match super::language(&l.id) {
                 Ok(_) => println!("OK   {:40} {:?}", l.id, t.elapsed()),
+                Err(e) if std::env::var_os("SURVEY_FULL").is_some() => {
+                    println!("FAIL {:40} {e}", l.id);
+                }
                 Err(e) => println!(
                     "FAIL {:40} {}",
                     l.id,

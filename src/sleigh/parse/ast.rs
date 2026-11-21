@@ -629,6 +629,8 @@ impl ParserDisplay for Statement {
 pub enum BranchDst {
     Direct(JumpLabel),
     Indirect(JumpLabel),
+    /// univdreams: `[expr]` with a computed address (`call [tbr + disp*4]`).
+    Computed(Box<PcodeExpr>),
     Label(Ident),
 }
 
@@ -641,6 +643,7 @@ impl ParserDisplay for BranchDst {
         match self {
             Self::Direct(inner) => inner.fmt(f, p),
             Self::Indirect(inner) => write!(f, "[{}]", inner.display(p)),
+            Self::Computed(inner) => write!(f, "[{}]", inner.display(p)),
             Self::Label(inner) => write!(f, "<{}>", inner.display(p)),
         }
     }

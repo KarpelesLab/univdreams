@@ -20,7 +20,7 @@ impl Token {
     /// Create a new error message for an unexpected token kind error
     #[cold]
     pub fn error_unexpected(&self, expected: &[TokenKind]) -> Error {
-        assert!(!expected.contains(&self.kind));
+        // univdreams: no `assert!` here; it hid the parse error it reports.
 
         let message = match self.kind {
             TokenKind::UnclosedString if expected == [TokenKind::String] => {

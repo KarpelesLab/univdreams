@@ -198,9 +198,9 @@ Driven by a corpus of a few thousand firmware blobs (raw images and ELF, for ARM
 - [ ] Functions of relocatable objects: every section starts at 0, so functions are only told apart by address within one section; objects with several code sections (`-ffunction-sections`, `.text.startup`, COMDAT) keep all their code as bytes.
 - [ ] Containers: Intel HEX, Qualcomm MBN, Cypress CYACD, TI ROM boot tables.
 - [ ] Decoders for the corpus' CPUs from Ghidra's SLEIGH processor specs (a pure-Rust SLEIGH engine), so instructions round-trip as `@asm` with pinned bytes; encoders and lifting after.
-  - [x] icicle-emu's SLEIGH engine vendored (`src/sleigh/`), Ghidra's specs for 32 processors embedded (`sleigh-specs/`, feature `sleigh`); 87 of 126 languages compile (RISC-V, AVR, NDS32, V850, PIC-18 among them: names in spaces other than the register space are kept as registers); constructors whose p-code the engine can't type still decode, without p-code.
-  - [ ] Engine gaps: parser gaps (Hexagon, TriCore, SH-4, M16C, PIC24, ARMv8-M, MCS96), partially overlapping registers (Dalvik, CR16), panics (PIC-12/16/17, CP1600).
-  - [x] Opaque ELF code (ARM, MIPS, PowerPC, SPARC, 68k, Xtensa, SH-2, MSP430, Z80, LoongArch) and `--arch` raw images disassemble to `@asm` with pinned bytes, in `code_<addr>` blocks.
+  - [x] icicle-emu's SLEIGH engine vendored (`src/sleigh/`), Ghidra's specs for 32 processors embedded (`sleigh-specs/`, feature `sleigh`); 124 of 126 languages compile. Engine extensions for Ghidra's grammar: names in non-register spaces, compound `if` conditions and store addresses, `[expr]` branch targets, sizeless constant targets, space attributes in any order, `_` in attach values, partially overlapping registers (own storage), named p-code sections and `crossbuild` (Hexagon, accepted, not modelled); constructors whose p-code the engine can't type, or that `globalset` a computed address, still decode without p-code. Delay slots decode as their own instruction.
+  - [ ] Engine gaps: context registers wider than 64 bits (Hexagon, PA-RISC); p-code for the constructors above.
+  - [x] Opaque ELF code (ARM, MIPS, PowerPC, SPARC, 68k, Xtensa, SuperH, TriCore, RISC-V, V850, NDS32, AVR, 8051, HCS12, MSP430, Z80, LoongArch) and `--arch` raw images disassemble to `@asm` with pinned bytes, in `code_<addr>` blocks.
   - [ ] Function boundaries and ARM/Thumb interworking (mapping symbols); ELF without section headers (code from `PT_LOAD` segments); memory use on very large images.
 
 ## Beyond v1

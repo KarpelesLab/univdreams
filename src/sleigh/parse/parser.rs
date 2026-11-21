@@ -776,14 +776,30 @@ impl Parse for ast::Space {
         }
 
         let name = p.parse()?;
-        let kind = parse_ident_value_v2(p, "type")?;
-        let size = parse_ident_value(p, "size", Parser::parse_size_field)?;
-
-        let word_size = match p.check_ident("wordsize") {
-            true => Some(parse_ident_value(p, "wordsize", Parser::parse_size_field)?),
-            false => None,
+        // univdreams: the attributes come in any order, as in Ghidra
+        // (`type=ram_space wordsize=2 size=2 default`).
+        let (mut kind, mut size, mut word_size, mut default) = (None, None, None, false);
+        loop {
+            if p.check_ident("type") {
+                kind = Some(parse_ident_value_v2(p, "type")?);
+            } else if p.check_ident("size") {
+                size = Some(parse_ident_value(p, "size", Parser::parse_size_field)?);
+            } else if p.check_ident("wordsize") {
+                word_size = Some(parse_ident_value(p, "wordsize", Parser::parse_size_field)?);
+            } else if p.bump_if(TokenKind::Default)?.is_some() {
+                default = true;
+            } else {
+                break;
+            }
+        }
+        let kind = match kind {
+            Some(kind) => kind,
+            None => parse_ident_value_v2(p, "type")?,
         };
-        let default = p.bump_if(TokenKind::Default)?.is_some();
+        let size = match size {
+            Some(size) => size,
+            None => parse_ident_value(p, "size", Parser::parse_size_field)?,
+        };
 
         Ok(Some(ast::Space {
             name,
@@ -981,7 +997,16 @@ impl Parse for ast::AttachValues {
             return Ok(None);
         }
         let fields = parse_ident_list(p)?;
-        let ItemOrList(values) = p.parse()?;
+        // univdreams: `_` marks a field value with no meaning (80251);
+        // it stands as `i64::MIN`, which no real value takes.
+        let values = parse_item_or_list(p, |p| {
+            if p.check_ident("_") {
+                p.next();
+                Ok(i64::MIN)
+            } else {
+                p.parse()
+            }
+        })?;
         Ok(Some(ast::AttachValues { fields, values }))
     }
 }
@@ -1297,13 +1322,24 @@ impl Parse for ast::Statement {
                     ast::Statement::Local { name, size }
                 }
             }
+            // univdreams: Ghidra's `crossbuild <addr>, <section>;` (Hexagon
+            // packets) builds another instruction's p-code; not modelled.
+            TokenKind::Ident if p.check_ident("crossbuild") && p.check_nth(1, TokenKind::Ident) => {
+                p.next();
+                let _: ast::Ident = p.parse()?;
+                p.expect(TokenKind::Comma)?;
+                let _: ast::Ident = p.parse()?;
+                ast::Statement::Unimplemented
+            }
             TokenKind::Build => {
                 p.expect(TokenKind::Build)?;
                 let name = p.parse()?;
                 ast::Statement::Build { name }
             }
             TokenKind::Star => {
-                let (space, size, pointer) = parse_deref(p)?;
+                // univdreams: a store's address is a whole expression
+                // (`*[ram]:8 BO+8 = x`), as in Ghidra's grammar.
+                let (space, size, pointer) = parse_deref_with(p, |p| p.parse())?;
                 p.expect(TokenKind::Equal)?;
                 let value = p.parse()?;
                 ast::Statement::Store {
@@ -1315,7 +1351,9 @@ impl Parse for ast::Statement {
             }
             TokenKind::If => {
                 p.expect(TokenKind::If)?;
-                let cond = parse_pcode_term(p)?;
+                // univdreams: a whole expression, as in Ghidra's grammar
+                // (`if count == 16 goto <end>`, `if (a) && (b) goto …`).
+                let cond = p.parse()?;
                 p.expect(TokenKind::Goto)?;
                 let dst = p.parse()?;
                 ast::Statement::CondBranch {
@@ -1345,6 +1383,19 @@ impl Parse for ast::Statement {
                     hint: ast::BranchHint::Return,
                 }
             }
+            // univdreams: Ghidra's named p-code sections (`<<COMMIT>>`,
+            // Hexagon's packet semantics) aren't modelled; each becomes a
+            // label of its own, which no branch targets.
+            TokenKind::LessThan if p.check_nth(1, TokenKind::LessThan) => {
+                p.expect(TokenKind::LessThan)?;
+                p.expect(TokenKind::LessThan)?;
+                let name: ast::Ident = p.parse()?;
+                p.expect(TokenKind::GreaterThan)?;
+                p.expect(TokenKind::GreaterThan)?;
+                let name = format!("<<{}>>", p.get_ident_str(name));
+                let label = p.get_ident(&name);
+                return Ok(Some(ast::Statement::Label { label }));
+            }
             TokenKind::LessThan => {
                 let label = parse_label(p)?;
                 // Labels do not end with a semi-colon so exit early here
@@ -1367,6 +1418,13 @@ impl Parse for ast::Statement {
 fn parse_deref(
     p: &mut Parser,
 ) -> Result<(Option<ast::Ident>, Option<VarSize>, ast::PcodeExpr), Error> {
+    parse_deref_with(p, parse_pcode_term)
+}
+
+fn parse_deref_with(
+    p: &mut Parser,
+    pointer: impl FnOnce(&mut Parser) -> Result<ast::PcodeExpr, Error>,
+) -> Result<(Option<ast::Ident>, Option<VarSize>, ast::PcodeExpr), Error> {
     p.expect(TokenKind::Star)?;
     let space = match p.bump_if(TokenKind::LeftBracket)?.is_some() {
         true => {
@@ -1377,7 +1435,7 @@ fn parse_deref(
         false => None,
     };
     let size = parse_optional_size(p)?;
-    let pointer = parse_pcode_term(p)?;
+    let pointer = pointer(p)?;
     Ok((space, size, pointer))
 }
 
@@ -1408,9 +1466,24 @@ impl Parse for ast::BranchDst {
             TokenKind::Ident | TokenKind::Number => Some(ast::BranchDst::Direct(p.parse()?)),
             TokenKind::LeftBracket => {
                 p.expect(TokenKind::LeftBracket)?;
-                let offset = p.parse()?;
+                // univdreams: any expression, as in Ghidra's grammar; a
+                // lone varnode keeps the indirect form.
+                let dst = match p.parse::<ast::PcodeExpr>()? {
+                    ast::PcodeExpr::Ident { value } => {
+                        ast::BranchDst::Indirect(ast::JumpLabel::Ident(value))
+                    }
+                    ast::PcodeExpr::Truncate { value, size }
+                        if matches!(*value, ast::PcodeExpr::Integer { .. }) =>
+                    {
+                        let ast::PcodeExpr::Integer { value } = *value else {
+                            unreachable!()
+                        };
+                        ast::BranchDst::Indirect(ast::JumpLabel::Integer(value, size))
+                    }
+                    expr => ast::BranchDst::Computed(Box::new(expr)),
+                };
                 p.expect(TokenKind::RightBracket)?;
-                Some(ast::BranchDst::Indirect(offset))
+                Some(dst)
             }
             TokenKind::LessThan => Some(ast::BranchDst::Label(parse_label(p)?)),
             _ => None,
@@ -1438,7 +1511,9 @@ impl Parse for ast::JumpLabel {
             TokenKind::Ident => Some(ast::JumpLabel::Ident(p.parse()?)),
             TokenKind::Number => {
                 let offset = p.parse()?;
-                let size = parse_optional_size(p)?.ok_or_else(|| p.error("expected size"))?;
+                // univdreams: Ghidra takes a constant address without a
+                // size (`call 0x0fffe0`); 0 stands for none.
+                let size = parse_optional_size(p)?.unwrap_or(0);
                 Some(ast::JumpLabel::Integer(offset, size))
             }
             _ => None,

@@ -796,6 +796,9 @@ impl<'a, 'b> Builder<'a, 'b> {
             ast::BranchDst::Direct(dst) | ast::BranchDst::Indirect(dst) => {
                 let dst = match *dst {
                     ast::JumpLabel::Ident(ident) => self.resolve_ident(ident)?,
+                    ast::JumpLabel::Integer(_, 0) => {
+                        return Err("branch to a constant without a size".into());
+                    }
                     ast::JumpLabel::Integer(value, size) => ExprValue::Const(value, Some(size)),
                 };
 
@@ -817,6 +820,10 @@ impl<'a, 'b> Builder<'a, 'b> {
                     self.read_value(dst, None)?
                 };
 
+                self.op_no_output(crate::sleigh::pcode::Op::Branch(hint), &[cond, address]);
+            }
+            ast::BranchDst::Computed(expr) => {
+                let address = self.resolve_expr_value(expr)?;
                 self.op_no_output(crate::sleigh::pcode::Op::Branch(hint), &[cond, address]);
             }
             ast::BranchDst::Label(label) => {
