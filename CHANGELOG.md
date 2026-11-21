@@ -8,6 +8,25 @@ Until we hit `1.0.0`, minor-version bumps signal intentional API breakage.
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/KarpelesLab/univdreams/compare/v0.5.1...v0.6.0) - 2026-11-21
+
+### ELF
+
+- objects with several sections of one name (COMDAT .group)
+- big-endian files, and malformed ones as raw images
+- verify decompiles compile back, keep failing functions as bytes
+
+### PE
+
+- verify decompiles compile back; quote call targets that aren't names
+
+### SLEIGH
+
+- checked varnode slice bounds (debug overflow compiling Hexagon)
+- 128-bit context register; Hexagon and PA-RISC decode
+- 124 of 126 Ghidra languages compile
+- RISC-V, AVR, NDS32, V850, PIC-18 compile; keep constructors whose p-code fails
+
 ## [0.5.1](https://github.com/KarpelesLab/univdreams/compare/v0.5.0...v0.5.1) - 2026-11-03
 
 ### Documentation
