@@ -202,7 +202,8 @@ Driven by a corpus of a few thousand firmware blobs (raw images and ELF, for ARM
   - [ ] Engine gaps: p-code for the constructors above; Hexagon packets and `crossbuild`.
   - [x] Opaque ELF code (ARM, MIPS, PowerPC, SPARC, 68k, Xtensa, SuperH, TriCore, Hexagon, PA-RISC, RISC-V, V850, NDS32, AVR, 8051, HCS12, MSP430, Z80, LoongArch) and `--arch` raw images disassemble to `@asm` with pinned bytes, in `code_<addr>` blocks.
   - [x] ARM/Thumb interworking: `$a`/`$t`/`$d` mapping symbols (or Thumb function symbols, or an odd entry point) switch between ARM, Thumb and literal-pool data.
-  - [ ] Function boundaries; ELF without section headers (code from `PT_LOAD` segments); memory use on very large images.
+  - [x] ELF without section headers: executable `PT_LOAD` bytes become `@section` blocks that padding entries name (`{ offset, section: "segment2@0x1000" }`), disassembled.
+  - [ ] Function boundaries; memory use on very large images.
 
 ## Beyond v1
 

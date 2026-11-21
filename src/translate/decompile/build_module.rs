@@ -11,11 +11,56 @@
 use crate::ast::{Field, Module, Value};
 use crate::format::elf::{Elf64File, Phdr64};
 
+/// Padding bytes given by a `@section` block (code of an ELF without
+/// section headers) instead of a byte list.
+#[derive(Debug, Clone)]
+pub struct CodePadding {
+    /// File offset.
+    pub offset: u64,
+    pub len: u64,
+    /// Load address of its first byte.
+    pub addr: u64,
+    /// The `@section` block holding it.
+    pub name: String,
+}
+
+/// The executable `PT_LOAD` parts of `elf`'s padding (all of its file
+/// content when there are no section headers).
+#[must_use]
+pub fn code_padding(elf: &Elf64File) -> Vec<CodePadding> {
+    const PT_LOAD: u32 = 1;
+    const PF_X: u32 = 1;
+    let mut out = Vec::new();
+    for (i, ph) in elf.phdrs.iter().enumerate() {
+        if ph.p_type != PT_LOAD || ph.p_flags & PF_X == 0 || ph.p_filesz == 0 {
+            continue;
+        }
+        let (lo, hi) = (ph.p_offset, ph.p_offset.saturating_add(ph.p_filesz));
+        for (off, bytes) in elf.padding() {
+            let (start, end) = (lo.max(*off), hi.min(off + bytes.len() as u64));
+            let overlaps = out
+                .iter()
+                .any(|c: &CodePadding| start < c.offset + c.len && c.offset < end);
+            if start < end && !overlaps {
+                out.push(CodePadding {
+                    offset: start,
+                    len: end - start,
+                    addr: ph.p_vaddr + (start - ph.p_offset),
+                    name: format!("segment{i}@0x{start:x}"),
+                });
+            }
+        }
+    }
+    out.sort_by_key(|c| c.offset);
+    out
+}
+
 /// Construct a [`Module`] capturing the full ELF metadata: the
 /// interpreted header fields, the program-header table, the section-
-/// header table, and the file padding regions.
+/// header table, and the file padding regions; the `code` parts of the
+/// padding name the `@section` block that holds them instead.
 #[must_use]
-pub fn build_module(elf: &Elf64File) -> Module {
+pub fn build_module(elf: &Elf64File, code: &[CodePadding]) -> Module {
     let arch = crate::arch::opaque::elf_machine_name(elf.ehdr.e_machine).unwrap_or("unknown");
     let abi = guess_abi(elf);
 
@@ -68,16 +113,7 @@ pub fn build_module(elf: &Elf64File) -> Module {
         // region can be hundreds of bytes long in stripped binaries).
         // Non-zero padding (0xCC fills, debug guards, etc.) still
         // round-trips through its explicit byte list.
-        field(
-            "padding",
-            Value::List(
-                elf.padding()
-                    .iter()
-                    .filter(|(_, bytes)| bytes.iter().any(|&b| b != 0))
-                    .map(padding_block)
-                    .collect(),
-            ),
-        ),
+        field("padding", Value::List(padding_entries(elf, code))),
     ]);
 
     let bits = match elf.class {
@@ -131,6 +167,32 @@ fn shdr_block(elf: &Elf64File, idx: usize, s: &crate::format::elf::Shdr64) -> Va
         field("sh_addralign", Value::Int(s.sh_addralign)),
         field("sh_entsize", Value::Int(s.sh_entsize)),
     ])
+}
+
+/// The padding entries: byte lists (all-zero ones left out), split
+/// around the `code` parts, which name their `@section` block instead.
+fn padding_entries(elf: &Elf64File, code: &[CodePadding]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let bytes_entry = |out: &mut Vec<Value>, offset: u64, bytes: &[u8]| {
+        if bytes.iter().any(|&b| b != 0) {
+            out.push(padding_block(&(offset, bytes.to_vec())));
+        }
+    };
+    for (off, bytes) in elf.padding() {
+        let end = off + bytes.len() as u64;
+        let slice = |from: u64, to: u64| &bytes[(from - off) as usize..(to - off) as usize];
+        let mut at = *off;
+        for c in code.iter().filter(|c| c.offset >= *off && c.offset < end) {
+            bytes_entry(&mut out, at, slice(at, c.offset));
+            out.push(Value::Block(vec![
+                field("offset", Value::Int(c.offset)),
+                field("section", Value::String(c.name.clone())),
+            ]));
+            at = c.offset + c.len;
+        }
+        bytes_entry(&mut out, at, slice(at, end));
+    }
+    out
 }
 
 fn padding_block(p: &(u64, Vec<u8>)) -> Value {

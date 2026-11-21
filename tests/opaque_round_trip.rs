@@ -70,3 +70,17 @@ fn headerless_bytes() {
         Vec::<u8>::new()
     );
 }
+
+#[test]
+fn elf_without_section_headers() {
+    // An ELF32 relabelled as ARM, its section header table dropped
+    // (e_shoff, e_shnum, e_shstrndx zeroed): the executable segment's
+    // bytes become a `@section` block the padding entry names.
+    let mut bytes = with_machine(fixture("sqrt-gcc13-O0-m32"), 40);
+    bytes[32..36].fill(0);
+    bytes[48..52].fill(0);
+    let text = elf_round_trip(&bytes);
+    assert!(text.contains("section: \"segment"), "{text}");
+    assert!(text.contains("@section(\"segment"), "{text}");
+    assert_eq!(text.contains("@asm("), cfg!(feature = "sleigh"));
+}

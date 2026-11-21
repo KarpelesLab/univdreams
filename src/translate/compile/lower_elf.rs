@@ -47,7 +47,9 @@ pub enum ElfLowerError {
     #[error("`@module.build.e_ident` must be a list of exactly 16 bytes")]
     BadEIdent,
 
-    #[error("`@section` block named `{section}` has no matching shdr in `@module.build.shdrs`")]
+    #[error(
+        "`@section` block named `{section}` has no matching shdr in `@module.build.shdrs` or padding entry"
+    )]
     UnknownSection { section: String },
 
     #[error("more `@section` blocks named `{section}` than sections of that name")]
@@ -85,7 +87,7 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
     let mut ehdr = read_ehdr(&file.module, build)?;
     let mut phdrs = read_phdrs(build)?;
     let mut shdrs = read_shdrs(build)?;
-    let mut padding = read_padding(build)?;
+    let padding_entries = read_padding(build)?;
     let mut file_size = read_int(build, "file_size")?;
 
     let arch = resolve_arch_codec(&file.module)?;
@@ -117,6 +119,19 @@ pub fn build_elf64(file: &UdFile) -> Result<Elf64File, ElfLowerError> {
             return Err(ElfLowerError::UnknownSection { section: name });
         };
         section_data.push(bytes);
+    }
+
+    // Padding entries naming a @section block take its bytes.
+    let mut padding = Vec::with_capacity(padding_entries.len());
+    for (offset, bytes) in padding_entries {
+        let bytes = match bytes {
+            PaddingBytes::Listed(bytes) => bytes,
+            PaddingBytes::Section(name) => by_name
+                .get_mut(&name)
+                .and_then(std::collections::VecDeque::pop_front)
+                .ok_or(ElfLowerError::UnknownSection { section: name })?,
+        };
+        padding.push((offset, bytes));
     }
 
     // Any leftover @section blocks didn't map to a shdr.
@@ -467,7 +482,14 @@ fn read_one_shdr(v: &Value) -> Result<Shdr64, ElfLowerError> {
     })
 }
 
-fn read_padding(build: &[crate::ast::Field]) -> Result<Vec<(u64, Vec<u8>)>, ElfLowerError> {
+/// A padding entry's bytes: listed, or the `@section` block it names
+/// (the code of an ELF without section headers).
+enum PaddingBytes {
+    Listed(Vec<u8>),
+    Section(String),
+}
+
+fn read_padding(build: &[crate::ast::Field]) -> Result<Vec<(u64, PaddingBytes)>, ElfLowerError> {
     let value = lookup_field(build, "padding")?;
     let Value::List(items) = value else {
         return Err(ElfLowerError::WrongShape {
@@ -484,6 +506,10 @@ fn read_padding(build: &[crate::ast::Field]) -> Result<Vec<(u64, Vec<u8>)>, ElfL
             });
         };
         let offset = read_int(fields, "offset")?;
+        if let Ok(Value::String(name)) = lookup_field(fields, "section") {
+            out.push((offset, PaddingBytes::Section(name.clone())));
+            continue;
+        }
         let bytes_value = lookup_field(fields, "bytes")?;
         let Value::List(byte_items) = bytes_value else {
             return Err(ElfLowerError::WrongShape {
@@ -508,7 +534,7 @@ fn read_padding(build: &[crate::ast::Field]) -> Result<Vec<(u64, Vec<u8>)>, ElfL
             }
             bytes.push(*n as u8);
         }
-        out.push((offset, bytes));
+        out.push((offset, PaddingBytes::Listed(bytes)));
     }
     Ok(out)
 }

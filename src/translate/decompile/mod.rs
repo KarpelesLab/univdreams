@@ -80,16 +80,51 @@ fn sleigh_section(
     elf: &Elf64File,
     language: &str,
     arm_mapping: &[(usize, u64, crate::analysis::ArmMapping)],
-    idx: usize,
-    sh: &Shdr64,
+    idx: Option<usize>,
+    addr: u64,
     data: &[u8],
 ) -> Option<Vec<Item>> {
-    let mut modes = sleigh::arm_modes(arm_mapping, idx);
+    let mut modes = idx.map_or_else(Vec::new, |idx| sleigh::arm_modes(arm_mapping, idx));
     // No symbols at all: an odd entry point means Thumb code.
     if arm_mapping.is_empty() && elf.ehdr.e_machine == EM_ARM && elf.ehdr.e_entry & 1 == 1 {
-        modes.push((sh.sh_addr, sleigh::Mode::Context("TMode", 1)));
+        modes.push((addr, sleigh::Mode::Context("TMode", 1)));
     }
-    sleigh::code_items_with(language, sh.sh_addr, data, &modes)
+    sleigh::code_items_with(language, addr, data, &modes)
+}
+
+/// An ELF without section headers: its executable segments' bytes as
+/// `@section` blocks the padding entries name, disassembled with SLEIGH
+/// `language`.
+fn segment_code(
+    elf: &Elf64File,
+    language: Option<&str>,
+) -> (Vec<build_module::CodePadding>, Vec<Item>) {
+    let Some(language) = language.filter(|_| elf.shdrs.is_empty()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let code = build_module::code_padding(elf);
+    let mut items = Vec::new();
+    for c in &code {
+        // `code_padding` cut each part out of one padding region.
+        let Some(data) = elf.padding().iter().find_map(|(off, bytes)| {
+            let lo = usize::try_from(c.offset.checked_sub(*off)?).ok()?;
+            bytes.get(lo..lo.checked_add(usize::try_from(c.len).ok()?)?)
+        }) else {
+            continue;
+        };
+        let body = sleigh_section(elf, language, &[], None, c.addr, data).unwrap_or_else(|| {
+            vec![Item::Raw {
+                addr: c.addr,
+                bytes: data.to_vec(),
+            }]
+        });
+        items.push(Item::Section {
+            name: c.name.clone(),
+            addr: c.addr,
+            items: body,
+        });
+    }
+    (code, items)
 }
 
 /// Which arch backend to drive for a given ELF.
@@ -193,7 +228,6 @@ fn arch_of(elf: &Elf64File) -> Arch {
 }
 
 fn decompile_arch(elf: &Elf64File, arch: Arch, options: &Options) -> Result<UdFile> {
-    let module = build_module::build_module(elf);
     // No hand-written decoder: disassemble with SLEIGH when a spec
     // covers the machine (unless all code is to stay bytes).
     let sleigh_language = if matches!(arch, Arch::Opaque) && !options.opaque {
@@ -205,6 +239,9 @@ fn decompile_arch(elf: &Elf64File, arch: Arch, options: &Options) -> Result<UdFi
     } else {
         None
     };
+    // No section headers: executable segments are code all the same.
+    let (code_padding, segment_items) = segment_code(elf, sleigh_language);
+    let module = build_module::build_module(elf, &code_padding);
     // ARM: mapping symbols say where Thumb code and literal pools are.
     let arm_mapping = if sleigh_language.is_some() && elf.ehdr.e_machine == EM_ARM {
         crate::analysis::arm_mapping(elf)
@@ -267,7 +304,7 @@ fn decompile_arch(elf: &Elf64File, arch: Arch, options: &Options) -> Result<UdFi
             .map_or_else(|| format!("section{idx}"), str::to_string);
         let sleigh_code = sleigh_language
             .filter(|_| sh.sh_flags & SHF_EXECINSTR != 0 && !data.is_empty())
-            .and_then(|lang| sleigh_section(elf, lang, &arm_mapping, idx, sh, data));
+            .and_then(|lang| sleigh_section(elf, lang, &arm_mapping, Some(idx), sh.sh_addr, data));
         let mut section_items = match sleigh_code {
             Some(items) => items,
             None => build_section_items(
@@ -289,6 +326,7 @@ fn decompile_arch(elf: &Elf64File, arch: Arch, options: &Options) -> Result<UdFi
             items: section_items,
         });
     }
+    items.extend(segment_items);
 
     // After every section is built, harvest the jump-table
     // metadata from `Stmt::Switch` instances and replace the
