@@ -83,3 +83,44 @@ fn arm_mapping_symbols_pick_thumb_arm_and_data() {
         "{text}"
     );
 }
+
+#[test]
+fn pe_fixtures_decompile_whole() {
+    for name in [
+        "loops-mingw15-O0-i386.exe",
+        "loops-mingw15-O0-x64.exe",
+        "sqrt-mingw15-O0-x64.exe",
+        "sqrt-mingw15-O0.exe",
+    ] {
+        let bytes = fixture(name);
+        let pe = univdreams::format::pe::PeFile::parse(&bytes).expect("parse PE");
+        let v = univdreams::translate::decompile::decompile_pe_verified(&pe);
+        assert!(v.opaque.is_none(), "{name}: {:?}", v.opaque);
+        let text = univdreams::ast::emit(&v.ast);
+        let rebuilt = univdreams::translate::compile::lower_to_pe(&parse(&text).expect("parse"))
+            .expect("lower");
+        assert!(rebuilt == bytes, "{name}: differs after round-trip");
+        assert!(text.contains("fn "), "{name}: no function lifted");
+    }
+}
+
+#[test]
+fn pe_function_that_does_not_compile_back_is_kept_as_bytes() {
+    // A function whose bytes the x86 codec can't re-encode: the entry
+    // point's first instruction patched to a `call rel32` whose target
+    // wraps around the 32-bit address space.
+    let mut bytes = fixture("sqrt-mingw15-O0.exe");
+    let pe = univdreams::format::pe::PeFile::parse(&bytes).expect("parse PE");
+    let entry = pe
+        .rva_to_file_offset(pe.address_of_entry_point)
+        .expect("entry offset");
+    bytes[entry..entry + 5].copy_from_slice(&[0xe8, 0x00, 0x00, 0x00, 0x80]);
+    let pe = univdreams::format::pe::PeFile::parse(&bytes).expect("parse PE");
+    let v = univdreams::translate::decompile::decompile_pe_verified(&pe);
+    assert!(v.opaque.is_none(), "{:?}", v.opaque);
+    assert!(!v.raw_functions.is_empty(), "the patched function lifted");
+    let text = univdreams::ast::emit(&v.ast);
+    let rebuilt =
+        univdreams::translate::compile::lower_to_pe(&parse(&text).expect("parse")).expect("lower");
+    assert!(rebuilt == bytes, "differs after round-trip");
+}

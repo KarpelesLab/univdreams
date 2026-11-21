@@ -39,7 +39,7 @@ pub use lower_elf::{ElfLowerError, build_elf64, lower_to_elf};
 pub use lower_evm::{EvmLowerError, lower_to_evm};
 pub use lower_macho::{MachoLowerError, lower_to_macho};
 pub use lower_ne::{NeLowerError, lower_to_ne};
-pub use lower_pe::{PeLowerError, lower_to_pe};
+pub use lower_pe::{PeLowerError, lower_pe_function, lower_to_pe};
 pub use lower_raw::{RawLowerError, lower_to_raw};
 pub use lower_wasm::{WasmLowerError, lower_to_wasm};
 pub use parser::{ParseError, parse};

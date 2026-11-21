@@ -16,7 +16,7 @@
 //!
 //! [`PeFile`]: crate::format::pe::PeFile
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::arch::x86::{Bitness, lift_function};
 use crate::ast::{Field, Item, Module, UdFile, Value};
@@ -32,9 +32,195 @@ use crate::translate::decompile::build_function;
 /// per-region `@raw` blocks.
 #[must_use]
 pub fn decompile_pe(pe: &PeFile) -> UdFile {
+    decompile_pe_keeping(pe, &Keep::None)
+}
+
+/// Which functions to keep as bytes rather than lift.
+enum Keep<'a> {
+    None,
+    /// Those at these file offsets.
+    These(&'a HashSet<u64>),
+    All,
+}
+
+fn decompile_pe_keeping(pe: &PeFile, keep: &Keep<'_>) -> UdFile {
     let module = build_pe_module(pe);
-    let items = build_pe_items(pe);
+    let items = build_pe_items(pe, keep);
     UdFile { module, items }
+}
+
+/// A PE decompilation checked to compile back to the input's bytes.
+#[derive(Debug)]
+pub struct VerifiedPe {
+    pub ast: UdFile,
+    /// Functions kept as bytes because their source didn't compile
+    /// back to them: (file offset, name).
+    pub raw_functions: Vec<(u64, String)>,
+    /// Set when no function could be lifted safely and all code is
+    /// kept as bytes: why.
+    pub opaque: Option<String>,
+}
+
+/// [`decompile_pe`], compiled back and compared with the input: a
+/// function whose source doesn't parse, doesn't lower, or lowers to other
+/// bytes is kept as bytes instead, and when the whole file still differs
+/// all code is.
+#[must_use]
+pub fn decompile_pe_verified(pe: &PeFile) -> VerifiedPe {
+    let bytes = pe.raw_bytes();
+    let mut keep = HashSet::new();
+    // Names of the functions kept, from when they were still lifted.
+    let mut names: HashMap<u64, String> = HashMap::new();
+    let reason = loop {
+        let ast = decompile_pe_keeping(pe, &Keep::These(&keep));
+        for (start, _, f) in function_ranges(&ast) {
+            names.entry(start).or_insert_with(|| f.name.clone());
+        }
+        let mut culprits = failing_functions(&ast, bytes);
+        if culprits.is_subset(&keep) {
+            match whole_file_culprits(&ast, bytes) {
+                Ok(()) => {
+                    let mut raw_functions: Vec<(u64, String)> = keep
+                        .iter()
+                        .map(|&at| (at, names.get(&at).cloned().unwrap_or_default()))
+                        .collect();
+                    raw_functions.sort_unstable();
+                    return VerifiedPe {
+                        ast,
+                        raw_functions,
+                        opaque: None,
+                    };
+                }
+                Err((found, reason)) => {
+                    culprits = found;
+                    if culprits.is_subset(&keep) {
+                        break reason;
+                    }
+                }
+            }
+        }
+        keep.extend(culprits);
+    };
+    VerifiedPe {
+        ast: decompile_pe_keeping(pe, &Keep::All),
+        raw_functions: Vec::new(),
+        opaque: Some(reason),
+    }
+}
+
+/// Every lifted function's file range: from its `@addr` to the next
+/// item's.
+fn function_ranges(ast: &UdFile) -> Vec<(u64, u64, &crate::ast::FnDecl)> {
+    let mut starts: Vec<(u64, Option<&crate::ast::FnDecl>)> = ast
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Function(f) => Some((f.addr?, Some(f))),
+            Item::Raw { addr, .. } => Some((*addr, None)),
+            _ => None,
+        })
+        .collect();
+    starts.sort_by_key(|(at, _)| *at);
+    let mut out = Vec::new();
+    for (i, (at, f)) in starts.iter().enumerate() {
+        if let Some(f) = f {
+            let end = starts.get(i + 1).map_or(u64::MAX, |(next, _)| *next);
+            out.push((*at, end, *f));
+        }
+    }
+    out
+}
+
+/// Functions whose source, emitted and parsed on its own, doesn't lower
+/// to exactly the bytes it was lifted from.
+fn failing_functions(ast: &UdFile, bytes: &[u8]) -> HashSet<u64> {
+    // Only what the parser and codec need of the module.
+    let module = Module {
+        fields: ast
+            .module
+            .fields
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.name.as_str(),
+                    "arch" | "format" | "bits" | "endian" | "build"
+                )
+            })
+            .cloned()
+            .collect(),
+    };
+    let mut out = HashSet::new();
+    for (start, end, f) in function_ranges(ast) {
+        let one = UdFile {
+            module: Module {
+                fields: module
+                    .fields
+                    .iter()
+                    .filter(|f| f.name != "build")
+                    .cloned()
+                    .collect(),
+            },
+            items: vec![Item::Function(f.clone())],
+        };
+        let reparsed = crate::translate::compile::parse(&crate::ast::emit(&one));
+        let lowered = reparsed.ok().and_then(|file| {
+            let Some(Item::Function(g)) = file.items.into_iter().next() else {
+                return None;
+            };
+            crate::translate::compile::lower_pe_function(&module, &g).ok()
+        });
+        let original = usize::try_from(start).ok().and_then(|lo| {
+            let len = lowered.as_ref()?.len();
+            let hi = lo.checked_add(len)?;
+            (hi as u64 <= end).then(|| bytes.get(lo..hi))?
+        });
+        if lowered.is_none() || original.is_none() || lowered.as_deref() != original {
+            out.insert(start);
+        }
+    }
+    out
+}
+
+/// Compile the whole of `ast` back: `Ok` if it gives `bytes`, else the
+/// functions at fault (those holding differing bytes, or the one before
+/// an overlap) and why.
+fn whole_file_culprits(ast: &UdFile, bytes: &[u8]) -> Result<(), (HashSet<u64>, String)> {
+    let ranges = function_ranges(ast);
+    let containing = |at: u64| -> HashSet<u64> {
+        ranges
+            .iter()
+            .filter(|(start, end, _)| *start <= at && at < *end)
+            .map(|(start, _, _)| *start)
+            .collect()
+    };
+    let text = crate::ast::emit(ast);
+    let parsed =
+        crate::translate::compile::parse(&text).map_err(|e| (HashSet::new(), e.to_string()))?;
+    match crate::translate::compile::lower_to_pe(&parsed) {
+        Ok(rebuilt) if rebuilt == bytes => Ok(()),
+        Ok(rebuilt) => {
+            let mut found = HashSet::new();
+            let len = rebuilt.len().max(bytes.len());
+            for at in 0..len {
+                if rebuilt.get(at) != bytes.get(at) {
+                    found.extend(containing(at as u64));
+                }
+            }
+            Err((
+                found,
+                "differs where no function is left to keep as bytes".into(),
+            ))
+        }
+        Err(e) => {
+            let found = match &e {
+                crate::translate::compile::PeLowerError::OverlappingRaws { cursor, .. } => {
+                    containing(cursor.saturating_sub(1))
+                }
+                _ => HashSet::new(),
+            };
+            Err((found, e.to_string()))
+        }
+    }
 }
 
 /// Convenience: build the AST and pretty-print it to canonical text.
@@ -265,7 +451,7 @@ fn scan_vtables(pe: &PeFile) -> Vec<Value> {
 /// Inter-function gaps (alignment, unknown content) get their own
 /// `@raw` blocks. Round-trip is unchanged because the lower path
 /// concatenates `@raw` blocks in offset order.
-fn build_pe_items(pe: &PeFile) -> Vec<Item> {
+fn build_pe_items(pe: &PeFile, keep: &Keep<'_>) -> Vec<Item> {
     let bytes = pe.raw_bytes();
     let mut items: Vec<Item> = Vec::new();
 
@@ -301,6 +487,19 @@ fn build_pe_items(pe: &PeFile) -> Vec<Item> {
 
     let mut cursor = header_end.min(bytes.len());
     for (start, end, sec_idx) in &regions {
+        // Sections whose file data overlaps (a small one inside
+        // `.rsrc`): the bytes already emitted aren't emitted again,
+        // and the rest stays bytes.
+        if *start < cursor {
+            if *end > cursor {
+                items.push(Item::Raw {
+                    addr: cursor as u64,
+                    bytes: bytes[cursor..*end].to_vec(),
+                });
+                cursor = *end;
+            }
+            continue;
+        }
         if *start > cursor {
             // Trailing alignment between section table and
             // first section's raw data. Small, often a few
@@ -311,7 +510,15 @@ fn build_pe_items(pe: &PeFile) -> Vec<Item> {
             });
         }
         if let Some(funcs) = funcs_by_section.get(sec_idx) {
-            emit_section_with_function_split(pe, *sec_idx, *start, *end, funcs, bytes, &mut items);
+            emit_section_with_function_split(
+                pe,
+                *sec_idx,
+                *start..*end,
+                funcs,
+                bytes,
+                keep,
+                &mut items,
+            );
         } else {
             items.push(Item::Raw {
                 addr: *start as u64,
@@ -559,12 +766,13 @@ fn export_function_name(export: &PeExport) -> String {
 fn emit_section_with_function_split(
     pe: &PeFile,
     sec_idx: usize,
-    start: usize,
-    end: usize,
+    range: std::ops::Range<usize>,
     funcs: &[PeFunctionRecord],
     bytes: &[u8],
+    keep: &Keep<'_>,
     items: &mut Vec<Item>,
 ) {
+    let (start, end) = (range.start, range.end);
     let _ = &pe.sections[sec_idx]; // bounds check; structural fields used via section_name below
     let section_size = (end - start) as u32;
 
@@ -605,7 +813,12 @@ fn emit_section_with_function_split(
         // Falls back to a per-function `@raw` block on hard
         // failures (zero decoded bytes, unsupported machine type,
         // CFG construction failure).
-        if let Some(bn) = bitness
+        let kept = match keep {
+            Keep::None => false,
+            Keep::These(at) => at.contains(&(lo as u64)),
+            Keep::All => true,
+        };
+        if let Some(bn) = bitness.filter(|_| !kept)
             && let Some(emitted) =
                 lift_pe_function(pe, &f.name, lo as u64, f.rva, bn, func_bytes, &name_at)
         {

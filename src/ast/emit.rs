@@ -390,16 +390,16 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, indent: &str) {
             bytes,
             direct_target,
         } => {
-            // A target that isn't a name or a bracketed expression (an
-            // indirect call through a register known to hold `0`) is
-            // parenthesized, which the parser reads as the call target.
-            let starts_ok = name.chars().next().is_some_and(|c| {
-                c.is_ascii_alphabetic() || matches!(c, '_' | '[' | '(' | '*' | '&')
-            });
-            if starts_ok && lexes(name) {
+            // A name (or `this->f` chain) or a bracketed expression is
+            // written as is; any other target (an import by ordinal,
+            // `COREDLL@199`, a mangled `?f@@YAXXZ`, `&sym`, a constant)
+            // is quoted, which the parser reads as the call target.
+            let plain = name.split("->").all(is_identifier)
+                || (name.starts_with('[') && name.ends_with(']') && lexes(name));
+            if plain {
                 write!(out, "{indent}{name}(").unwrap();
             } else {
-                write!(out, "{indent}({name})(").unwrap();
+                write!(out, "{indent}{}(", quote_string(name)).unwrap();
             }
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {

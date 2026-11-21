@@ -1049,7 +1049,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             } else if univdreams::format::pe::is_pe(&bytes) {
                 let pe = univdreams::format::pe::PeFile::parse(&bytes)
                     .with_context(|| format!("parse {} as PE", input.display()))?;
-                univdreams::translate::decompile::decompile_pe_to_text(&pe)
+                if no_verify {
+                    univdreams::translate::decompile::decompile_pe_to_text(&pe)
+                } else {
+                    let verified = univdreams::translate::decompile::decompile_pe_verified(&pe);
+                    warn_kept_as_bytes(&input, verified.opaque.as_deref(), &verified.raw_functions);
+                    univdreams::ast::emit(&verified.ast)
+                }
             } else if univdreams::format::macho::is_macho64(&bytes) {
                 let macho = univdreams::format::macho::MachoFile::parse(&bytes)
                     .with_context(|| format!("parse {} as Mach-O", input.display()))?;
@@ -5538,14 +5544,19 @@ fn verified_elf_source(
 ) -> anyhow::Result<String> {
     let verified = univdreams::translate::decompile::decompile_verified(elf, bytes)
         .with_context(|| format!("decompile {}", input.display()))?;
-    if let Some(reason) = &verified.opaque {
+    warn_kept_as_bytes(input, verified.opaque.as_deref(), &verified.raw_functions);
+    Ok(univdreams::ast::emit(&verified.ast))
+}
+
+/// Report what a verified decompile kept as bytes.
+fn warn_kept_as_bytes(input: &Path, opaque: Option<&str>, raw_functions: &[(u64, String)]) {
+    if let Some(reason) = opaque {
         eprintln!(
             "warning: {}: all code kept as bytes, its source didn't compile back: {reason}",
             input.display()
         );
-    } else if !verified.raw_functions.is_empty() {
-        let names: Vec<String> = verified
-            .raw_functions
+    } else if !raw_functions.is_empty() {
+        let names: Vec<String> = raw_functions
             .iter()
             .take(8)
             .map(|(addr, name)| format!("{name}@{addr:#x}"))
@@ -5553,14 +5564,13 @@ fn verified_elf_source(
         eprintln!(
             "warning: {}: {} function(s) kept as bytes, their source didn't compile back: {}{}",
             input.display(),
-            verified.raw_functions.len(),
+            raw_functions.len(),
             names.join(", "),
-            if verified.raw_functions.len() > names.len() {
+            if raw_functions.len() > names.len() {
                 ", …"
             } else {
                 ""
             }
         );
     }
-    Ok(univdreams::ast::emit(&verified.ast))
 }

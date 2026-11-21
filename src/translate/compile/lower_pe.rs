@@ -89,6 +89,23 @@ impl From<crate::arch::codec::ArchError> for PeLowerError {
 }
 
 /// Lower a `.ud` file describing a PE image to its bytes.
+/// The bytes one function of a PE `module` lowers to, placed as
+/// [`lower_to_pe`] places it: its `@addr` is a file offset, its
+/// instructions are encoded at the matching RVA.
+pub fn lower_pe_function(module: &Module, f: &crate::ast::FnDecl) -> Result<Vec<u8>, PeLowerError> {
+    let arch = crate::translate::compile::module::resolve_arch_codec(module)?;
+    let build = build_block(module)?;
+    let addr = f.addr.ok_or_else(|| PeLowerError::FunctionWithoutAddr {
+        name: f.name.clone(),
+    })?;
+    let ip_base = file_offset_to_rva(addr, &collect_section_ip_offsets(build));
+    Ok(crate::translate::compile::lower::lower_function_bytes_at(
+        f,
+        ip_base,
+        arch.as_ref(),
+    )?)
+}
+
 pub fn lower_to_pe(file: &UdFile) -> Result<Vec<u8>, PeLowerError> {
     let format = read_string(&file.module, "format").ok_or(PeLowerError::UnknownFormat)?;
     if format != "pe" {

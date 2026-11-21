@@ -810,6 +810,11 @@ impl Parser {
                     let stmt = self.parse_call_or_move_stmt()?;
                     body.push(stmt);
                 }
+                // `"COREDLL@199"(…)`: a call target that isn't a name.
+                TokenKind::String(_) if self.next_is_lparen() => {
+                    let stmt = self.parse_call_stmt()?;
+                    body.push(stmt);
+                }
                 other => {
                     return Err(ParseError::Expected {
                         expected: "`@asm`, `// comment`, function call, or `}`".into(),
@@ -1070,6 +1075,14 @@ impl Parser {
         Ok(Stmt::Move { dst, src, bytes })
     }
 
+    /// Whether the token after the current one is `(`.
+    fn next_is_lparen(&self) -> bool {
+        matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::LParen)
+        )
+    }
+
     /// Parse a function-call statement:
     ///
     /// ```text
@@ -1095,6 +1108,12 @@ impl Parser {
     ///   the matching `]` (inclusive of both) is returned verbatim.
     fn parse_call_target_name(&mut self) -> Result<String, ParseError> {
         let tok = self.peek().clone();
+        // A quoted target: an import by ordinal (`COREDLL@199`), a C++
+        // mangled name (`?f@@YAXXZ`), or any text that isn't a name.
+        if let TokenKind::String(name) = &tok.kind {
+            self.bump();
+            return Ok(name.clone());
+        }
         if let TokenKind::Ident(n) = &tok.kind {
             let start = tok.start;
             let mut name = n.clone();
@@ -1777,6 +1796,7 @@ impl Parser {
             TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::LParen | TokenKind::Dollar => {
                 self.parse_call_or_move_stmt()
             }
+            TokenKind::String(_) if self.next_is_lparen() => self.parse_call_stmt(),
             other => Err(ParseError::Expected {
                 expected: "`@asm`, `// comment`, function call, or `}`".into(),
                 got: describe(&other),

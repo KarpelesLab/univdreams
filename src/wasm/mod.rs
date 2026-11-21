@@ -111,7 +111,8 @@ fn decompile_as_elf(bytes: &[u8]) -> Result<String, JsError> {
 fn decompile_as_pe(bytes: &[u8]) -> Result<String, JsError> {
     let pe = crate::format::pe::PeFile::parse(bytes)
         .map_err(|e| JsError::new(&format!("parse PE: {e}")))?;
-    Ok(crate::translate::decompile::decompile_pe_to_text(&pe))
+    let verified = crate::translate::decompile::decompile_pe_verified(&pe);
+    Ok(crate::ast::emit(&verified.ast))
 }
 
 fn decompile_as_macho(bytes: &[u8]) -> Result<String, JsError> {

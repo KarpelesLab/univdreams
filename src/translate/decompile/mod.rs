@@ -58,7 +58,7 @@ pub use data_lookup::DataLookup;
 pub use evm::{decompile_evm, decompile_evm_to_text};
 pub use macho::{decompile_macho, decompile_macho_to_text};
 pub use ne::{decompile_ne, decompile_ne_to_text};
-pub use pe::{decompile_pe, decompile_pe_to_text};
+pub use pe::{VerifiedPe, decompile_pe, decompile_pe_to_text, decompile_pe_verified};
 pub use raw::{decompile_raw_opaque, decompile_raw_opaque_to_text};
 pub use raw6502::{decompile_raw_6502, decompile_raw_6502_to_text};
 pub use wasm::{decompile_wasm, decompile_wasm_to_text};
