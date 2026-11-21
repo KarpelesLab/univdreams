@@ -156,7 +156,7 @@ impl crate::sleigh::parse::Input for Embedded {
 pub struct Language {
     pub def: LanguageDef,
     sleigh: SleighData,
-    initial_ctx: u64,
+    initial_ctx: u128,
 }
 
 impl std::fmt::Debug for Language {
@@ -211,7 +211,7 @@ fn compile(id: &str) -> Result<Language, String> {
     // `SLEIGH_VERBOSE=1` prints the constructors the engine leaves out.
     let verbose = std::env::var_os("SLEIGH_VERBOSE").is_some();
     let sleigh = crate::sleigh::compile::build_inner(parser, verbose)?;
-    let mut initial_ctx = 0u64;
+    let mut initial_ctx = 0u128;
     let pspec = file_in(&def.dir, &def.pspec).unwrap_or("");
     for (name, val) in pspec_context(pspec) {
         if let Some(field) = sleigh.get_context_field(&name) {
@@ -274,7 +274,7 @@ impl Disassembler<'_> {
         if len == 0 || len > bytes.len() {
             return None;
         }
-        let text = self.runtime.disasm(sleigh)?.to_string();
+        let text = self.runtime.disasm(sleigh)?.trim_end().to_string();
         Some((len, text))
     }
 }
@@ -329,6 +329,17 @@ mod tests {
             ("avr8:LE:16:extended", &[0x0f, 0x91][..], "pop R16"),
             // ARM blx #imm: a globalset to a computed address
             ("ARM:LE:32:v8", &[0x00, 0x00, 0x00, 0xfa][..], "blx"),
+            // Context wider than 64 bits: Hexagon `jumpr LR`, PA-RISC `bv (rp)`
+            (
+                "Hexagon:LE:32:default",
+                &[0x00, 0xc0, 0x9f, 0x52][..],
+                "jumpr LR",
+            ),
+            (
+                "pa-risc:BE:32:default",
+                &[0xe8, 0x40, 0xc0, 0x00][..],
+                "BV (rp)",
+            ),
             // V850: jmp [lp]
             ("V850:LE:32:default", &[0x7f, 0x00][..], "jmp"),
         ] {

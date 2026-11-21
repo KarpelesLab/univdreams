@@ -117,19 +117,70 @@ struct MatcherOrdering {
     pub ord: Option<Ordering>,
 }
 
+/// Token and context bits side by side (univdreams: the context is 128
+/// bits wide, so the two no longer pack into one `u128`).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct Bits {
+    token: u128,
+    context: u128,
+}
+
+impl Bits {
+    fn of(token: &Pattern, context: &Pattern, f: impl Fn(&Pattern) -> u128) -> Self {
+        Self {
+            token: f(token),
+            context: f(context),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.token != 0 || self.context != 0
+    }
+}
+
+impl std::ops::BitAnd for Bits {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        Self {
+            token: self.token & rhs.token,
+            context: self.context & rhs.context,
+        }
+    }
+}
+
+impl std::ops::BitOr for Bits {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self {
+            token: self.token | rhs.token,
+            context: self.context | rhs.context,
+        }
+    }
+}
+
+impl std::ops::Not for Bits {
+    type Output = Self;
+    fn not(self) -> Self {
+        Self {
+            token: !self.token,
+            context: !self.context,
+        }
+    }
+}
+
 /// Returns a mask and value for fields representing the bits with simple
 /// constraints.
-fn pattern_mask_value_simple(case: &MatchCase) -> (u128, u128) {
-    let mask = (case.token.mask as u128) << u64::BITS | case.context.mask as u128;
-    let value = (case.token.bits as u128) << u64::BITS | case.context.bits as u128;
+fn pattern_mask_value_simple(case: &MatchCase) -> (Bits, Bits) {
+    let mask = Bits::of(&case.token, &case.context, |p| p.mask);
+    let value = Bits::of(&case.token, &case.context, |p| p.bits);
     //NOTE value & mask is important because of the complex constraint
     (mask, value & mask)
 }
 
 /// Returns the mask for fields representing the bits with complex constraints.
-fn pattern_mask_complex(case: &MatchCase) -> u128 {
-    let mask = (case.token.mask as u128) << u64::BITS | case.context.mask as u128;
-    let value = (case.token.bits as u128) << u64::BITS | case.context.bits as u128;
+fn pattern_mask_complex(case: &MatchCase) -> Bits {
+    let mask = Bits::of(&case.token, &case.context, |p| p.mask);
+    let value = Bits::of(&case.token, &case.context, |p| p.bits);
     !mask & value
 }
 
@@ -187,18 +238,13 @@ fn complex_equal_intersection(case_a: &MatchCase, case_b: &MatchCase) -> bool {
 }
 
 // Returns true if the constraint affect the mask
-fn constraint_in_mask(constraint: &Constraint, mask: u128) -> bool {
-    let bits = match constraint {
-        Constraint::Token { token, field, .. } => {
-            let mut bits = field.mask();
-            if token.big_endian {
-                bits = byteswap_value(bits, token.size as u64 * 8);
-            }
-            (bits as u128) >> 64
-        }
-        Constraint::Context { field, .. } => field.mask().into(),
-    };
-    bits & mask != 0
+fn constraint_in_mask(constraint: &Constraint, mask: Bits) -> bool {
+    match constraint {
+        // Upstream shifted token bits out of its packed `u128` here
+        // (`>> 64`), so token constraints never counted; kept as is.
+        Constraint::Token { .. } => false,
+        Constraint::Context { field, .. } => field.mask_wide() & mask.context != 0,
+    }
 }
 
 /// Compares the bits set in self with other.
@@ -221,9 +267,9 @@ fn compare_match_cases(case_a: &MatchCase, case_b: &MatchCase) -> MatcherOrderin
     }
 }
 
-fn ordering_from_mask(mask_a: u128, mask_b: u128) -> Option<Ordering> {
-    let extra_a = mask_a & !mask_b != 0;
-    let extra_b = mask_b & !mask_a != 0;
+fn ordering_from_mask(mask_a: Bits, mask_b: Bits) -> Option<Ordering> {
+    let extra_a = (mask_a & !mask_b).any();
+    let extra_b = (mask_b & !mask_a).any();
     match (extra_a, extra_b) {
         (false, false) => Some(Ordering::Equal),
         (true, true) => None,

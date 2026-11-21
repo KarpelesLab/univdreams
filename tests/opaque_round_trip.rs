@@ -36,7 +36,7 @@ fn elf_of_an_undecoded_architecture() {
     // hand-written decoder. x86 code read as ARM or MIPS is nonsense,
     // but each instruction keeps its bytes, so it still round-trips.
     for (name, machine, arch, sleigh) in [
-        ("sqrt-gcc13-O0", 164, "hexagon", false),
+        ("sqrt-gcc13-O0", 50, "ia64", false),
         ("sqrt-gcc13-O0-m32", 40, "arm", true),
         ("loops-gcc14-O0-m32", 8, "mips", true),
     ] {
@@ -59,7 +59,7 @@ fn headerless_bytes() {
     let bytes: Vec<u8> = (0..10_000u32)
         .map(|i| (i * 7 + i / 13).to_le_bytes()[0])
         .collect();
-    for (arch, load) in [("unknown", 0), ("hexagon", 0x8000_0000)] {
+    for (arch, load) in [("unknown", 0), ("ia64", 0x8000_0000)] {
         let text = decompile_raw_opaque_to_text(&bytes, arch, load);
         let ast = parse(&text).unwrap_or_else(|e| panic!("parse: {e}"));
         assert_eq!(lower_to_raw(&ast).expect("lower"), bytes, "{arch}");

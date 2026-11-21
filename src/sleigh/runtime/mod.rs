@@ -32,7 +32,7 @@ const MAX_REG_SIZE: u8 = 16;
 #[derive(Debug, Copy, Clone)]
 pub struct RuntimeConfig {
     /// The initial value of the context register used for decoding.
-    pub context: u64,
+    pub context: u128,
     /// Controls whether the decoder should attempt to decode any delay slots present in the
     /// instruction.
     pub ignore_delay_slots: bool,
@@ -55,7 +55,7 @@ impl Default for RuntimeConfig {
 }
 
 pub struct Runtime {
-    pub context: u64,
+    pub context: u128,
     update_context: bool,
     lifter: Lifter,
     state: Decoder,
@@ -64,7 +64,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new(context: u64) -> Self {
+    pub fn new(context: u128) -> Self {
         Self::new_with_config(&RuntimeConfig {
             context,
             ..Default::default()
@@ -184,24 +184,40 @@ impl Field {
         }
     }
 
-    /// Extract and sign-extend the field from `value`.
-    pub fn extract(&self, value: u64) -> i64 {
-        let value = (value >> self.offset) & crate::sleigh::pcode::mask(self.num_bits as u64);
+    /// Extract and sign-extend the field from `value` (a token, or the
+    /// context register, which univdreams widens to 128 bits for
+    /// Hexagon and PA-RISC).
+    pub fn extract(&self, value: impl Into<u128>) -> i64 {
+        let value = ((value.into() >> self.offset) & mask128(self.num_bits)) as u64;
         match self.signed {
             true => crate::sleigh::pcode::sxt64(value, self.num_bits as u64) as i64,
             false => value as i64,
         }
     }
 
-    /// Write the value of the field to `dst`.
-    pub fn set(&self, dst: &mut u64, value: i64) {
-        let mask = self.mask();
-        *dst = (*dst & !mask) | (((value as u64) << self.offset) & mask);
+    /// Write the value of the field to the context register `dst`.
+    pub fn set(&self, dst: &mut u128, value: i64) {
+        let mask = self.mask_wide();
+        *dst = (*dst & !mask) | ((u128::from(value as u64) << self.offset) & mask);
+    }
+
+    /// [`Self::mask`], for a field of the 128-bit context register.
+    pub fn mask_wide(&self) -> u128 {
+        mask128(self.num_bits) << self.offset
     }
 
     /// Get a mask representing the bits that are read as part of `field`.
     pub fn mask(&self) -> u64 {
         crate::sleigh::pcode::mask(self.num_bits as u64) << self.offset
+    }
+}
+
+/// The low `bits` bits set.
+fn mask128(bits: u16) -> u128 {
+    match bits {
+        0 => 0,
+        128.. => u128::MAX,
+        n => u128::MAX >> (128 - u32::from(n)),
     }
 }
 

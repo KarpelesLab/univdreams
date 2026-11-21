@@ -67,7 +67,7 @@ pub struct MatchCase {
 }
 
 impl MatchCase {
-    fn matches(&self, state: &Decoder, context_reg: u64, token: u64) -> bool {
+    fn matches(&self, state: &Decoder, context_reg: u128, token: u64) -> bool {
         self.context.matches(context_reg)
             && self.token.matches(token)
             && (self.constraints.is_empty() || self.matches_complex(state))
@@ -81,8 +81,8 @@ impl MatchCase {
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Pattern {
-    pub bits: u64,
-    pub mask: u64,
+    pub bits: u128,
+    pub mask: u128,
 }
 
 impl std::fmt::Display for Pattern {
@@ -102,8 +102,8 @@ impl std::fmt::Display for Pattern {
 }
 
 impl Pattern {
-    pub fn matches(&self, other: u64) -> bool {
-        self.mask & self.bits == self.mask & other
+    pub fn matches(&self, other: impl Into<u128>) -> bool {
+        self.mask & self.bits == self.mask & other.into()
     }
 }
 
@@ -152,7 +152,7 @@ impl Constraint {
 }
 
 struct ConstraintEvalCtx {
-    src_val: u64,
+    src_val: u128,
 }
 
 impl EvalPatternValue for ConstraintEvalCtx {
@@ -164,10 +164,11 @@ impl EvalPatternValue for ConstraintEvalCtx {
 }
 fn eval_constraint(
     field: Field,
-    src_val: u64,
+    src_val: impl Into<u128>,
     operand: &ConstraintOperand,
     cmp: ConstraintCmp,
 ) -> bool {
+    let src_val: u128 = src_val.into();
     let lhs = field.extract(src_val);
     let rhs = match operand {
         ConstraintOperand::Constant(x) => *x,

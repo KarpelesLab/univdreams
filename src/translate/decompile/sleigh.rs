@@ -22,6 +22,8 @@ pub fn elf_language(machine: u16, is_64: bool, big_endian: bool) -> Option<&'sta
     let e = |be: &'static str, le: &'static str| if big_endian { be } else { le };
     Some(match (machine, is_64) {
         (2 | 18, _) => "sparc:BE:32:default",
+        (15, false) => "pa-risc:BE:32:default",
+        (164, _) => "Hexagon:LE:32:default",
         (43, _) => "sparc:BE:64:default",
         (4, _) => "68000:BE:32:default",
         (8 | 10, false) => e("MIPS:BE:32:default", "MIPS:LE:32:default"),
@@ -107,6 +109,8 @@ pub fn named_language(arch: &str) -> Option<&str> {
         "cr16" => "CR16AB:LE:16:default",
         "loongarch" | "loongarch64" => "Loongarch:LE:64:lp64d",
         "jvm" => "JVM:BE:32:default",
+        "hexagon" | "qdsp6" => "Hexagon:LE:32:default",
+        "hppa" | "parisc" | "pa-risc" => "pa-risc:BE:32:default",
         "riscv" | "riscv32" | "rv32" => "RISCV:LE:32:default",
         "riscv64" | "rv64" => "RISCV:LE:64:default",
         "v850" => "V850:LE:32:default",
@@ -189,10 +193,14 @@ mod tests {
         assert_eq!(elf_language(8, false, true), Some("MIPS:BE:32:default"));
         assert_eq!(elf_language(40, false, false), Some("ARM:LE:32:v8"));
         assert_eq!(elf_language(243, true, false), Some("RISCV:LE:64:default"));
-        assert_eq!(elf_language(164, false, false), None);
+        assert_eq!(
+            elf_language(164, false, false),
+            Some("Hexagon:LE:32:default")
+        );
+        assert_eq!(elf_language(50, true, false), None);
         assert_eq!(named_language("mipsel"), Some("MIPS:LE:32:default"));
         assert_eq!(named_language("ARM:BE:32:v7"), Some("ARM:BE:32:v7"));
-        assert_eq!(named_language("hexagon"), None);
+        assert_eq!(named_language("alpha"), None);
     }
 
     #[cfg(feature = "sleigh")]

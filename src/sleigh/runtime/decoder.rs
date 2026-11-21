@@ -14,10 +14,10 @@ use std::collections::HashMap;
 /// The decoder context for the current instruction.
 pub struct Decoder {
     /// The global decoder context.
-    pub global_context: u64,
+    pub global_context: u128,
 
     /// The local context value.
-    pub(crate) context: u64,
+    pub(crate) context: u128,
 
     /// The future context modifications. The address is the key for the (Field, Val) tuple.
     future_context_mods: HashMap<u64, Vec<(Field, i64)>>,
