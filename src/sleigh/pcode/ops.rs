@@ -76,7 +76,9 @@ impl VarNode {
 
     #[inline]
     pub fn try_slice(self, offset: VarOffset, size: VarSize) -> Option<VarNode> {
-        if offset + size > self.size {
+        // univdreams: checked, a partly overlapping register's offset can
+        // be far past this one.
+        if offset.checked_add(size)? > self.size {
             return None;
         }
         Some(VarNode {
